@@ -1,5 +1,5 @@
 [package]
-name = "rust-chem"
+name = "chem"
 version = "0.0.1"
 description = "A cheminformatics library by Rust." 
 edition = "2018"
