@@ -1,9 +1,15 @@
 [package]
 name = "rust-chem"
-version = "0.1.0"
+version = "0.0.1"
+description = "A cheminformatics library by Rust." 
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "Apache 2.0"
+homepage = "https://github.com/chiral-data/rust-chem"
+repository = "https://github.com/chiral-data/rust-chem"
+documentation = "https://docs.rs/chem"
+readme = "README.md"
+keywords = ["cheminformatics", "algorithms", "molecule", "SMILES"]
+categories = ["science"]
 
 [dependencies]
 
