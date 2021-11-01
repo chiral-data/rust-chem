@@ -10,6 +10,8 @@
 //! 
 //! build SMILES from atom symbols, bond symbols, topological connectivities and atom rankings
 //! ```rust
+//! use chem::smiles_writer::write_smiles;
+//! 
 //! let atom_symbols: Vec<String> = vec!["c", "c", "c", "c", "c", "c", "O"].into_iter().map(|s| s.to_string()).collect();
 //! let atom_neighbours: Vec<Vec<usize>> = vec![vec![1, 5], vec![2, 0], vec![1, 3], vec![2, 4], vec![3, 5], vec![0, 4, 6], vec![5]];
 //! let atom_rankings: Vec<usize> = vec![0, 1, 2, 3, 4, 5, 6];
@@ -19,6 +21,9 @@
 //!
 //! or implement the trait [TraitMoleculeForSMILES](trait.TraitMoleculeForSMILES.html) for your own Molecule Type, e.g. a Molecule Type from crate [purr](https://github.com/rapodaca/purr)
 //! ```rust
+//! use chem::smiles_writer::TraitMoleculeForSMILES;
+//! use chem::smiles_writer::write_smiles_for_mol;
+//! 
 //! struct Molecule {
 //!     pub atoms: Vec<purr::graph::Atom>,
 //!     pub bond_table: std::collections::HashMap<String, String>
@@ -65,7 +70,7 @@
 //!         self.atoms[*atom].kind.to_string()
 //!     }
 //! 
-//!     fn get_atom_ranking(&self, atom: &usize) -> usize {
+//!     fn get_atom_ranking(&self, atom: &usize, rankings: &Vec<usize>) -> usize {
 //!         atom.clone()
 //!     }
 //! 
@@ -74,9 +79,9 @@
 //!     }
 //! }
 //! 
-//! let smiles = String::from("Oc1ccccc1")
+//! let smiles = String::from("Oc1ccccc1");
 //! let mol = Molecule::from_smiles(&smiles);
-//! assert_eq!(write_smiles_for_mol(&mol), smiles);
+//! assert_eq!(write_smiles_for_mol(&mol, &(0..mol.atoms.len()).collect()), smiles);
 //! ```
 
 /// Manager of ring digit
@@ -136,14 +141,14 @@ pub trait TraitMoleculeForSMILES {
     fn get_neighbours_of_atom(&self, atom: &usize) -> Vec<usize>;
     fn get_bond_symbol(&self, atom_1: &usize, atom_2: &usize) -> String;
     fn get_atom_symbol(&self, atom: &usize) -> String;
-    fn get_atom_ranking(&self, atom: &usize) -> usize;
+    fn get_atom_ranking(&self, atom: &usize, rankings: &Vec<usize>) -> usize;
     fn count_of_atoms(&self) -> usize;
 }
 
 struct MoleculeForSmiles {
     atom_symbols: Vec<String>,
     atom_neighbours: Vec<Vec<usize>>,
-    atom_rankings: Vec<usize>,
+    // atom_rankings: Vec<usize>,
     bond_symbols: std::collections::HashMap<String, String>,
 }
 
@@ -163,8 +168,8 @@ impl TraitMoleculeForSMILES for MoleculeForSmiles {
         self.atom_symbols[*atom].clone()
     }
 
-    fn get_atom_ranking(&self, atom: &usize) -> usize {
-        self.atom_rankings[*atom]
+    fn get_atom_ranking(&self, atom: &usize, rankings: &Vec<usize>) -> usize {
+        rankings[*atom]
     }
 
     fn count_of_atoms(&self) -> usize {
@@ -189,6 +194,7 @@ fn get_neighbours_excluding_parent<T: TraitMoleculeForSMILES>(
 /// A recursive function for detecting opening closures by the 1st traversing
 fn get_closures_for_atom<T: TraitMoleculeForSMILES>(
     mol: &T,
+    rankings: &Vec<usize>,
     atom_current: usize, 
     atom_parent_opt: Option<usize>, 
     dp: &mut DataPool
@@ -197,7 +203,7 @@ fn get_closures_for_atom<T: TraitMoleculeForSMILES>(
     dp.visited.push(atom_current);
     
     let mut nbors: Vec<usize> = get_neighbours_excluding_parent(mol, atom_current, atom_parent_opt); 
-    nbors.sort_by_key(|idx| mol.get_atom_ranking(idx));
+    nbors.sort_by_key(|idx| mol.get_atom_ranking(idx, rankings));
 
     for nb in nbors.iter() {
         if dp.ancestors.contains(nb) { 
@@ -205,7 +211,7 @@ fn get_closures_for_atom<T: TraitMoleculeForSMILES>(
         }
         else {
             if !dp.visited.contains(nb) { 
-                get_closures_for_atom(mol, *nb, Some(atom_current), dp); 
+                get_closures_for_atom(mol, rankings, *nb, Some(atom_current), dp); 
             }
         }
     }
@@ -217,6 +223,7 @@ fn get_closures_for_atom<T: TraitMoleculeForSMILES>(
 /// A recursive function for building smiles by the 2nd traversing
 fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
     mol: &T,
+    rankings: &Vec<usize>,
     atom_current: usize,
     atom_parent_opt: Option<usize>,
     dp: &mut DataPool
@@ -257,12 +264,12 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
     }
 
     let mut nbors: Vec<usize> = get_neighbours_excluding_parent(mol, atom_current, atom_parent_opt); 
-    nbors.sort_by_key(|idx| mol.get_atom_ranking(idx));
+    nbors.sort_by_key(|idx| mol.get_atom_ranking(idx, rankings));
 
     let mut branches: Vec<String> = vec![];
     for n in nbors.iter() {
         if !dp.visited.contains(&n) {
-            branches.push(build_smiles_for_atom(mol, *n, Some(atom_current), dp));
+            branches.push(build_smiles_for_atom(mol, rankings, *n, Some(atom_current), dp));
         }
     }
 
@@ -281,18 +288,19 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
 
 /// SMILES writer with trait Molecule 
 pub fn write_smiles_for_mol<T: TraitMoleculeForSMILES>(
-    mol: &T
+    mol: &T,
+    rankings: &Vec<usize>
 ) -> String {
     let mut dp = DataPool::init();
 
     // find the atom with minimum ranking to start
     let mut atom_indexes: Vec<usize> = (0..mol.count_of_atoms()).collect();
-    atom_indexes.sort_by_key(|idx| mol.get_atom_ranking(idx));
+    atom_indexes.sort_by_key(|idx| mol.get_atom_ranking(idx, rankings));
 
-    get_closures_for_atom(mol, atom_indexes[0], None, &mut dp);
+    get_closures_for_atom(mol, rankings, atom_indexes[0], None, &mut dp);
 
     dp.visited.clear();
-    build_smiles_for_atom(mol, atom_indexes[0], None, &mut dp)
+    build_smiles_for_atom(mol, rankings, atom_indexes[0], None, &mut dp)
 }
 
 /// SMILES writer with raw data
@@ -302,8 +310,8 @@ pub fn write_smiles(
     atom_rankings: Vec<usize>,
     bond_symbols: std::collections::HashMap<String, String>,
 ) -> String {
-    let mol = MoleculeForSmiles { atom_symbols, atom_neighbours, bond_symbols, atom_rankings };
-    write_smiles_for_mol(&mol)
+    let mol = MoleculeForSmiles { atom_symbols, atom_neighbours, bond_symbols };
+    write_smiles_for_mol(&mol, &atom_rankings)
 }
 
 
@@ -357,7 +365,7 @@ mod tests {
             self.atoms[*atom].kind.to_string()
         }
 
-        fn get_atom_ranking(&self, atom: &usize) -> usize {
+        fn get_atom_ranking(&self, atom: &usize, _rankings: &Vec<usize>) -> usize {
             atom.clone()
         }
 
@@ -404,7 +412,7 @@ mod tests {
        for td in test_data.iter() {
             let smiles = td.clone();
             let mol = Molecule::from_smiles(&smiles);
-            assert_eq!(write_smiles_for_mol(&mol), smiles);
+            assert_eq!(write_smiles_for_mol(&mol, &(0..mol.atoms.len()).collect()), smiles);
        }
     }
 
@@ -431,9 +439,5 @@ mod tests {
             let (atom_symbols, atom_neighbours, atom_rankings, bond_symbols, smiles) = td.clone();
             assert_eq!(write_smiles(atom_symbols, atom_neighbours, atom_rankings, bond_symbols), smiles);
        }
-    }
-
-    #[test]
-    fn name() {
     }
 }

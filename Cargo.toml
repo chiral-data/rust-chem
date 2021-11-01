@@ -1,6 +1,6 @@
 [package]
 name = "chem"
-version = "0.0.1"
+version = "0.0.2"
 description = "A cheminformatics library by Rust." 
 edition = "2018"
 license = "MIT"

@@ -5,5 +5,3 @@ Rust Implementation of Algorithms in Cheminformatics.
 
 ## Implemented
 - a SMILES writer `smiles_writer.rs`
-
-## Planned
