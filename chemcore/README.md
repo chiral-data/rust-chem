@@ -378,7 +378,3 @@ cargo doc -p chemcore --open
 - **Separation**: Atoms, bonds, graph kept separate → Clean, parallelizable
 - **Builder pattern**: Fluent API → Ergonomic
 - **Type safety**: Enums for bond order, element → Compile-time checks
-
-## Next Steps
-
-Week 2 will add SMILES parsing to create molecules from strings like `"CCO"` (ethanol).
