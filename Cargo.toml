@@ -1,17 +1,11 @@
-[package]
-name = "chem"
-version = "0.0.2"
-description = "A cheminformatics library by Rust." 
-edition = "2018"
-license = "MIT"
-homepage = "https://github.com/chiral-data/rust-chem"
-repository = "https://github.com/chiral-data/rust-chem"
-documentation = "https://docs.rs/chem"
-readme = "README.md"
-keywords = ["cheminformatics", "algorithms", "molecule", "SMILES"]
-categories = ["science"]
+[workspace]
+members = ["chemcore", "chemfp", "chemgpu", "chemio"]
 
-[dependencies]
+[workspace.dependencies]
+chemcore = { path = "./chemcore" }
+chemio = { path = "./chemio" }
+chemfp = { path = "./chemfp" }
+chemgpu = { path = "./chemgpu" }
+thiserror = "2.0.17"
+anyhow = "1.0"
 
-[dev-dependencies]
-purr = "0.9"
