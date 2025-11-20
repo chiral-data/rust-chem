@@ -168,8 +168,9 @@ fn parse_element_symbol(input: &str) -> IResult<&str, String> {
         // Second Alternative
         map(
             recognize(nom::sequence::pair(
-                one_of("BCNOFPSIbcnofpsi"),
-                opt(one_of("abcdefghijklmnopqrstuvwxyz")),
+                // Example: Fe ==> (F): Matched by 1st Parser || (e): Matched by 2nd Parser
+                one_of("BCNOFPSIbcnofpsi"), // Matched 1st Char
+                opt(one_of("abcdefghijklmnopqrstuvwxyz")), // Matches 2nd Char
             )),
             |s: &str| s.to_string(),
         ),
@@ -236,14 +237,13 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                 let atom_idx = add_atom_from_token(&mut mol, atom_token)?;
 
                 if let Some(prev_atom) = current_atom {
-                    let bond_order =
-                        next_bond
-                            .map(|b| b.to_bond_order())
-                            .unwrap_or(if atom_token.aromatic {
-                                BondOrder::Aromatic
-                            } else {
-                                BondOrder::Single
-                            });
+                    let bond_order = next_bond // This is the previous pending_bond that will be applied NOW.
+                        .map(|b| b.to_bond_order())
+                        .unwrap_or(if atom_token.aromatic {
+                            BondOrder::Aromatic
+                        } else {
+                            BondOrder::Single
+                        });
 
                     let mut bond = Bond::new(prev_atom, atom_idx, bond_order);
                     if bond_order == BondOrder::Aromatic {
@@ -254,7 +254,7 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                 }
 
                 current_atom = Some(atom_idx);
-                next_bond = None;
+                next_bond = None; // pending_bond: i.e. it will be applied once next atom arrives
             }
 
             Token::Bond(bond_token) => {
@@ -309,6 +309,7 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
 }
 
 fn add_atom_from_token(mol: &mut Molecule, token: &AtomToken) -> Result<usize, SmilesError> {
+    // FIX:Hard coded... solve this
     let atomic_number = match token.element.as_str() {
         "H" => 1,
         "C" => 6,
@@ -394,6 +395,13 @@ mod tests {
         let mol = parse_smiles("CC(C)C").unwrap();
         assert_eq!(mol.num_atoms(), 4);
         assert_eq!(mol.formula(), "C4H10");
+    }
+
+    #[test]
+    fn test_complex_mol() {
+        let mol = parse_smiles("CC(=O)c1ccccc1").unwrap();
+        assert_eq!(mol.num_atoms(), 9); // 8 C + 1 O == 9
+        assert_eq!(mol.formula(), "C8H8O");
     }
 
     #[test]
