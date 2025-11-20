@@ -17,3 +17,18 @@ pub enum SmilesError {
     #[error("Mismatched branches")]
     MismatchedBranches,
 }
+
+#[derive(Error, Debug)]
+pub enum SdfError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid bond line: {0}")]
+    InvalidBondLine(String),
+
+    #[error("Missing counts line")]
+    MissingCountsLine,
+}
