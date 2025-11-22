@@ -3,19 +3,15 @@ use std::collections::HashMap;
 use nom::{
     branch::alt,
     bytes::complete::tag,
-    character::complete::{char, digit1, one_of},
-    combinator::{map, opt, recognize},
+    character::complete::{char, digit1},
+    combinator::{map, opt},
     multi::many0,
     sequence::{delimited, preceded},
     IResult, Parser,
 };
 
 use crate::errors::SmilesError;
-use chemcore::{
-    atom::{Atom, Element},
-    bond::{Bond, BondOrder},
-    molecule::Molecule,
-};
+use chemcore::prelude::*;
 
 #[derive(Debug, Clone)]
 enum Token {
@@ -45,7 +41,7 @@ enum BondToken {
 }
 
 impl BondToken {
-    fn to_bond_order(&self) -> BondOrder {
+    fn to_bond_order(self) -> BondOrder {
         match self {
             BondToken::Single => BondOrder::Single,
             BondToken::Double => BondOrder::Double,
@@ -70,8 +66,7 @@ fn tokenize_smiles(input: &str) -> Result<Vec<Token>, SmilesError> {
         Ok((remaining, tokens)) => {
             if !remaining.is_empty() {
                 Err(SmilesError::ParseError(format!(
-                    "Unexpected characters: {}",
-                    remaining
+                    "Parsing {input} with error Unexpected characters: {remaining}",
                 )))
             } else {
                 Ok(tokens)
@@ -84,40 +79,13 @@ fn tokenize_smiles(input: &str) -> Result<Vec<Token>, SmilesError> {
 fn parse_smiles_tokens(input: &str) -> IResult<&str, Vec<Token>> {
     many0(alt((
         map(parse_bracket_atom, Token::Atom),
-        map(parse_organic_atom, Token::Atom),
+        map(parse_element_atom, Token::Atom),
         map(parse_bond, Token::Bond),
         map(char('('), |_| Token::Branch),
         map(char(')'), |_| Token::BranchEnd),
         map(parse_ring_number, Token::Ring),
     )))
     .parse(input)
-}
-
-fn parse_organic_atom(input: &str) -> IResult<&str, AtomToken> {
-    let (remaining_input, symbol) = alt((
-        recognize(tag("Cl")),
-        recognize(tag("Br")),
-        recognize(one_of("BCNOPSFIbcnops")),
-    ))
-    .parse(input)?;
-
-    let aromatic = symbol.chars().next().unwrap().is_lowercase();
-    let element = if aromatic {
-        symbol.to_uppercase()
-    } else {
-        symbol.to_string()
-    };
-
-    Ok((
-        remaining_input,
-        AtomToken {
-            element,
-            aromatic,
-            charge: 0,
-            isotope: None,
-            h_count: None,
-        },
-    ))
 }
 
 fn parse_bracket_atom(input: &str) -> IResult<&str, AtomToken> {
@@ -158,24 +126,113 @@ fn parse_bracket_atom(input: &str) -> IResult<&str, AtomToken> {
     .parse(input)
 }
 
+fn parse_element_atom(input: &str) -> IResult<&str, AtomToken> {
+    let (remaining_input, symbol) = parse_element_symbol(input)?;
+
+    // Determine aromaticity: lowercase first character indicates aromatic atom
+    let aromatic = symbol.chars().next().unwrap().is_lowercase();
+
+    // Normalize element symbol to uppercase for consistency
+    let element = if aromatic {
+        symbol.to_uppercase()
+    } else {
+        symbol
+    };
+
+    Ok((
+        remaining_input,
+        AtomToken {
+            element,
+            aromatic,
+            charge: 0,
+            isotope: None,
+            h_count: None,
+        },
+    ))
+}
+
+/// Parses element symbols from SMILES strings.
+///
+/// This parser handles:
+/// - All standard element symbols from the periodic table (case-sensitive)
+/// - SMILES aromatic lowercase symbols (b, c, n, o, p, s, se, as)
+///
+/// The parser tries to match the longest possible symbol first (2 chars),
+/// then falls back to single character symbols.
 fn parse_element_symbol(input: &str) -> IResult<&str, String> {
     alt((
-        // First Alternative
-        map(
-            alt((tag("Cl"), tag("Br"), tag("cl"), tag("br"))), // element must match exactly one of the 4
-            |s: &str| s.to_string(),
-        ),
-        // Second Alternative
-        map(
-            recognize(nom::sequence::pair(
-                // Example: Fe ==> (F): Matched by 1st Parser || (e): Matched by 2nd Parser
-                one_of("BCNOFPSIbcnofpsi"), // Matched 1st Char
-                opt(one_of("abcdefghijklmnopqrstuvwxyz")), // Matches 2nd Char
-            )),
-            |s: &str| s.to_string(),
-        ),
+        // Try 2-character symbols first (to avoid matching "C" when input is "Cl")
+        parse_two_char_element,
+        // Then try 1-character symbols
+        parse_one_char_element,
     ))
     .parse(input)
+}
+
+/// Parses 2-character element symbols.
+///
+/// This dynamically generates parsers for all 2-character elements from ELEMENT_SYMBOLS,
+/// plus SMILES aromatic symbols (se, as).
+fn parse_two_char_element(input: &str) -> IResult<&str, String> {
+    // Need at least 2 characters
+    if input.len() < 2 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    let two_chars = &input[0..2];
+
+    // Check if it matches any 2-character element from ELEMENT_SYMBOLS
+    let is_valid_element = ELEMENT_SYMBOLS
+        .iter()
+        .any(|&symbol| symbol.len() == 2 && symbol == two_chars);
+
+    // Also check for SMILES aromatic 2-character symbols
+    let is_aromatic = matches!(two_chars, "se" | "as");
+
+    if is_valid_element || is_aromatic {
+        Ok((&input[2..], two_chars.to_string()))
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )))
+    }
+}
+
+/// Parses 1-character element symbols.
+///
+/// This handles:
+/// - Single-letter elements from ELEMENT_SYMBOLS (H, B, C, N, O, F, P, S, I, etc.)
+/// - SMILES aromatic lowercase symbols (b, c, n, o, p, s)
+fn parse_one_char_element(input: &str) -> IResult<&str, String> {
+    if input.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    let one_char = &input[0..1];
+
+    // Check if it matches any 1-character element from ELEMENT_SYMBOLS
+    let is_valid_element = ELEMENT_SYMBOLS
+        .iter()
+        .any(|&symbol| symbol.len() == 1 && symbol == one_char);
+
+    // Also check for SMILES aromatic 1-character symbols (lowercase)
+    let is_aromatic = matches!(one_char, "b" | "c" | "n" | "o" | "p" | "s");
+
+    if is_valid_element || is_aromatic {
+        Ok((&input[1..], one_char.to_string()))
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )))
+    }
 }
 
 fn parse_h_count(input: &str) -> IResult<&str, u8> {
@@ -208,6 +265,7 @@ fn parse_bond(input: &str) -> IResult<&str, BondToken> {
         map(char('='), |_| BondToken::Double),
         map(char('#'), |_| BondToken::Triple),
         map(char(':'), |_| BondToken::Aromatic),
+        map(char('$'), |_| BondToken::Quadruble),
     ))
     .parse(input)
 }
@@ -309,23 +367,12 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
 }
 
 fn add_atom_from_token(mol: &mut Molecule, token: &AtomToken) -> Result<usize, SmilesError> {
-    // FIX:Hard coded... solve this
-    let atomic_number = match token.element.as_str() {
-        "H" => 1,
-        "C" => 6,
-        "N" => 7,
-        "O" => 8,
-        "F" => 9,
-        "P" => 15,
-        "S" => 16,
-        "Cl" => 17,
-        "Br" => 35,
-        "I" => 53,
-        "B" => 5,
-        _ => return Err(SmilesError::InvalidElement(token.element.clone())),
-    };
+    let atomic_number = ELEMENT_SYMBOLS
+        .iter()
+        .position(|&symbol| symbol == token.element.as_str())
+        .ok_or_else(|| SmilesError::InvalidElement(token.element.clone()))?;
 
-    let element = Element::new(atomic_number)
+    let element = Element::new(atomic_number as u8)
         .ok_or_else(|| SmilesError::InvalidElement(token.element.clone()))?;
 
     let mut atom = Atom::new(element);
@@ -427,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_parse_organic_symbol() {
-        let result = parse_organic_atom("Cl123");
+        let result = parse_element_atom("Cl123");
         assert!(result.is_ok());
         let (remaining, atom) = result.unwrap();
         assert_eq!(remaining, "123");
@@ -437,7 +484,7 @@ mod tests {
         assert_eq!(atom.isotope, None);
         assert_eq!(atom.h_count, None);
 
-        let result = parse_organic_atom("BrOH");
+        let result = parse_element_atom("BrOH");
         assert!(result.is_ok());
         let (remaining, atom) = result.unwrap();
         assert_eq!(remaining, "OH");
@@ -872,19 +919,6 @@ mod tests {
         assert_eq!(remaining, "(OH)");
         assert_eq!(element, "Br");
 
-        // Test 2: Two-letter elements (lowercase) - should match first alternative
-        let result = parse_element_symbol("cl2");
-        assert!(result.is_ok());
-        let (remaining, element) = result.unwrap();
-        assert_eq!(remaining, "2");
-        assert_eq!(element, "cl");
-
-        let result = parse_element_symbol("br-");
-        assert!(result.is_ok());
-        let (remaining, element) = result.unwrap();
-        assert_eq!(remaining, "-");
-        assert_eq!(element, "br");
-
         // Test 3: Single letter elements - should match second alternative
         let result = parse_element_symbol("C");
         assert!(result.is_ok());
@@ -981,11 +1015,8 @@ mod tests {
 
         // Test 10: Case sensitivity verification
         let result_upper = parse_element_symbol("Br");
-        let result_lower = parse_element_symbol("br");
         assert!(result_upper.is_ok());
-        assert!(result_lower.is_ok());
         assert_eq!(result_upper.unwrap().1, "Br");
-        assert_eq!(result_lower.unwrap().1, "br");
 
         // Test 11: Elements that could be ambiguous
         let result = parse_element_symbol("C3");
@@ -993,11 +1024,12 @@ mod tests {
         let (remaining, element) = result.unwrap();
         assert_eq!(remaining, "3");
         assert_eq!(element, "C");
+    }
 
-        let result = parse_element_symbol("cl");
-        assert!(result.is_ok());
-        let (remaining, element) = result.unwrap();
-        assert_eq!(remaining, "");
-        assert_eq!(element, "cl");
+    #[test]
+    fn test_quadruble() {
+        let mol = parse_smiles("[Rh-](Cl)(Cl)(Cl)(Cl)$[Rh-](Cl)(Cl)(Cl)Cl").unwrap();
+        assert_eq!(mol.num_atoms(), 10);
+        assert_eq!(mol.formula(), "Cl8Rh2");
     }
 }
