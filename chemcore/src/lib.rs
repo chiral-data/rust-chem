@@ -3,11 +3,12 @@ pub mod bond;
 pub mod graph;
 pub mod molecule;
 
-mod elements;
+pub mod elements;
 
 pub mod prelude {
     pub use crate::atom::{Atom, Chirality, Element, Hybridization};
     pub use crate::bond::{Bond, BondOrder, BondStereo, BondType};
+    pub use crate::elements::{ATOMIC_MASSES, ELEMENT_NAMES, ELEMENT_SYMBOLS};
     pub use crate::graph::{MoleculeGraph, Neighbor};
     pub use crate::molecule::{Molecule, MoleculeError};
 }
