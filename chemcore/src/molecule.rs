@@ -155,6 +155,12 @@ impl Molecule {
     pub fn calculate_implicit_hydrogens(&mut self) {
         for atom_idx in 0..self.atoms.len() {
             let atom = &self.atoms[atom_idx];
+
+            // Skip if explicit H count is already set
+            if atom.explicit_hydrogens() > 0 {
+                continue;
+            }
+
             let element = atom.element();
             let typical_valence = element.typical_valence();
 
@@ -162,17 +168,17 @@ impl Molecule {
                 continue;
             }
 
-            let mut explicit_valence = 0;
+            let mut explicit_valence = 0.0_f64;
             for neighbor in self.graph.neighbors(atom_idx) {
                 let bond = &self.bonds[neighbor.bond_idx];
-                explicit_valence += bond.order().value() as u8;
+                explicit_valence += bond.order().value();
             }
 
             let charge = atom.formal_charge();
             let adjusted_valence = (typical_valence as i16 - charge as i16) as u8;
 
-            if explicit_valence < adjusted_valence {
-                let implicit_h = adjusted_valence - explicit_valence;
+            if (explicit_valence.round() as u8) < adjusted_valence {
+                let implicit_h = adjusted_valence - explicit_valence.round() as u8;
                 self.atoms[atom_idx].set_implicit_hydrogens(implicit_h);
             }
         }

@@ -144,6 +144,10 @@ impl Atom {
         self
     }
 
+    pub fn set_aromatic(&mut self, aromatic: bool) {
+        self.is_aromatic = aromatic;
+    }
+
     pub const fn hybridization(&self) -> Hybridization {
         self.hybridization
     }
