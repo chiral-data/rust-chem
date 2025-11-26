@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     character::complete::{char, digit1},
     combinator::{map, opt},
     multi::many0,
     sequence::{delimited, preceded},
-    IResult, Parser,
 };
 
 use crate::errors::SmilesError;

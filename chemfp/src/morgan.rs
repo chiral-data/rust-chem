@@ -1,5 +1,5 @@
 use crate::{
-    bitvec::{multi_hash, BitVec},
+    bitvec::{BitVec, multi_hash},
     errors::FingerprintError,
 };
 use chemcore::prelude::*;
