@@ -1,8 +1,9 @@
 use crate::{
-    bitvec::{BitVec, multi_hash},
+    bitvec::{hash_to_position, BitVec},
     errors::FingerprintError,
 };
 use chemcore::prelude::*;
+use std::collections::HashSet;
 
 /// Configuration options for the Morgan/ECFP fingerprint generator.
 ///
@@ -24,7 +25,7 @@ use chemcore::prelude::*;
 ///   for each hashed atom-environment. Setting multiple bits reduces
 ///   sensitivity to hash collisions and improves robustness.
 pub struct MorganOptions {
-    /// Radius of the fingerprint (number of bonds)
+    /// Radius of the fingerprint (dist from a central atom to neighbouring atoms when geenrating circular substructures)
     pub radius: u32,
     /// Number of bits in the fingerprint
     pub nbits: usize,
@@ -37,7 +38,7 @@ impl Default for MorganOptions {
         MorganOptions {
             radius: 2,
             nbits: 2048,
-            bits_per_feature: 2,
+            bits_per_feature: 1,
         }
     }
 }
@@ -78,25 +79,23 @@ pub fn morgan_fingerprint(
     }
 
     let mut fp = BitVec::new(options.nbits);
-
-    // Initialize identifiers for each atom
+    let mut all_hashes = HashSet::new();
     let mut identifiers = initialize_identifiers(mol);
 
-    // Iterate for radius iterations
     for iteration in 0..=options.radius {
-        // Hash identifiers to fingerprint
         for &hash in identifiers.iter().take(mol.num_atoms()) {
-            let positions = multi_hash(hash, options.nbits, options.bits_per_feature);
-
-            for pos in positions {
-                fp.set(pos);
-            }
+            all_hashes.insert(hash);
         }
 
-        // Update identifiers for next iteration (except last)
         if iteration < options.radius {
             identifiers = update_identifiers(mol, &identifiers);
         }
+    }
+
+    // Simple mapping: one hash → one bit position
+    for hash in all_hashes {
+        let pos = hash_to_position(hash, options.nbits);
+        fp.set(pos);
     }
 
     Ok(fp)
@@ -112,7 +111,7 @@ pub fn morgan_fingerprint(
 /// - total hydrogen count
 ///
 /// These hashes form the base layer for later iterative updates.
-fn initialize_identifiers(mol: &Molecule) -> Vec<u64> {
+fn initialize_identifiers(mol: &Molecule) -> Vec<u32> {
     let mut identifiers = Vec::with_capacity(mol.num_atoms());
 
     for atom_idx in 0..mol.num_atoms() {
@@ -131,26 +130,19 @@ fn initialize_identifiers(mol: &Molecule) -> Vec<u64> {
 ///
 /// The hashing scheme uses multiplicative mixing to avoid collisions.
 /// No cryptographic security is intended.
-fn compute_atom_hash(atom: &Atom, degree: usize) -> u64 {
-    let mut hash = atom.atomic_number() as u64;
+fn compute_atom_hash(atom: &Atom, degree: usize) -> u32 {
+    let atomic_num = atom.atomic_number() as u32;
+    let valence = (degree as u32) + (atom.total_hydrogens() as u32);
+    let charge = (atom.formal_charge() + 5) as u32; // Offset by 5
 
-    // Include charge
-    hash = hash
-        .wrapping_mul(31)
-        .wrapping_add((atom.formal_charge() + 5) as u64); // normalize negative charges
+    // RDKit's atom invariant calculation
+    let mut hash = atomic_num;
+    hash = hash.wrapping_mul(37).wrapping_add(valence);
+    hash = hash.wrapping_mul(37).wrapping_add(charge);
 
-    // Include aromaticity
-    hash = hash
-        .wrapping_mul(31)
-        .wrapping_add(atom.is_aromatic() as u64);
-
-    // Include degree
-    hash = hash.wrapping_mul(31).wrapping_add(degree as u64);
-
-    // Include hydrogen count
-    hash = hash
-        .wrapping_mul(31)
-        .wrapping_add(atom.total_hydrogens() as u64);
+    if atom.is_aromatic() {
+        hash = hash.wrapping_mul(37).wrapping_add(1);
+    }
 
     hash
 }
@@ -162,7 +154,7 @@ fn compute_atom_hash(atom: &Atom, degree: usize) -> u64 {
 /// depend on the atom indexing of the molecule (canonical behavior).
 ///
 /// This stage is equivalent to RDKit's ECFP neighborhood hash update.
-fn update_identifiers(mol: &Molecule, old_ids: &[u64]) -> Vec<u64> {
+fn update_identifiers(mol: &Molecule, old_ids: &[u32]) -> Vec<u32> {
     let mut new_ids = Vec::with_capacity(mol.num_atoms());
 
     for atom_idx in 0..mol.num_atoms() {
@@ -172,20 +164,25 @@ fn update_identifiers(mol: &Molecule, old_ids: &[u64]) -> Vec<u64> {
             let bond = mol.bond(neighbor.bond_idx);
             let neighbor_id = old_ids[neighbor.atom_idx];
 
-            // Include bond order in hash
-            let bond_hash = (bond.order().value() * 10.0) as u64;
-            let combined = neighbor_id.wrapping_mul(31).wrapping_add(bond_hash);
+            let bond_val = match bond.order() {
+                BondOrder::Single => 1u32,
+                BondOrder::Double => 2u32,
+                BondOrder::Triple => 3u32,
+                BondOrder::Aromatic => 4u32,
+                BondOrder::Quadruple => 4u32,
+            };
 
+            // RDKit combines: neighbor_hash * 100 + bond_order
+            let combined = neighbor_id.wrapping_mul(100).wrapping_add(bond_val);
             neighbor_hashes.push(combined);
         }
 
-        // Sort for consistency
         neighbor_hashes.sort_unstable();
 
-        // Combine current identifier with neighbor hashes
+        // Combine with current hash using multiply-add chain
         let mut new_hash = old_ids[atom_idx];
-        for nh in neighbor_hashes {
-            new_hash = new_hash.wrapping_mul(31).wrapping_add(nh);
+        for &nh in &neighbor_hashes {
+            new_hash = new_hash.wrapping_mul(37).wrapping_add(nh);
         }
 
         new_ids.push(new_hash);

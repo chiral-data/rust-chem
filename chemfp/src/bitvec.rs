@@ -145,8 +145,8 @@ impl fmt::Display for BitVec {
 /// * ## Intended use
 /// Mapping atom-environment hashes to fingerprint positions.
 ///
-pub fn hash_to_position(hash: u64, nbits: usize) -> usize {
-    (hash % nbits as u64) as usize
+pub fn hash_to_position(hash: u32, nbits: usize) -> usize {
+    (hash as u64 % nbits as u64) as usize
 }
 
 /// Derives multiple fingerprint bit positions from a single 64-bit hash.
@@ -162,15 +162,18 @@ pub fn hash_to_position(hash: u64, nbits: usize) -> usize {
 /// ## Returns
 /// A list of bit positions in the range `[0, nbits)`.
 ///
-pub fn multi_hash(hash: u64, nbits: usize, count: usize) -> Vec<usize> {
+pub fn multi_hash(hash: u32, nbits: usize, count: usize) -> Vec<usize> {
+    if count == 1 {
+        return vec![hash_to_position(hash, nbits)];
+    }
+
     let mut positions = Vec::with_capacity(count);
     let mut h = hash;
 
     for i in 0..count {
-        // Mix the hash for each iteration
-        h = h.wrapping_mul(0x9e3779b97f4a7c15u64);
-        h = h.wrapping_add(i as u64);
         positions.push(hash_to_position(h, nbits));
+        // Use 32-bit mixing
+        h = h.wrapping_mul(0x9e3779b9u32).wrapping_add((i + 1) as u32);
     }
 
     positions

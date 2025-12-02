@@ -1,5 +1,5 @@
 [workspace]
-members = ["chemcore", "chemfp", "chemgpu", "chemio"]
+members = ["chemcore", "chemfp", "chemgpu", "chemio", "cli"]
 
 [workspace.dependencies]
 nom  = "8.0.0" # Build safe Parsers
@@ -7,6 +7,7 @@ rayon = "1.11.0"
 anyhow = "1.0"
 thiserror = "2.0.17"
 
+cli = { path = "./cli" }
 chemio = { path = "./chemio" }
 chemfp = { path = "./chemfp" }
 chemgpu = { path = "./chemgpu" }
