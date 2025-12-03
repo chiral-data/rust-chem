@@ -179,6 +179,8 @@ class RustFingerprintValidator:
             rust_fp = self.get_rust_fingerprint(smiles)
             rdkit_fp = self.get_rdkit_fingerprint(smiles)
 
+            print(f"DEBUG: {rust_fp} {rdkit_fp}")
+
             if rust_fp is None or rdkit_fp is None:
                 print("  SKIP: Failed to generate fingerprint")
                 continue
@@ -203,8 +205,7 @@ class RustFingerprintValidator:
         total = len(results)
         matches = sum(1 for _, _, s in results if s["match"])
         avg_similarity = (
-            sum(s["similarity"]
-                for _, _, s in results) / total if total > 0 else 0
+            sum(s["similarity"] for _, _, s in results) / total if total > 0 else 0
         )
 
         print(f"Total tested:     {total}")
