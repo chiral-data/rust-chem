@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod buffers;
+pub mod context;
+pub mod error;
+pub mod pipeline;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub use buffers::BufferManager;
+pub use context::GpuContext;
+pub use error::GpuError;
+pub use pipeline::ComputePipeline;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+/// Initialize logging for GPU operations.
+pub fn init_logging() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 }
