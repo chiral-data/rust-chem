@@ -7,6 +7,14 @@ edition = "2024"
 name = "cli"
 path = "src/bin/cli.rs"
 
+[[bin]]
+name = "bench_gpu"
+path = "src/bin/bench_gpu.rs"
+
+[[bin]]
+name = "hash_test"
+path = "src/bin/hash_test.rs"
+
 [dependencies]
 bitvec = "1.0.1"
 fxhash = "0.2.1"
@@ -14,4 +22,5 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 
 chemio = { workspace = true }
+chemgpu = { workspace = true }
 chemcore = { workspace = true }

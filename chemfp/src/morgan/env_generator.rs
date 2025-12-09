@@ -120,10 +120,25 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
                 // Calculate new invariant
                 let mut invar = layer;
-                hash::hash_combine(&mut invar, &current_invariants[atom_idx]);
+                let current_inv = current_invariants[atom_idx];
 
-                for (bt, neighbor_inv) in &neighborhood_invariants {
+                eprintln!(
+                    "Atom {} layer {}: start with invar={}",
+                    atom_idx, layer, invar
+                );
+                hash::hash_combine(&mut invar, &current_inv);
+                eprintln!(
+                    "  After hash current_inv {}: invar={}",
+                    current_invariants[atom_idx], invar
+                );
+
+                //for (bt, neighbor_inv) in &neighborhood_invariants {
+                for (i, (bt, neighbor_inv)) in neighborhood_invariants.iter().enumerate() {
                     hash::hash_pair(&mut invar, *bt, *neighbor_inv);
+                    eprintln!(
+                        "  After neighbor {} ({}, {}): invar={}",
+                        i, bt, neighbor_inv, invar
+                    );
                 }
 
                 // Handle chirality if needed
@@ -132,9 +147,9 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                 //&& atom.chiral_tag != crate::fingerprint::ChiralTag::Unspecified
                 {
                     let chiral_code = match atom.chirality() {
-                        Chirality::Clockwise => 3,
-                        Chirality::CounterClockwise => 2,
-                        _ => 1,
+                        Chirality::Clockwise => 3u32,
+                        Chirality::CounterClockwise => 2u32,
+                        _ => 1u32,
                     };
                     hash::hash_combine(&mut invar, &chiral_code);
                     //if let Some(ref cip) = atom.cip_code {

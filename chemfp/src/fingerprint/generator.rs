@@ -153,7 +153,7 @@ pub struct FingerprintGenerator<OutputType> {
     bond_inv_generator: Box<dyn BondInvariantsGenerator>,
 }
 
-impl<OutputType: Copy + std::hash::Hash + Eq> FingerprintGenerator<OutputType> {
+impl<OutputType: Copy + std::hash::Hash + Eq + Into<u64>> FingerprintGenerator<OutputType> {
     pub fn new(
         env_generator: Box<dyn AtomEnvironmentGenerator<OutputType>>,
         arguments: Box<dyn FingerprintArguments>,
@@ -211,8 +211,13 @@ impl<OutputType: Copy + std::hash::Hash + Eq> FingerprintGenerator<OutputType> {
         Ok(result)
     }
 
-    fn hash_to_size(&self, _value: OutputType, fp_size: usize) -> usize {
+    fn hash_to_size(&self, value: OutputType, fp_size: usize) -> usize
+    where
+        OutputType: Into<u64>,
+    {
         // Simplified hashing - in production use proper hash function
-        0 % fp_size
+        //0 % fp_size
+        let hash = value.into();
+        (hash % fp_size as u64) as usize
     }
 }

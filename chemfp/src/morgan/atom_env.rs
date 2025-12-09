@@ -22,18 +22,33 @@ impl MorganAtomEnv {
 impl AtomEnvironment<u32> for MorganAtomEnv {
     fn get_bit_id(
         &self,
-        _arguments: &dyn FingerprintArguments,
+        arguments: &dyn FingerprintArguments,
         _atom_invariants: &[u32],
         _bond_invariants: &[u32],
         _additional_output: Option<&mut AdditionalOutputData>,
         _hash_results: bool,
         _fp_size: u64,
     ) -> u32 {
+        let fp_size = if _fp_size == 0 {
+            arguments.fp_size() as u64
+        } else {
+            _fp_size
+        };
+
+        let bit_pos = (self.code as u64 % fp_size) as u32;
+
         eprintln!(
-            "DEBUG: MorganAtomEnv code={} atom={} layer={}",
-            self.code, self.atom_id, self.layer
+            "DEBUG: code={} fp_size={} → bit={}",
+            self.code, fp_size, bit_pos
         );
-        self.code
+
+        bit_pos
+        //eprintln!(
+        //    "DEBUG: MorganAtomEnv code={} atom={} layer={}",
+        //    self.code, self.atom_id, self.layer
+        //);
+        ////self.code
+        //(self.code as u64 % _fp_size) as u32
     }
 
     fn update_additional_output(&self, output: &mut AdditionalOutputData, bit_id: u64) {
