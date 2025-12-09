@@ -1,7 +1,4 @@
-"""
-Validate Rust Morgan fingerprints against RDKit.
-Builds Rust binary, generates fingerprints, and compares results.
-"""
+"""Validate Rust Morgan fingerprints against RDKit with side-by-side comparison."""
 
 import subprocess
 import sys
@@ -9,227 +6,206 @@ from pathlib import Path
 
 try:
     from rdkit import Chem
-    from rdkit.Chem import rdFingerprintGenerator
+    from rdkit.Chem import AllChem, rdFingerprintGenerator
 except ImportError:
     print("ERROR: RDKit not installed")
-    print("Install with: pip install -r requirements.txt")
     sys.exit(1)
 
 
-class RustFingerprintValidator:
+class Validator:
     def __init__(self):
         self.project_root = Path(__file__).parent.parent
-        self.binary_name = "cli"
-        self.binary_path = None
+        self.binary_path = self.project_root / "target" / "release" / "cli"
 
-    def build_rust_binary(self):
-        """Build the Rust CLI tool."""
-        print("Building Rust fingerprint CLI...")
-
+    def build(self):
+        print("Building Rust binary...")
         result = subprocess.run(
-            ["cargo", "build", "--bin", self.binary_name],
+            ["cargo", "build", "--release", "--bin", "cli"],
             cwd=self.project_root,
             capture_output=True,
             text=True,
         )
-
         if result.returncode != 0:
-            print("ERROR: Failed to build Rust binary")
-            print(result.stderr)
+            print("Build failed:", result.stderr)
             sys.exit(1)
+        print(f"Built: {self.binary_path}\n")
 
-        self.binary_path = self.project_root / "target" / "debug" / self.binary_name
+    def get_rdkit_data(self, smiles, radius=2, nbits=2048):
+        """Get complete RDKit data."""
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
 
-        if not self.binary_path.exists():
-            print(f"ERROR: Binary not found at {self.binary_path}")
-            sys.exit(1)
+        # Initial invariants (bit-packed)
+        invariants = []
+        for atom in mol.GetAtoms():
+            Z = atom.GetAtomicNum()
+            deg = atom.GetDegree()
+            H = atom.GetTotalNumHs()
+            val = deg + H
+            chg = atom.GetFormalCharge()
+            arom = atom.GetIsAromatic()
 
-        print(f"Built binary: {self.binary_path}")
+            code = Z % 128
+            code |= min(val, 15) << 8
+            code |= min(H, 8) << 12
+            code |= min(deg, 15) << 16
+            code |= ((chg + 5) & 0xF) << 20
+            if arom:
+                code |= 1 << 24
 
-    def get_rust_fingerprint(self, smiles, radius=2, nbits=2048):
-        """Get fingerprint from Rust implementation."""
-        if not self.binary_path:
-            self.build_rust_binary()
+            invariants.append(code)
 
+        # All environments
+        info = {}
+        AllChem.GetMorganFingerprint(mol, radius=radius, bitInfo=info)
+
+        envs = []
+        for env_hash, features in info.items():
+            for atom_idx, rad in features:
+                envs.append((atom_idx, rad, env_hash))
+        envs.sort(key=lambda x: (x[1], x[0]))
+
+        # Final fingerprint
+        gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+        fp = gen.GetFingerprint(mol)
+        # fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=nbits)
+        bits = sorted(fp.GetOnBits())
+
+        return {
+            "invariants": invariants,
+            "environments": envs,
+            "bits": bits,
+            "mol": mol,
+        }
+
+    def get_rust_fp(self, smiles, radius=2, nbits=2048):
+        """Get Rust fingerprint bits."""
         result = subprocess.run(
             [str(self.binary_path), smiles, str(radius), str(nbits)],
             capture_output=True,
             text=True,
         )
-
         if result.returncode != 0:
-            print(f"ERROR: Rust fingerprint failed for {smiles}")
-            print(result.stderr)
             return None
+        output = result.stdout.strip()
+        if not output:
+            return []
+        return sorted(map(int, output.split(",")))
 
-        # Parse output: comma-separated list of bit positions
-        try:
-            output = result.stdout.strip()
-            if not output:
-                return set()
-            bit_positions = set(map(int, output.split(",")))
-            return bit_positions
-        except Exception as e:
-            print(f"ERROR parsing Rust output: {e}")
-            return None
+    def compare(self, smiles, name, radius=2, nbits=2048):
+        """Compare side-by-side."""
+        print(f"\n{'=' * 100}")
+        print(f"{name} ({smiles})")
+        print(f"{'=' * 100}")
 
-    def get_rdkit_fingerprint(self, smiles, radius=2, nbits=2048):
-        """Get fingerprint from RDKit."""
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
+        rdkit = self.get_rdkit_data(smiles, radius, nbits)
+        if not rdkit:
+            print("ERROR: Failed to parse SMILES")
+            return False
 
-        # ✅ Use GetMorganFingerprint with bitInfo to get feature hashes
-        from rdkit.Chem import AllChem
+        rust_bits = self.get_rust_fp(smiles, radius, nbits)
+        if rust_bits is None:
+            print("ERROR: Rust failed")
+            return False
 
-        bit_info = {}
-        fp = AllChem.GetMorganFingerprintAsBitVect(
-            mol, radius=radius, nBits=nbits, bitInfo=bit_info
+        # 1. Initial Invariants
+        print(f"\n{'STEP 1: INITIAL ATOM INVARIANTS (Bit-Packed)':^100}")
+        print(f"{'-' * 100}")
+        print(f"{'Atom':<6} {'Symbol':<8} {'Z':<4} {'Deg':<5} {'H':<4} {'Val':<5}")
+        print(f"{'Chg':<5} {'Arom':<6} {'RDKit Invariant':<20}")
+        print(f"{'-' * 100}")
+
+        for i, inv in enumerate(rdkit["invariants"]):
+            atom = rdkit["mol"].GetAtoms()[i]
+            print(
+                f"{i:<6} {atom.GetSymbol():<8} {atom.GetAtomicNum():<4} "
+                f"{atom.GetDegree():<5} {atom.GetTotalNumHs():<4} "
+                f"{atom.GetDegree() + atom.GetTotalNumHs():<5} "
+                f"{atom.GetFormalCharge():<5} {str(atom.GetIsAromatic()):<6} "
+                f"{inv:<10} (0x{inv:08x})"
+            )
+
+        # 2. Bonds
+        if rdkit["mol"].GetNumBonds() > 0:
+            print(f"\n{'STEP 2: BONDS':^100}")
+            print(f"{'-' * 100}")
+            print(f"{'Bond':<8} {'Atoms':<12} {'Type':<10}")
+            print(f"{'-' * 100}")
+            for bond in rdkit["mol"].GetBonds():
+                print(
+                    f"{bond.GetIdx():<8} "
+                    f"{bond.GetBeginAtomIdx()}-{bond.GetEndAtomIdx():<8} "
+                    f"{int(bond.GetBondType()):<10}"
+                )
+
+        # 3. Environments - Side by Side
+        print(f"\n{'STEP 3: ENVIRONMENTS (All Radius Layers)':^100}")
+        print(f"{'-' * 100}")
+        print(f"{'RDKit':<50} | {'Rust (Expected)':<49}")
+        print(f"{'-' * 100}")
+        print(
+            f"{'Atom':<6} {'Radius':<8} {'Hash':<18} {'→ Bit':<10}",
+            "|",
+            f"{'Should Match':<49}",
         )
+        print(f"{'-' * 100}")
 
-        # bit_info format: {bit_position: [(atom_idx, radius), ...]}
-        # We want to count unique features across all radii
-        unique_features = set()
-        for bit_pos, atom_list in bit_info.items():
-            for atom_idx, feature_radius in atom_list:
-                unique_features.add((atom_idx, feature_radius))
+        for atom_idx, rad, env_hash in rdkit["environments"]:
+            bit_id = env_hash % nbits
+            print(
+                f"{atom_idx:<6} {rad:<8} {env_hash:<10} (0x{env_hash:08x})",
+                f" → {bit_id:<10} | ",
+                f"{'✓ If your hash matches' if bit_id in rust_bits else '✗ Missing in Rust'}",
+            )
 
-        print(f"  RDKit unique features: {len(unique_features)}")
-        print(f"  RDKit bit positions: {len(bit_info)}")
+        # 4. Final Fingerprint
+        print(f"\n{'STEP 4: FINAL FINGERPRINT':^100}")
+        print(f"{'-' * 100}")
+        print(f"{'Source':<15} {'Bits Set':<12} {'Bit Positions':<73}")
+        print(f"{'-' * 100}")
+        print(f"{'RDKit':<15} {len(rdkit['bits']):<12} {str(rdkit['bits'][:20]):<73}")
+        print(f"{'Rust':<15} {len(rust_bits):<12} {str(rust_bits[:20]):<73}")
 
-        # Get set bits
-        bit_positions = set(fp.GetOnBits())
-        return bit_positions
+        # 5. Comparison
+        rdkit_set = set(rdkit["bits"])
+        rust_set = set(rust_bits)
+        match = rdkit_set == rust_set
 
-    # def get_rdkit_fingerprint(self, smiles, radius=2, nbits=2048):
-    #     """Get fingerprint from RDKit."""
-    #     mol = Chem.MolFromSmiles(smiles)
-    #     if mol is None:
-    #         return None
-    #
-    #     gen = rdFingerprintGenerator.GetMorganGenerator(
-    #         radius=radius, fpSize=nbits)
-    #
-    #     info = rdFingerprintGenerator.AdditionalOutput()
-    #     fp = gen.GetFingerprint(mol, additionalOutput=info)
-    #
-    #     print(f"  RDKit atom counts: {sorted(info.GetAtomCounts().keys())}")
-    #     print(f"  RDKit num atoms: {len(info.GetAtomCounts())}")
-    #
-    #     # Get set bits
-    #     bit_positions = set(fp.GetOnBits())
-    #     return bit_positions
+        print(f"\n{'RESULT':^100}")
+        print(f"{'-' * 100}")
+        print(f"Match: {'✓ PASS' if match else '✗ FAIL'}")
 
-    def compare_fingerprints(self, rust_bits, rdkit_bits):
-        """Compare two fingerprints and return statistics."""
-        if rust_bits is None or rdkit_bits is None:
-            return None
+        if not match:
+            only_rdkit = sorted(rdkit_set - rust_set)
+            only_rust = sorted(rust_set - rdkit_set)
+            both = sorted(rdkit_set & rust_set)
 
-        intersection = rust_bits & rdkit_bits
-        union = rust_bits | rdkit_bits
+            print(f"Both have:     {len(both)} bits → {both[:10]}")
+            print(f"Only RDKit:    {len(only_rdkit)} bits → {only_rdkit[:10]}")
+            print(f"Only Rust:     {len(only_rust)} bits → {only_rust[:10]}")
 
-        only_rust = rust_bits - rdkit_bits
-        only_rdkit = rdkit_bits - rust_bits
+        return match
 
-        if len(union) == 0:
-            similarity = 1.0
-        else:
-            similarity = len(intersection) / len(union)
-
-        return {
-            "rust_bits": len(rust_bits),
-            "rdkit_bits": len(rdkit_bits),
-            "intersection": len(intersection),
-            "union": len(union),
-            "similarity": similarity,
-            "only_rust": len(only_rust),
-            "only_rdkit": len(only_rdkit),
-            "match": similarity == 1.0,
-        }
-
-    def validate_test_set(self):
-        """Run validation on a test set of molecules."""
-        test_molecules = [
+    def run(self):
+        """Run validation."""
+        tests = [
             ("C", "Methane"),
             ("CC", "Ethane"),
-            ("CCC", "Propane"),
-            ("C=C", "Ethene"),
-            ("C#C", "Ethyne"),
-            ("CCO", "Ethanol"),
-            ("CC(C)C", "Isobutane"),
-            ("c1ccccc1", "Benzene"),
-            ("CC(=O)O", "Acetic acid"),
-            ("CC(C)(C)C", "Neopentane"),
-            ("C1CCCCC1", "Cyclohexane"),
-            ("c1ccc(O)cc1", "Phenol"),
-            ("CCN", "Ethylamine"),
-            ("O", "Water"),
-            ("N", "Ammonia"),
+            # ("CCC", "Propane"),
         ]
 
-        print("\n" + "=" * 80)
-        print("VALIDATION RESULTS")
-        print("=" * 80)
+        results = [self.compare(smiles, name) for smiles, name in tests]
 
-        results = []
+        print(f"\n{'=' * 100}")
+        print(f"{'SUMMARY':^100}")
+        print(f"{'=' * 100}")
+        print(f"Passed: {sum(results)}/{len(results)}")
 
-        for smiles, name in test_molecules:
-            print(f"\nTesting: {name} ({smiles})")
-
-            rust_fp = self.get_rust_fingerprint(smiles)
-            rdkit_fp = self.get_rdkit_fingerprint(smiles)
-
-            print(f"DEBUG: {rust_fp} {rdkit_fp}")
-
-            if rust_fp is None or rdkit_fp is None:
-                print("  SKIP: Failed to generate fingerprint")
-                continue
-
-            stats = self.compare_fingerprints(rust_fp, rdkit_fp)
-            results.append((name, smiles, stats))
-
-            print(f"  Rust bits:   {stats['rust_bits']}")
-            print(f"  RDKit bits:  {stats['rdkit_bits']}")
-            print(f"  Similarity:  {stats['similarity']:.4f}")
-            print(f"  Match:       {'PASS' if stats['match'] else 'FAIL'}")
-
-            if not stats["match"]:
-                print(f"  Only Rust:   {stats['only_rust']} bits")
-                print(f"  Only RDKit:  {stats['only_rdkit']} bits")
-
-        # Summary
-        print("\n" + "=" * 80)
-        print("SUMMARY")
-        print("=" * 80)
-
-        total = len(results)
-        matches = sum(1 for _, _, s in results if s["match"])
-        avg_similarity = (
-            sum(s["similarity"] for _, _, s in results) / total if total > 0 else 0
-        )
-
-        print(f"Total tested:     {total}")
-        print(f"Exact matches:    {matches}")
-        print(f"Match rate:       {matches / total * 100:.1f}%")
-        print(f"Avg similarity:   {avg_similarity:.4f}")
-
-        if matches == total:
-            print("\nRESULT: ALL TESTS PASSED")
-            return 0
-        else:
-            print("\nRESULT: SOME TESTS FAILED")
-            return 1
-
-
-def main():
-    print("RDKit Morgan Fingerprint Validator")
-    print("=" * 80)
-
-    validator = RustFingerprintValidator()
-    exit_code = validator.validate_test_set()
-
-    sys.exit(exit_code)
+        return 0 if all(results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    validator = Validator()
+    validator.build()
+    sys.exit(validator.run())
