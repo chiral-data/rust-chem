@@ -13,4 +13,7 @@ pub enum FingerprintError {
 
     #[error("Fingerprint size mismatch: {0} vs {1}")]
     SizeMismatch(usize, usize),
+
+    #[error("Molecule has no atoms")]
+    EmptyMolecule,
 }
