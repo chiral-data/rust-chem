@@ -1,5 +1,5 @@
 [workspace]
-members = ["chemcore", "chemfp", "chemgpu", "chemio", "cli"]
+members = ["chemcore", "chemfp", "chemgpu", "chemio"]
 
 [workspace.dependencies]
 log = "0.4.0"
@@ -13,7 +13,6 @@ bytemuck = { version = "1.24", features = ["derive"] }
 thiserror = "2.0.17"
 env_logger = "0.11.8"
 
-cli = { path = "./cli" }
 chemio = { path = "./chemio" }
 chemfp = { path = "./chemfp" }
 chemgpu = { path = "./chemgpu" }
