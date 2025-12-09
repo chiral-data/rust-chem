@@ -12,6 +12,6 @@ pollster = { workspace = true }
 thiserror = { workspace = true }
 env_logger = { workspace = true }
 
-chemfp = { workspace = true }
+# chemfp = { workspace = true }
 chemcore = { workspace = true }
 
