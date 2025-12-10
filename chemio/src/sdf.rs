@@ -193,7 +193,7 @@ fn parse_bond_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
             return Err(SdfError::InvalidBondLine(format!(
                 "Invalid bond type: {} (must be 1-4)",
                 bond_type
-            )))
+            )));
         }
     };
 
