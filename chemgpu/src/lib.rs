@@ -8,7 +8,7 @@ pub mod tanimoto;
 pub use buffers::BufferManager;
 pub use context::GpuContext;
 pub use error::GpuError;
-pub use morgan::{GpuMorganFingerprint, MoleculeEncoder};
+pub use morgan::GpuMorganFingerprint;
 pub use pipeline::ComputePipeline;
 pub use tanimoto::GpuTanimoto;
 

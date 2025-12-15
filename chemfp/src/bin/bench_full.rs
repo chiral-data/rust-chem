@@ -98,18 +98,13 @@ fn main() {
         .map(|fp| bitvec_to_u32_vec(fp, fp_size))
         .collect();
 
-    // GPU Morgan
-    println!("\nGPU Morgan fingerprints...");
+    // GPU Morgan (batched)
+    println!("\nGPU Morgan fingerprints (batched)...");
     let gpu_morgan_gen = GpuMorganFingerprint::new().unwrap();
     let gpu_morgan_start = Instant::now();
-    let gpu_fps: Vec<Vec<u32>> = molecules
-        .iter()
-        .map(|mol| {
-            gpu_morgan_gen
-                .generate_fingerprint(mol, radius, fp_size, false, true, false)
-                .unwrap()
-        })
-        .collect();
+    let gpu_fps = gpu_morgan_gen
+        .generate_fingerprints_batch(&molecules, radius, fp_size, false, true, false)
+        .unwrap();
     let gpu_morgan_time = gpu_morgan_start.elapsed();
     println!("  Time: {:?}", gpu_morgan_time);
 
@@ -282,6 +277,11 @@ fn main() {
     println!(
         "  Tanimoto: CPU={:?}, GPU={:?}",
         cpu_tanimoto_time, gpu_tanimoto_time
+    );
+    println!("\nSpeedups:");
+    println!(
+        "  Morgan GPU vs CPU: {:.2}x",
+        cpu_morgan_time.as_secs_f64() / gpu_morgan_time.as_secs_f64()
     );
     println!("\nALL TESTS PASSED!");
 }

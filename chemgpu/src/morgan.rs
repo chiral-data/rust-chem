@@ -1,26 +1,36 @@
 use crate::buffers::BufferManager;
 use crate::context::GpuContext;
 use crate::error::GpuError;
-use crate::pipeline::ComputePipeline;
 use bytemuck::{Pod, Zeroable};
 use chemcore::molecule::Molecule;
 use wgpu;
 
 // ============================================================================
-// GPU DATA STRUCTURES (must match WGSL layout)
+// BATCH GPU DATA STRUCTURES
 // ============================================================================
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuMoleculeData {
-    num_atoms: u32,
-    num_bonds: u32,
+pub struct BatchParams {
+    num_molecules: u32,
+    max_atoms: u32,
     radius: u32,
     fp_size: u32,
+    fp_words: u32,
     use_chirality: u32,
     use_bond_types: u32,
     only_nonzero_invariants: u32,
-    _padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MoleculeOffset {
+    atom_start: u32,
+    atom_count: u32,
+    bond_start: u32,
+    bond_count: u32,
+    adj_start: u32,
+    fp_start: u32,
 }
 
 #[repr(C)]
@@ -67,121 +77,15 @@ struct IterationParams {
 }
 
 // ============================================================================
-// ENCODER: Molecule → GPU format
-// ============================================================================
-
-pub struct MoleculeEncoder;
-
-impl MoleculeEncoder {
-    pub fn encode_molecule(
-        mol: &Molecule,
-        radius: u32,
-        fp_size: u32,
-        use_chirality: bool,
-        use_bond_types: bool,
-        only_nonzero_invariants: bool,
-    ) -> EncodedMolecule {
-        let num_atoms = mol.num_atoms();
-        let num_bonds = mol.num_bonds();
-
-        // Encode metadata
-        let metadata = GpuMoleculeData {
-            num_atoms: num_atoms as u32,
-            num_bonds: num_bonds as u32,
-            radius,
-            fp_size,
-            use_chirality: use_chirality as u32,
-            use_bond_types: use_bond_types as u32,
-            only_nonzero_invariants: only_nonzero_invariants as u32,
-            _padding: 0,
-        };
-
-        // Encode atoms
-        let mut atoms = Vec::with_capacity(num_atoms);
-        for (idx, atom) in mol.atoms().iter().enumerate() {
-            atoms.push(GpuAtom {
-                atomic_number: atom.atomic_number() as u32,
-                degree: mol.degree(idx) as u32,
-                is_aromatic: atom.is_aromatic() as u32,
-                chirality: match atom.chirality() {
-                    chemcore::atom::Chirality::None => 0,
-                    chemcore::atom::Chirality::Unspecified => 1,
-                    chemcore::atom::Chirality::CounterClockwise => 2,
-                    chemcore::atom::Chirality::Clockwise => 3,
-                },
-                formal_charge: atom.formal_charge() as i32,
-                _padding1: 0,
-                _padding2: 0,
-                _padding3: 0,
-            });
-        }
-
-        // Encode bonds
-        let mut bonds = Vec::with_capacity(num_bonds);
-        for bond in mol.bonds() {
-            bonds.push(GpuBond {
-                atom1: bond.atom1() as u32,
-                atom2: bond.atom2() as u32,
-                order: match bond.order() {
-                    chemcore::bond::BondOrder::Single => 1,
-                    chemcore::bond::BondOrder::Double => 2,
-                    chemcore::bond::BondOrder::Triple => 3,
-                    chemcore::bond::BondOrder::Quadruple => 4,
-                    chemcore::bond::BondOrder::Aromatic => 12,
-                },
-                stereo: match bond.stereo() {
-                    chemcore::bond::BondStereo::None => 0,
-                    chemcore::bond::BondStereo::E => 1,
-                    chemcore::bond::BondStereo::Z => 2,
-                    chemcore::bond::BondStereo::Unspecified => 0,
-                },
-                is_aromatic: bond.is_aromatic() as u32,
-                _padding1: 0,
-                _padding2: 0,
-                _padding3: 0,
-            });
-        }
-
-        // Build flat adjacency list
-        let mut adjacency = Vec::new();
-        let mut adjacency_offsets = vec![0u32];
-
-        for atom_idx in 0..num_atoms {
-            for neighbor in mol.neighbors(atom_idx) {
-                adjacency.push(GpuNeighbor {
-                    atom_idx: neighbor.atom_idx as u32,
-                    bond_idx: neighbor.bond_idx as u32,
-                });
-            }
-            adjacency_offsets.push(adjacency.len() as u32);
-        }
-
-        EncodedMolecule {
-            metadata,
-            atoms,
-            bonds,
-            adjacency,
-            adjacency_offsets,
-        }
-    }
-}
-
-pub struct EncodedMolecule {
-    pub metadata: GpuMoleculeData,
-    pub atoms: Vec<GpuAtom>,
-    pub bonds: Vec<GpuBond>,
-    pub adjacency: Vec<GpuNeighbor>,
-    pub adjacency_offsets: Vec<u32>,
-}
-
-// ============================================================================
 // GPU MORGAN FINGERPRINT GENERATOR
+// Processes multiple molecules in a single GPU dispatch for maximum performance
 // ============================================================================
 
 pub struct GpuMorganFingerprint {
     ctx: GpuContext,
-    init_pipeline: wgpu::ComputePipeline, // ComputePipeline,
-    iteration_pipeline: wgpu::ComputePipeline, // ComputePipeline,
+    init_pipeline: wgpu::ComputePipeline,
+    iteration_pipeline: wgpu::ComputePipeline,
+    copy_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -191,32 +95,31 @@ impl GpuMorganFingerprint {
 
         let shader_source = include_str!("shaders/morgan.wgsl");
 
-        // Create shader module once
         let shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("morgan_shader"),
+                label: Some("morgan_batch_shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
 
-        // Create bind group layout (8 bindings for Morgan)
+        // Create bind group layout (10 bindings for batch Morgan)
         let bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("morgan_bind_group_layout"),
+                    label: Some("morgan_batch_bind_group_layout"),
                     entries: &[
-                        // @binding(0): molecule_data
+                        // @binding(0): params (uniform)
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
                                 min_binding_size: None,
                             },
                             count: None,
                         },
-                        // @binding(1): atoms
+                        // @binding(1): molecule_offsets
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -227,7 +130,7 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(2): bonds
+                        // @binding(2): atoms
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -238,7 +141,7 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(3): adjacency
+                        // @binding(3): bonds
                         wgpu::BindGroupLayoutEntry {
                             binding: 3,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -249,7 +152,7 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(4): adjacency_offsets
+                        // @binding(4): adjacency
                         wgpu::BindGroupLayoutEntry {
                             binding: 4,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -260,18 +163,18 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(5): current_invariants (read_write)
+                        // @binding(5): adjacency_offsets
                         wgpu::BindGroupLayoutEntry {
                             binding: 5,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
                                 has_dynamic_offset: false,
                                 min_binding_size: None,
                             },
                             count: None,
                         },
-                        // @binding(6): next_invariants (read_write)
+                        // @binding(6): current_invariants
                         wgpu::BindGroupLayoutEntry {
                             binding: 6,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -282,7 +185,7 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(7): fingerprint (read_write)
+                        // @binding(7): next_invariants
                         wgpu::BindGroupLayoutEntry {
                             binding: 7,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -293,8 +196,20 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
+                        // @binding(8): fingerprints
                         wgpu::BindGroupLayoutEntry {
                             binding: 8,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // @binding(9): iter_params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 9,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
@@ -309,7 +224,7 @@ impl GpuMorganFingerprint {
         let pipeline_layout = ctx
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("morgan_pipeline_layout"),
+                label: Some("morgan_batch_pipeline_layout"),
                 bind_group_layouts: &[&bind_group_layout],
                 push_constant_ranges: &[],
             });
@@ -317,10 +232,10 @@ impl GpuMorganFingerprint {
         let init_pipeline = ctx
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("morgan_init"),
+                label: Some("morgan_batch_init"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: Some("init_invariants"),
+                entry_point: Some("init_invariants_batch"),
                 cache: None,
                 compilation_options: Default::default(),
             });
@@ -328,208 +243,342 @@ impl GpuMorganFingerprint {
         let iteration_pipeline =
             ctx.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("morgan_iter"),
+                    label: Some("morgan_batch_iter"),
                     layout: Some(&pipeline_layout),
                     module: &shader,
-                    entry_point: Some("morgan_iteration"),
+                    entry_point: Some("morgan_iteration_batch"),
                     cache: None,
                     compilation_options: Default::default(),
                 });
 
-        //let init_pipeline =
-        //    ComputePipeline::new(&ctx.device, shader_source, "init_invariants", "morgan_init")?;
-        //
-        //let iteration_pipeline = ComputePipeline::new(
-        //    &ctx.device,
-        //    shader_source,
-        //    "morgan_iteration",
-        //    "morgan_iter",
-        //)?;
+        let copy_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("morgan_batch_copy"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some("copy_invariants"),
+                    cache: None,
+                    compilation_options: Default::default(),
+                });
 
         Ok(Self {
             ctx,
             init_pipeline,
             iteration_pipeline,
+            copy_pipeline,
             bind_group_layout,
         })
     }
 
-    pub fn generate_fingerprint(
+    /// Generate fingerprints for multiple molecules in a single batch
+    ///
+    /// This is MUCH faster than calling generate_fingerprint() in a loop because:
+    /// 1. Single buffer allocation for all molecules
+    /// 2. Single GPU dispatch processes all atoms in parallel
+    /// 3. Single sync point at the end
+    pub fn generate_fingerprints_batch(
         &self,
-        mol: &Molecule,
+        molecules: &[Molecule],
         radius: u32,
         fp_size: u32,
         use_chirality: bool,
         use_bond_types: bool,
         only_nonzero_invariants: bool,
-    ) -> Result<Vec<u32>, GpuError> {
-        let encoded = MoleculeEncoder::encode_molecule(
-            mol,
+    ) -> Result<Vec<Vec<u32>>, GpuError> {
+        if molecules.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let fp_words = ((fp_size + 31) / 32) as usize;
+        let num_molecules = molecules.len();
+
+        // Encode all molecules and compute offsets
+        let mut all_atoms: Vec<GpuAtom> = Vec::new();
+        let mut all_bonds: Vec<GpuBond> = Vec::new();
+        let mut all_adjacency: Vec<GpuNeighbor> = Vec::new();
+        let mut all_adjacency_offsets: Vec<u32> = Vec::new();
+        let mut molecule_offsets: Vec<MoleculeOffset> = Vec::new();
+
+        let mut total_atoms = 0u32;
+        let mut total_bonds = 0u32;
+        let mut total_adj = 0u32;
+
+        for (mol_idx, mol) in molecules.iter().enumerate() {
+            let num_atoms = mol.num_atoms();
+            let num_bonds = mol.num_bonds();
+
+            let offset = MoleculeOffset {
+                atom_start: total_atoms,
+                atom_count: num_atoms as u32,
+                bond_start: total_bonds,
+                bond_count: num_bonds as u32,
+                adj_start: total_adj,
+                fp_start: (mol_idx * fp_words) as u32,
+            };
+            molecule_offsets.push(offset);
+
+            // Encode atoms
+            for (idx, atom) in mol.atoms().iter().enumerate() {
+                all_atoms.push(GpuAtom {
+                    atomic_number: atom.atomic_number() as u32,
+                    degree: mol.degree(idx) as u32,
+                    is_aromatic: atom.is_aromatic() as u32,
+                    chirality: match atom.chirality() {
+                        chemcore::atom::Chirality::None => 0,
+                        chemcore::atom::Chirality::Unspecified => 1,
+                        chemcore::atom::Chirality::CounterClockwise => 2,
+                        chemcore::atom::Chirality::Clockwise => 3,
+                    },
+                    formal_charge: atom.formal_charge() as i32,
+                    _padding1: 0,
+                    _padding2: 0,
+                    _padding3: 0,
+                });
+            }
+
+            // Encode bonds
+            for bond in mol.bonds() {
+                all_bonds.push(GpuBond {
+                    atom1: bond.atom1() as u32,
+                    atom2: bond.atom2() as u32,
+                    order: match bond.order() {
+                        chemcore::bond::BondOrder::Single => 1,
+                        chemcore::bond::BondOrder::Double => 2,
+                        chemcore::bond::BondOrder::Triple => 3,
+                        chemcore::bond::BondOrder::Quadruple => 4,
+                        chemcore::bond::BondOrder::Aromatic => 12,
+                    },
+                    stereo: match bond.stereo() {
+                        chemcore::bond::BondStereo::None => 0,
+                        chemcore::bond::BondStereo::E => 1,
+                        chemcore::bond::BondStereo::Z => 2,
+                        chemcore::bond::BondStereo::Unspecified => 0,
+                    },
+                    is_aromatic: bond.is_aromatic() as u32,
+                    _padding1: 0,
+                    _padding2: 0,
+                    _padding3: 0,
+                });
+            }
+
+            // Build adjacency list for this molecule
+            for atom_idx in 0..num_atoms {
+                all_adjacency_offsets.push(all_adjacency.len() as u32);
+                for neighbor in mol.neighbors(atom_idx) {
+                    all_adjacency.push(GpuNeighbor {
+                        atom_idx: neighbor.atom_idx as u32,
+                        bond_idx: neighbor.bond_idx as u32,
+                    });
+                }
+            }
+            // Final offset for last atom's end
+            all_adjacency_offsets.push(all_adjacency.len() as u32);
+
+            total_atoms += num_atoms as u32;
+            total_bonds += num_bonds as u32;
+            total_adj = all_adjacency.len() as u32;
+        }
+
+        // Remove the extra adjacency offset we added per molecule
+        // Actually, we need to fix the adjacency_offsets to be contiguous
+        // Let me recalculate...
+        all_adjacency_offsets.clear();
+        let mut adj_idx = 0u32;
+        for mol in molecules.iter() {
+            for atom_idx in 0..mol.num_atoms() {
+                all_adjacency_offsets.push(adj_idx);
+                adj_idx += mol.neighbors(atom_idx).len() as u32;
+            }
+        }
+        all_adjacency_offsets.push(adj_idx); // Final terminator
+
+        let params = BatchParams {
+            num_molecules: num_molecules as u32,
+            max_atoms: total_atoms,
             radius,
             fp_size,
-            use_chirality,
-            use_bond_types,
-            only_nonzero_invariants,
-        );
-
-        let num_atoms = encoded.atoms.len();
-        let fp_words = ((fp_size + 31) / 32) as usize;
+            fp_words: fp_words as u32,
+            use_chirality: use_chirality as u32,
+            use_bond_types: use_bond_types as u32,
+            only_nonzero_invariants: only_nonzero_invariants as u32,
+        };
 
         let manager = BufferManager::new(&self.ctx.device, &self.ctx.queue);
 
-        // Create buffers
-        let metadata_buffer = self.create_buffer(&manager, &[encoded.metadata]);
-        let atoms_buffer = self.create_buffer(&manager, &encoded.atoms);
-        let bonds_buffer = self.create_buffer(&manager, &encoded.bonds);
-        let adjacency_buffer = self.create_buffer(&manager, &encoded.adjacency);
-        let adjacency_offsets_buffer = self.create_buffer(&manager, &encoded.adjacency_offsets);
+        // Pad vectors if empty (wgpu requires non-zero buffer sizes)
+        if all_atoms.is_empty() {
+            all_atoms.push(GpuAtom {
+                atomic_number: 0,
+                degree: 0,
+                is_aromatic: 0,
+                chirality: 0,
+                formal_charge: 0,
+                _padding1: 0,
+                _padding2: 0,
+                _padding3: 0,
+            });
+        }
+        if all_bonds.is_empty() {
+            all_bonds.push(GpuBond {
+                atom1: 0,
+                atom2: 0,
+                order: 0,
+                stereo: 0,
+                is_aromatic: 0,
+                _padding1: 0,
+                _padding2: 0,
+                _padding3: 0,
+            });
+        }
+        if all_adjacency.is_empty() {
+            all_adjacency.push(GpuNeighbor {
+                atom_idx: 0,
+                bond_idx: 0,
+            });
+        }
 
+        // Create all buffers ONCE
+        let params_buffer = manager.create_uniform_buffer("batch_params", 32);
+        let offsets_buffer = self.create_buffer(&manager, &molecule_offsets);
+        let atoms_buffer = self.create_buffer(&manager, &all_atoms);
+        let bonds_buffer = self.create_buffer(&manager, &all_bonds);
+        let adjacency_buffer = self.create_buffer(&manager, &all_adjacency);
+        let adjacency_offsets_buffer = self.create_buffer(&manager, &all_adjacency_offsets);
+
+        let invariants_size = (total_atoms as usize * 4) as u64;
         let current_inv_buffer =
-            manager.create_storage_buffer("current_invariants", (num_atoms * 4) as u64, true);
+            manager.create_storage_buffer("current_invariants", std::cmp::max(invariants_size, 4), true);
         let next_inv_buffer =
-            manager.create_storage_buffer("next_invariants", (num_atoms * 4) as u64, true);
-        let fp_buffer = manager.create_storage_buffer("fingerprint", (fp_words * 4) as u64, true);
+            manager.create_storage_buffer("next_invariants", std::cmp::max(invariants_size, 4), true);
+
+        let fp_total_words = num_molecules * fp_words;
+        let fp_buffer =
+            manager.create_storage_buffer("fingerprints", (fp_total_words * 4) as u64, true);
+
         let iter_params_buffer = manager.create_uniform_buffer("iter_params", 16);
 
-        // Initialize fingerprint to zero
-        manager.write_buffer(&fp_buffer, &vec![0u32; fp_words]);
+        // Initialize fingerprints and invariants to zero
+        manager.write_buffer(&fp_buffer, &vec![0u32; fp_total_words]);
+        manager.write_buffer(&params_buffer, &[params]);
 
-        // Create bind group layout for Morgan pipeline
+        // Create bind group
         let bind_group = self
             .ctx
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("morgan_bind_group"),
+                label: Some("morgan_batch_bind_group"),
                 layout: &self.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: metadata_buffer.as_entire_binding(),
+                        resource: params_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: atoms_buffer.as_entire_binding(),
+                        resource: offsets_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: bonds_buffer.as_entire_binding(),
+                        resource: atoms_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: adjacency_buffer.as_entire_binding(),
+                        resource: bonds_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: adjacency_offsets_buffer.as_entire_binding(),
+                        resource: adjacency_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: current_inv_buffer.as_entire_binding(),
+                        resource: adjacency_offsets_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: next_inv_buffer.as_entire_binding(),
+                        resource: current_inv_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: fp_buffer.as_entire_binding(),
+                        resource: next_inv_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 8,
+                        resource: fp_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
                         resource: iter_params_buffer.as_entire_binding(),
                     },
                 ],
             });
 
-        // Execute compute passes
+        // Create command encoder
         let mut encoder = self
             .ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("morgan_encoder"),
+                label: Some("morgan_batch_encoder"),
             });
 
-        // Pass 1: Initialize invariants (layer 0)
+        let workgroups = (total_atoms + 255) / 256;
+
+        // Pass 1: Initialize invariants for ALL molecules
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("morgan_init_pass"),
+                label: Some("morgan_batch_init_pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.init_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((num_atoms as u32 + 63) / 64, 1, 1);
+            pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        // Pass 2..N: Iterate through radius layers
+        // Pass 2..N: Iterate through radius layers for ALL molecules
         for layer in 0..radius {
-            let params = IterationParams {
+            let iter_params = IterationParams {
                 current_layer: layer,
                 _padding1: 0,
                 _padding2: 0,
                 _padding3: 0,
             };
-            manager.write_buffer(&iter_params_buffer, &[params]);
+            manager.write_buffer(&iter_params_buffer, &[iter_params]);
 
-            println!("GPU computing layer {}", layer);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("morgan_batch_iter_layer_{}", layer)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.iteration_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
 
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(&format!("morgan_iter_layer_{}", layer)),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.iteration_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((num_atoms as u32 + 63) / 64, 1, 1);
-            drop(pass);
-
-            // Swap buffers (copy next → current)
-            encoder.copy_buffer_to_buffer(
-                &next_inv_buffer,
-                0,
-                &current_inv_buffer,
-                0,
-                (num_atoms * 4) as u64,
-            );
-        }
-
-        self.ctx.queue.submit(Some(encoder.finish()));
-
-        let gpu_invariants: Vec<u32> =
-            manager.read_buffer_blocking(&current_inv_buffer, num_atoms)?;
-        println!("\nGPU invariants after all layers:");
-        for (i, &inv) in gpu_invariants.iter().enumerate() {
-            let expected = if radius >= 2 {
-                501318127
-            } else if radius >= 1 {
-                2837459962
-            } else {
-                37324
-            };
-            println!(
-                "  Atom {}: GPU={}, CPU expected={}, match={}",
-                i,
-                inv,
-                expected,
-                inv == expected
-            );
-        }
-
-        // Read back fingerprint
-        let gpu_fp = manager.read_buffer_blocking(&fp_buffer, fp_words)?;
-
-        // ADD THIS DEBUG:
-        println!("\nGPU fingerprint bits set:");
-        for (word_idx, &word) in gpu_fp.iter().enumerate() {
-            if word != 0 {
-                for bit in 0..32 {
-                    if (word & (1 << bit)) != 0 {
-                        let global_bit = word_idx * 32 + bit;
-                        println!("  Bit {}: word {} bit {}", global_bit, word_idx, bit);
-                    }
-                }
+            // Copy next -> current using GPU (no sync!)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("morgan_batch_copy_layer_{}", layer)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.copy_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
             }
         }
 
-        Ok(gpu_fp)
+        // Submit ALL work at once
+        self.ctx.queue.submit(Some(encoder.finish()));
+
+        // Single readback of ALL fingerprints
+        let all_fps: Vec<u32> = manager.read_buffer_blocking(&fp_buffer, fp_total_words)?;
+
+        // Split into individual fingerprints
+        let result: Vec<Vec<u32>> = all_fps
+            .chunks(fp_words)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        Ok(result)
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, manager: &BufferManager, data: &[T]) -> wgpu::Buffer {

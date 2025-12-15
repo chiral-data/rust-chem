@@ -119,14 +119,15 @@ fn main() {
         positions
     });
 
-    // GPU fingerprint
+    // GPU fingerprint (using batched API with single molecule)
     println!("Computing GPU fingerprint...");
     let gpu_generator = GpuMorganFingerprint::new().unwrap();
 
     let gpu_start = Instant::now();
-    let gpu_vec = gpu_generator
-        .generate_fingerprint(&mol, radius, fp_size, false, true, false)
+    let gpu_vecs = gpu_generator
+        .generate_fingerprints_batch(&[mol.clone()], radius, fp_size, false, true, false)
         .unwrap();
+    let gpu_vec = gpu_vecs[0].clone();
     let gpu_time = gpu_start.elapsed();
 
     let gpu_on_bits: usize = gpu_vec.iter().map(|w| w.count_ones() as usize).sum();
