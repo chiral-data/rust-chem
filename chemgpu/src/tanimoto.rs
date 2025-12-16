@@ -144,12 +144,11 @@ impl GpuTanimoto {
         &self,
         query: &[u32],
         targets: &[u32],
-        fp_size: u32,
     ) -> Result<Vec<f32>, GpuError> {
         let fp_words = query.len();
         let num_targets = targets.len() / fp_words;
 
-        if targets.len() % fp_words != 0 {
+        if targets.len().is_multiple_of(fp_words) {
             return Err(GpuError::BufferError(
                 "Target fingerprints not aligned".to_string(),
             ));
@@ -215,7 +214,7 @@ impl GpuTanimoto {
             });
             pass.set_pipeline(&self.single_query_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((num_targets as u32 + 255) / 256, 1, 1);
+            pass.dispatch_workgroups((num_targets as u32).div_ceil(256), 1, 1);
         }
 
         self.ctx.queue.submit(Some(encoder.finish()));
@@ -239,11 +238,11 @@ impl GpuTanimoto {
         targets: &[u32],
         fp_size: u32,
     ) -> Result<Vec<f32>, GpuError> {
-        let fp_words = ((fp_size + 31) / 32) as usize;
+        let fp_words = fp_size.div_ceil(32) as usize;
         let num_queries = queries.len() / fp_words;
         let num_targets = targets.len() / fp_words;
 
-        if queries.len() % fp_words != 0 || targets.len() % fp_words != 0 {
+        if queries.len().is_multiple_of(fp_words) || targets.len().is_multiple_of(fp_words) {
             return Err(GpuError::BufferError(
                 "Fingerprints not aligned".to_string(),
             ));
@@ -308,8 +307,8 @@ impl GpuTanimoto {
             pass.set_bind_group(0, &bind_group, &[]);
 
             // 16x16 workgroup size
-            let workgroups_x = (num_queries as u32 + 15) / 16;
-            let workgroups_y = (num_targets as u32 + 15) / 16;
+            let workgroups_x = (num_queries as u32).div_ceil(16);
+            let workgroups_y = (num_targets as u32).div_ceil(16);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
@@ -319,7 +318,7 @@ impl GpuTanimoto {
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, manager: &BufferManager, data: &[T]) -> wgpu::Buffer {
-        let size = (data.len() * std::mem::size_of::<T>()) as u64;
+        let size = std::mem::size_of_val(data) as u64;
         let buffer = manager.create_storage_buffer("temp", size, false);
         manager.write_buffer(&buffer, data);
         buffer

@@ -1,40 +1,9 @@
 use super::AdditionalOutputData;
 use crate::errors::FingerprintError;
 use bitvec::prelude::*;
-use chemcore::{atom::Atom as ChemAtom, bond::Bond as ChemBond, molecule::Molecule};
+use chemcore::molecule::Molecule;
 
 pub type ROMol = Molecule;
-
-pub trait ROMolExt {
-    fn get_atom_with_idx(&self, idx: usize) -> &ChemAtom;
-    fn get_bond_with_idx(&self, idx: usize) -> &ChemBond;
-    fn get_atom_bonds(&self, idx: usize) -> Vec<(usize, &ChemBond)>;
-}
-
-impl ROMolExt for ROMol {
-    fn get_atom_with_idx(&self, idx: usize) -> &ChemAtom {
-        self.atom(idx)
-    }
-
-    fn get_bond_with_idx(&self, idx: usize) -> &ChemBond {
-        self.bond(idx)
-    }
-
-    fn get_atom_bonds(&self, idx: usize) -> Vec<(usize, &ChemBond)> {
-        self.neighbors(idx)
-            .iter()
-            .map(|n| (n.bond_idx, self.bond(n.bond_idx)))
-            .collect()
-    }
-}
-
-///// Molecule representation (simplified for this conversion)
-//pub struct ROMol {
-//    pub num_atoms: usize,
-//    pub num_bonds: usize,
-//    pub atoms: Vec<Atom>,
-//    pub bonds: Vec<Bond>,
-//}
 
 #[derive(Clone)]
 pub struct Atom {

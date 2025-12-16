@@ -72,6 +72,12 @@ impl MorganFeatureAtomInvGenerator {
     }
 }
 
+impl Default for MorganFeatureAtomInvGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AtomInvariantsGenerator for MorganFeatureAtomInvGenerator {
     fn get_atom_invariants(&self, mol: &ROMol) -> Vec<u32> {
         // Feature-based invariants implementation
@@ -110,14 +116,6 @@ impl BondInvariantsGenerator for MorganBondInvGenerator {
             let mut bond_invariant = 1u32;
 
             if self.use_bond_types {
-                let bond_type_value = match bond.order() {
-                    BondOrder::Single => 1,
-                    BondOrder::Double => 2,
-                    BondOrder::Triple => 3,
-                    BondOrder::Quadruple => 4,
-                    BondOrder::Aromatic => 12, // RDKit uses 12!
-                };
-
                 if !self.use_chirality
                     || bond.order() != BondOrder::Double
                     || bond.stereo() == BondStereo::None

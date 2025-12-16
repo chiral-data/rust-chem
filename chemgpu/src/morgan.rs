@@ -290,7 +290,7 @@ impl GpuMorganFingerprint {
             return Ok(Vec::new());
         }
 
-        let fp_words = ((fp_size + 31) / 32) as usize;
+        let fp_words = fp_size.div_ceil(32) as usize;
         let num_molecules = molecules.len();
 
         // Encode all molecules and compute offsets
@@ -527,7 +527,7 @@ impl GpuMorganFingerprint {
                 label: Some("morgan_batch_encoder"),
             });
 
-        let workgroups = (total_atoms + 255) / 256;
+        let workgroups = total_atoms.div_ceil(256);
 
         // Pass 1: Initialize invariants for ALL molecules
         {
@@ -588,7 +588,7 @@ impl GpuMorganFingerprint {
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, manager: &BufferManager, data: &[T]) -> wgpu::Buffer {
-        let size = (data.len() * std::mem::size_of::<T>()) as u64;
+        let size = std::mem::size_of_val(data) as u64;
         let buffer = manager.create_storage_buffer("temp", size, false);
         manager.write_buffer(&buffer, data);
         buffer

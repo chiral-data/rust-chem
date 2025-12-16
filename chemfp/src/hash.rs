@@ -35,7 +35,7 @@ pub fn hash_combine<T: std::hash::Hash>(seed: &mut u32, value: &T) {
         hasher.finish() as u32
     };
 
-    *seed = (*seed ^ hash); //.wrapping_add(1);
+    *seed ^= hash; //.wrapping_add(1);
 }
 
 /// Hash a pair (for bond type + neighbor invariant)

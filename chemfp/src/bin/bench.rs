@@ -37,21 +37,20 @@ fn create_molecules(count: usize) -> Vec<Molecule> {
 
 fn bitvec_to_u32_vec(bv: &BitVec, fp_size: u32) -> Vec<u32> {
     // CHANGED: removed bitvec::prelude::
-    let num_words = ((fp_size + 31) / 32) as usize;
-    let mut result = vec![0u32; num_words];
+    let num_words = fp_size.div_ceil(32) as usize;
 
-    for word_idx in 0..num_words {
-        let mut word = 0u32;
-        for bit_idx in 0..32 {
-            let global_bit = word_idx * 32 + bit_idx;
-            if global_bit < fp_size as usize && bv[global_bit] {
-                word |= 1u32 << bit_idx;
-            }
-        }
-        result[word_idx] = word;
-    }
-
-    result
+    (0..num_words)
+        .map(|word_idx| {
+            (0..32).fold(0u32, |word, bit_idx| {
+                let global_bit = word_idx * 32 + bit_idx;
+                if global_bit < fp_size as usize && bv[global_bit] {
+                    word | (1 << bit_idx)
+                } else {
+                    word
+                }
+            })
+        })
+        .collect()
 }
 
 fn main() {
@@ -160,7 +159,7 @@ fn main() {
 
     let gpu_tanimoto_start = Instant::now();
     let gpu_similarities = gpu_tanimoto
-        .compute_single_query(query_u32, &targets_u32, fp_size)
+        .compute_single_query(query_u32, &targets_u32)
         .unwrap();
     let gpu_tanimoto_time = gpu_tanimoto_start.elapsed();
     println!("  Time: {:?}", gpu_tanimoto_time);
