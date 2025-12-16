@@ -5,48 +5,6 @@ use chemcore::molecule::Molecule;
 
 pub type ROMol = Molecule;
 
-#[derive(Clone)]
-pub struct Atom {
-    pub idx: u32,
-    pub atomic_num: u32,
-    pub degree: u32,
-    pub chiral_tag: ChiralTag,
-    pub is_aromatic: bool,
-    pub cip_code: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum ChiralTag {
-    Unspecified,
-    TetrahedralCW,
-    TetrahedralCCW,
-}
-
-#[derive(Clone)]
-pub struct Bond {
-    pub idx: u32,
-    pub begin_atom_idx: u32,
-    pub end_atom_idx: u32,
-    pub bond_type: BondType,
-    pub is_aromatic: bool,
-    pub stereo: BondStereo,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum BondType {
-    Single = 1,
-    Double = 2,
-    Triple = 3,
-    Aromatic = 12,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum BondStereo {
-    None,
-    E,
-    Z,
-}
-
 /// Arguments for fingerprint generation
 pub trait FingerprintArguments: Send + Sync {
     fn info_string(&self) -> String;

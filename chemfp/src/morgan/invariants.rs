@@ -18,13 +18,11 @@ impl MorganAtomInvGenerator {
         let mut invariants = Vec::with_capacity(mol.num_atoms());
 
         for (i, atom) in mol.atoms().iter().enumerate() {
-            let mut inv = 0u32;
-
-            // Atomic number
-            inv = atom.atomic_number() as u32;
-
             // Degree
             let degree = mol.degree(i) as u32;
+
+            // Atomic number
+            let mut inv = atom.atomic_number() as u32;
             inv = inv.wrapping_mul(100) + degree;
 
             // Aromatic flag

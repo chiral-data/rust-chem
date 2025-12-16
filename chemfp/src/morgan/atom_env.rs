@@ -1,20 +1,20 @@
-use crate::fingerprint::{AdditionalOutputData, AtomEnvironment, FingerprintArguments, ROMol};
+use crate::fingerprint::{AdditionalOutputData, AtomEnvironment, FingerprintArguments};
 
 /// Morgan atom environment
 pub struct MorganAtomEnv {
     code: u32,
     atom_id: u32,
     layer: u32,
-    num_atoms: usize,
+    //num_atoms: usize,
 }
 
 impl MorganAtomEnv {
-    pub fn new(code: u32, atom_id: u32, layer: u32, mol: &ROMol) -> Self {
+    pub fn new(code: u32, atom_id: u32, layer: u32 /*mol: &ROMol*/) -> Self {
         Self {
             code,
             atom_id,
             layer,
-            num_atoms: mol.num_atoms(),
+            //num_atoms: mol.num_atoms(),
         }
     }
 }

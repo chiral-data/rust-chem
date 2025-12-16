@@ -20,6 +20,7 @@ pub struct MorganFingerprint;
 
 impl MorganFingerprint {
     /// Get Morgan fingerprint as BitVec
+    #[allow(clippy::too_many_arguments)]
     pub fn get_fingerprint_as_bitvec(
         mol: &ROMol,
         radius: u32,

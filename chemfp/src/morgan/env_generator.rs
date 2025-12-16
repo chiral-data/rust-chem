@@ -70,7 +70,7 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                     current_invariants[i],
                     i as u32,
                     0,
-                    mol,
+                    //mol,
                 )));
             }
         }
@@ -174,7 +174,7 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                             invar,
                             atom_idx,
                             layer + 1,
-                            mol,
+                            //mol,
                         )));
                         neighborhoods.insert(neighborhood);
                     }
@@ -198,16 +198,5 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
     fn info_string(&self) -> String {
         "MorganEnvironmentGenerator".to_string()
-    }
-}
-
-// Trait extension for downcasting
-pub trait AsAny {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-impl AsAny for MorganArguments {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
