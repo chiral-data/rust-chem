@@ -42,7 +42,7 @@ pub fn tanimoto_similarity(fp1: &BitVec, fp2: &BitVec) -> Result<f64, Fingerprin
     let union = fp1
         .iter()
         .zip(fp2.iter())
-        .filter(|(a, b)| **a && **b)
+        .filter(|(a, b)| **a || **b)
         .count(); // (fp1 | fp2).count_ones(); // Bits active in either fingerprint
 
     // Avoid division by zero when both fp1 and fp2 are all-zero (no features)

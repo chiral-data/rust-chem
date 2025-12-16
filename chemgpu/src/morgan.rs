@@ -251,16 +251,16 @@ impl GpuMorganFingerprint {
                     compilation_options: Default::default(),
                 });
 
-        let copy_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("morgan_batch_copy"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("copy_invariants"),
-                    cache: None,
-                    compilation_options: Default::default(),
-                });
+        let copy_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("morgan_batch_copy"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("copy_invariants"),
+                cache: None,
+                compilation_options: Default::default(),
+            });
 
         Ok(Self {
             ctx,
@@ -447,10 +447,16 @@ impl GpuMorganFingerprint {
         let adjacency_offsets_buffer = self.create_buffer(&manager, &all_adjacency_offsets);
 
         let invariants_size = (total_atoms as usize * 4) as u64;
-        let current_inv_buffer =
-            manager.create_storage_buffer("current_invariants", std::cmp::max(invariants_size, 4), true);
-        let next_inv_buffer =
-            manager.create_storage_buffer("next_invariants", std::cmp::max(invariants_size, 4), true);
+        let current_inv_buffer = manager.create_storage_buffer(
+            "current_invariants",
+            std::cmp::max(invariants_size, 4),
+            true,
+        );
+        let next_inv_buffer = manager.create_storage_buffer(
+            "next_invariants",
+            std::cmp::max(invariants_size, 4),
+            true,
+        );
 
         let fp_total_words = num_molecules * fp_words;
         let fp_buffer =

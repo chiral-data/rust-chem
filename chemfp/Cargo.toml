@@ -8,16 +8,12 @@ name = "cli"
 path = "src/bin/cli.rs"
 
 [[bin]]
-name = "bench_gpu"
-path = "src/bin/bench_gpu.rs"
-
-[[bin]]
 name = "hash_test"
 path = "src/bin/hash_test.rs"
 
 [[bin]]
-name = "bench_full"
-path = "src/bin/bench_full.rs"
+name = "bench"
+path = "src/bin/bench.rs"
 
 [dependencies]
 bitvec = "1.0.1"

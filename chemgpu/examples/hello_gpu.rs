@@ -1,4 +1,4 @@
-use chemgpu::{init_logging, BufferManager, ComputePipeline, GpuContext};
+use chemgpu::{BufferManager, ComputePipeline, GpuContext, init_logging};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
