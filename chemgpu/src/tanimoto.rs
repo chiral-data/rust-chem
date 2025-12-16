@@ -148,7 +148,7 @@ impl GpuTanimoto {
         let fp_words = query.len();
         let num_targets = targets.len() / fp_words;
 
-        if targets.len().is_multiple_of(fp_words) {
+        if !targets.len().is_multiple_of(fp_words) {
             return Err(GpuError::BufferError(
                 "Target fingerprints not aligned".to_string(),
             ));
@@ -242,7 +242,7 @@ impl GpuTanimoto {
         let num_queries = queries.len() / fp_words;
         let num_targets = targets.len() / fp_words;
 
-        if queries.len().is_multiple_of(fp_words) || targets.len().is_multiple_of(fp_words) {
+        if !queries.len().is_multiple_of(fp_words) || !targets.len().is_multiple_of(fp_words) {
             return Err(GpuError::BufferError(
                 "Fingerprints not aligned".to_string(),
             ));
