@@ -13,13 +13,14 @@ pub use invariants::{
 use crate::errors::FingerprintError;
 use crate::fingerprint::{FingerprintFuncArguments, FingerprintGenerator, ROMol};
 use bitvec::prelude::*;
-use std::collections::HashMap;
+//use std::collections::HashMap;
 
 /// Morgan fingerprint main interface
 pub struct MorganFingerprint;
 
 impl MorganFingerprint {
     /// Get Morgan fingerprint as BitVec
+    #[allow(clippy::too_many_arguments)]
     pub fn get_fingerprint_as_bitvec(
         mol: &ROMol,
         radius: u32,
@@ -49,20 +50,19 @@ impl MorganFingerprint {
         generator.get_fingerprint(mol, args)
     }
 
-    /// Get sparse count fingerprint
-    pub fn get_sparse_count_fingerprint(
-        mol: &ROMol,
-        radius: u32,
-        invariants: Option<&[u32]>,
-        from_atoms: Option<&[u32]>,
-        use_chirality: bool,
-        use_bond_types: bool,
-        use_counts: bool,
-        only_nonzero_invariants: bool,
-    ) -> Result<HashMap<u32, u32>, FingerprintError> {
-        // Implementation for sparse count fingerprint
-        Ok(HashMap::new())
-    }
+    //pub fn get_sparse_count_fingerprint(
+    //    _mol: &ROMol,
+    //    _radius: u32,
+    //    _invariants: Option<&[u32]>,
+    //    _from_atoms: Option<&[u32]>,
+    //    _use_chirality: bool,
+    //    _use_bond_types: bool,
+    //    _use_counts: bool,
+    //    _only_nonzero_invariants: bool,
+    //) -> Result<HashMap<u32, u32>, FingerprintError> {
+    //    // Implementation for sparse count fingerprint
+    //    Ok(HashMap::new())
+    //}
 
     fn get_morgan_generator(
         radius: u32,

@@ -13,6 +13,7 @@ pub struct MorganArguments {
 }
 
 impl MorganArguments {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         radius: u32,
         count_simulation: bool,

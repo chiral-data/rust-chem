@@ -9,6 +9,12 @@ use fxhash::FxHashSet;
 /// Morgan environment generator
 pub struct MorganEnvGenerator;
 
+impl Default for MorganEnvGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MorganEnvGenerator {
     pub fn new() -> Self {
         Self
@@ -57,15 +63,15 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
         // Add round 0 invariants
         for i in 0..n_atoms {
-            if include_atoms[i] {
-                if !morgan_args.only_nonzero_invariants || current_invariants[i] != 0 {
-                    result.push(Box::new(MorganAtomEnv::new(
-                        current_invariants[i],
-                        i as u32,
-                        0,
-                        mol,
-                    )));
-                }
+            if include_atoms[i] && !morgan_args.only_nonzero_invariants
+                || current_invariants[i] != 0
+            {
+                result.push(Box::new(MorganAtomEnv::new(
+                    current_invariants[i],
+                    i as u32,
+                    0,
+                    //mol,
+                )));
             }
         }
 
@@ -88,7 +94,6 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
                 // Get neighbors through bonds
                 for neighbor in mol.neighbors(atom_idx) {
-                    let bond = mol.bond(neighbor.bond_idx);
                     let other_idx = neighbor.atom_idx;
 
                     round_atom_neighborhoods[atom_idx].set(neighbor.bond_idx, true);
@@ -97,33 +102,31 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                     let bt = bond_invariants[neighbor.bond_idx] as i32;
                     neighborhood_invariants.push((bt, current_invariants[other_idx]));
                 }
-                //for bond in &mol.bonds {
-                //    if bond.begin_atom_idx == atom_idx as u32 {
-                //        let other_idx = bond.end_atom_idx as usize;
-                //        round_atom_neighborhoods[atom_idx].set(bond.idx as usize, true);
-                //        round_atom_neighborhoods[atom_idx] |= &atom_neighborhoods[other_idx];
-                //
-                //        let bt = bond_invariants[bond.idx as usize] as i32;
-                //        neighborhood_invariants.push((bt, current_invariants[other_idx]));
-                //    } else if bond.end_atom_idx == atom_idx as u32 {
-                //        let other_idx = bond.begin_atom_idx as usize;
-                //        round_atom_neighborhoods[atom_idx].set(bond.idx as usize, true);
-                //        round_atom_neighborhoods[atom_idx] |= &atom_neighborhoods[other_idx];
-                //
-                //        let bt = bond_invariants[bond.idx as usize] as i32;
-                //        neighborhood_invariants.push((bt, current_invariants[other_idx]));
-                //    }
-                //}
 
                 // Sort neighbors
                 neighborhood_invariants.sort_unstable();
 
                 // Calculate new invariant
                 let mut invar = layer;
-                hash::hash_combine(&mut invar, &current_invariants[atom_idx]);
+                let current_inv = current_invariants[atom_idx];
 
-                for (bt, neighbor_inv) in &neighborhood_invariants {
+                eprintln!(
+                    "Atom {} layer {}: start with invar={}",
+                    atom_idx, layer, invar
+                );
+                hash::hash_combine(&mut invar, &current_inv);
+                eprintln!(
+                    "  After hash current_inv {}: invar={}",
+                    current_invariants[atom_idx], invar
+                );
+
+                //for (bt, neighbor_inv) in &neighborhood_invariants {
+                for (i, (bt, neighbor_inv)) in neighborhood_invariants.iter().enumerate() {
                     hash::hash_pair(&mut invar, *bt, *neighbor_inv);
+                    eprintln!(
+                        "  After neighbor {} ({}, {}): invar={}",
+                        i, bt, neighbor_inv, invar
+                    );
                 }
 
                 // Handle chirality if needed
@@ -132,9 +135,9 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                 //&& atom.chiral_tag != crate::fingerprint::ChiralTag::Unspecified
                 {
                     let chiral_code = match atom.chirality() {
-                        Chirality::Clockwise => 3,
-                        Chirality::CounterClockwise => 2,
-                        _ => 1,
+                        Chirality::Clockwise => 3u32,
+                        Chirality::CounterClockwise => 2u32,
+                        _ => 1u32,
                     };
                     hash::hash_combine(&mut invar, &chiral_code);
                     //if let Some(ref cip) = atom.cip_code {
@@ -163,18 +166,17 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                 if morgan_args.include_redundant_environments
                     || !neighborhoods.contains(&neighborhood)
                 {
-                    if !morgan_args.only_nonzero_invariants
-                        || atom_invariants[atom_idx as usize] != 0
+                    if (!morgan_args.only_nonzero_invariants
+                        || atom_invariants[atom_idx as usize] != 0)
+                        && include_atoms[atom_idx as usize]
                     {
-                        if include_atoms[atom_idx as usize] {
-                            result.push(Box::new(MorganAtomEnv::new(
-                                invar,
-                                atom_idx,
-                                layer + 1,
-                                mol,
-                            )));
-                            neighborhoods.insert(neighborhood);
-                        }
+                        result.push(Box::new(MorganAtomEnv::new(
+                            invar,
+                            atom_idx,
+                            layer + 1,
+                            //mol,
+                        )));
+                        neighborhoods.insert(neighborhood);
                     }
                 } else {
                     dead_atoms.set(atom_idx as usize, true);
@@ -196,16 +198,5 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
     fn info_string(&self) -> String {
         "MorganEnvironmentGenerator".to_string()
-    }
-}
-
-// Trait extension for downcasting
-pub trait AsAny {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-impl AsAny for MorganArguments {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

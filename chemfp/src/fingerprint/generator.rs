@@ -1,82 +1,9 @@
 use super::AdditionalOutputData;
 use crate::errors::FingerprintError;
 use bitvec::prelude::*;
-use chemcore::{atom::Atom as ChemAtom, bond::Bond as ChemBond, molecule::Molecule};
+use chemcore::molecule::Molecule;
 
 pub type ROMol = Molecule;
-
-pub trait ROMolExt {
-    fn get_atom_with_idx(&self, idx: usize) -> &ChemAtom;
-    fn get_bond_with_idx(&self, idx: usize) -> &ChemBond;
-    fn get_atom_bonds(&self, idx: usize) -> Vec<(usize, &ChemBond)>;
-}
-
-impl ROMolExt for ROMol {
-    fn get_atom_with_idx(&self, idx: usize) -> &ChemAtom {
-        self.atom(idx)
-    }
-
-    fn get_bond_with_idx(&self, idx: usize) -> &ChemBond {
-        self.bond(idx)
-    }
-
-    fn get_atom_bonds(&self, idx: usize) -> Vec<(usize, &ChemBond)> {
-        self.neighbors(idx)
-            .iter()
-            .map(|n| (n.bond_idx, self.bond(n.bond_idx)))
-            .collect()
-    }
-}
-
-///// Molecule representation (simplified for this conversion)
-//pub struct ROMol {
-//    pub num_atoms: usize,
-//    pub num_bonds: usize,
-//    pub atoms: Vec<Atom>,
-//    pub bonds: Vec<Bond>,
-//}
-
-#[derive(Clone)]
-pub struct Atom {
-    pub idx: u32,
-    pub atomic_num: u32,
-    pub degree: u32,
-    pub chiral_tag: ChiralTag,
-    pub is_aromatic: bool,
-    pub cip_code: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum ChiralTag {
-    Unspecified,
-    TetrahedralCW,
-    TetrahedralCCW,
-}
-
-#[derive(Clone)]
-pub struct Bond {
-    pub idx: u32,
-    pub begin_atom_idx: u32,
-    pub end_atom_idx: u32,
-    pub bond_type: BondType,
-    pub is_aromatic: bool,
-    pub stereo: BondStereo,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum BondType {
-    Single = 1,
-    Double = 2,
-    Triple = 3,
-    Aromatic = 12,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum BondStereo {
-    None,
-    E,
-    Z,
-}
 
 /// Arguments for fingerprint generation
 pub trait FingerprintArguments: Send + Sync {
@@ -153,7 +80,7 @@ pub struct FingerprintGenerator<OutputType> {
     bond_inv_generator: Box<dyn BondInvariantsGenerator>,
 }
 
-impl<OutputType: Copy + std::hash::Hash + Eq> FingerprintGenerator<OutputType> {
+impl<OutputType: Copy + std::hash::Hash + Eq + Into<u64>> FingerprintGenerator<OutputType> {
     pub fn new(
         env_generator: Box<dyn AtomEnvironmentGenerator<OutputType>>,
         arguments: Box<dyn FingerprintArguments>,
@@ -211,8 +138,13 @@ impl<OutputType: Copy + std::hash::Hash + Eq> FingerprintGenerator<OutputType> {
         Ok(result)
     }
 
-    fn hash_to_size(&self, _value: OutputType, fp_size: usize) -> usize {
+    fn hash_to_size(&self, value: OutputType, fp_size: usize) -> usize
+    where
+        OutputType: Into<u64>,
+    {
         // Simplified hashing - in production use proper hash function
-        0 % fp_size
+        //0 % fp_size
+        let hash = value.into();
+        (hash % fp_size as u64) as usize
     }
 }
