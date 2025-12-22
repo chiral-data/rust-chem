@@ -1,0 +1,23 @@
+[package]
+name = "chem_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+rfd = { workspace = true }
+pollster = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+chemcore = { workspace = true }
+chemfp = { workspace = true }
+chemgpu = { workspace = true }
+chemio = { workspace = true }
+
+[dependencies.bitvec]
+version = "1.0"
+features = ["std"]
