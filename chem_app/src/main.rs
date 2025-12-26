@@ -15,12 +15,16 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
             .with_title("ChemFP Demo - Molecular Fingerprint Search"),
+        //renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
     eframe::run_native(
         "ChemFP Demo",
         options,
-        Box::new(|cc| Ok(Box::new(ChemFpDemoApp::new(cc)))),
+        Box::new(|cc| {
+            //cc.egui_ctx.set_pixels_per_point(1.25);
+            Ok(Box::new(ChemFpDemoApp::new(cc)))
+        }),
     )
 }

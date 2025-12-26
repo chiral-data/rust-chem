@@ -1,0 +1,167 @@
+# Alkanes - Simple chains (very similar to each other)
+C Methane
+CC Ethane
+CCC Propane
+CCCC Butane
+CCCCC Pentane
+CCCCCC Hexane
+CCCCCCC Heptane
+CCCCCCCC Octane
+CCCCCCCCC Nonane
+CCCCCCCCCC Decane
+
+# Branched alkanes - Similar to linear but slightly different
+CC(C)C Isobutane
+CC(C)CC Isopentane
+CC(C)CCC Isohexane
+CC(C)(C)C Neopentane
+CCC(C)CC 3-Methylpentane
+CC(C)C(C)C 2,3-Dimethylbutane
+
+# Benzene derivatives - All very similar (aromatic family)
+c1ccccc1 Benzene
+Cc1ccccc1 Toluene
+CCc1ccccc1 Ethylbenzene
+Cc1ccccc1C o-Xylene
+Cc1ccc(C)cc1 p-Xylene
+Cc1cccc(C)c1 m-Xylene
+c1ccccc1C(C)C Cumene
+CCCc1ccccc1 Propylbenzene
+
+# Phenols - Similar structure, different substitution
+c1ccccc1O Phenol
+Cc1ccccc1O o-Cresol
+Cc1ccc(O)cc1 p-Cresol
+Cc1cccc(O)c1 m-Cresol
+Cc1c(O)cccc1C 2,6-Dimethylphenol
+CC(C)c1ccc(O)cc1 p-Isopropylphenol
+
+# Anilines - Similar to phenols but with NH2
+c1ccccc1N Aniline
+Cc1ccccc1N o-Toluidine
+Cc1ccc(N)cc1 p-Toluidine
+Cc1cccc(N)c1 m-Toluidine
+Nc1ccc(N)cc1 p-Phenylenediamine
+
+# Alcohols - Different chain lengths
+CO Methanol
+CCO Ethanol
+CCCO 1-Propanol
+CC(C)O 2-Propanol
+CCCCO 1-Butanol
+CC(C)CO Isobutanol
+CC(O)CC 2-Butanol
+CCCCCO 1-Pentanol
+CCCCCCO 1-Hexanol
+
+# Ketones - Similar functional group
+CC(=O)C Acetone
+CC(=O)CC 2-Butanone
+CCC(=O)CC 3-Pentanone
+CC(=O)CCC 2-Pentanone
+CC(=O)CCCC 2-Hexanone
+CC(=O)c1ccccc1 Acetophenone
+CC(=O)c1ccc(C)cc1 p-Methylacetophenone
+
+# Carboxylic acids - Similar to ketones
+C(=O)O Formic_acid
+CC(=O)O Acetic_acid
+CCC(=O)O Propionic_acid
+CCCC(=O)O Butyric_acid
+CCCCC(=O)O Valeric_acid
+c1ccccc1C(=O)O Benzoic_acid
+Cc1ccccc1C(=O)O o-Toluic_acid
+
+# Esters - Similar to acids
+CC(=O)OC Methyl_acetate
+CCOC(=O)C Ethyl_acetate
+CC(=O)OCC Ethyl_acetate_alt
+CCCOC(=O)C Propyl_acetate
+CC(=O)OCCC Propyl_acetate_alt
+
+# Ethers - Oxygen bridge
+COC Dimethyl_ether
+CCOC Ethyl_methyl_ether
+CCOCC Diethyl_ether
+c1ccccc1OC Anisole
+c1ccccc1OCc2ccccc2 Benzyl_phenyl_ether
+
+# Nitriles
+C#N Hydrogen_cyanide
+CC#N Acetonitrile
+CCC#N Propionitrile
+c1ccccc1C#N Benzonitrile
+Cc1ccccc1C#N o-Tolunitrile
+
+# Polycyclic aromatics - Very similar to each other
+c1ccc2ccccc2c1 Naphthalene
+c1ccc2c(c1)ccc1ccccc12 Anthracene
+c1ccc2c(c1)ccc1c2cccc1 Phenanthrene
+c1ccc2cc3ccccc3cc2c1 Pyrene
+
+# Heterocycles - 5-membered rings (similar family)
+c1ccoc1 Furan
+c1ccsc1 Thiophene
+c1cc[nH]c1 Pyrrole
+Cc1ccoc1 2-Methylfuran
+c1csc(C)c1 2-Methylthiophene
+
+# Heterocycles - 6-membered rings (similar family)
+c1ccncc1 Pyridine
+c1cnccc1 Pyridine_isomer
+Cc1ccncc1 2-Methylpyridine
+Cc1cccnc1 3-Methylpyridine
+Cc1ccnc(C)c1 2,6-Dimethylpyridine
+c1ccnc2ccccc12 Quinoline
+c1ccc2ncccc2c1 Isoquinoline
+
+# Halogenated aromatics - Similar base structures
+c1ccccc1F Fluorobenzene
+c1ccccc1Cl Chlorobenzene
+c1ccccc1Br Bromobenzene
+c1ccccc1I Iodobenzene
+Fc1ccccc1F o-Difluorobenzene
+Fc1ccc(F)cc1 p-Difluorobenzene
+
+# Nitro compounds
+c1ccccc1[N+](=O)[O-] Nitrobenzene
+Cc1ccccc1[N+](=O)[O-] o-Nitrotoluene
+Cc1ccc([N+](=O)[O-])cc1 p-Nitrotoluene
+
+# Amino acids (simplified)
+NCC(=O)O Glycine
+CC(N)C(=O)O Alanine
+CC(C)C(N)C(=O)O Valine
+CCC(N)C(=O)O 2-Aminobutyric_acid
+
+# Drug-like molecules
+CC(C)Cc1ccc(cc1)C(C)C(=O)O Ibuprofen
+CC(=O)Oc1ccccc1C(=O)O Aspirin
+CC(C)NCC(O)c1ccc(O)c(O)c1 Isoproterenol
+Cc1ccc(cc1)S(=O)(=O)N Toluenesulfonamide
+
+# Sugars (open chain)
+OCC(O)C(O)C(O)C(O)C=O Glucose_linear
+OCC(O)C(O)C(O)C=O Erythrose
+
+# Terpenes
+CC(=C)C1CCC(=C)CC1 Limonene
+CC(C)=CCCC(C)=C Myrcene
+CC1=CCC(CC1)C(=C)C alpha-Terpinene
+
+# Cycloalkanes
+C1CCCC1 Cyclopentane
+C1CCCCC1 Cyclohexane
+C1CCCCCC1 Cycloheptane
+C1CCC(C)CC1 Methylcyclohexane
+
+# Bicyclic compounds
+C1CC2CCC1C2 Norbornane
+C1CCC2CCCCC2C1 Decalin
+
+# Miscellaneous
+O Water
+N Ammonia
+S Hydrogen_sulfide
+c1ccc2c(c1)OCO2 Benzodioxole
+CC1(C)CCCC(C)(C)O1 Musk_ketone

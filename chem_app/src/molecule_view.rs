@@ -44,9 +44,10 @@ pub fn show_atom_list(ui: &mut Ui, mol: &Molecule) {
         ui.label(egui::RichText::new("Atoms").strong().size(14.0));
 
         egui::ScrollArea::vertical()
+            .id_salt("atom_scroll")
             .max_height(200.0)
             .show(ui, |ui| {
-                egui::Grid::new("atom_list")
+                egui::Grid::new(format!("atom_list_{:p}", mol as *const _))
                     .num_columns(4)
                     .spacing([10.0, 5.0])
                     .striped(true)
@@ -74,9 +75,10 @@ pub fn show_bond_list(ui: &mut Ui, mol: &Molecule) {
         ui.label(egui::RichText::new("Bonds").strong().size(14.0));
 
         egui::ScrollArea::vertical()
+            .id_salt("bond_scroll")
             .max_height(200.0)
             .show(ui, |ui| {
-                egui::Grid::new("bond_list")
+                egui::Grid::new(format!("bond_list_{:p}", mol as *const _))
                     .num_columns(4)
                     .spacing([10.0, 5.0])
                     .striped(true)
