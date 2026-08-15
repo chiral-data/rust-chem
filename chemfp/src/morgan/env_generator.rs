@@ -63,8 +63,8 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
         // Add round 0 invariants
         for i in 0..n_atoms {
-            if include_atoms[i] && !morgan_args.only_nonzero_invariants
-                || current_invariants[i] != 0
+            if include_atoms[i]
+                && (!morgan_args.only_nonzero_invariants || current_invariants[i] != 0)
             {
                 result.push(Box::new(MorganAtomEnv::new(
                     current_invariants[i],
