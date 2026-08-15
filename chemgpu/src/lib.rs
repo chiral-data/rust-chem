@@ -10,7 +10,7 @@ pub use context::GpuContext;
 pub use error::GpuError;
 pub use morgan::GpuMorganFingerprint;
 pub use pipeline::ComputePipeline;
-pub use tanimoto::GpuTanimoto;
+pub use tanimoto::{GpuTanimoto, GpuTargetSet};
 
 /// Initialize logging for GPU operations.
 pub fn init_logging() {

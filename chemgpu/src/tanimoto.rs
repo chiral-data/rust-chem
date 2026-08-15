@@ -28,6 +28,29 @@ pub struct GpuTanimoto {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
+/// A target fingerprint set already uploaded to the GPU.
+///
+/// Search callers upload this once per dataset via [`GpuTanimoto::upload_targets`]
+/// and reuse it across many queries with [`GpuTanimoto::compute_single_query_against`],
+/// instead of re-uploading the whole dataset on every query.
+pub struct GpuTargetSet {
+    buffer: wgpu::Buffer,
+    count: usize,
+    fp_words: usize,
+}
+
+impl GpuTargetSet {
+    /// Number of target fingerprints held in this set.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Words per fingerprint in this set.
+    pub fn fp_words(&self) -> usize {
+        self.fp_words
+    }
+}
+
 impl GpuTanimoto {
     pub fn new() -> Result<Self, GpuError> {
         let ctx = GpuContext::new()?;
@@ -140,6 +163,11 @@ impl GpuTanimoto {
     ///
     /// # Returns
     /// Vector of similarities, one per target
+    ///
+    /// Uploads `targets` to a fresh GPU buffer on every call. When the same
+    /// target set is queried repeatedly (e.g. an interactive search box),
+    /// prefer [`Self::upload_targets`] once plus
+    /// [`Self::compute_single_query_against`] per query instead.
     pub fn compute_single_query(
         &self,
         query: &[u32],
@@ -152,8 +180,6 @@ impl GpuTanimoto {
             ));
         }
 
-        let num_targets = targets.len() / fp_words;
-
         if !targets.len().is_multiple_of(fp_words) {
             return Err(GpuError::BufferError(
                 "Target fingerprints not aligned".to_string(),
@@ -162,29 +188,94 @@ impl GpuTanimoto {
 
         // No targets means no results — return early rather than creating
         // 0-byte GPU buffers, which wgpu rejects as an invalid buffer size.
-        if num_targets == 0 {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let manager = BufferManager::new(&self.ctx.device, &self.ctx.queue);
+        let target_buffer = self.create_buffer(&manager, targets);
+        let target_set = GpuTargetSet {
+            buffer: target_buffer,
+            count: targets.len() / fp_words,
+            fp_words,
+        };
+
+        self.compute_single_query_against(query, &target_set)
+    }
+
+    /// Upload a target fingerprint set to the GPU once, for reuse across
+    /// many queries via [`Self::compute_single_query_against`].
+    ///
+    /// # Arguments
+    /// * `targets` - Multiple fingerprints (flattened, as u32 words)
+    /// * `fp_words` - Words per fingerprint
+    pub fn upload_targets(
+        &self,
+        targets: &[u32],
+        fp_words: usize,
+    ) -> Result<GpuTargetSet, GpuError> {
+        if fp_words == 0 {
+            return Err(GpuError::BufferError("fp_words must be > 0".to_string()));
+        }
+
+        if !targets.len().is_multiple_of(fp_words) {
+            return Err(GpuError::BufferError(
+                "Target fingerprints not aligned".to_string(),
+            ));
+        }
+
+        let manager = BufferManager::new(&self.ctx.device, &self.ctx.queue);
+        let buffer = self.create_buffer(&manager, targets);
+
+        Ok(GpuTargetSet {
+            buffer,
+            count: targets.len() / fp_words,
+            fp_words,
+        })
+    }
+
+    /// Compute Tanimoto similarity between one query and a previously
+    /// uploaded target set, without re-uploading the targets.
+    pub fn compute_single_query_against(
+        &self,
+        query: &[u32],
+        targets: &GpuTargetSet,
+    ) -> Result<Vec<f32>, GpuError> {
+        let fp_words = query.len();
+        if fp_words == 0 {
+            return Err(GpuError::BufferError(
+                "Query fingerprint is empty".to_string(),
+            ));
+        }
+        if fp_words != targets.fp_words {
+            return Err(GpuError::BufferError(format!(
+                "Query fingerprint size ({} words) does not match uploaded target set ({} words)",
+                fp_words, targets.fp_words
+            )));
+        }
+
+        // No targets means no results — return early rather than creating
+        // 0-byte GPU buffers, which wgpu rejects as an invalid buffer size.
+        if targets.count == 0 {
             return Ok(Vec::new());
         }
 
         let params = TanimotoParams {
             num_queries: 1,
-            num_targets: num_targets as u32,
+            num_targets: targets.count as u32,
             fp_words: fp_words as u32,
             _padding: 0,
         };
 
         let manager = BufferManager::new(&self.ctx.device, &self.ctx.queue);
 
-        // Create buffers
         let query_buffer = self.create_buffer(&manager, query);
-        let target_buffer = self.create_buffer(&manager, targets);
         let params_buffer = manager.create_uniform_buffer("params", 16);
         let results_buffer =
-            manager.create_storage_buffer("results", (num_targets * 4) as u64, true);
+            manager.create_storage_buffer("results", (targets.count * 4) as u64, true);
 
         manager.write_buffer(&params_buffer, &[params]);
 
-        // Create bind group
         let bind_group = self
             .ctx
             .device
@@ -198,7 +289,7 @@ impl GpuTanimoto {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: target_buffer.as_entire_binding(),
+                        resource: targets.buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -226,13 +317,13 @@ impl GpuTanimoto {
             });
             pass.set_pipeline(&self.single_query_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((num_targets as u32).div_ceil(256), 1, 1);
+            pass.dispatch_workgroups((targets.count as u32).div_ceil(256), 1, 1);
         }
 
         self.ctx.queue.submit(Some(encoder.finish()));
 
         // Read results
-        manager.read_buffer_blocking(&results_buffer, num_targets)
+        manager.read_buffer_blocking(&results_buffer, targets.count)
     }
 
     /// Compute all-pairs Tanimoto similarity matrix
