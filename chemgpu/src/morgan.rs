@@ -31,6 +31,12 @@ pub struct MoleculeOffset {
     bond_count: u32,
     adj_start: u32,
     fp_start: u32,
+    /// Start word index in the (ping-ponged) neighborhood-bitset buffers,
+    /// (bond_count + 31) / 32 words per atom.
+    neighborhood_start: u32,
+    /// Start word index in the persistent seen_neighborhoods buffer,
+    /// capacity atom_count * radius * bond_words for this molecule.
+    seen_start: u32,
 }
 
 #[repr(C)]
@@ -85,7 +91,9 @@ pub struct GpuMorganFingerprint {
     ctx: GpuContext,
     init_pipeline: wgpu::ComputePipeline,
     iteration_pipeline: wgpu::ComputePipeline,
+    dedup_pipeline: wgpu::ComputePipeline,
     copy_pipeline: wgpu::ComputePipeline,
+    copy_neighborhoods_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -218,6 +226,61 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
+                        // @binding(10): dead_atoms
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 10,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // @binding(11): current_neighborhoods
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 11,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // @binding(12): next_neighborhoods
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 12,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // @binding(13): seen_neighborhoods
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 13,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // @binding(14): seen_count
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 14,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -251,6 +314,17 @@ impl GpuMorganFingerprint {
                     compilation_options: Default::default(),
                 });
 
+        let dedup_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("morgan_batch_dedup"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some("dedup_environments_batch"),
+                    cache: None,
+                    compilation_options: Default::default(),
+                });
+
         let copy_pipeline = ctx
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -262,11 +336,24 @@ impl GpuMorganFingerprint {
                 compilation_options: Default::default(),
             });
 
+        let copy_neighborhoods_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("morgan_batch_copy_neighborhoods"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some("copy_neighborhoods"),
+                    cache: None,
+                    compilation_options: Default::default(),
+                });
+
         Ok(Self {
             ctx,
             init_pipeline,
             iteration_pipeline,
+            dedup_pipeline,
             copy_pipeline,
+            copy_neighborhoods_pipeline,
             bind_group_layout,
         })
     }
@@ -303,10 +390,19 @@ impl GpuMorganFingerprint {
         let mut total_atoms = 0u32;
         let mut total_bonds = 0u32;
         let mut total_adj = 0u32;
+        let mut total_neighborhood_words = 0u32;
+        let mut total_seen_words = 0u32;
 
         for (mol_idx, mol) in molecules.iter().enumerate() {
             let num_atoms = mol.num_atoms();
             let num_bonds = mol.num_bonds();
+            let bond_words = (num_bonds as u32).div_ceil(32).max(1);
+            let neighborhood_words_for_mol = num_atoms as u32 * bond_words;
+            // Capacity for the cumulative "seen neighborhoods" set: at most
+            // atom_count new environments can be accepted per layer, across
+            // `radius` layers (round 0 has no redundancy check, see the
+            // shader's init_invariants_batch).
+            let seen_words_for_mol = num_atoms as u32 * radius * bond_words;
 
             let offset = MoleculeOffset {
                 atom_start: total_atoms,
@@ -315,8 +411,12 @@ impl GpuMorganFingerprint {
                 bond_count: num_bonds as u32,
                 adj_start: total_adj,
                 fp_start: (mol_idx * fp_words) as u32,
+                neighborhood_start: total_neighborhood_words,
+                seen_start: total_seen_words,
             };
             molecule_offsets.push(offset);
+            total_neighborhood_words += neighborhood_words_for_mol;
+            total_seen_words += seen_words_for_mol;
 
             // Encode atoms
             for (idx, atom) in mol.atoms().iter().enumerate() {
@@ -464,9 +564,42 @@ impl GpuMorganFingerprint {
 
         let iter_params_buffer = manager.create_uniform_buffer("iter_params", 16);
 
-        // Initialize fingerprints and invariants to zero
+        // Redundant-environment dedup buffers (see chemgpu/src/shaders/morgan.wgsl
+        // dedup_environments_batch for the full explanation).
+        let dead_atoms_buffer = manager.create_storage_buffer(
+            "dead_atoms",
+            std::cmp::max((total_atoms as usize * 4) as u64, 4),
+            true,
+        );
+        let neighborhood_size = std::cmp::max((total_neighborhood_words as usize * 4) as u64, 4);
+        let current_neigh_buffer =
+            manager.create_storage_buffer("current_neighborhoods", neighborhood_size, true);
+        let next_neigh_buffer =
+            manager.create_storage_buffer("next_neighborhoods", neighborhood_size, true);
+        let seen_neigh_buffer = manager.create_storage_buffer(
+            "seen_neighborhoods",
+            std::cmp::max((total_seen_words as usize * 4) as u64, 4),
+            true,
+        );
+        let seen_count_buffer = manager.create_storage_buffer(
+            "seen_count",
+            std::cmp::max((num_molecules * 4) as u64, 4),
+            true,
+        );
+
+        // Initialize fingerprints, invariants, and dedup state to zero
         manager.write_buffer(&fp_buffer, &vec![0u32; fp_total_words]);
         manager.write_buffer(&params_buffer, &[params]);
+        manager.write_buffer(&dead_atoms_buffer, &vec![0u32; total_atoms as usize]);
+        manager.write_buffer(
+            &current_neigh_buffer,
+            &vec![0u32; total_neighborhood_words as usize],
+        );
+        manager.write_buffer(
+            &next_neigh_buffer,
+            &vec![0u32; total_neighborhood_words as usize],
+        );
+        manager.write_buffer(&seen_count_buffer, &vec![0u32; num_molecules]);
 
         // Create bind group
         let bind_group = self
@@ -516,6 +649,26 @@ impl GpuMorganFingerprint {
                         binding: 9,
                         resource: iter_params_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: dead_atoms_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: current_neigh_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: next_neigh_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: seen_neigh_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 14,
+                        resource: seen_count_buffer.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -540,6 +693,17 @@ impl GpuMorganFingerprint {
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
+        // Submit the init pass now: queue.write_buffer calls are ordered
+        // relative to queue.submit calls, not to when compute passes are
+        // *recorded* into an encoder. Below, the per-layer `iter_params`
+        // buffer is rewritten once per layer via write_buffer — if every
+        // layer's passes were recorded into one shared encoder and submitted
+        // only once at the very end (as this used to do), every layer's
+        // iteration pass would see whichever `current_layer` was written
+        // *last*, not its own. Submitting once per layer keeps each write
+        // correctly ordered before the pass that depends on it.
+        self.ctx.queue.submit(Some(encoder.finish()));
+
         // Pass 2..N: Iterate through radius layers for ALL molecules
         for layer in 0..radius {
             let iter_params = IterationParams {
@@ -550,8 +714,15 @@ impl GpuMorganFingerprint {
             };
             manager.write_buffer(&iter_params_buffer, &[iter_params]);
 
+            let mut layer_encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some(&format!("morgan_batch_layer_{}_encoder", layer)),
+                    });
+
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = layer_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some(&format!("morgan_batch_iter_layer_{}", layer)),
                     timestamp_writes: None,
                 });
@@ -560,9 +731,27 @@ impl GpuMorganFingerprint {
                 pass.dispatch_workgroups(workgroups, 1, 1);
             }
 
-            // Copy next -> current using GPU (no sync!)
+            // Redundant-environment dedup: decides which of this round's
+            // freshly computed environments are unique (contribute a
+            // fingerprint bit, get recorded as "seen") vs. redundant
+            // (freeze that atom via dead_atoms, no bit). Must run after the
+            // iteration pass (needs this round's next_invariants/
+            // next_neighborhoods) and before the copy passes (which promote
+            // next -> current for the following round).
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = layer_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("morgan_batch_dedup_layer_{}", layer)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.dedup_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(num_molecules as u32, 1, 1);
+            }
+
+            // Copy next -> current using GPU (no host sync needed beyond the
+            // per-layer submit above)
+            {
+                let mut pass = layer_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some(&format!("morgan_batch_copy_layer_{}", layer)),
                     timestamp_writes: None,
                 });
@@ -570,10 +759,20 @@ impl GpuMorganFingerprint {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
             }
-        }
 
-        // Submit ALL work at once
-        self.ctx.queue.submit(Some(encoder.finish()));
+            {
+                let neighborhood_workgroups = total_neighborhood_words.div_ceil(256).max(1);
+                let mut pass = layer_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("morgan_batch_copy_neighborhoods_layer_{}", layer)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.copy_neighborhoods_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(neighborhood_workgroups, 1, 1);
+            }
+
+            self.ctx.queue.submit(Some(layer_encoder.finish()));
+        }
 
         // Single readback of ALL fingerprints
         let all_fps: Vec<u32> = manager.read_buffer_blocking(&fp_buffer, fp_total_words)?;
