@@ -34,16 +34,8 @@ pub fn tanimoto_similarity(fp1: &BitVec, fp2: &BitVec) -> Result<f64, Fingerprin
         return Err(FingerprintError::SizeMismatch(fp1.len(), fp2.len()));
     }
 
-    let intersection = fp1
-        .iter()
-        .zip(fp2.iter())
-        .filter(|(a, b)| **a && **b)
-        .count(); // (fp1 & fp2).count_ones(); // Bits active in both fingerprints
-    let union = fp1
-        .iter()
-        .zip(fp2.iter())
-        .filter(|(a, b)| **a || **b)
-        .count(); // (fp1 | fp2).count_ones(); // Bits active in either fingerprint
+    let intersection = (fp1.clone() & fp2.clone()).count_ones(); // Bits active in both fingerprints
+    let union = (fp1.clone() | fp2.clone()).count_ones(); // Bits active in either fingerprint
 
     // Avoid division by zero when both fp1 and fp2 are all-zero (no features)
     if union == 0 {
@@ -81,11 +73,7 @@ pub fn dice_similarity(fp1: &BitVec, fp2: &BitVec) -> Result<f64, FingerprintErr
         return Err(FingerprintError::SizeMismatch(fp1.len(), fp2.len()));
     }
 
-    let intersection = fp1
-        .iter()
-        .zip(fp2.iter())
-        .filter(|(a, b)| **a && **b)
-        .count(); // (fp1 & fp2).count_ones();
+    let intersection = (fp1.clone() & fp2.clone()).count_ones();
     let sum = fp1.count_ones() + fp2.count_ones();
 
     if sum == 0 {
