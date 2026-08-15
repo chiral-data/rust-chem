@@ -53,12 +53,8 @@ fn bitvec_to_u32_vec(bv: &BitVec, fp_size: u32) -> Vec<u32> {
         .collect()
 }
 
-fn main() {
-    println!("=== GPU Morgan + Tanimoto Full Benchmark ===\n");
-
-    let num_molecules = 100;
-    let radius = 2;
-    let fp_size = 2048;
+fn run_benchmark(label: &str, num_molecules: usize, radius: u32, fp_size: u32) {
+    println!("\n=== {} ({} molecules) ===\n", label, num_molecules);
 
     println!("Configuration:");
     println!("  Molecules: {}", num_molecules);
@@ -265,7 +261,7 @@ fn main() {
     // SUMMARY
     // ========================================================================
 
-    println!("\n=== SUMMARY ===");
+    println!("\n=== {} SUMMARY ===", label);
     println!("✓ Morgan fingerprints: GPU matches CPU");
     println!("✓ Tanimoto similarity: GPU matches CPU");
     println!("\nOverall times:");
@@ -282,5 +278,23 @@ fn main() {
         "  Morgan GPU vs CPU: {:.2}x",
         cpu_morgan_time.as_secs_f64() / gpu_morgan_time.as_secs_f64()
     );
+    println!("  Tanimoto GPU vs CPU: {:.2}x", {
+        cpu_tanimoto_time.as_secs_f64() / gpu_tanimoto_time.as_secs_f64()
+    });
+}
+
+fn main() {
+    println!("=== GPU Morgan + Tanimoto Full Benchmark ===");
+
+    let radius = 2;
+    let fp_size = 2048;
+
+    // Small batch: dominated by fixed per-dispatch GPU overhead, so CPU wins here.
+    run_benchmark("Small batch", 100, radius, fp_size);
+
+    // Large batch: amortizes GPU dispatch overhead across many molecules,
+    // demonstrating the GPU's real throughput advantage at scale.
+    run_benchmark("Large batch", 60_000, radius, fp_size);
+
     println!("\nALL TESTS PASSED!");
 }
