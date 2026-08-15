@@ -128,6 +128,19 @@ impl FingerprintSearch {
     ) -> anyhow::Result<Vec<f64>> {
         let gpu = self.gpu_tanimoto.as_ref().unwrap();
 
+        // Word-count divisibility alone can't catch a wrong-but-divisible target
+        // size (e.g. 1024-bit targets against a 2048-bit query), since the GPU
+        // path only sees flattened u32 words, not each fingerprint's bit length.
+        // Check exact bit lengths here, same as the CPU path's tanimoto_similarity.
+        if let Some(mismatch_idx) = target_fps.iter().position(|fp| fp.len() != query_fp.len()) {
+            anyhow::bail!(
+                "Target fingerprint size mismatch at index {}: expected {} bits, got {} bits",
+                mismatch_idx,
+                query_fp.len(),
+                target_fps[mismatch_idx].len()
+            );
+        }
+
         let query_words = Self::bitvec_to_words(query_fp);
         let target_words: Vec<u32> = target_fps
             .iter()
@@ -214,5 +227,33 @@ impl FingerprintSearch {
 impl Default for FingerprintSearch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gpu_search_rejects_mismatched_fingerprint_size() {
+        let search = FingerprintSearch::new();
+        if !search.is_using_gpu() {
+            println!("GPU not available, skipping GPU-path size-mismatch test");
+            return;
+        }
+
+        // Two 1024-bit targets flatten to exactly the same word count as one
+        // 2048-bit query (64 words), so a word-count-divisibility-only check
+        // would silently accept this and treat the two targets as one —
+        // exactly the "2*N-1 index" corruption the size check must prevent.
+        let query_fp = BitVec::repeat(false, 2048);
+        let mismatched_targets = vec![BitVec::repeat(false, 1024), BitVec::repeat(false, 1024)];
+
+        let result = search.search(&query_fp, &mismatched_targets, 2);
+        assert!(
+            result.is_err(),
+            "expected a size-mismatch error, got {:?}",
+            result
+        );
     }
 }
