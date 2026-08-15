@@ -2,7 +2,7 @@ use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
 use chemfp::morgan::MorganFingerprint;
 use chemfp::tanimoto::tanimoto_similarity;
-use chemgpu::{GpuMorganFingerprint, GpuTanimoto};
+use chemgpu::{GpuMorganFingerprint, GpuTanimoto, GpuTargetSet};
 
 #[derive(Clone, Debug)]
 pub struct SearchResult {
@@ -14,6 +14,10 @@ pub struct FingerprintSearch {
     gpu_morgan: Option<GpuMorganFingerprint>,
     gpu_tanimoto: Option<GpuTanimoto>,
     use_gpu: bool,
+    /// Target dataset already uploaded to the GPU, reused across searches
+    /// so only the (small) query fingerprint round-trips per search instead
+    /// of re-uploading the whole dataset every time.
+    gpu_targets: Option<GpuTargetSet>,
 }
 
 impl FingerprintSearch {
@@ -33,6 +37,7 @@ impl FingerprintSearch {
             gpu_morgan,
             gpu_tanimoto,
             use_gpu,
+            gpu_targets: None,
         }
     }
 
@@ -68,8 +73,34 @@ impl FingerprintSearch {
         }
     }
 
+    /// Upload `target_fps` to the GPU once, so subsequent [`Self::search`]
+    /// calls reuse the same buffer instead of re-uploading the whole
+    /// dataset on every query. Call this whenever the dataset changes;
+    /// `search` will still lazily upload on its own if this was skipped.
+    pub fn set_target_dataset(&mut self, target_fps: &[BitVec]) -> anyhow::Result<()> {
+        if !(self.use_gpu && self.gpu_tanimoto.is_some()) || target_fps.is_empty() {
+            self.gpu_targets = None;
+            return Ok(());
+        }
+
+        let gpu = self.gpu_tanimoto.as_ref().unwrap();
+        let fp_words = Self::bitvec_to_words(&target_fps[0]).len();
+        let flattened: Vec<u32> = target_fps
+            .iter()
+            .flat_map(Self::bitvec_to_words)
+            .collect();
+
+        self.gpu_targets = Some(gpu.upload_targets(&flattened, fp_words)?);
+        Ok(())
+    }
+
+    /// Drop the cached GPU target upload, e.g. when the dataset is cleared.
+    pub fn invalidate_target_dataset(&mut self) {
+        self.gpu_targets = None;
+    }
+
     pub fn search(
-        &self,
+        &mut self,
         query_fp: &BitVec,
         target_fps: &[BitVec],
         top_k: usize,
@@ -122,12 +153,10 @@ impl FingerprintSearch {
     }
 
     fn compute_similarities_gpu(
-        &self,
+        &mut self,
         query_fp: &BitVec,
         target_fps: &[BitVec],
     ) -> anyhow::Result<Vec<f64>> {
-        let gpu = self.gpu_tanimoto.as_ref().unwrap();
-
         // Word-count divisibility alone can't catch a wrong-but-divisible target
         // size (e.g. 1024-bit targets against a 2048-bit query), since the GPU
         // path only sees flattened u32 words, not each fingerprint's bit length.
@@ -141,13 +170,31 @@ impl FingerprintSearch {
             );
         }
 
-        let query_words = Self::bitvec_to_words(query_fp);
-        let target_words: Vec<u32> = target_fps
-            .iter()
-            .flat_map(|fp| Self::bitvec_to_words(fp))
-            .collect();
+        // No targets means no results — mirrors the empty-buffer guard the
+        // GPU path itself uses, and sidesteps caching an empty upload.
+        if target_fps.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let similarities_f32 = gpu.compute_single_query(&query_words, &target_words)?;
+        let query_words = Self::bitvec_to_words(query_fp);
+
+        // Reuse the cached upload when it already matches this target set's
+        // shape; only re-upload (the whole point of #16) when the caller
+        // never called `set_target_dataset` or the dataset actually changed.
+        let cache_valid = self
+            .gpu_targets
+            .as_ref()
+            .is_some_and(|t| t.count() == target_fps.len() && t.fp_words() == query_words.len());
+        if !cache_valid {
+            self.set_target_dataset(target_fps)?;
+        }
+
+        let gpu = self.gpu_tanimoto.as_ref().unwrap();
+        let targets = self
+            .gpu_targets
+            .as_ref()
+            .expect("set_target_dataset populates gpu_targets for a non-empty dataset");
+        let similarities_f32 = gpu.compute_single_query_against(&query_words, targets)?;
         Ok(similarities_f32.into_iter().map(|s| s as f64).collect())
     }
 
@@ -236,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_gpu_search_rejects_mismatched_fingerprint_size() {
-        let search = FingerprintSearch::new();
+        let mut search = FingerprintSearch::new();
         if !search.is_using_gpu() {
             println!("GPU not available, skipping GPU-path size-mismatch test");
             return;
@@ -254,6 +301,38 @@ mod tests {
             result.is_err(),
             "expected a size-mismatch error, got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn test_gpu_search_reflects_new_dataset_after_reupload() {
+        let mut search = FingerprintSearch::new();
+        if !search.is_using_gpu() {
+            println!("GPU not available, skipping GPU target-cache test");
+            return;
+        }
+
+        // Same shape (1 target, 64 words) for both datasets, so a cache keyed
+        // only on count/fp_words would wrongly keep serving dataset A's
+        // upload after dataset B replaces it via `set_target_dataset`.
+        let query_fp = BitVec::repeat(true, 2048);
+
+        let dataset_a = vec![BitVec::repeat(true, 2048)];
+        search.set_target_dataset(&dataset_a).unwrap();
+        let results_a = search.search(&query_fp, &dataset_a, 1).unwrap();
+        assert!(
+            (results_a[0].similarity - 1.0).abs() < 1e-6,
+            "expected perfect self-similarity against dataset A, got {:?}",
+            results_a
+        );
+
+        let dataset_b = vec![BitVec::repeat(false, 2048)];
+        search.set_target_dataset(&dataset_b).unwrap();
+        let results_b = search.search(&query_fp, &dataset_b, 1).unwrap();
+        assert!(
+            results_b[0].similarity.abs() < 1e-6,
+            "expected zero similarity against dataset B, got a stale result from dataset A: {:?}",
+            results_b
         );
     }
 }

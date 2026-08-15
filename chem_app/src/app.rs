@@ -70,6 +70,7 @@ impl ChemFpDemoApp {
                     self.dataset_status = format!("Loaded {} molecules from file", dataset.len());
                     self.dataset = dataset;
                     self.dataset_fingerprints.clear();
+                    self.search_engine.invalidate_target_dataset();
                     self.search_results.clear();
                     self.selected_result = None;
                     log::info!("Dataset loaded successfully");
@@ -88,6 +89,7 @@ impl ChemFpDemoApp {
                 self.dataset_status = format!("Loaded {} example molecules", dataset.len());
                 self.dataset = dataset;
                 self.dataset_fingerprints.clear();
+                self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
                 self.selected_result = None;
             }
@@ -112,6 +114,12 @@ impl ChemFpDemoApp {
         ) {
             Ok(fps) => {
                 self.dataset_fingerprints = fps;
+                if let Err(e) = self
+                    .search_engine
+                    .set_target_dataset(&self.dataset_fingerprints)
+                {
+                    log::warn!("Failed to upload dataset to GPU: {}", e);
+                }
                 let elapsed = start.elapsed().as_secs_f64();
                 self.dataset_status = format!(
                     "Computed {} fingerprints in {:.2}ms ({} mode)",
@@ -455,19 +463,21 @@ impl eframe::App for ChemFpDemoApp {
             0.0
         };
 
-        if self
-            .query_dirty_since
-            .is_some_and(|since| since.elapsed() >= QUERY_DEBOUNCE)
-        {
-            self.query_dirty_since = None;
-            self.parse_query();
+        if let Some(dirty_since) = self.query_dirty_since {
+            let elapsed = dirty_since.elapsed();
+            if elapsed >= QUERY_DEBOUNCE {
+                self.query_dirty_since = None;
+                self.parse_query();
+            } else {
+                // Wake up exactly when the debounce window closes instead of
+                // repainting every frame while the query box sits idle.
+                ctx.request_repaint_after(QUERY_DEBOUNCE - elapsed);
+            }
         }
 
         self.top_panel(ctx);
         self.dataset_panel(ctx);
         self.query_panel(ctx);
         self.results_panel(ctx);
-
-        ctx.request_repaint();
     }
 }
