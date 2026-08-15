@@ -66,12 +66,24 @@ impl GpuContext {
             adapter_info.backend
         );
 
+        // wgpu::Limits::default() caps max_storage_buffers_per_shader_stage at 8
+        // (a conservative, portable-across-backends default). The Morgan batch
+        // shader's redundant-environment dedup uses 13 storage buffer bindings
+        // in one compute stage, so ask for more — clamped to what this adapter
+        // actually reports, so we never request above its real capability.
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffers_per_shader_stage = adapter_limits
+            .max_storage_buffers_per_shader_stage
+            .min(16)
+            .max(wgpu::Limits::default().max_storage_buffers_per_shader_stage);
+
         // Request device and queue
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ChemGPU Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 trace: wgpu::Trace::default(),
