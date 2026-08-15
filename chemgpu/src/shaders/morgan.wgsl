@@ -120,6 +120,15 @@ var<storage, read_write> seen_neighborhoods: array<u32>;
 @group(0) @binding(14)
 var<storage, read_write> seen_count: array<u32>;
 
+// Scratch space for morgan_iteration_batch's per-atom (bond_inv, neighbor_inv)
+// candidate list, one slot per adjacency entry (indexed identically to the
+// `adjacency` buffer itself, so each atom's own slice is exactly
+// adjacency[atom_adj_start..atom_adj_end], no cap on degree — unlike a fixed-
+// size function-local array, which would silently truncate any atom with
+// more neighbors than the array's capacity.
+@group(0) @binding(15)
+var<storage, read_write> neighbor_scratch: array<vec2<u32>>;
+
 // ============================================================================
 // HASH FUNCTIONS
 // ============================================================================
@@ -273,16 +282,14 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let atom_adj_start = adjacency_offsets[mol.atom_start + local_atom_idx];
     let atom_adj_end = adjacency_offsets[mol.atom_start + local_atom_idx + 1u];
 
-    // Collect neighbor invariants (capped at 16, matching the pre-existing
-    // hash-computation bound — see issue #12; unrelated to and independent of
-    // the neighborhood-bitset tracking below, which is never capped).
-    var neighbor_data: array<vec2<u32>, 16>;
-    var neighbor_count = 0u;
-
     for (var w = 0u; w < bond_words; w = w + 1u) {
         next_neighborhoods[neigh_base + w] = 0u;
     }
 
+    // Collect neighbor invariants directly into neighbor_scratch, indexed
+    // identically to `adjacency` (so this atom's own slice is exactly
+    // neighbor_scratch[atom_adj_start..atom_adj_end]) — unbounded, no cap on
+    // degree, unlike a fixed-size function-local array.
     for (var i = atom_adj_start; i < atom_adj_end; i = i + 1u) {
         let neighbor = adjacency[i];
         let bond = bonds[mol.bond_start + neighbor.bond_idx];
@@ -300,25 +307,22 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 next_neighborhoods[neigh_base + w] | current_neighborhoods[neighbor_neigh_base + w];
         }
 
-        if (neighbor_count < 16u) {
-            var bond_inv = 1u;
-            if (params.use_bond_types != 0u) {
-                bond_inv = bond.order;
-            }
-            let neighbor_inv = atomicLoad(&current_invariants[mol.atom_start + neighbor.atom_idx]);
-            neighbor_data[neighbor_count] = vec2<u32>(bond_inv, neighbor_inv);
-            neighbor_count = neighbor_count + 1u;
+        var bond_inv = 1u;
+        if (params.use_bond_types != 0u) {
+            bond_inv = bond.order;
         }
+        let neighbor_inv = atomicLoad(&current_invariants[mol.atom_start + neighbor.atom_idx]);
+        neighbor_scratch[i] = vec2<u32>(bond_inv, neighbor_inv);
     }
 
-    // Sort neighbors
-    for (var i = 0u; i < neighbor_count; i = i + 1u) {
-        for (var j = i + 1u; j < neighbor_count; j = j + 1u) {
-            let a = neighbor_data[i];
-            let b = neighbor_data[j];
+    // Sort this atom's neighbor_scratch slice in place.
+    for (var i = atom_adj_start; i < atom_adj_end; i = i + 1u) {
+        for (var j = i + 1u; j < atom_adj_end; j = j + 1u) {
+            let a = neighbor_scratch[i];
+            let b = neighbor_scratch[j];
             if (a.x > b.x || (a.x == b.x && a.y > b.y)) {
-                neighbor_data[i] = b;
-                neighbor_data[j] = a;
+                neighbor_scratch[i] = b;
+                neighbor_scratch[j] = a;
             }
         }
     }
@@ -328,9 +332,10 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var new_inv = iter_params.current_layer;
     hash_combine(&new_inv, current_inv);
 
-    for (var i = 0u; i < neighbor_count; i = i + 1u) {
-        let bond_inv = i32(neighbor_data[i].x);
-        let atom_inv = neighbor_data[i].y;
+    for (var i = atom_adj_start; i < atom_adj_end; i = i + 1u) {
+        let pair = neighbor_scratch[i];
+        let bond_inv = i32(pair.x);
+        let atom_inv = pair.y;
         hash_pair(&new_inv, bond_inv, atom_inv);
     }
 

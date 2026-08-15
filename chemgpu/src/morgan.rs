@@ -281,6 +281,17 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
+                        // @binding(15): neighbor_scratch
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 15,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -586,6 +597,14 @@ impl GpuMorganFingerprint {
             std::cmp::max((num_molecules * 4) as u64, 4),
             true,
         );
+        // One vec2<u32> (bond_inv, neighbor_inv) slot per adjacency entry —
+        // indexed identically to `adjacency` itself, so each atom's own
+        // neighbor candidate list is unbounded (no fixed-size cap; see #12).
+        let neighbor_scratch_buffer = manager.create_storage_buffer(
+            "neighbor_scratch",
+            std::cmp::max((total_adj as usize * 8) as u64, 8),
+            true,
+        );
 
         // Initialize fingerprints, invariants, and dedup state to zero
         manager.write_buffer(&fp_buffer, &vec![0u32; fp_total_words]);
@@ -600,6 +619,7 @@ impl GpuMorganFingerprint {
             &vec![0u32; total_neighborhood_words as usize],
         );
         manager.write_buffer(&seen_count_buffer, &vec![0u32; num_molecules]);
+        manager.write_buffer(&neighbor_scratch_buffer, &vec![0u32; total_adj as usize * 2]);
 
         // Create bind group
         let bind_group = self
@@ -668,6 +688,10 @@ impl GpuMorganFingerprint {
                     wgpu::BindGroupEntry {
                         binding: 14,
                         resource: seen_count_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 15,
+                        resource: neighbor_scratch_buffer.as_entire_binding(),
                     },
                 ],
             });
