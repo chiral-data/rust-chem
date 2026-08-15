@@ -146,12 +146,24 @@ impl GpuTanimoto {
         targets: &[u32],
     ) -> Result<Vec<f32>, GpuError> {
         let fp_words = query.len();
+        if fp_words == 0 {
+            return Err(GpuError::BufferError(
+                "Query fingerprint is empty".to_string(),
+            ));
+        }
+
         let num_targets = targets.len() / fp_words;
 
         if !targets.len().is_multiple_of(fp_words) {
             return Err(GpuError::BufferError(
                 "Target fingerprints not aligned".to_string(),
             ));
+        }
+
+        // No targets means no results — return early rather than creating
+        // 0-byte GPU buffers, which wgpu rejects as an invalid buffer size.
+        if num_targets == 0 {
+            return Ok(Vec::new());
         }
 
         let params = TanimotoParams {
@@ -239,6 +251,10 @@ impl GpuTanimoto {
         fp_size: u32,
     ) -> Result<Vec<f32>, GpuError> {
         let fp_words = fp_size.div_ceil(32) as usize;
+        if fp_words == 0 {
+            return Err(GpuError::BufferError("fp_size must be > 0".to_string()));
+        }
+
         let num_queries = queries.len() / fp_words;
         let num_targets = targets.len() / fp_words;
 
@@ -246,6 +262,13 @@ impl GpuTanimoto {
             return Err(GpuError::BufferError(
                 "Fingerprints not aligned".to_string(),
             ));
+        }
+
+        // No queries or no targets means no results — return early rather
+        // than creating 0-byte GPU buffers, which wgpu rejects as an invalid
+        // buffer size.
+        if num_queries == 0 || num_targets == 0 {
+            return Ok(Vec::new());
         }
 
         let params = TanimotoParams {
@@ -322,5 +345,66 @@ impl GpuTanimoto {
         let buffer = manager.create_storage_buffer("temp", size, false);
         manager.write_buffer(&buffer, data);
         buffer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_single_query_empty_targets_returns_empty_not_panic() {
+        env_logger::try_init().ok();
+
+        let Ok(gpu) = GpuTanimoto::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        let query = vec![0u32; 64];
+        let result = gpu.compute_single_query(&query, &[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_single_query_empty_query_is_error() {
+        env_logger::try_init().ok();
+
+        let Ok(gpu) = GpuTanimoto::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        let targets = vec![0u32; 64];
+        assert!(gpu.compute_single_query(&[], &targets).is_err());
+    }
+
+    #[test]
+    fn test_compute_all_pairs_empty_inputs_return_empty_not_panic() {
+        env_logger::try_init().ok();
+
+        let Ok(gpu) = GpuTanimoto::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        let fp_size = 2048u32;
+        let one_fp = vec![0u32; (fp_size / 32) as usize];
+
+        assert!(gpu.compute_all_pairs(&[], &one_fp, fp_size).unwrap().is_empty());
+        assert!(gpu.compute_all_pairs(&one_fp, &[], fp_size).unwrap().is_empty());
+        assert!(gpu.compute_all_pairs(&[], &[], fp_size).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_compute_all_pairs_zero_fp_size_is_error() {
+        env_logger::try_init().ok();
+
+        let Ok(gpu) = GpuTanimoto::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        assert!(gpu.compute_all_pairs(&[1u32], &[1u32], 0).is_err());
     }
 }
