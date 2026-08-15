@@ -6,7 +6,11 @@ use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
 use chemio::smiles::parse_smiles;
 use egui::{Color32, RichText};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long the query SMILES box must sit idle before we run fingerprint
+/// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
+const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct ChemFpDemoApp {
     dataset: MoleculeDataset,
@@ -26,6 +30,7 @@ pub struct ChemFpDemoApp {
     last_fp_gen_time: Option<f64>,
     fps_counter: f64,
     frame_times: Vec<f64>,
+    query_dirty_since: Option<Instant>,
 }
 
 impl ChemFpDemoApp {
@@ -51,6 +56,7 @@ impl ChemFpDemoApp {
             last_fp_gen_time: None,
             fps_counter: 0.0,
             frame_times: Vec::with_capacity(60),
+            query_dirty_since: None,
         }
     }
 
@@ -285,7 +291,11 @@ impl ChemFpDemoApp {
                     ui.label("SMILES:");
                     let response = ui.text_edit_singleline(&mut self.query_smiles);
 
-                    if response.changed() || ui.button("Parse").clicked() {
+                    if response.changed() {
+                        self.query_dirty_since = Some(Instant::now());
+                    }
+                    if ui.button("Parse").clicked() {
+                        self.query_dirty_since = None;
                         self.parse_query();
                     }
                 });
@@ -444,6 +454,14 @@ impl eframe::App for ChemFpDemoApp {
         } else {
             0.0
         };
+
+        if self
+            .query_dirty_since
+            .is_some_and(|since| since.elapsed() >= QUERY_DEBOUNCE)
+        {
+            self.query_dirty_since = None;
+            self.parse_query();
+        }
 
         self.top_panel(ctx);
         self.dataset_panel(ctx);
