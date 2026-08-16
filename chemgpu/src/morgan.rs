@@ -5,14 +5,48 @@ use bytemuck::{Pod, Zeroable};
 use chemcore::molecule::Molecule;
 use wgpu;
 
-// dedup_environments_batch dispatches one workgroup per DEDUP_WORKGROUP_SIZE
-// molecules (see the shader's workgroup_size and its mol_idx bounds check);
-// WebGPU caps dispatch group count at 65,535 per dimension (see #27), so a
-// single GPU dispatch cannot process more than MAX_MOLECULES_PER_DISPATCH
-// molecules. generate_fingerprints_batch transparently splits larger batches
-// across multiple dispatches instead of erroring.
-const DEDUP_WORKGROUP_SIZE: usize = 256;
-const MAX_MOLECULES_PER_DISPATCH: usize = DEDUP_WORKGROUP_SIZE * 65_535;
+// Every kernel in the batch pipeline (init_invariants_batch,
+// morgan_iteration_batch, dedup_environments_batch, copy_invariants,
+// copy_neighborhoods) is @workgroup_size(256), and each is dispatched with
+// ceil(N / 256) workgroups, where N is num_molecules (dedup), total_atoms
+// (init/iteration/copy), or total_neighborhood_words (copy_neighborhoods).
+// WebGPU caps dispatch group count at 65,535 per dimension, so a single GPU
+// dispatch cannot let any of those three counts exceed 256 * 65,535 (see #27
+// for num_molecules, #33 for total_atoms/total_neighborhood_words).
+// generate_fingerprints_batch transparently splits larger batches across
+// multiple dispatches, keeping every chunk under all three caps at once,
+// instead of erroring.
+const WORKGROUP_SIZE: usize = 256;
+const MAX_MOLECULES_PER_DISPATCH: usize = WORKGROUP_SIZE * 65_535;
+const MAX_ATOMS_PER_DISPATCH: u32 = (WORKGROUP_SIZE * 65_535) as u32;
+const MAX_NEIGHBORHOOD_WORDS_PER_DISPATCH: u32 = (WORKGROUP_SIZE * 65_535) as u32;
+
+/// Per-dispatch caps a single GPU dispatch must stay under simultaneously
+/// (see the constants above). Bundled into one struct so
+/// `generate_fingerprints_batch_chunked` takes one parameter instead of
+/// three, and so tests can shrink individual caps independently to exercise
+/// each chunking trigger without needing tens of millions of atoms.
+#[derive(Clone, Copy)]
+struct DispatchLimits {
+    max_molecules: usize,
+    max_atoms: u32,
+    max_neighborhood_words: u32,
+}
+
+const DISPATCH_LIMITS: DispatchLimits = DispatchLimits {
+    max_molecules: MAX_MOLECULES_PER_DISPATCH,
+    max_atoms: MAX_ATOMS_PER_DISPATCH,
+    max_neighborhood_words: MAX_NEIGHBORHOOD_WORDS_PER_DISPATCH,
+};
+
+/// Atom count and neighborhood-word count `mol` contributes to a single
+/// dispatch's totals (mirrors the per-molecule accumulation in
+/// `generate_fingerprints_batch_single_dispatch`).
+fn molecule_dispatch_cost(mol: &Molecule) -> (u32, u32) {
+    let num_atoms = mol.num_atoms() as u32;
+    let bond_words = (mol.num_bonds() as u32).div_ceil(32).max(1);
+    (num_atoms, num_atoms * bond_words)
+}
 
 // ============================================================================
 // BATCH GPU DATA STRUCTURES
@@ -400,20 +434,21 @@ impl GpuMorganFingerprint {
             use_chirality,
             use_bond_types,
             only_nonzero_invariants,
-            MAX_MOLECULES_PER_DISPATCH,
+            DISPATCH_LIMITS,
         )
     }
 
-    /// Splits `molecules` into chunks of at most `max_molecules_per_dispatch`
-    /// and runs each chunk through its own GPU dispatch. Each molecule's GPU
-    /// state (buffers, dedup bookkeeping) is scoped to its own chunk, so
-    /// chunking never changes a molecule's resulting fingerprint — only how
-    /// many molecules one GPU dispatch processes at a time.
+    /// Splits `molecules` into chunks that each stay under every cap in
+    /// `limits` simultaneously (molecule count, total atoms, and total
+    /// neighborhood words — see #27 and #33) and runs each chunk through its
+    /// own GPU dispatch. Each molecule's GPU state (buffers, dedup
+    /// bookkeeping) is scoped to its own chunk, so chunking never changes a
+    /// molecule's resulting fingerprint — only how many molecules one GPU
+    /// dispatch processes at a time.
     ///
-    /// `max_molecules_per_dispatch` is a parameter (rather than always using
-    /// the `MAX_MOLECULES_PER_DISPATCH` constant) purely so tests can
-    /// exercise multi-chunk behavior without needing tens of millions of
-    /// molecules.
+    /// `limits` is a parameter (rather than always using `DISPATCH_LIMITS`)
+    /// purely so tests can shrink individual caps to exercise each chunking
+    /// trigger without needing tens of millions of atoms/molecules.
     #[allow(clippy::too_many_arguments)]
     fn generate_fingerprints_batch_chunked(
         &self,
@@ -423,29 +458,45 @@ impl GpuMorganFingerprint {
         use_chirality: bool,
         use_bond_types: bool,
         only_nonzero_invariants: bool,
-        max_molecules_per_dispatch: usize,
+        limits: DispatchLimits,
     ) -> Result<Vec<Vec<u32>>, GpuError> {
-        if molecules.len() <= max_molecules_per_dispatch {
-            return self.generate_fingerprints_batch_single_dispatch(
-                molecules,
-                radius,
-                fp_size,
-                use_chirality,
-                use_bond_types,
-                only_nonzero_invariants,
-            );
-        }
-
         let mut result = Vec::with_capacity(molecules.len());
-        for chunk in molecules.chunks(max_molecules_per_dispatch) {
+        let mut start = 0usize;
+        while start < molecules.len() {
+            // Greedily grow [start, end) while it stays under every cap.
+            // `end > start` guards the first molecule in: a single molecule
+            // whose own atom/neighborhood-word cost already exceeds a cap
+            // still gets its own (unsplittable) chunk, which
+            // single_dispatch's bounds check will then reject.
+            let mut end = start;
+            let mut atoms_acc = 0u32;
+            let mut neighborhood_words_acc = 0u32;
+            while end < molecules.len() {
+                let (atoms, neighborhood_words) = molecule_dispatch_cost(&molecules[end]);
+                let next_atoms = atoms_acc + atoms;
+                let next_neighborhood_words = neighborhood_words_acc + neighborhood_words;
+                let next_count = end - start + 1;
+                if end > start
+                    && (next_count > limits.max_molecules
+                        || next_atoms > limits.max_atoms
+                        || next_neighborhood_words > limits.max_neighborhood_words)
+                {
+                    break;
+                }
+                atoms_acc = next_atoms;
+                neighborhood_words_acc = next_neighborhood_words;
+                end += 1;
+            }
+
             result.extend(self.generate_fingerprints_batch_single_dispatch(
-                chunk,
+                &molecules[start..end],
                 radius,
                 fp_size,
                 use_chirality,
                 use_bond_types,
                 only_nonzero_invariants,
             )?);
+            start = end;
         }
         Ok(result)
     }
@@ -572,6 +623,27 @@ impl GpuMorganFingerprint {
             total_atoms += num_atoms as u32;
             total_bonds += num_bonds as u32;
             total_adj = all_adjacency.len() as u32;
+        }
+
+        // Defensive fallback: generate_fingerprints_batch_chunked always
+        // keeps every chunk it builds under these same caps, so this should
+        // be unreachable via the public API — except for a single molecule
+        // whose own atom/neighborhood-word count already exceeds a cap,
+        // which cannot be split any further (see #33).
+        if total_atoms > MAX_ATOMS_PER_DISPATCH {
+            return Err(GpuError::OperationFailed(format!(
+                "batch has {total_atoms} total atoms, exceeding the maximum supported by a \
+                 single GPU dispatch ({MAX_ATOMS_PER_DISPATCH}); if this is a single molecule, \
+                 it cannot be chunked any further"
+            )));
+        }
+        if total_neighborhood_words > MAX_NEIGHBORHOOD_WORDS_PER_DISPATCH {
+            return Err(GpuError::OperationFailed(format!(
+                "batch has {total_neighborhood_words} total neighborhood words, exceeding the \
+                 maximum supported by a single GPU dispatch \
+                 ({MAX_NEIGHBORHOOD_WORDS_PER_DISPATCH}); if this is a single molecule, it \
+                 cannot be chunked any further"
+            )));
         }
 
         // Remove the extra adjacency offset we added per molecule
@@ -853,7 +925,7 @@ impl GpuMorganFingerprint {
                 pass.set_pipeline(&self.dedup_pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(
-                    (num_molecules as u32).div_ceil(DEDUP_WORKGROUP_SIZE as u32),
+                    (num_molecules as u32).div_ceil(WORKGROUP_SIZE as u32),
                     1,
                     1,
                 );
@@ -911,12 +983,35 @@ mod tests {
     use chemcore::atom::{Atom, Element};
     use chemcore::bond::{Bond, BondOrder};
 
+    fn chain_molecule(num_atoms: u32) -> Molecule {
+        let mut mol = Molecule::new();
+        let first = mol.add_atom(Atom::new(Element::carbon()));
+        let mut prev = first;
+        for _ in 1..num_atoms {
+            let next = mol.add_atom(Atom::new(Element::carbon()));
+            mol.add_bond(Bond::new(prev, next, BondOrder::Single))
+                .unwrap();
+            prev = next;
+        }
+        mol.calculate_implicit_hydrogens();
+        mol
+    }
+
+    fn no_bond_molecule(num_atoms: u32) -> Molecule {
+        let mut mol = Molecule::new();
+        for _ in 0..num_atoms {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        mol.calculate_implicit_hydrogens();
+        mol
+    }
+
     /// Regression test for #27's chunking follow-up: molecules must produce
     /// the same fingerprints whether they land in one GPU dispatch or are
     /// split across several, since chunking is purely a workaround for
     /// WebGPU's dispatch-group cap and must not change results. Uses a tiny
-    /// artificial `max_molecules_per_dispatch` so the multi-chunk path is
-    /// exercised without needing millions of molecules.
+    /// artificial `max_molecules` so the multi-chunk path is exercised
+    /// without needing millions of molecules.
     #[test]
     fn test_chunked_dispatch_matches_single_dispatch() {
         let Ok(gpu) = GpuMorganFingerprint::new() else {
@@ -926,21 +1021,7 @@ mod tests {
 
         // Varying atom/bond counts per molecule so chunk boundaries can't
         // accidentally line up with identical, trivially-matching molecules.
-        let molecules: Vec<Molecule> = (1..=10u32)
-            .map(|n| {
-                let mut mol = Molecule::new();
-                let first = mol.add_atom(Atom::new(Element::carbon()));
-                let mut prev = first;
-                for _ in 1..n {
-                    let next = mol.add_atom(Atom::new(Element::carbon()));
-                    mol.add_bond(Bond::new(prev, next, BondOrder::Single))
-                        .unwrap();
-                    prev = next;
-                }
-                mol.calculate_implicit_hydrogens();
-                mol
-            })
-            .collect();
+        let molecules: Vec<Molecule> = (1..=10u32).map(chain_molecule).collect();
 
         let radius = 2;
         let fp_size = 128;
@@ -953,11 +1034,129 @@ mod tests {
                 false,
                 true,
                 false,
-                molecules.len(),
+                DispatchLimits {
+                    max_molecules: molecules.len(),
+                    max_atoms: u32::MAX,
+                    max_neighborhood_words: u32::MAX,
+                },
             )
             .unwrap();
         let chunked = gpu
-            .generate_fingerprints_batch_chunked(&molecules, radius, fp_size, false, true, false, 3)
+            .generate_fingerprints_batch_chunked(
+                &molecules,
+                radius,
+                fp_size,
+                false,
+                true,
+                false,
+                DispatchLimits {
+                    max_molecules: 3,
+                    max_atoms: u32::MAX,
+                    max_neighborhood_words: u32::MAX,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(chunked, single);
+    }
+
+    /// Regression test for #33: even when a batch's molecule count is well
+    /// under `MAX_MOLECULES_PER_DISPATCH`, a small `max_atoms` cap (standing
+    /// in for the real `256 * 65,535`, which would need tens of millions of
+    /// atoms to hit) must still force chunking, since `init`/`iteration`/
+    /// `copy` dispatch `ceil(total_atoms / 256)` workgroups.
+    #[test]
+    fn test_chunking_triggered_by_atom_count() {
+        let Ok(gpu) = GpuMorganFingerprint::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        // No bonds, so neighborhood_words == atom_count for each molecule —
+        // isolates the atom-count cap from the neighborhood-word cap.
+        let molecules: Vec<Molecule> = [5u32, 7, 9, 11].into_iter().map(no_bond_molecule).collect();
+
+        let radius = 2;
+        let fp_size = 128;
+        let generous = DispatchLimits {
+            max_molecules: usize::MAX,
+            max_atoms: u32::MAX,
+            max_neighborhood_words: u32::MAX,
+        };
+        let atom_capped = DispatchLimits {
+            max_molecules: usize::MAX,
+            max_atoms: 15,
+            max_neighborhood_words: u32::MAX,
+        };
+
+        let single = gpu
+            .generate_fingerprints_batch_chunked(
+                &molecules, radius, fp_size, false, true, false, generous,
+            )
+            .unwrap();
+        let chunked = gpu
+            .generate_fingerprints_batch_chunked(
+                &molecules,
+                radius,
+                fp_size,
+                false,
+                true,
+                false,
+                atom_capped,
+            )
+            .unwrap();
+
+        assert_eq!(chunked, single);
+    }
+
+    /// Regression test for #33: a small `max_neighborhood_words` cap must
+    /// force chunking even when molecule count and atom count are both well
+    /// under their own caps, since `copy_neighborhoods` dispatches
+    /// `ceil(total_neighborhood_words / 256)` workgroups. Uses chain
+    /// molecules with >32 bonds each (bond_words = 2) so
+    /// `neighborhood_words = atoms * 2` differs from the atom count, proving
+    /// this cap is checked independently rather than piggybacking on the
+    /// atom-count check.
+    #[test]
+    fn test_chunking_triggered_by_neighborhood_word_count() {
+        let Ok(gpu) = GpuMorganFingerprint::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        let molecules: Vec<Molecule> = [35u32, 40, 45, 50]
+            .into_iter()
+            .map(chain_molecule)
+            .collect();
+
+        let radius = 1;
+        let fp_size = 128;
+        let generous = DispatchLimits {
+            max_molecules: molecules.len(),
+            max_atoms: u32::MAX,
+            max_neighborhood_words: u32::MAX,
+        };
+        let neighborhood_capped = DispatchLimits {
+            max_molecules: usize::MAX,
+            max_atoms: u32::MAX,
+            max_neighborhood_words: 150,
+        };
+
+        let single = gpu
+            .generate_fingerprints_batch_chunked(
+                &molecules, radius, fp_size, false, true, false, generous,
+            )
+            .unwrap();
+        let chunked = gpu
+            .generate_fingerprints_batch_chunked(
+                &molecules,
+                radius,
+                fp_size,
+                false,
+                true,
+                false,
+                neighborhood_capped,
+            )
             .unwrap();
 
         assert_eq!(chunked, single);
