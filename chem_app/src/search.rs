@@ -10,6 +10,13 @@ pub struct SearchResult {
     pub similarity: f64,
 }
 
+/// Cheaply `Clone` (see [`GpuMorganFingerprint`]/[`GpuTanimoto`]) — the
+/// wasm32 async call sites in `chem_app::app` clone a snapshot to move into
+/// `spawn_local` rather than sharing `&mut` access across the await
+/// boundary. Cloned snapshots don't propagate their `gpu_targets` cache
+/// back, so those call sites re-upload the target dataset per search rather
+/// than reusing the cache #16 added — an accepted, wasm32-only tradeoff.
+#[derive(Clone)]
 pub struct FingerprintSearch {
     gpu_morgan: Option<GpuMorganFingerprint>,
     gpu_tanimoto: Option<GpuTanimoto>,
@@ -21,14 +28,16 @@ pub struct FingerprintSearch {
 }
 
 impl FingerprintSearch {
-    // chemgpu's GPU init blocks the calling thread on wgpu futures via
-    // pollster::block_on, which deadlocks a browser's single JS thread
-    // (nothing can drive those futures forward). Stick to the CPU path on
-    // wasm32 until the GPU init/search flow is ported to be properly async
-    // (tracked separately).
+    // On native, GPU init can block the calling thread — it's only ever
+    // called from a plain (non-UI) thread at startup. On wasm32, `new()`
+    // runs inside eframe's synchronous app-construction callback, so it
+    // can't block OR run the async adapter/device request itself; start
+    // CPU-only and upgrade to GPU shortly after via `try_init_gpu_async` +
+    // `install_gpu`, which `chem_app::app` drives with `spawn_local` and
+    // polls once per frame (mirroring the file-load pattern from #37).
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
-        log::info!("Web build: GPU acceleration not wired up yet, using CPU fallback");
+        log::info!("Web build: starting CPU-only, upgrading to GPU asynchronously if available");
         Self::new_cpu_only()
     }
 
@@ -75,27 +84,92 @@ impl FingerprintSearch {
         Ok((morgan, tanimoto))
     }
 
+    /// Attempts GPU init without blocking the calling thread — for wasm32,
+    /// where `new()` can't do this itself (see [`Self::new`]). Returns
+    /// `None` (rather than an error) on failure, since the caller's only
+    /// reasonable response is to keep using the existing CPU-only instance.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub async fn try_init_gpu_async() -> Option<(GpuMorganFingerprint, GpuTanimoto)> {
+        let morgan = match GpuMorganFingerprint::new_async().await {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Async GPU initialization failed (Morgan): {}", e);
+                return None;
+            }
+        };
+        let tanimoto = match GpuTanimoto::new_async().await {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("Async GPU initialization failed (Tanimoto): {}", e);
+                return None;
+            }
+        };
+        log::info!("GPU acceleration enabled (async)");
+        Some((morgan, tanimoto))
+    }
+
+    /// Upgrades a CPU-only instance in place once [`Self::try_init_gpu_async`]
+    /// succeeds. Drops any cached GPU target upload — there wasn't one while
+    /// CPU-only, but this keeps the invariant explicit rather than assuming it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn install_gpu(&mut self, gpu_morgan: GpuMorganFingerprint, gpu_tanimoto: GpuTanimoto) {
+        self.gpu_morgan = Some(gpu_morgan);
+        self.gpu_tanimoto = Some(gpu_tanimoto);
+        self.use_gpu = true;
+        self.gpu_targets = None;
+    }
+
+    // Unused on wasm32: chem_app::app only calls the _async twin there
+    // (blocking would deadlock the browser's single JS thread — see
+    // Self::new). Still part of the public API and exercised by tests.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn generate_fingerprint(
         &self,
         mol: &Molecule,
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<BitVec> {
+        pollster::block_on(self.generate_fingerprint_async(mol, radius, fp_size))
+    }
+
+    /// Async twin of [`Self::generate_fingerprint`] for callers that can't
+    /// block the current thread (namely wasm32).
+    pub async fn generate_fingerprint_async(
+        &self,
+        mol: &Molecule,
+        radius: u32,
+        fp_size: u32,
+    ) -> anyhow::Result<BitVec> {
         if self.use_gpu && self.gpu_morgan.is_some() {
-            self.generate_fingerprint_gpu(mol, radius, fp_size)
+            self.generate_fingerprint_gpu_async(mol, radius, fp_size)
+                .await
         } else {
             self.generate_fingerprint_cpu(mol, radius, fp_size)
         }
     }
 
+    // Unused on wasm32 — see the note on generate_fingerprint above.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn generate_fingerprints_batch(
         &self,
         molecules: &[Molecule],
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<Vec<BitVec>> {
+        pollster::block_on(self.generate_fingerprints_batch_async(molecules, radius, fp_size))
+    }
+
+    /// Async twin of [`Self::generate_fingerprints_batch`] for callers that
+    /// can't block the current thread (namely wasm32).
+    pub async fn generate_fingerprints_batch_async(
+        &self,
+        molecules: &[Molecule],
+        radius: u32,
+        fp_size: u32,
+    ) -> anyhow::Result<Vec<BitVec>> {
         if self.use_gpu && self.gpu_morgan.is_some() {
-            self.generate_fingerprints_gpu_batch(molecules, radius, fp_size)
+            self.generate_fingerprints_gpu_batch_async(molecules, radius, fp_size)
+                .await
         } else {
             self.generate_fingerprints_cpu_batch(molecules, radius, fp_size)
         }
@@ -124,14 +198,28 @@ impl FingerprintSearch {
         self.gpu_targets = None;
     }
 
+    // Unused on wasm32 — see the note on generate_fingerprint above.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn search(
         &mut self,
         query_fp: &BitVec,
         target_fps: &[BitVec],
         top_k: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
+        pollster::block_on(self.search_async(query_fp, target_fps, top_k))
+    }
+
+    /// Async twin of [`Self::search`] for callers that can't block the
+    /// current thread (namely wasm32).
+    pub async fn search_async(
+        &mut self,
+        query_fp: &BitVec,
+        target_fps: &[BitVec],
+        top_k: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
         let similarities = if self.use_gpu && self.gpu_tanimoto.is_some() {
-            self.compute_similarities_gpu(query_fp, target_fps)?
+            self.compute_similarities_gpu_async(query_fp, target_fps)
+                .await?
         } else {
             self.compute_similarities_cpu(query_fp, target_fps)?
         };
@@ -148,34 +236,37 @@ impl FingerprintSearch {
         Ok(results)
     }
 
-    fn generate_fingerprint_gpu(
+    async fn generate_fingerprint_gpu_async(
         &self,
         mol: &Molecule,
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<BitVec> {
         let gpu = self.gpu_morgan.as_ref().unwrap();
-        let fp_words = gpu.generate_fingerprints_batch(
-            std::slice::from_ref(mol),
-            radius,
-            fp_size,
-            false,
-            true,
-            false,
-        )?;
+        let fp_words = gpu
+            .generate_fingerprints_batch_async(
+                std::slice::from_ref(mol),
+                radius,
+                fp_size,
+                false,
+                true,
+                false,
+            )
+            .await?;
 
         Ok(Self::words_to_bitvec(&fp_words[0], fp_size as usize))
     }
 
-    fn generate_fingerprints_gpu_batch(
+    async fn generate_fingerprints_gpu_batch_async(
         &self,
         molecules: &[Molecule],
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<Vec<BitVec>> {
         let gpu = self.gpu_morgan.as_ref().unwrap();
-        let fp_words_batch =
-            gpu.generate_fingerprints_batch(molecules, radius, fp_size, false, true, false)?;
+        let fp_words_batch = gpu
+            .generate_fingerprints_batch_async(molecules, radius, fp_size, false, true, false)
+            .await?;
 
         Ok(fp_words_batch
             .iter()
@@ -183,7 +274,7 @@ impl FingerprintSearch {
             .collect())
     }
 
-    fn compute_similarities_gpu(
+    async fn compute_similarities_gpu_async(
         &mut self,
         query_fp: &BitVec,
         target_fps: &[BitVec],
@@ -225,7 +316,9 @@ impl FingerprintSearch {
             .gpu_targets
             .as_ref()
             .expect("set_target_dataset populates gpu_targets for a non-empty dataset");
-        let similarities_f32 = gpu.compute_single_query_against(&query_words, targets)?;
+        let similarities_f32 = gpu
+            .compute_single_query_against_async(&query_words, targets)
+            .await?;
         Ok(similarities_f32.into_iter().map(|s| s as f64).collect())
     }
 
