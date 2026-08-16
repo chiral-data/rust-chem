@@ -5,6 +5,15 @@ use bytemuck::{Pod, Zeroable};
 use chemcore::molecule::Molecule;
 use wgpu;
 
+// dedup_environments_batch dispatches one workgroup per DEDUP_WORKGROUP_SIZE
+// molecules (see the shader's workgroup_size and its mol_idx bounds check);
+// WebGPU caps dispatch group count at 65,535 per dimension (see #27), so a
+// single GPU dispatch cannot process more than MAX_MOLECULES_PER_DISPATCH
+// molecules. generate_fingerprints_batch transparently splits larger batches
+// across multiple dispatches instead of erroring.
+const DEDUP_WORKGROUP_SIZE: usize = 256;
+const MAX_MOLECULES_PER_DISPATCH: usize = DEDUP_WORKGROUP_SIZE * 65_535;
+
 // ============================================================================
 // BATCH GPU DATA STRUCTURES
 // ============================================================================
@@ -384,6 +393,72 @@ impl GpuMorganFingerprint {
         use_bond_types: bool,
         only_nonzero_invariants: bool,
     ) -> Result<Vec<Vec<u32>>, GpuError> {
+        self.generate_fingerprints_batch_chunked(
+            molecules,
+            radius,
+            fp_size,
+            use_chirality,
+            use_bond_types,
+            only_nonzero_invariants,
+            MAX_MOLECULES_PER_DISPATCH,
+        )
+    }
+
+    /// Splits `molecules` into chunks of at most `max_molecules_per_dispatch`
+    /// and runs each chunk through its own GPU dispatch. Each molecule's GPU
+    /// state (buffers, dedup bookkeeping) is scoped to its own chunk, so
+    /// chunking never changes a molecule's resulting fingerprint — only how
+    /// many molecules one GPU dispatch processes at a time.
+    ///
+    /// `max_molecules_per_dispatch` is a parameter (rather than always using
+    /// the `MAX_MOLECULES_PER_DISPATCH` constant) purely so tests can
+    /// exercise multi-chunk behavior without needing tens of millions of
+    /// molecules.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_fingerprints_batch_chunked(
+        &self,
+        molecules: &[Molecule],
+        radius: u32,
+        fp_size: u32,
+        use_chirality: bool,
+        use_bond_types: bool,
+        only_nonzero_invariants: bool,
+        max_molecules_per_dispatch: usize,
+    ) -> Result<Vec<Vec<u32>>, GpuError> {
+        if molecules.len() <= max_molecules_per_dispatch {
+            return self.generate_fingerprints_batch_single_dispatch(
+                molecules,
+                radius,
+                fp_size,
+                use_chirality,
+                use_bond_types,
+                only_nonzero_invariants,
+            );
+        }
+
+        let mut result = Vec::with_capacity(molecules.len());
+        for chunk in molecules.chunks(max_molecules_per_dispatch) {
+            result.extend(self.generate_fingerprints_batch_single_dispatch(
+                chunk,
+                radius,
+                fp_size,
+                use_chirality,
+                use_bond_types,
+                only_nonzero_invariants,
+            )?);
+        }
+        Ok(result)
+    }
+
+    fn generate_fingerprints_batch_single_dispatch(
+        &self,
+        molecules: &[Molecule],
+        radius: u32,
+        fp_size: u32,
+        use_chirality: bool,
+        use_bond_types: bool,
+        only_nonzero_invariants: bool,
+    ) -> Result<Vec<Vec<u32>>, GpuError> {
         if molecules.is_empty() {
             return Ok(Vec::new());
         }
@@ -391,16 +466,11 @@ impl GpuMorganFingerprint {
         let fp_words = fp_size.div_ceil(32) as usize;
         let num_molecules = molecules.len();
 
-        // dedup_environments_batch dispatches one workgroup per
-        // DEDUP_WORKGROUP_SIZE molecules (see the shader's workgroup_size and
-        // its mol_idx bounds check); WebGPU caps dispatch group count at
-        // 65,535 per dimension (see #27).
-        const DEDUP_WORKGROUP_SIZE: u32 = 256;
-        let max_molecules = DEDUP_WORKGROUP_SIZE as usize * 65_535;
-        if num_molecules > max_molecules {
+        if num_molecules > MAX_MOLECULES_PER_DISPATCH {
             return Err(GpuError::OperationFailed(format!(
-                "batch of {num_molecules} molecules exceeds the maximum supported by \
-                 generate_fingerprints_batch ({max_molecules}); split into smaller batches"
+                "batch of {num_molecules} molecules exceeds the maximum supported by a \
+                 single GPU dispatch ({MAX_MOLECULES_PER_DISPATCH}); this should have been \
+                 chunked by generate_fingerprints_batch"
             )));
         }
 
@@ -783,7 +853,7 @@ impl GpuMorganFingerprint {
                 pass.set_pipeline(&self.dedup_pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(
-                    (num_molecules as u32).div_ceil(DEDUP_WORKGROUP_SIZE),
+                    (num_molecules as u32).div_ceil(DEDUP_WORKGROUP_SIZE as u32),
                     1,
                     1,
                 );
@@ -832,5 +902,64 @@ impl GpuMorganFingerprint {
         let buffer = manager.create_storage_buffer("temp", size, false);
         manager.write_buffer(&buffer, data);
         buffer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chemcore::atom::{Atom, Element};
+    use chemcore::bond::{Bond, BondOrder};
+
+    /// Regression test for #27's chunking follow-up: molecules must produce
+    /// the same fingerprints whether they land in one GPU dispatch or are
+    /// split across several, since chunking is purely a workaround for
+    /// WebGPU's dispatch-group cap and must not change results. Uses a tiny
+    /// artificial `max_molecules_per_dispatch` so the multi-chunk path is
+    /// exercised without needing millions of molecules.
+    #[test]
+    fn test_chunked_dispatch_matches_single_dispatch() {
+        let Ok(gpu) = GpuMorganFingerprint::new() else {
+            println!("GPU not available, skipping");
+            return;
+        };
+
+        // Varying atom/bond counts per molecule so chunk boundaries can't
+        // accidentally line up with identical, trivially-matching molecules.
+        let molecules: Vec<Molecule> = (1..=10u32)
+            .map(|n| {
+                let mut mol = Molecule::new();
+                let first = mol.add_atom(Atom::new(Element::carbon()));
+                let mut prev = first;
+                for _ in 1..n {
+                    let next = mol.add_atom(Atom::new(Element::carbon()));
+                    mol.add_bond(Bond::new(prev, next, BondOrder::Single))
+                        .unwrap();
+                    prev = next;
+                }
+                mol.calculate_implicit_hydrogens();
+                mol
+            })
+            .collect();
+
+        let radius = 2;
+        let fp_size = 128;
+
+        let single = gpu
+            .generate_fingerprints_batch_chunked(
+                &molecules,
+                radius,
+                fp_size,
+                false,
+                true,
+                false,
+                molecules.len(),
+            )
+            .unwrap();
+        let chunked = gpu
+            .generate_fingerprints_batch_chunked(&molecules, radius, fp_size, false, true, false, 3)
+            .unwrap();
+
+        assert_eq!(chunked, single);
     }
 }
