@@ -6,11 +6,28 @@ use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
 use chemio::smiles::parse_smiles;
 use egui::{Color32, RichText};
-use std::time::{Duration, Instant};
+// std::time::Instant panics at runtime on wasm32-unknown-unknown (no clock
+// source there); web-time is a drop-in replacement that re-exports std on
+// native and uses performance.now() on web.
+use web_time::{Duration, Instant};
+
+#[cfg(target_arch = "wasm32")]
+use std::{cell::RefCell, rc::Rc};
 
 /// How long the query SMILES box must sit idle before we run fingerprint
 /// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Formats a duration for display, switching to microseconds below 1ms so
+/// fast operations (a single small-molecule fingerprint, say) don't just
+/// show as "0.00ms".
+fn format_elapsed_ms(ms: f64) -> String {
+    if ms < 1.0 {
+        format!("{:.1}\u{b5}s", ms * 1000.0)
+    } else {
+        format!("{:.2}ms", ms)
+    }
+}
 
 pub struct ChemFpDemoApp {
     dataset: MoleculeDataset,
@@ -31,6 +48,11 @@ pub struct ChemFpDemoApp {
     fps_counter: f64,
     frame_times: Vec<f64>,
     query_dirty_since: Option<Instant>,
+    // Browsers have no blocking main-thread file picker, so the wasm file
+    // load has to happen on a spawned future and hand its result back here
+    // to be picked up by the next `update()` poll.
+    #[cfg(target_arch = "wasm32")]
+    pending_file_load: Rc<RefCell<Option<Vec<u8>>>>,
 }
 
 impl ChemFpDemoApp {
@@ -57,15 +79,19 @@ impl ChemFpDemoApp {
             fps_counter: 0.0,
             frame_times: Vec::with_capacity(60),
             query_dirty_since: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_file_load: Rc::new(RefCell::new(None)),
         }
     }
 
+    // Goes through AsyncFileDialog and reads content as bytes (rather than
+    // FileDialog + a path) so file loading works on both native and web,
+    // where there's no filesystem to read a path from.
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_dataset_from_file(&mut self) {
-        // Goes through AsyncFileDialog and reads content as bytes (rather than
-        // FileDialog + a path) so this same call works once compiled for the
-        // browser, where there's no filesystem to read a path from and no
-        // blocking main-thread picker. On native, pollster::block_on keeps
-        // today's blocking-dialog UX; wasm swaps this for spawn_local later.
+        // pollster::block_on keeps the dialog's existing blocking-call UX;
+        // this is safe on native since blocking the calling thread doesn't
+        // stop other threads from driving the future forward.
         let picked = pollster::block_on(async {
             let file = rfd::AsyncFileDialog::new()
                 .add_filter("SMILES", &["smi", "smiles", "txt"])
@@ -74,10 +100,31 @@ impl ChemFpDemoApp {
             Some(file.read().await)
         });
 
-        let Some(bytes) = picked else {
-            return;
-        };
+        if let Some(bytes) = picked {
+            self.apply_loaded_file_bytes(bytes);
+        }
+    }
 
+    // Browsers have only one JS thread, and it also drives the file picker's
+    // Promise machinery, so blocking on it would deadlock the tab. Spawn the
+    // dialog as a non-blocking task instead and hand its result to
+    // `pending_file_load`, polled from `update()` on the next frame.
+    #[cfg(target_arch = "wasm32")]
+    fn load_dataset_from_file(&mut self) {
+        let slot = self.pending_file_load.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("SMILES", &["smi", "smiles", "txt"])
+                .pick_file()
+                .await;
+            if let Some(file) = file {
+                let bytes = file.read().await;
+                *slot.borrow_mut() = Some(bytes);
+            }
+        });
+    }
+
+    fn apply_loaded_file_bytes(&mut self, bytes: Vec<u8>) {
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(e) => {
@@ -143,9 +190,9 @@ impl ChemFpDemoApp {
                 }
                 let elapsed = start.elapsed().as_secs_f64();
                 self.dataset_status = format!(
-                    "Computed {} fingerprints in {:.2}ms ({} mode)",
+                    "Computed {} fingerprints in {} ({} mode)",
                     self.dataset_fingerprints.len(),
-                    elapsed * 1000.0,
+                    format_elapsed_ms(elapsed * 1000.0),
                     if self.search_engine.is_using_gpu() {
                         "GPU"
                     } else {
@@ -343,7 +390,7 @@ impl ChemFpDemoApp {
                     fingerprint_full(ui, fp);
 
                     if let Some(time) = self.last_fp_gen_time {
-                        ui.label(format!("Generated in {:.2}ms", time));
+                        ui.label(format!("Generated in {}", format_elapsed_ms(time)));
                     }
                 }
 
@@ -365,7 +412,7 @@ impl ChemFpDemoApp {
                 }
 
                 if let Some(time) = self.last_search_time {
-                    ui.label(format!("Search completed in {:.2}ms", time));
+                    ui.label(format!("Search completed in {}", format_elapsed_ms(time)));
                 }
             });
     }
@@ -472,6 +519,14 @@ impl ChemFpDemoApp {
 
 impl eframe::App for ChemFpDemoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let loaded = self.pending_file_load.borrow_mut().take();
+            if let Some(bytes) = loaded {
+                self.apply_loaded_file_bytes(bytes);
+            }
+        }
+
         let frame_time = ctx.input(|i| i.stable_dt as f64);
         self.frame_times.push(frame_time);
         if self.frame_times.len() > 60 {
