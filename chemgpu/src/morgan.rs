@@ -391,6 +391,19 @@ impl GpuMorganFingerprint {
         let fp_words = fp_size.div_ceil(32) as usize;
         let num_molecules = molecules.len();
 
+        // dedup_environments_batch dispatches one workgroup per
+        // DEDUP_WORKGROUP_SIZE molecules (see the shader's workgroup_size and
+        // its mol_idx bounds check); WebGPU caps dispatch group count at
+        // 65,535 per dimension (see #27).
+        const DEDUP_WORKGROUP_SIZE: u32 = 256;
+        let max_molecules = DEDUP_WORKGROUP_SIZE as usize * 65_535;
+        if num_molecules > max_molecules {
+            return Err(GpuError::OperationFailed(format!(
+                "batch of {num_molecules} molecules exceeds the maximum supported by \
+                 generate_fingerprints_batch ({max_molecules}); split into smaller batches"
+            )));
+        }
+
         // Encode all molecules and compute offsets
         let mut all_atoms: Vec<GpuAtom> = Vec::new();
         let mut all_bonds: Vec<GpuBond> = Vec::new();
@@ -769,7 +782,11 @@ impl GpuMorganFingerprint {
                 });
                 pass.set_pipeline(&self.dedup_pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(num_molecules as u32, 1, 1);
+                pass.dispatch_workgroups(
+                    (num_molecules as u32).div_ceil(DEDUP_WORKGROUP_SIZE),
+                    1,
+                    1,
+                );
             }
 
             // Copy next -> current using GPU (no host sync needed beyond the
