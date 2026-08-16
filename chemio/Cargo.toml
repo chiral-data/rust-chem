@@ -1,7 +1,10 @@
 [package]
 name = "chemio"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "SMILES/SDF parsing and aromaticity perception for cheminformatics"
 
 [dependencies]
 nom = { workspace = true }
