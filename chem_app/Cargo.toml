@@ -11,6 +11,7 @@ rfd = { workspace = true }
 pollster = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+web-time = "1.1.0"
 
 chemcore = { workspace = true }
 chemfp = { workspace = true }

@@ -6,7 +6,10 @@ use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
 use chemio::smiles::parse_smiles;
 use egui::{Color32, RichText};
-use std::time::{Duration, Instant};
+// std::time::Instant panics at runtime on wasm32-unknown-unknown (no clock
+// source there); web-time is a drop-in replacement that re-exports std on
+// native and uses performance.now() on web.
+use web_time::{Duration, Instant};
 
 #[cfg(target_arch = "wasm32")]
 use std::{cell::RefCell, rc::Rc};
