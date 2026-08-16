@@ -21,19 +21,19 @@ pub struct FingerprintSearch {
 }
 
 impl FingerprintSearch {
+    // chemgpu's GPU init blocks the calling thread on wgpu futures via
+    // pollster::block_on, which deadlocks a browser's single JS thread
+    // (nothing can drive those futures forward). Stick to the CPU path on
+    // wasm32 until the GPU init/search flow is ported to be properly async
+    // (tracked separately).
+    #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
-        // chemgpu's GPU init blocks the calling thread on wgpu futures via
-        // pollster::block_on, which deadlocks a browser's single JS thread
-        // (nothing can drive those futures forward). Stick to the CPU path
-        // on wasm32 until the GPU init/search flow is ported to be properly
-        // async (tracked separately).
-        #[cfg(target_arch = "wasm32")]
-        let (gpu_morgan, gpu_tanimoto, use_gpu) = {
-            log::info!("Web build: GPU acceleration not wired up yet, using CPU fallback");
-            (None, None, false)
-        };
+        log::info!("Web build: GPU acceleration not wired up yet, using CPU fallback");
+        Self::new_cpu_only()
+    }
 
-        #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Self {
         let (gpu_morgan, gpu_tanimoto, use_gpu) = match Self::init_gpu() {
             Ok((m, t)) => {
                 log::info!("GPU acceleration enabled");
@@ -49,6 +49,21 @@ impl FingerprintSearch {
             gpu_morgan,
             gpu_tanimoto,
             use_gpu,
+            gpu_targets: None,
+        }
+    }
+
+    /// Bypasses GPU init entirely and always uses the CPU fingerprinting/
+    /// search path. Used on wasm32 (see [`Self::new`]) and by tests that need
+    /// deterministic CPU-path coverage regardless of whether the machine
+    /// running them has a GPU; also public for callers that want to force
+    /// CPU mode on native (e.g. benchmarking against the GPU path).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn new_cpu_only() -> Self {
+        Self {
+            gpu_morgan: None,
+            gpu_tanimoto: None,
+            use_gpu: false,
             gpu_targets: None,
         }
     }
@@ -318,6 +333,68 @@ mod tests {
             "expected a size-mismatch error, got {:?}",
             result
         );
+    }
+
+    // The two tests above only assert once GPU acceleration is actually in
+    // use, so on any machine/CI runner without a usable GPU adapter they
+    // silently skip and verify nothing. The CPU path is what every wasm32
+    // (web) build and any GPU-less native machine actually runs, so give it
+    // its own deterministic coverage that never skips.
+
+    #[test]
+    fn test_cpu_search_rejects_mismatched_fingerprint_size() {
+        let mut search = FingerprintSearch::new_cpu_only();
+        assert!(!search.is_using_gpu());
+
+        let query_fp = BitVec::repeat(false, 2048);
+        let mismatched_targets = vec![BitVec::repeat(false, 1024), BitVec::repeat(false, 1024)];
+
+        let result = search.search(&query_fp, &mismatched_targets, 2);
+        assert!(
+            result.is_err(),
+            "expected a size-mismatch error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cpu_search_similarity_is_correct() {
+        let mut search = FingerprintSearch::new_cpu_only();
+
+        let query_fp = BitVec::repeat(true, 2048);
+
+        let dataset_a = vec![BitVec::repeat(true, 2048)];
+        let results_a = search.search(&query_fp, &dataset_a, 1).unwrap();
+        assert!(
+            (results_a[0].similarity - 1.0).abs() < 1e-6,
+            "expected perfect self-similarity, got {:?}",
+            results_a
+        );
+
+        let dataset_b = vec![BitVec::repeat(false, 2048)];
+        let results_b = search.search(&query_fp, &dataset_b, 1).unwrap();
+        assert!(
+            results_b[0].similarity.abs() < 1e-6,
+            "expected zero similarity against an all-zero target, got {:?}",
+            results_b
+        );
+    }
+
+    #[test]
+    fn test_cpu_fingerprint_generation_produces_requested_size() {
+        let search = FingerprintSearch::new_cpu_only();
+        let mol = chemio::smiles::parse_smiles("c1ccccc1").expect("valid SMILES");
+
+        let fp = search
+            .generate_fingerprint(&mol, 2, 2048)
+            .expect("CPU fingerprint generation should succeed");
+        assert_eq!(fp.len(), 2048);
+
+        let batch = search
+            .generate_fingerprints_batch(std::slice::from_ref(&mol), 2, 2048)
+            .expect("CPU batch fingerprint generation should succeed");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].len(), 2048);
     }
 
     #[test]
