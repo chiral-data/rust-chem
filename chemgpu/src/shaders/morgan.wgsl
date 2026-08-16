@@ -383,7 +383,11 @@ fn candidate_less(mol: MoleculeOffset, bond_words: u32, a_local: u32, b_local: u
     return a_local < b_local;
 }
 
-@compute @workgroup_size(1)
+// workgroup_size(256) so the dispatch below chunks by molecule count instead
+// of mapping num_molecules directly 1:1 to the WebGPU dispatch-group count,
+// which WebGPU caps at 65,535 per dimension (see #27). The mol_idx bounds
+// check below already tolerates the tail workgroup overshooting num_molecules.
+@compute @workgroup_size(256)
 fn dedup_environments_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let mol_idx = global_id.x;
     if (mol_idx >= params.num_molecules) {
