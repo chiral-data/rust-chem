@@ -407,7 +407,7 @@ impl ChemFpDemoApp {
                             ui.painter().rect_stroke(
                                 response.response.rect,
                                 2.0,
-                                egui::Stroke::new(2.0, Color32::from_rgb(70, 130, 180)),
+                                egui::Stroke::new(2.0_f32, Color32::from_rgb(70, 130, 180)),
                                 egui::epaint::StrokeKind::Outside,
                             );
                         }
