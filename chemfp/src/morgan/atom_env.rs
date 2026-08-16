@@ -35,20 +35,7 @@ impl AtomEnvironment<u32> for MorganAtomEnv {
             _fp_size
         };
 
-        let bit_pos = (self.code as u64 % fp_size) as u32;
-
-        eprintln!(
-            "DEBUG: code={} fp_size={} → bit={}",
-            self.code, fp_size, bit_pos
-        );
-
-        bit_pos
-        //eprintln!(
-        //    "DEBUG: MorganAtomEnv code={} atom={} layer={}",
-        //    self.code, self.atom_id, self.layer
-        //);
-        ////self.code
-        //(self.code as u64 % _fp_size) as u32
+        (self.code as u64 % fp_size) as u32
     }
 
     fn update_additional_output(&self, output: &mut AdditionalOutputData, bit_id: u64) {

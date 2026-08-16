@@ -189,11 +189,9 @@ fn is_aromatic_ring(mol: &Molecule, ring: &[usize]) -> bool {
                     pi_electrons += 1; // Pyrrole-like
                 }
             }
-            8 | 16 => {
-                // O, S with lone pair
-                if mol.degree(atom_idx) == 2 {
-                    pi_electrons += 2;
-                }
+            // O, S with lone pair
+            8 | 16 if mol.degree(atom_idx) == 2 => {
+                pi_electrons += 2;
             }
             _ => {}
         }

@@ -63,8 +63,8 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
 
         // Add round 0 invariants
         for i in 0..n_atoms {
-            if include_atoms[i] && !morgan_args.only_nonzero_invariants
-                || current_invariants[i] != 0
+            if include_atoms[i]
+                && (!morgan_args.only_nonzero_invariants || current_invariants[i] != 0)
             {
                 result.push(Box::new(MorganAtomEnv::new(
                     current_invariants[i],
@@ -110,23 +110,10 @@ impl AtomEnvironmentGenerator<u32> for MorganEnvGenerator {
                 let mut invar = layer;
                 let current_inv = current_invariants[atom_idx];
 
-                eprintln!(
-                    "Atom {} layer {}: start with invar={}",
-                    atom_idx, layer, invar
-                );
                 hash::hash_combine(&mut invar, &current_inv);
-                eprintln!(
-                    "  After hash current_inv {}: invar={}",
-                    current_invariants[atom_idx], invar
-                );
 
-                //for (bt, neighbor_inv) in &neighborhood_invariants {
-                for (i, (bt, neighbor_inv)) in neighborhood_invariants.iter().enumerate() {
+                for (bt, neighbor_inv) in &neighborhood_invariants {
                     hash::hash_pair(&mut invar, *bt, *neighbor_inv);
-                    eprintln!(
-                        "  After neighbor {} ({}, {}): invar={}",
-                        i, bt, neighbor_inv, invar
-                    );
                 }
 
                 // Handle chirality if needed

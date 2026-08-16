@@ -2,6 +2,11 @@ use crate::error::GpuError;
 use wgpu;
 
 /// GPU context containing device and queue.
+///
+/// Cheaply `Clone`: `wgpu::Device`/`Queue` are thin `Arc`-backed handles, so
+/// cloning shares the same underlying GPU device rather than creating a new
+/// one.
+#[derive(Clone)]
 pub struct GpuContext {
     /// The GPU device
     pub device: wgpu::Device,
@@ -66,12 +71,26 @@ impl GpuContext {
             adapter_info.backend
         );
 
+        // wgpu::Limits::default() caps max_storage_buffers_per_shader_stage at 8
+        // (a conservative, portable-across-backends default). The Morgan batch
+        // shader's redundant-environment dedup uses 13 storage buffer bindings
+        // in one compute stage, so ask for more — clamped to what this adapter
+        // actually reports, so we never request above its real capability.
+        let adapter_limits = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: adapter_limits
+                .max_storage_buffers_per_shader_stage
+                .min(16)
+                .max(wgpu::Limits::default().max_storage_buffers_per_shader_stage),
+            ..Default::default()
+        };
+
         // Request device and queue
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ChemGPU Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 trace: wgpu::Trace::default(),
@@ -109,23 +128,44 @@ impl std::fmt::Debug for GpuContext {
     }
 }
 
+/// A single `GpuContext`, lazily created once and shared by every GPU test
+/// across the crate (`context`, `buffers`, `pipeline`).
+///
+/// Each test previously called `GpuContext::new()` independently, which under
+/// the default parallel test runner meant multiple threads racing to create
+/// a `wgpu::Instance`/adapter/device concurrently against the same physical
+/// GPU — that race hangs indefinitely on at least one driver (see #19).
+/// Sharing one context removes the concurrent-creation race entirely; the
+/// shared `Device`/`Queue` are `Send + Sync` and safe to use from multiple
+/// test threads afterward.
+#[cfg(test)]
+pub(crate) fn shared_test_context() -> Option<&'static GpuContext> {
+    static CTX: std::sync::OnceLock<Option<GpuContext>> = std::sync::OnceLock::new();
+    CTX.get_or_init(|| {
+        env_logger::try_init().ok();
+        match GpuContext::new() {
+            Ok(ctx) => {
+                println!("GPU initialized: {:?}", ctx.adapter_info);
+                Some(ctx)
+            }
+            Err(e) => {
+                println!("GPU not available: {}", e);
+                // Not a failure - GPU might not be available in CI
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_gpu_init() {
-        env_logger::try_init().ok();
-
-        match GpuContext::new() {
-            Ok(ctx) => {
-                println!("GPU initialized: {:?}", ctx.adapter_info);
-                assert!(ctx.supports_compute());
-            }
-            Err(e) => {
-                println!("GPU not available: {}", e);
-                // Not a failure - GPU might not be available in CI
-            }
+        if let Some(ctx) = shared_test_context() {
+            assert!(ctx.supports_compute());
         }
     }
 }
