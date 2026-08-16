@@ -368,16 +368,16 @@ impl GpuMorganFingerprint {
                     compilation_options: Default::default(),
                 });
 
-        let dedup_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("morgan_batch_dedup"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("dedup_environments_batch"),
-                    cache: None,
-                    compilation_options: Default::default(),
-                });
+        let dedup_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("morgan_batch_dedup"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("dedup_environments_batch"),
+                cache: None,
+                compilation_options: Default::default(),
+            });
 
         let copy_pipeline = ctx
             .device
@@ -774,7 +774,10 @@ impl GpuMorganFingerprint {
             &vec![0u32; total_neighborhood_words as usize],
         );
         manager.write_buffer(&seen_count_buffer, &vec![0u32; num_molecules]);
-        manager.write_buffer(&neighbor_scratch_buffer, &vec![0u32; total_adj as usize * 2]);
+        manager.write_buffer(
+            &neighbor_scratch_buffer,
+            &vec![0u32; total_adj as usize * 2],
+        );
 
         // Create bind group
         let bind_group = self

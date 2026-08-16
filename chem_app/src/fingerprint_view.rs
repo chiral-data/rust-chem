@@ -40,7 +40,7 @@ pub struct FingerprintStats {
 impl<'a> Widget for FingerprintView<'a> {
     fn ui(self, ui: &mut Ui) -> Response {
         let total_bits = self.fingerprint.len();
-        let grid_height = (total_bits + self.grid_width - 1) / self.grid_width;
+        let grid_height = total_bits.div_ceil(self.grid_width);
 
         let cell_size = 8.0;
         let spacing = 1.0;

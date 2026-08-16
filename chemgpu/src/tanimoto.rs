@@ -504,8 +504,16 @@ mod tests {
         let fp_size = 2048u32;
         let one_fp = vec![0u32; (fp_size / 32) as usize];
 
-        assert!(gpu.compute_all_pairs(&[], &one_fp, fp_size).unwrap().is_empty());
-        assert!(gpu.compute_all_pairs(&one_fp, &[], fp_size).unwrap().is_empty());
+        assert!(
+            gpu.compute_all_pairs(&[], &one_fp, fp_size)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            gpu.compute_all_pairs(&one_fp, &[], fp_size)
+                .unwrap()
+                .is_empty()
+        );
         assert!(gpu.compute_all_pairs(&[], &[], fp_size).unwrap().is_empty());
     }
 

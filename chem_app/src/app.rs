@@ -423,7 +423,7 @@ impl ChemFpDemoApp {
 
                                     ui.separator();
 
-                                    if let Some(ref fp) = self.dataset_fingerprints.get(idx) {
+                                    if let Some(fp) = self.dataset_fingerprints.get(idx) {
                                         ui.vertical(|ui| {
                                             fingerprint_compact(ui, fp, "Molecule Fingerprint");
 

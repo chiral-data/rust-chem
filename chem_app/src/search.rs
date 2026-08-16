@@ -85,10 +85,7 @@ impl FingerprintSearch {
 
         let gpu = self.gpu_tanimoto.as_ref().unwrap();
         let fp_words = Self::bitvec_to_words(&target_fps[0]).len();
-        let flattened: Vec<u32> = target_fps
-            .iter()
-            .flat_map(Self::bitvec_to_words)
-            .collect();
+        let flattened: Vec<u32> = target_fps.iter().flat_map(Self::bitvec_to_words).collect();
 
         self.gpu_targets = Some(gpu.upload_targets(&flattened, fp_words)?);
         Ok(())
@@ -130,8 +127,14 @@ impl FingerprintSearch {
         fp_size: u32,
     ) -> anyhow::Result<BitVec> {
         let gpu = self.gpu_morgan.as_ref().unwrap();
-        let fp_words =
-            gpu.generate_fingerprints_batch(&[mol.clone()], radius, fp_size, false, true, false)?;
+        let fp_words = gpu.generate_fingerprints_batch(
+            std::slice::from_ref(mol),
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+        )?;
 
         Ok(Self::words_to_bitvec(&fp_words[0], fp_size as usize))
     }
@@ -252,7 +255,7 @@ impl FingerprintSearch {
     }
 
     fn bitvec_to_words(bv: &BitVec) -> Vec<u32> {
-        let num_words = (bv.len() + 31) / 32;
+        let num_words = bv.len().div_ceil(32);
         let mut words = vec![0u32; num_words];
 
         for (i, bit) in bv.iter().enumerate() {
