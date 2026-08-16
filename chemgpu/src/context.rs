@@ -39,7 +39,10 @@ impl GpuContext {
         pollster::block_on(Self::new_async_with_preference(power_pref))
     }
 
-    async fn new_async() -> Result<Self, GpuError> {
+    /// Async twin of [`Self::new`] for callers that can't block the current
+    /// thread while waiting on adapter/device requests (namely wasm32,
+    /// where blocking the browser's single JS thread would deadlock).
+    pub async fn new_async() -> Result<Self, GpuError> {
         Self::new_async_with_preference(wgpu::PowerPreference::HighPerformance).await
     }
 

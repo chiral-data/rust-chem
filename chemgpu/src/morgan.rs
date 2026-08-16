@@ -130,6 +130,10 @@ struct IterationParams {
 // Processes multiple molecules in a single GPU dispatch for maximum performance
 // ============================================================================
 
+/// Cheaply `Clone`: every field is an `Arc`-backed wgpu handle (or a
+/// `GpuContext`, itself cheaply `Clone` for the same reason), so cloning
+/// shares the same pipelines/device rather than rebuilding them.
+#[derive(Clone)]
 pub struct GpuMorganFingerprint {
     ctx: GpuContext,
     init_pipeline: wgpu::ComputePipeline,
@@ -142,7 +146,41 @@ pub struct GpuMorganFingerprint {
 
 impl GpuMorganFingerprint {
     pub fn new() -> Result<Self, GpuError> {
-        let ctx = GpuContext::new()?;
+        Self::from_context(GpuContext::new()?)
+    }
+
+    /// Async twin of [`Self::new`] for callers that can't block the current
+    /// thread while waiting on adapter/device requests (namely wasm32).
+    pub async fn new_async() -> Result<Self, GpuError> {
+        Self::from_context(GpuContext::new_async().await?)
+    }
+
+    /// Build from an already-initialized [`GpuContext`] instead of creating a
+    /// new one. Pipeline/shader setup is entirely synchronous (only
+    /// obtaining the `GpuContext` itself needs async adapter/device
+    /// requests), so both [`Self::new`] and [`Self::new_async`] share this
+    /// once they have one.
+    pub(crate) fn from_context(ctx: GpuContext) -> Result<Self, GpuError> {
+        // The batch bind group layout below uses this many storage-buffer
+        // bindings in its one compute stage. Some WebGPU backends (browsers)
+        // only report the spec's guaranteed minimum (10) — well under what
+        // native backends typically allow (see GpuContext::new_async's own
+        // request for up to 16) — so this has to be checked before
+        // attempting to build the pipeline: wgpu's bind-group/pipeline
+        // creation calls aren't fallible at the Rust API level on the
+        // WebGPU backend (errors surface asynchronously, e.g. via the
+        // browser's console or a lost device), so requesting more bindings
+        // than the adapter supports doesn't error here — it silently
+        // creates invalid pipelines that hang forever the first time
+        // something tries to actually read back their output.
+        const REQUIRED_STORAGE_BUFFERS_PER_STAGE: u32 = 14;
+        let max_storage_buffers = ctx.limits().max_storage_buffers_per_shader_stage;
+        if max_storage_buffers < REQUIRED_STORAGE_BUFFERS_PER_STAGE {
+            return Err(GpuError::OperationFailed(format!(
+                "adapter supports only {} storage buffers per compute stage, but the Morgan batch shader needs {}",
+                max_storage_buffers, REQUIRED_STORAGE_BUFFERS_PER_STAGE
+            )));
+        }
 
         let shader_source = include_str!("shaders/morgan.wgsl");
 
@@ -427,6 +465,29 @@ impl GpuMorganFingerprint {
         use_bond_types: bool,
         only_nonzero_invariants: bool,
     ) -> Result<Vec<Vec<u32>>, GpuError> {
+        pollster::block_on(self.generate_fingerprints_batch_async(
+            molecules,
+            radius,
+            fp_size,
+            use_chirality,
+            use_bond_types,
+            only_nonzero_invariants,
+        ))
+    }
+
+    /// Async twin of [`Self::generate_fingerprints_batch`] for callers that
+    /// can't block the current thread while waiting on the GPU (namely
+    /// wasm32, where blocking the browser's single JS thread would deadlock
+    /// — nothing could drive the readback future forward).
+    pub async fn generate_fingerprints_batch_async(
+        &self,
+        molecules: &[Molecule],
+        radius: u32,
+        fp_size: u32,
+        use_chirality: bool,
+        use_bond_types: bool,
+        only_nonzero_invariants: bool,
+    ) -> Result<Vec<Vec<u32>>, GpuError> {
         self.generate_fingerprints_batch_chunked(
             molecules,
             radius,
@@ -436,6 +497,7 @@ impl GpuMorganFingerprint {
             only_nonzero_invariants,
             DISPATCH_LIMITS,
         )
+        .await
     }
 
     /// Splits `molecules` into chunks that each stay under every cap in
@@ -450,7 +512,7 @@ impl GpuMorganFingerprint {
     /// purely so tests can shrink individual caps to exercise each chunking
     /// trigger without needing tens of millions of atoms/molecules.
     #[allow(clippy::too_many_arguments)]
-    fn generate_fingerprints_batch_chunked(
+    async fn generate_fingerprints_batch_chunked(
         &self,
         molecules: &[Molecule],
         radius: u32,
@@ -488,20 +550,23 @@ impl GpuMorganFingerprint {
                 end += 1;
             }
 
-            result.extend(self.generate_fingerprints_batch_single_dispatch(
-                &molecules[start..end],
-                radius,
-                fp_size,
-                use_chirality,
-                use_bond_types,
-                only_nonzero_invariants,
-            )?);
+            result.extend(
+                self.generate_fingerprints_batch_single_dispatch(
+                    &molecules[start..end],
+                    radius,
+                    fp_size,
+                    use_chirality,
+                    use_bond_types,
+                    only_nonzero_invariants,
+                )
+                .await?,
+            );
             start = end;
         }
         Ok(result)
     }
 
-    fn generate_fingerprints_batch_single_dispatch(
+    async fn generate_fingerprints_batch_single_dispatch(
         &self,
         molecules: &[Molecule],
         radius: u32,
@@ -961,7 +1026,7 @@ impl GpuMorganFingerprint {
         }
 
         // Single readback of ALL fingerprints
-        let all_fps: Vec<u32> = manager.read_buffer_blocking(&fp_buffer, fp_total_words)?;
+        let all_fps: Vec<u32> = manager.read_buffer(&fp_buffer, fp_total_words).await?;
 
         // Split into individual fingerprints
         let result: Vec<Vec<u32>> = all_fps
@@ -1029,36 +1094,34 @@ mod tests {
         let radius = 2;
         let fp_size = 128;
 
-        let single = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                DispatchLimits {
-                    max_molecules: molecules.len(),
-                    max_atoms: u32::MAX,
-                    max_neighborhood_words: u32::MAX,
-                },
-            )
-            .unwrap();
-        let chunked = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                DispatchLimits {
-                    max_molecules: 3,
-                    max_atoms: u32::MAX,
-                    max_neighborhood_words: u32::MAX,
-                },
-            )
-            .unwrap();
+        let single = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            DispatchLimits {
+                max_molecules: molecules.len(),
+                max_atoms: u32::MAX,
+                max_neighborhood_words: u32::MAX,
+            },
+        ))
+        .unwrap();
+        let chunked = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            DispatchLimits {
+                max_molecules: 3,
+                max_atoms: u32::MAX,
+                max_neighborhood_words: u32::MAX,
+            },
+        ))
+        .unwrap();
 
         assert_eq!(chunked, single);
     }
@@ -1092,22 +1155,20 @@ mod tests {
             max_neighborhood_words: u32::MAX,
         };
 
-        let single = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules, radius, fp_size, false, true, false, generous,
-            )
-            .unwrap();
-        let chunked = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                atom_capped,
-            )
-            .unwrap();
+        let single = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules, radius, fp_size, false, true, false, generous,
+        ))
+        .unwrap();
+        let chunked = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            atom_capped,
+        ))
+        .unwrap();
 
         assert_eq!(chunked, single);
     }
@@ -1145,22 +1206,20 @@ mod tests {
             max_neighborhood_words: 150,
         };
 
-        let single = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules, radius, fp_size, false, true, false, generous,
-            )
-            .unwrap();
-        let chunked = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                neighborhood_capped,
-            )
-            .unwrap();
+        let single = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules, radius, fp_size, false, true, false, generous,
+        ))
+        .unwrap();
+        let chunked = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            neighborhood_capped,
+        ))
+        .unwrap();
 
         assert_eq!(chunked, single);
     }
