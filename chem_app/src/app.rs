@@ -18,6 +18,17 @@ use std::{cell::RefCell, rc::Rc};
 /// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Formats a duration for display, switching to microseconds below 1ms so
+/// fast operations (a single small-molecule fingerprint, say) don't just
+/// show as "0.00ms".
+fn format_elapsed_ms(ms: f64) -> String {
+    if ms < 1.0 {
+        format!("{:.1}\u{b5}s", ms * 1000.0)
+    } else {
+        format!("{:.2}ms", ms)
+    }
+}
+
 pub struct ChemFpDemoApp {
     dataset: MoleculeDataset,
     dataset_fingerprints: Vec<BitVec>,
@@ -179,9 +190,9 @@ impl ChemFpDemoApp {
                 }
                 let elapsed = start.elapsed().as_secs_f64();
                 self.dataset_status = format!(
-                    "Computed {} fingerprints in {:.2}ms ({} mode)",
+                    "Computed {} fingerprints in {} ({} mode)",
                     self.dataset_fingerprints.len(),
-                    elapsed * 1000.0,
+                    format_elapsed_ms(elapsed * 1000.0),
                     if self.search_engine.is_using_gpu() {
                         "GPU"
                     } else {
@@ -379,7 +390,7 @@ impl ChemFpDemoApp {
                     fingerprint_full(ui, fp);
 
                     if let Some(time) = self.last_fp_gen_time {
-                        ui.label(format!("Generated in {:.2}ms", time));
+                        ui.label(format!("Generated in {}", format_elapsed_ms(time)));
                     }
                 }
 
@@ -401,7 +412,7 @@ impl ChemFpDemoApp {
                 }
 
                 if let Some(time) = self.last_search_time {
-                    ui.label(format!("Search completed in {:.2}ms", time));
+                    ui.label(format!("Search completed in {}", format_elapsed_ms(time)));
                 }
             });
     }
