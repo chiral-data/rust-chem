@@ -103,15 +103,12 @@ impl ComputePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::GpuContext;
+    use crate::context::shared_test_context;
 
     #[test]
     fn test_pipeline_creation() {
-        env_logger::try_init().ok();
-
-        let ctx = match GpuContext::new() {
-            Ok(c) => c,
-            Err(_) => return,
+        let Some(ctx) = shared_test_context() else {
+            return;
         };
 
         let shader = include_str!("shaders/hello.wgsl");
