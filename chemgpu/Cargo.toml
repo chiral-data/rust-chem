@@ -1,7 +1,10 @@
 [package]
 name = "chemgpu"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "GPU-accelerated Morgan fingerprint and Tanimoto similarity kernels via wgpu"
 
 [dependencies]
 log = { workspace = true }
