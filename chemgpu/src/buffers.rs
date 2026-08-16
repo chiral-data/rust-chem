@@ -117,15 +117,12 @@ impl<'a> BufferManager<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::GpuContext;
+    use crate::context::shared_test_context;
 
     #[test]
     fn test_buffer_creation() {
-        env_logger::try_init().ok();
-
-        let ctx = match GpuContext::new() {
-            Ok(c) => c,
-            Err(_) => return, // Skip if no GPU
+        let Some(ctx) = shared_test_context() else {
+            return; // Skip if no GPU
         };
 
         let manager = BufferManager::new(&ctx.device, &ctx.queue);
@@ -139,11 +136,8 @@ mod tests {
 
     #[test]
     fn test_buffer_read_write() {
-        env_logger::try_init().ok();
-
-        let ctx = match GpuContext::new() {
-            Ok(c) => c,
-            Err(_) => return,
+        let Some(ctx) = shared_test_context() else {
+            return;
         };
 
         let manager = BufferManager::new(&ctx.device, &ctx.queue);

@@ -2,6 +2,11 @@ use crate::error::GpuError;
 use wgpu;
 
 /// GPU context containing device and queue.
+///
+/// Cheaply `Clone`: `wgpu::Device`/`Queue` are thin `Arc`-backed handles, so
+/// cloning shares the same underlying GPU device rather than creating a new
+/// one.
+#[derive(Clone)]
 pub struct GpuContext {
     /// The GPU device
     pub device: wgpu::Device,
@@ -121,23 +126,44 @@ impl std::fmt::Debug for GpuContext {
     }
 }
 
+/// A single `GpuContext`, lazily created once and shared by every GPU test
+/// across the crate (`context`, `buffers`, `pipeline`).
+///
+/// Each test previously called `GpuContext::new()` independently, which under
+/// the default parallel test runner meant multiple threads racing to create
+/// a `wgpu::Instance`/adapter/device concurrently against the same physical
+/// GPU — that race hangs indefinitely on at least one driver (see #19).
+/// Sharing one context removes the concurrent-creation race entirely; the
+/// shared `Device`/`Queue` are `Send + Sync` and safe to use from multiple
+/// test threads afterward.
+#[cfg(test)]
+pub(crate) fn shared_test_context() -> Option<&'static GpuContext> {
+    static CTX: std::sync::OnceLock<Option<GpuContext>> = std::sync::OnceLock::new();
+    CTX.get_or_init(|| {
+        env_logger::try_init().ok();
+        match GpuContext::new() {
+            Ok(ctx) => {
+                println!("GPU initialized: {:?}", ctx.adapter_info);
+                Some(ctx)
+            }
+            Err(e) => {
+                println!("GPU not available: {}", e);
+                // Not a failure - GPU might not be available in CI
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_gpu_init() {
-        env_logger::try_init().ok();
-
-        match GpuContext::new() {
-            Ok(ctx) => {
-                println!("GPU initialized: {:?}", ctx.adapter_info);
-                assert!(ctx.supports_compute());
-            }
-            Err(e) => {
-                println!("GPU not available: {}", e);
-                // Not a failure - GPU might not be available in CI
-            }
+        if let Some(ctx) = shared_test_context() {
+            assert!(ctx.supports_compute());
         }
     }
 }

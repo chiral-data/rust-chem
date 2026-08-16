@@ -53,7 +53,14 @@ impl GpuTargetSet {
 
 impl GpuTanimoto {
     pub fn new() -> Result<Self, GpuError> {
-        let ctx = GpuContext::new()?;
+        Self::from_context(GpuContext::new()?)
+    }
+
+    /// Build from an already-initialized [`GpuContext`] instead of creating a
+    /// new one. Lets callers (notably this crate's own test suite) share a
+    /// single context across many `GpuTanimoto` instances instead of each
+    /// racing to create its own `wgpu::Instance`/adapter/device concurrently.
+    pub(crate) fn from_context(ctx: GpuContext) -> Result<Self, GpuError> {
         let shader_source = include_str!("shaders/tanimoto.wgsl");
 
         let shader = ctx
@@ -442,12 +449,31 @@ impl GpuTanimoto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::shared_test_context;
+
+    /// A single `GpuTanimoto`, lazily built once from the crate's shared test
+    /// `GpuContext` and reused by every test below — building each test's own
+    /// `GpuTanimoto::new()` would each create an independent `GpuContext`,
+    /// reintroducing the concurrent-context-creation hang this crate's test
+    /// suite hit under the default parallel runner (see #19).
+    fn shared_test_tanimoto() -> Option<&'static GpuTanimoto> {
+        static GPU: std::sync::OnceLock<Option<GpuTanimoto>> = std::sync::OnceLock::new();
+        GPU.get_or_init(|| {
+            let ctx = shared_test_context()?.clone();
+            match GpuTanimoto::from_context(ctx) {
+                Ok(gpu) => Some(gpu),
+                Err(e) => {
+                    println!("GPU tanimoto pipeline unavailable, skipping: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+    }
 
     #[test]
     fn test_compute_single_query_empty_targets_returns_empty_not_panic() {
-        env_logger::try_init().ok();
-
-        let Ok(gpu) = GpuTanimoto::new() else {
+        let Some(gpu) = shared_test_tanimoto() else {
             println!("GPU not available, skipping");
             return;
         };
@@ -459,9 +485,7 @@ mod tests {
 
     #[test]
     fn test_compute_single_query_empty_query_is_error() {
-        env_logger::try_init().ok();
-
-        let Ok(gpu) = GpuTanimoto::new() else {
+        let Some(gpu) = shared_test_tanimoto() else {
             println!("GPU not available, skipping");
             return;
         };
@@ -472,9 +496,7 @@ mod tests {
 
     #[test]
     fn test_compute_all_pairs_empty_inputs_return_empty_not_panic() {
-        env_logger::try_init().ok();
-
-        let Ok(gpu) = GpuTanimoto::new() else {
+        let Some(gpu) = shared_test_tanimoto() else {
             println!("GPU not available, skipping");
             return;
         };
@@ -489,9 +511,7 @@ mod tests {
 
     #[test]
     fn test_compute_all_pairs_zero_fp_size_is_error() {
-        env_logger::try_init().ok();
-
-        let Ok(gpu) = GpuTanimoto::new() else {
+        let Some(gpu) = shared_test_tanimoto() else {
             println!("GPU not available, skipping");
             return;
         };
