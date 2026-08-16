@@ -23,3 +23,6 @@ Cargo.lock
 #Cargo.lock
 
 .chiral/
+
+# trunk (chem_app web build output)
+/chem_app/dist/

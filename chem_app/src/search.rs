@@ -22,6 +22,18 @@ pub struct FingerprintSearch {
 
 impl FingerprintSearch {
     pub fn new() -> Self {
+        // chemgpu's GPU init blocks the calling thread on wgpu futures via
+        // pollster::block_on, which deadlocks a browser's single JS thread
+        // (nothing can drive those futures forward). Stick to the CPU path
+        // on wasm32 until the GPU init/search flow is ported to be properly
+        // async (tracked separately).
+        #[cfg(target_arch = "wasm32")]
+        let (gpu_morgan, gpu_tanimoto, use_gpu) = {
+            log::info!("Web build: GPU acceleration not wired up yet, using CPU fallback");
+            (None, None, false)
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
         let (gpu_morgan, gpu_tanimoto, use_gpu) = match Self::init_gpu() {
             Ok((m, t)) => {
                 log::info!("GPU acceleration enabled");
@@ -41,6 +53,7 @@ impl FingerprintSearch {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn init_gpu() -> anyhow::Result<(GpuMorganFingerprint, GpuTanimoto)> {
         let morgan = GpuMorganFingerprint::new()?;
         let tanimoto = GpuTanimoto::new()?;
