@@ -61,24 +61,45 @@ impl ChemFpDemoApp {
     }
 
     fn load_dataset_from_file(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("SMILES", &["smi", "smiles", "txt"])
-            .pick_file()
-        {
-            match MoleculeDataset::load_from_smiles_file(&path) {
-                Ok(dataset) => {
-                    self.dataset_status = format!("Loaded {} molecules from file", dataset.len());
-                    self.dataset = dataset;
-                    self.dataset_fingerprints.clear();
-                    self.search_engine.invalidate_target_dataset();
-                    self.search_results.clear();
-                    self.selected_result = None;
-                    log::info!("Dataset loaded successfully");
-                }
-                Err(e) => {
-                    self.dataset_status = format!("Failed to load file: {}", e);
-                    log::error!("Dataset load failed: {}", e);
-                }
+        // Goes through AsyncFileDialog and reads content as bytes (rather than
+        // FileDialog + a path) so this same call works once compiled for the
+        // browser, where there's no filesystem to read a path from and no
+        // blocking main-thread picker. On native, pollster::block_on keeps
+        // today's blocking-dialog UX; wasm swaps this for spawn_local later.
+        let picked = pollster::block_on(async {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("SMILES", &["smi", "smiles", "txt"])
+                .pick_file()
+                .await?;
+            Some(file.read().await)
+        });
+
+        let Some(bytes) = picked else {
+            return;
+        };
+
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(e) => {
+                self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
+                log::error!("Dataset load failed: {}", e);
+                return;
+            }
+        };
+
+        match MoleculeDataset::load_from_smiles_str(&content) {
+            Ok(dataset) => {
+                self.dataset_status = format!("Loaded {} molecules from file", dataset.len());
+                self.dataset = dataset;
+                self.dataset_fingerprints.clear();
+                self.search_engine.invalidate_target_dataset();
+                self.search_results.clear();
+                self.selected_result = None;
+                log::info!("Dataset loaded successfully");
+            }
+            Err(e) => {
+                self.dataset_status = format!("Failed to load file: {}", e);
+                log::error!("Dataset load failed: {}", e);
             }
         }
     }

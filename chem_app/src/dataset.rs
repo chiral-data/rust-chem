@@ -1,6 +1,5 @@
 use chemcore::molecule::Molecule;
 use chemio::smiles::parse_smiles;
-use std::path::Path;
 
 #[derive(Clone)]
 pub struct MoleculeDataset {
@@ -18,8 +17,11 @@ impl MoleculeDataset {
         }
     }
 
-    pub fn load_from_smiles_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+    /// Parses a SMILES dataset from already-loaded file content. Takes content
+    /// instead of a path so callers can supply bytes from any source (native
+    /// filesystem, browser file picker, etc.) without this function needing
+    /// to know how they were obtained.
+    pub fn load_from_smiles_str(content: &str) -> anyhow::Result<Self> {
         let mut dataset = Self::new();
 
         for (line_num, line) in content.lines().enumerate() {
