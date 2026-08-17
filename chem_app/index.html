@@ -22,11 +22,43 @@
             width: 100%;
             height: 100%;
         }
+        /* Plain HTML/CSS, shown immediately on page load, well before the
+           wasm bundle finishes downloading/starting — removed by main.rs
+           once eframe::WebRunner::start() resolves, or replaced with an
+           error message if it fails, so the page is never silently blank. */
+        #loading_overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 14px;
+            background: #1e1e1e;
+            color: #ccc;
+            font-family: sans-serif;
+            font-size: 1rem;
+        }
+        .loading_spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid #444;
+            border-top-color: #4a9eff;
+            border-radius: 50%;
+            animation: loading_spin 0.8s linear infinite;
+        }
+        @keyframes loading_spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="2" />
     <base data-trunk-public-url />
 </head>
 <body>
     <canvas id="the_canvas_id"></canvas>
+    <div id="loading_overlay">
+        <div class="loading_spinner"></div>
+        <div>Loading ChemFP Demo…</div>
+    </div>
 </body>
 </html>
