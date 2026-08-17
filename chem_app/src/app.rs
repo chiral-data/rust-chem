@@ -432,22 +432,29 @@ impl ChemFpDemoApp {
                         if ui.small_button("Use CPU").clicked() {
                             self.search_engine.force_cpu();
                         }
-                    } else if let Some(err) = self.search_engine.gpu_init_error() {
-                        ui.label(RichText::new("⚠ CPU").color(Color32::from_rgb(220, 50, 50)))
-                            .on_hover_text(format!("GPU unavailable: {}", err));
-                        if ui.small_button("Retry GPU").clicked() {
-                            self.retry_gpu();
-                        }
                     } else {
-                        ui.label(RichText::new("💻 CPU").color(Color32::from_rgb(200, 200, 50)));
-                        let label = if self.search_engine.has_gpu_available() {
-                            "Use GPU"
+                        // CPU is the active, working mode here — always shown
+                        // plainly. If GPU is what's actually in a failed
+                        // state, that gets its own separate alert rather
+                        // than being smeared onto the CPU label.
+                        if let Some(err) = self.search_engine.gpu_init_error().map(str::to_owned) {
+                            if ui.small_button("Retry GPU").clicked() {
+                                self.retry_gpu();
+                            }
+                            ui.label(RichText::new("⚠ GPU").color(Color32::from_rgb(220, 50, 50)))
+                                .on_hover_text(format!("GPU unavailable: {}", err));
+                            ui.separator();
                         } else {
-                            "Try GPU"
-                        };
-                        if ui.small_button(label).clicked() && !self.search_engine.force_gpu() {
-                            self.retry_gpu();
+                            let label = if self.search_engine.has_gpu_available() {
+                                "Use GPU"
+                            } else {
+                                "Try GPU"
+                            };
+                            if ui.small_button(label).clicked() && !self.search_engine.force_gpu() {
+                                self.retry_gpu();
+                            }
                         }
+                        ui.label(RichText::new("💻 CPU").color(Color32::from_rgb(200, 200, 50)));
                     }
                 });
             });
