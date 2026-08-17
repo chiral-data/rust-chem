@@ -51,6 +51,10 @@ pub struct ChemFpDemoApp {
     query_error: Option<String>,
     search_results: Vec<SearchResult>,
     selected_result: Option<usize>,
+    // Which row in the Data window's molecule table is expanded to show its
+    // detail view. Indexes into the active dataset, so it's reset alongside
+    // dataset_fingerprints/search_results whenever the active dataset changes.
+    selected_dataset_row: Option<usize>,
     fp_radius: u32,
     fp_size: u32,
     top_k: usize,
@@ -106,6 +110,7 @@ impl ChemFpDemoApp {
             query_error: None,
             search_results: Vec::new(),
             selected_result: None,
+            selected_dataset_row: None,
             fp_radius: 2,
             fp_size: 2048,
             top_k: 10,
@@ -200,6 +205,7 @@ impl ChemFpDemoApp {
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
                 self.selected_result = None;
+                self.selected_dataset_row = None;
                 log::info!("Dataset loaded successfully");
             }
             Err(e) => {
@@ -222,6 +228,7 @@ impl ChemFpDemoApp {
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
                 self.selected_result = None;
+                self.selected_dataset_row = None;
             }
             Err(e) => {
                 self.dataset_status = format!("Failed to load examples: {}", e);
@@ -244,6 +251,7 @@ impl ChemFpDemoApp {
         self.search_engine.invalidate_target_dataset();
         self.search_results.clear();
         self.selected_result = None;
+        self.selected_dataset_row = None;
     }
 
     fn precompute_dataset_fingerprints(&mut self) {
@@ -563,24 +571,70 @@ impl ChemFpDemoApp {
 
                     ui.separator();
 
+                    let num_fingerprints = self.dataset_fingerprints.len();
+                    let shown = active_dataset.len().min(20);
+                    let mut clicked_row = None;
+
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (i, (smiles, name)) in active_dataset
-                            .smiles
-                            .iter()
-                            .zip(active_dataset.names.iter())
-                            .enumerate()
-                            .take(20)
-                        {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{}.", i + 1));
-                                ui.label(RichText::new(smiles).code().small());
-                                ui.label(RichText::new(name).small());
+                        egui::Grid::new("dataset_table")
+                            .num_columns(5)
+                            .spacing([8.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Name").strong());
+                                ui.label(RichText::new("SMILES").strong());
+                                ui.label(RichText::new("Formula").strong());
+                                ui.label(RichText::new("MW").strong());
+                                ui.label(RichText::new("Fingerprint").strong());
+                                ui.end_row();
+
+                                for i in 0..shown {
+                                    let mol = &active_dataset.molecules[i];
+                                    let is_selected = self.selected_dataset_row == Some(i);
+
+                                    if ui
+                                        .selectable_label(is_selected, &active_dataset.names[i])
+                                        .clicked()
+                                    {
+                                        clicked_row = Some(i);
+                                    }
+                                    ui.label(
+                                        RichText::new(&active_dataset.smiles[i]).code().small(),
+                                    );
+                                    ui.label(mol.formula());
+                                    ui.label(format!("{:.2}", mol.molecular_weight()));
+                                    ui.label(if i < num_fingerprints { "Yes" } else { "No" });
+                                    ui.end_row();
+                                }
                             });
-                        }
-                        if active_dataset.len() > 20 {
-                            ui.label(format!("... and {} more", active_dataset.len() - 20));
+
+                        if active_dataset.len() > shown {
+                            ui.label(format!("... and {} more", active_dataset.len() - shown));
                         }
                     });
+
+                    if let Some(i) = clicked_row {
+                        self.selected_dataset_row = if self.selected_dataset_row == Some(i) {
+                            None
+                        } else {
+                            Some(i)
+                        };
+                    }
+
+                    if let Some(i) = self.selected_dataset_row {
+                        let active_dataset = self.loaded_files.active_dataset();
+                        if let Some(mol) = active_dataset.molecules.get(i) {
+                            ui.separator();
+                            show_molecule_info(
+                                ui,
+                                mol,
+                                &active_dataset.smiles[i],
+                                &active_dataset.names[i],
+                            );
+                            show_atom_list(ui, mol);
+                            show_bond_list(ui, mol);
+                        }
+                    }
                 }
             });
     }
