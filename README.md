@@ -4,7 +4,7 @@ Rust Implementation of Algorithms in Cheminformatics.
 [Documentation](https://docs.rs/chem)
 
 ## Implemented
-- a SMILES writer `smiles_writer.rs`
+- a SMILES writer `chemio/src/smiles_writer.rs`
 
 ## Inspiration
 - [sdfrust](https://github.com/HFooladi/sdfrust/) — a Rust library for parsing SDF (Structure-Data File) chemistry files
