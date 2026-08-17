@@ -43,7 +43,23 @@ impl GpuContext {
     /// thread while waiting on adapter/device requests (namely wasm32,
     /// where blocking the browser's single JS thread would deadlock).
     pub async fn new_async() -> Result<Self, GpuError> {
-        Self::new_async_with_preference(wgpu::PowerPreference::HighPerformance).await
+        match Self::new_async_with_preference(wgpu::PowerPreference::HighPerformance).await {
+            Ok(ctx) => Ok(ctx),
+            // Observed on Firefox/macOS (Apple Silicon): requestAdapter()
+            // returns null when asked for "high-performance" specifically,
+            // even though the same call with no power preference at all
+            // succeeds and returns a real adapter — there's only one
+            // unified GPU on Apple Silicon, so "high-performance" doesn't
+            // clearly map to anything for that implementation to return.
+            // Retry with no preference rather than give up.
+            Err(GpuError::NoAdapter) => {
+                log::warn!(
+                    "No adapter found with HighPerformance preference; retrying with no power preference"
+                );
+                Self::new_async_with_preference(wgpu::PowerPreference::None).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn new_async_with_preference(
