@@ -63,6 +63,12 @@ pub struct BatchParams {
     use_chirality: u32,
     use_bond_types: u32,
     only_nonzero_invariants: u32,
+    // Aggregate sizes needed by the shader to compute the combined `scratch`
+    // buffer's region offsets (see morgan.wgsl) — not derivable from the
+    // fields above alone, since they depend on each molecule's own bond
+    // count.
+    total_neighborhood_words: u32,
+    total_seen_words: u32,
 }
 
 #[repr(C)]
@@ -130,6 +136,10 @@ struct IterationParams {
 // Processes multiple molecules in a single GPU dispatch for maximum performance
 // ============================================================================
 
+/// Cheaply `Clone`: every field is an `Arc`-backed wgpu handle (or a
+/// `GpuContext`, itself cheaply `Clone` for the same reason), so cloning
+/// shares the same pipelines/device rather than rebuilding them.
+#[derive(Clone)]
 pub struct GpuMorganFingerprint {
     ctx: GpuContext,
     init_pipeline: wgpu::ComputePipeline,
@@ -142,7 +152,41 @@ pub struct GpuMorganFingerprint {
 
 impl GpuMorganFingerprint {
     pub fn new() -> Result<Self, GpuError> {
-        let ctx = GpuContext::new()?;
+        Self::from_context(GpuContext::new()?)
+    }
+
+    /// Async twin of [`Self::new`] for callers that can't block the current
+    /// thread while waiting on adapter/device requests (namely wasm32).
+    pub async fn new_async() -> Result<Self, GpuError> {
+        Self::from_context(GpuContext::new_async().await?)
+    }
+
+    /// Build from an already-initialized [`GpuContext`] instead of creating a
+    /// new one. Pipeline/shader setup is entirely synchronous (only
+    /// obtaining the `GpuContext` itself needs async adapter/device
+    /// requests), so both [`Self::new`] and [`Self::new_async`] share this
+    /// once they have one.
+    pub(crate) fn from_context(ctx: GpuContext) -> Result<Self, GpuError> {
+        // The batch bind group layout below uses this many storage-buffer
+        // bindings in its one compute stage. Some WebGPU backends (browsers)
+        // only guarantee wgpu's own baseline (8) — real hardware has been
+        // observed reporting exactly that (Firefox/Apple Silicon via Metal,
+        // see #50) — so this has to be checked before attempting to build
+        // the pipeline: wgpu's bind-group/pipeline creation calls aren't
+        // fallible at the Rust API level on the WebGPU backend (errors
+        // surface asynchronously, e.g. via the browser's console or a lost
+        // device), so requesting more bindings than the adapter supports
+        // doesn't error here — it silently creates invalid pipelines that
+        // hang forever the first time something tries to actually read back
+        // their output.
+        const REQUIRED_STORAGE_BUFFERS_PER_STAGE: u32 = 6;
+        let max_storage_buffers = ctx.limits().max_storage_buffers_per_shader_stage;
+        if max_storage_buffers < REQUIRED_STORAGE_BUFFERS_PER_STAGE {
+            return Err(GpuError::OperationFailed(format!(
+                "adapter supports only {} storage buffers per compute stage, but the Morgan batch shader needs {}",
+                max_storage_buffers, REQUIRED_STORAGE_BUFFERS_PER_STAGE
+            )));
+        }
 
         let shader_source = include_str!("shaders/morgan.wgsl");
 
@@ -153,7 +197,10 @@ impl GpuMorganFingerprint {
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
 
-        // Create bind group layout (10 bindings for batch Morgan)
+        // Create bind group layout (8 bindings for batch Morgan: 2 uniform +
+        // 6 storage — see morgan.wgsl's binding-count comment for why the
+        // 9 originally-separate read-write buffers are now packed into one
+        // combined `scratch` binding).
         let bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -225,7 +272,10 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(6): current_invariants
+                        // @binding(6): scratch (combined read-write arena —
+                        // current/next invariants, fingerprints, dead_atoms,
+                        // current/next/seen neighborhoods, seen_count,
+                        // neighbor_scratch; see morgan.wgsl)
                         wgpu::BindGroupLayoutEntry {
                             binding: 6,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -236,100 +286,12 @@ impl GpuMorganFingerprint {
                             },
                             count: None,
                         },
-                        // @binding(7): next_invariants
+                        // @binding(7): iter_params (uniform)
                         wgpu::BindGroupLayoutEntry {
                             binding: 7,
                             visibility: wgpu::ShaderStages::COMPUTE,
                             ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(8): fingerprints
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 8,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(9): iter_params (uniform)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 9,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(10): dead_atoms
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 10,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(11): current_neighborhoods
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 11,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(12): next_neighborhoods
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 12,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(13): seen_neighborhoods
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 13,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(14): seen_count
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 14,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // @binding(15): neighbor_scratch
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 15,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
                                 has_dynamic_offset: false,
                                 min_binding_size: None,
                             },
@@ -427,6 +389,29 @@ impl GpuMorganFingerprint {
         use_bond_types: bool,
         only_nonzero_invariants: bool,
     ) -> Result<Vec<Vec<u32>>, GpuError> {
+        pollster::block_on(self.generate_fingerprints_batch_async(
+            molecules,
+            radius,
+            fp_size,
+            use_chirality,
+            use_bond_types,
+            only_nonzero_invariants,
+        ))
+    }
+
+    /// Async twin of [`Self::generate_fingerprints_batch`] for callers that
+    /// can't block the current thread while waiting on the GPU (namely
+    /// wasm32, where blocking the browser's single JS thread would deadlock
+    /// — nothing could drive the readback future forward).
+    pub async fn generate_fingerprints_batch_async(
+        &self,
+        molecules: &[Molecule],
+        radius: u32,
+        fp_size: u32,
+        use_chirality: bool,
+        use_bond_types: bool,
+        only_nonzero_invariants: bool,
+    ) -> Result<Vec<Vec<u32>>, GpuError> {
         self.generate_fingerprints_batch_chunked(
             molecules,
             radius,
@@ -436,6 +421,7 @@ impl GpuMorganFingerprint {
             only_nonzero_invariants,
             DISPATCH_LIMITS,
         )
+        .await
     }
 
     /// Splits `molecules` into chunks that each stay under every cap in
@@ -450,7 +436,7 @@ impl GpuMorganFingerprint {
     /// purely so tests can shrink individual caps to exercise each chunking
     /// trigger without needing tens of millions of atoms/molecules.
     #[allow(clippy::too_many_arguments)]
-    fn generate_fingerprints_batch_chunked(
+    async fn generate_fingerprints_batch_chunked(
         &self,
         molecules: &[Molecule],
         radius: u32,
@@ -488,20 +474,23 @@ impl GpuMorganFingerprint {
                 end += 1;
             }
 
-            result.extend(self.generate_fingerprints_batch_single_dispatch(
-                &molecules[start..end],
-                radius,
-                fp_size,
-                use_chirality,
-                use_bond_types,
-                only_nonzero_invariants,
-            )?);
+            result.extend(
+                self.generate_fingerprints_batch_single_dispatch(
+                    &molecules[start..end],
+                    radius,
+                    fp_size,
+                    use_chirality,
+                    use_bond_types,
+                    only_nonzero_invariants,
+                )
+                .await?,
+            );
             start = end;
         }
         Ok(result)
     }
 
-    fn generate_fingerprints_batch_single_dispatch(
+    async fn generate_fingerprints_batch_single_dispatch(
         &self,
         molecules: &[Molecule],
         radius: u32,
@@ -668,6 +657,8 @@ impl GpuMorganFingerprint {
             use_chirality: use_chirality as u32,
             use_bond_types: use_bond_types as u32,
             only_nonzero_invariants: only_nonzero_invariants as u32,
+            total_neighborhood_words,
+            total_seen_words,
         };
 
         let manager = BufferManager::new(&self.ctx.device, &self.ctx.queue);
@@ -705,79 +696,49 @@ impl GpuMorganFingerprint {
         }
 
         // Create all buffers ONCE
-        let params_buffer = manager.create_uniform_buffer("batch_params", 32);
+        let params_buffer = manager.create_uniform_buffer("batch_params", 40);
         let offsets_buffer = self.create_buffer(&manager, &molecule_offsets);
         let atoms_buffer = self.create_buffer(&manager, &all_atoms);
         let bonds_buffer = self.create_buffer(&manager, &all_bonds);
         let adjacency_buffer = self.create_buffer(&manager, &all_adjacency);
         let adjacency_offsets_buffer = self.create_buffer(&manager, &all_adjacency_offsets);
 
-        let invariants_size = (total_atoms as usize * 4) as u64;
-        let current_inv_buffer = manager.create_storage_buffer(
-            "current_invariants",
-            std::cmp::max(invariants_size, 4),
-            true,
-        );
-        let next_inv_buffer = manager.create_storage_buffer(
-            "next_invariants",
-            std::cmp::max(invariants_size, 4),
-            true,
-        );
-
         let fp_total_words = num_molecules * fp_words;
-        let fp_buffer =
-            manager.create_storage_buffer("fingerprints", (fp_total_words * 4) as u64, true);
+
+        // All read-write working state (previously 9 separate buffers: the
+        // current/next invariants, fingerprints, dead_atoms,
+        // current/next/seen neighborhoods, seen_count, and neighbor_scratch)
+        // is packed into one combined `scratch` buffer, at the word offsets
+        // below — see morgan.wgsl's matching `*_base()` functions, which
+        // must agree with this exactly. current_invariants starts at word 0
+        // and next_invariants at `total_atoms`; only fingerprints_offset
+        // onward is needed on the Rust side (for the final readback below).
+        let fingerprints_offset = 2 * total_atoms;
+        let dead_atoms_offset = fingerprints_offset + fp_total_words as u32;
+        let current_neighborhoods_offset = dead_atoms_offset + total_atoms;
+        let next_neighborhoods_offset = current_neighborhoods_offset + total_neighborhood_words;
+        let seen_neighborhoods_offset = next_neighborhoods_offset + total_neighborhood_words;
+        let seen_count_offset = seen_neighborhoods_offset + total_seen_words;
+        let neighbor_scratch_offset = seen_count_offset + num_molecules as u32;
+        // neighbor_scratch holds one (bond_inv, neighbor_inv) pair — 2 words
+        // — per adjacency entry, indexed identically to `adjacency` itself
+        // (see #12), hence the *2.
+        let scratch_total_words = neighbor_scratch_offset + total_adj * 2;
+
+        let scratch_buffer = manager.create_storage_buffer(
+            "scratch",
+            std::cmp::max((scratch_total_words as usize * 4) as u64, 4),
+            true,
+        );
 
         let iter_params_buffer = manager.create_uniform_buffer("iter_params", 16);
 
-        // Redundant-environment dedup buffers (see chemgpu/src/shaders/morgan.wgsl
-        // dedup_environments_batch for the full explanation).
-        let dead_atoms_buffer = manager.create_storage_buffer(
-            "dead_atoms",
-            std::cmp::max((total_atoms as usize * 4) as u64, 4),
-            true,
-        );
-        let neighborhood_size = std::cmp::max((total_neighborhood_words as usize * 4) as u64, 4);
-        let current_neigh_buffer =
-            manager.create_storage_buffer("current_neighborhoods", neighborhood_size, true);
-        let next_neigh_buffer =
-            manager.create_storage_buffer("next_neighborhoods", neighborhood_size, true);
-        let seen_neigh_buffer = manager.create_storage_buffer(
-            "seen_neighborhoods",
-            std::cmp::max((total_seen_words as usize * 4) as u64, 4),
-            true,
-        );
-        let seen_count_buffer = manager.create_storage_buffer(
-            "seen_count",
-            std::cmp::max((num_molecules * 4) as u64, 4),
-            true,
-        );
-        // One vec2<u32> (bond_inv, neighbor_inv) slot per adjacency entry —
-        // indexed identically to `adjacency` itself, so each atom's own
-        // neighbor candidate list is unbounded (no fixed-size cap; see #12).
-        let neighbor_scratch_buffer = manager.create_storage_buffer(
-            "neighbor_scratch",
-            std::cmp::max((total_adj as usize * 8) as u64, 8),
-            true,
-        );
-
-        // Initialize fingerprints, invariants, and dedup state to zero
-        manager.write_buffer(&fp_buffer, &vec![0u32; fp_total_words]);
+        // Zero the whole combined arena in one write — every region needs a
+        // zeroed starting state except seen_neighborhoods (only ever read up
+        // to seen_count, which itself starts at 0, so its initial content
+        // never matters), which zeroing doesn't hurt either.
+        manager.write_buffer(&scratch_buffer, &vec![0u32; scratch_total_words as usize]);
         manager.write_buffer(&params_buffer, &[params]);
-        manager.write_buffer(&dead_atoms_buffer, &vec![0u32; total_atoms as usize]);
-        manager.write_buffer(
-            &current_neigh_buffer,
-            &vec![0u32; total_neighborhood_words as usize],
-        );
-        manager.write_buffer(
-            &next_neigh_buffer,
-            &vec![0u32; total_neighborhood_words as usize],
-        );
-        manager.write_buffer(&seen_count_buffer, &vec![0u32; num_molecules]);
-        manager.write_buffer(
-            &neighbor_scratch_buffer,
-            &vec![0u32; total_adj as usize * 2],
-        );
 
         // Create bind group
         let bind_group = self
@@ -813,43 +774,11 @@ impl GpuMorganFingerprint {
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: current_inv_buffer.as_entire_binding(),
+                        resource: scratch_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: next_inv_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: fp_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
                         resource: iter_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 10,
-                        resource: dead_atoms_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 11,
-                        resource: current_neigh_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 12,
-                        resource: next_neigh_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 13,
-                        resource: seen_neigh_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 14,
-                        resource: seen_count_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 15,
-                        resource: neighbor_scratch_buffer.as_entire_binding(),
                     },
                 ],
             });
@@ -960,8 +889,15 @@ impl GpuMorganFingerprint {
             self.ctx.queue.submit(Some(layer_encoder.finish()));
         }
 
-        // Single readback of ALL fingerprints
-        let all_fps: Vec<u32> = manager.read_buffer_blocking(&fp_buffer, fp_total_words)?;
+        // Single readback of ALL fingerprints, from their region within the
+        // combined scratch buffer.
+        let all_fps: Vec<u32> = manager
+            .read_buffer_at(
+                &scratch_buffer,
+                (fingerprints_offset as u64) * 4,
+                fp_total_words,
+            )
+            .await?;
 
         // Split into individual fingerprints
         let result: Vec<Vec<u32>> = all_fps
@@ -1029,36 +965,34 @@ mod tests {
         let radius = 2;
         let fp_size = 128;
 
-        let single = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                DispatchLimits {
-                    max_molecules: molecules.len(),
-                    max_atoms: u32::MAX,
-                    max_neighborhood_words: u32::MAX,
-                },
-            )
-            .unwrap();
-        let chunked = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                DispatchLimits {
-                    max_molecules: 3,
-                    max_atoms: u32::MAX,
-                    max_neighborhood_words: u32::MAX,
-                },
-            )
-            .unwrap();
+        let single = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            DispatchLimits {
+                max_molecules: molecules.len(),
+                max_atoms: u32::MAX,
+                max_neighborhood_words: u32::MAX,
+            },
+        ))
+        .unwrap();
+        let chunked = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            DispatchLimits {
+                max_molecules: 3,
+                max_atoms: u32::MAX,
+                max_neighborhood_words: u32::MAX,
+            },
+        ))
+        .unwrap();
 
         assert_eq!(chunked, single);
     }
@@ -1092,22 +1026,20 @@ mod tests {
             max_neighborhood_words: u32::MAX,
         };
 
-        let single = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules, radius, fp_size, false, true, false, generous,
-            )
-            .unwrap();
-        let chunked = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                atom_capped,
-            )
-            .unwrap();
+        let single = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules, radius, fp_size, false, true, false, generous,
+        ))
+        .unwrap();
+        let chunked = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            atom_capped,
+        ))
+        .unwrap();
 
         assert_eq!(chunked, single);
     }
@@ -1145,22 +1077,20 @@ mod tests {
             max_neighborhood_words: 150,
         };
 
-        let single = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules, radius, fp_size, false, true, false, generous,
-            )
-            .unwrap();
-        let chunked = gpu
-            .generate_fingerprints_batch_chunked(
-                &molecules,
-                radius,
-                fp_size,
-                false,
-                true,
-                false,
-                neighborhood_capped,
-            )
-            .unwrap();
+        let single = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules, radius, fp_size, false, true, false, generous,
+        ))
+        .unwrap();
+        let chunked = pollster::block_on(gpu.generate_fingerprints_batch_chunked(
+            &molecules,
+            radius,
+            fp_size,
+            false,
+            true,
+            false,
+            neighborhood_capped,
+        ))
+        .unwrap();
 
         assert_eq!(chunked, single);
     }
