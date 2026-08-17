@@ -77,7 +77,11 @@ In the **Search Results** panel, each hit shows its rank, structure summary, and
 
 ### Status bar
 
-Top-right of the window shows the current FPS and whether fingerprint search is running on **🚀 GPU** or **💻 CPU**.
+Top-right of the window shows the current FPS and whether fingerprint search is running on **🚀 GPU** or **💻 CPU**, plus a button next to it:
+
+- **🚀 GPU** (green) — GPU is active. Click **Use CPU** to switch to the CPU path without losing the GPU context (switching back is instant, no re-init needed).
+- **💻 CPU** (yellow) — on CPU by choice (either GPU hasn't been tried yet, or you switched away from it manually). The button reads **Use GPU** if a GPU context is already available (instant switch back) or **Try GPU** if one needs to be initialized first.
+- **⚠ CPU** (red) — a GPU init attempt actually failed. Hover the indicator to see why (e.g. "GPU unavailable: Morgan: No suitable GPU adapter found" or a storage-buffer-limit message). Click **Retry GPU** to try again — useful if you've since enabled WebGPU in your browser, for instance.
 
 ## Known limitations (web build)
 

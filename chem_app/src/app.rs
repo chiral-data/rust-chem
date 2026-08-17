@@ -25,7 +25,7 @@ const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 #[cfg(target_arch = "wasm32")]
 type PendingSlot<T> = Rc<RefCell<Option<(anyhow::Result<T>, f64)>>>;
 #[cfg(target_arch = "wasm32")]
-type PendingGpuInit = Rc<RefCell<Option<Option<(GpuMorganFingerprint, GpuTanimoto)>>>>;
+type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
 
 /// Formats a duration for display, switching to microseconds below 1ms so
 /// fast operations (a single small-molecule fingerprint, say) don't just
@@ -395,6 +395,29 @@ impl ChemFpDemoApp {
         }
     }
 
+    // Kicks off a (re)attempt at GPU init, e.g. from the top bar's "Retry
+    // GPU" button. Native does this synchronously (matching new()'s own
+    // startup behavior); wasm32 can't block the browser's single JS thread,
+    // so it spawns the same async task new() kicks off at startup and polls
+    // pending_gpu_init the same way.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn retry_gpu(&mut self) {
+        if let Err(e) = self.search_engine.retry_gpu_init() {
+            log::warn!("GPU retry failed: {}", e);
+        } else {
+            self.dataset_status = "GPU acceleration is now active".to_string();
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn retry_gpu(&mut self) {
+        let slot = self.pending_gpu_init.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = FingerprintSearch::try_init_gpu_async().await;
+            *slot.borrow_mut() = Some(result);
+        });
+    }
+
     fn top_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -404,12 +427,28 @@ impl ChemFpDemoApp {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
 
-                    let mode_text = if self.search_engine.is_using_gpu() {
-                        RichText::new("🚀 GPU").color(Color32::from_rgb(50, 200, 50))
+                    if self.search_engine.is_using_gpu() {
+                        ui.label(RichText::new("🚀 GPU").color(Color32::from_rgb(50, 200, 50)));
+                        if ui.small_button("Use CPU").clicked() {
+                            self.search_engine.force_cpu();
+                        }
+                    } else if let Some(err) = self.search_engine.gpu_init_error() {
+                        ui.label(RichText::new("⚠ CPU").color(Color32::from_rgb(220, 50, 50)))
+                            .on_hover_text(format!("GPU unavailable: {}", err));
+                        if ui.small_button("Retry GPU").clicked() {
+                            self.retry_gpu();
+                        }
                     } else {
-                        RichText::new("💻 CPU").color(Color32::from_rgb(200, 200, 50))
-                    };
-                    ui.label(mode_text);
+                        ui.label(RichText::new("💻 CPU").color(Color32::from_rgb(200, 200, 50)));
+                        let label = if self.search_engine.has_gpu_available() {
+                            "Use GPU"
+                        } else {
+                            "Try GPU"
+                        };
+                        if ui.small_button(label).clicked() && !self.search_engine.force_gpu() {
+                            self.retry_gpu();
+                        }
+                    }
                 });
             });
         });
@@ -651,13 +690,16 @@ impl eframe::App for ChemFpDemoApp {
             }
 
             let gpu_init = self.pending_gpu_init.borrow_mut().take();
-            if let Some(Some((morgan, tanimoto))) = gpu_init {
-                self.search_engine.install_gpu(morgan, tanimoto);
-                self.dataset_status = "GPU acceleration is now active".to_string();
+            match gpu_init {
+                Some(Ok((morgan, tanimoto))) => {
+                    self.search_engine.install_gpu(morgan, tanimoto);
+                    self.dataset_status = "GPU acceleration is now active".to_string();
+                }
+                Some(Err(e)) => {
+                    self.search_engine.record_gpu_init_failure(e);
+                }
+                None => {} // still pending
             }
-            // Some(None) means init was attempted and failed (already logged
-            // inside try_init_gpu_async); None means still pending. Either
-            // way there's nothing further to do here.
 
             let fingerprints = self.pending_dataset_fingerprints.borrow_mut().take();
             if let Some((result, elapsed_ms)) = fingerprints {
