@@ -620,23 +620,52 @@ impl ChemFpDemoApp {
                             Some(i)
                         };
                     }
-
-                    if let Some(i) = self.selected_dataset_row {
-                        let active_dataset = self.loaded_files.active_dataset();
-                        if let Some(mol) = active_dataset.molecules.get(i) {
-                            ui.separator();
-                            show_molecule_info(
-                                ui,
-                                mol,
-                                &active_dataset.smiles[i],
-                                &active_dataset.names[i],
-                            );
-                            show_atom_list(ui, mol);
-                            show_bond_list(ui, mol);
-                        }
-                    }
                 }
             });
+    }
+
+    // A floating window rather than an inline expand below the table: the
+    // Data window's side panel has a fixed height, and the detail view
+    // (info grid + atom list + bond list) can be taller than that on a
+    // short viewport with no way to scroll to the rest of it. A window is
+    // independently movable/resizable and scrolls on its own if needed.
+    fn molecule_detail_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.selected_dataset_row else {
+            return;
+        };
+        let active_dataset = self.loaded_files.active_dataset();
+        let Some(mol) = active_dataset.molecules.get(i) else {
+            return;
+        };
+        let name = active_dataset.names[i].clone();
+        let smiles = active_dataset.smiles[i].clone();
+        let mol = mol.clone();
+
+        // Caps the window itself to the available viewport height (minus
+        // some margin) so it can never grow past the screen on a short
+        // window/monitor — content beyond that scrolls inside instead of
+        // the window just growing off-screen with no way to reach it.
+        let max_height = (ctx.content_rect().height() - 80.0).max(200.0);
+
+        let mut open = true;
+        egui::Window::new(format!("Molecule: {}", name))
+            .id(egui::Id::new("molecule_detail_window"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(true)
+            .default_height(500.0)
+            .max_height(max_height)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    show_molecule_info(ui, &mol, &smiles, &name);
+                    show_atom_list(ui, &mol);
+                    show_bond_list(ui, &mol);
+                });
+            });
+
+        if !open {
+            self.selected_dataset_row = None;
+        }
     }
 
     fn query_panel(&mut self, ctx: &egui::Context) {
@@ -866,5 +895,6 @@ impl eframe::App for ChemFpDemoApp {
         self.dataset_panel(ctx);
         self.query_panel(ctx);
         self.results_panel(ctx);
+        self.molecule_detail_window(ctx);
     }
 }
