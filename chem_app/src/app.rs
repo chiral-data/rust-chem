@@ -4,6 +4,7 @@ use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, sho
 use crate::search::{FingerprintSearch, SearchResult};
 use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
+use chemio::aromaticity::detect_aromaticity;
 use chemio::smiles::parse_smiles;
 use egui::{Color32, RichText};
 // std::time::Instant panics at runtime on wasm32-unknown-unknown (no clock
@@ -260,6 +261,23 @@ impl ChemFpDemoApp {
             return;
         }
         self.precompute_dataset_fingerprints_dispatch();
+    }
+
+    // CPU-only, no GPU implementation exists or is needed for this — it's a
+    // simple ring search, nowhere near the cost of fingerprint generation.
+    // Wired directly rather than through any new operation abstraction, per
+    // this milestone's decision to defer that until there are more
+    // operations to generalize from (see the v0.3.0 tracking issue).
+    fn detect_aromaticity_for_dataset(&mut self) {
+        let dataset = self.loaded_files.active_dataset_mut();
+        if dataset.is_empty() {
+            self.dataset_status = "No dataset loaded".to_string();
+            return;
+        }
+        for mol in dataset.molecules.iter_mut() {
+            detect_aromaticity(mol);
+        }
+        self.dataset_status = format!("Detected aromaticity for {} molecules", dataset.len());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -558,6 +576,9 @@ impl ChemFpDemoApp {
                 if ui.button("⚡ Compute Fingerprints").clicked() {
                     self.precompute_dataset_fingerprints();
                 }
+                if ui.button("🔬 Detect Aromaticity").clicked() {
+                    self.detect_aromaticity_for_dataset();
+                }
 
                 ui.separator();
 
@@ -577,7 +598,7 @@ impl ChemFpDemoApp {
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         egui::Grid::new("dataset_table")
-                            .num_columns(5)
+                            .num_columns(6)
                             .spacing([8.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
@@ -586,6 +607,7 @@ impl ChemFpDemoApp {
                                 ui.label(RichText::new("Formula").strong());
                                 ui.label(RichText::new("MW").strong());
                                 ui.label(RichText::new("Fingerprint").strong());
+                                ui.label(RichText::new("Aromatic").strong());
                                 ui.end_row();
 
                                 for i in 0..shown {
@@ -604,6 +626,9 @@ impl ChemFpDemoApp {
                                     ui.label(mol.formula());
                                     ui.label(format!("{:.2}", mol.molecular_weight()));
                                     ui.label(if i < num_fingerprints { "Yes" } else { "No" });
+                                    let is_aromatic =
+                                        mol.atoms().iter().any(|atom| atom.is_aromatic());
+                                    ui.label(if is_aromatic { "Yes" } else { "No" });
                                     ui.end_row();
                                 }
                             });

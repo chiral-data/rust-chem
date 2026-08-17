@@ -263,6 +263,10 @@ impl LoadedFiles {
         &self.entries[self.active].dataset
     }
 
+    pub fn active_dataset_mut(&mut self) -> &mut MoleculeDataset {
+        &mut self.entries[self.active].dataset
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|e| e.name.as_str())
     }
