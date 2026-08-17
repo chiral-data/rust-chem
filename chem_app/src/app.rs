@@ -1,4 +1,4 @@
-use crate::dataset::{LoadedFiles, MoleculeDataset};
+use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
 use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
@@ -82,7 +82,7 @@ impl ChemFpDemoApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let dataset = MoleculeDataset::example_dataset().unwrap_or_default();
         let dataset_status = format!("Loaded {} example molecules", dataset.len());
-        let loaded_files = LoadedFiles::new("Examples".to_string(), dataset);
+        let loaded_files = LoadedFiles::new("Examples".to_string(), dataset, DatasetFormat::Smiles);
 
         #[cfg(target_arch = "wasm32")]
         let pending_gpu_init = Rc::new(RefCell::new(None));
@@ -138,6 +138,7 @@ impl ChemFpDemoApp {
         let picked = pollster::block_on(async {
             let file = rfd::AsyncFileDialog::new()
                 .add_filter("SMILES", &["smi", "smiles", "txt"])
+                .add_filter("SDF", &["sdf"])
                 .pick_file()
                 .await?;
             let name = file.file_name();
@@ -159,6 +160,7 @@ impl ChemFpDemoApp {
         wasm_bindgen_futures::spawn_local(async move {
             let file = rfd::AsyncFileDialog::new()
                 .add_filter("SMILES", &["smi", "smiles", "txt"])
+                .add_filter("SDF", &["sdf"])
                 .pick_file()
                 .await;
             if let Some(file) = file {
@@ -179,10 +181,21 @@ impl ChemFpDemoApp {
             }
         };
 
-        match MoleculeDataset::load_from_smiles_str(&content) {
+        let format = DatasetFormat::from_filename(&name);
+        let result = match format {
+            DatasetFormat::Sdf => MoleculeDataset::load_from_sdf_str(&content),
+            DatasetFormat::Smiles => MoleculeDataset::load_from_smiles_str(&content),
+        };
+
+        match result {
             Ok(dataset) => {
-                self.dataset_status = format!("Loaded {} molecules from '{}'", dataset.len(), name);
-                self.loaded_files.add_and_activate(name, dataset);
+                self.dataset_status = format!(
+                    "Loaded {} molecules from '{}' ({})",
+                    dataset.len(),
+                    name,
+                    format.label()
+                );
+                self.loaded_files.add_and_activate(name, dataset, format);
                 self.dataset_fingerprints.clear();
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
@@ -200,8 +213,11 @@ impl ChemFpDemoApp {
         match MoleculeDataset::example_dataset() {
             Ok(dataset) => {
                 self.dataset_status = format!("Loaded {} example molecules", dataset.len());
-                self.loaded_files
-                    .add_and_activate("Examples".to_string(), dataset);
+                self.loaded_files.add_and_activate(
+                    "Examples".to_string(),
+                    dataset,
+                    DatasetFormat::Smiles,
+                );
                 self.dataset_fingerprints.clear();
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
