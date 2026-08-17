@@ -45,7 +45,10 @@ The window is split into four panels: **Dataset** (left), **Query Molecule** (ri
 In the **Dataset** panel:
 
 - **📋 Load Examples** — loads 15 built-in molecules (methane, benzene, phenol, aniline, aspirin-adjacent structures, etc.) instantly. Good default if you just want to try things out.
-- **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file from disk. Format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
+- **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file, or a `.sdf` file, from disk.
+  - SMILES format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
+  - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
+  - Each load adds a new entry to the **Loaded Files** list rather than replacing what's already there — click any entry to switch back to it. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
 
 ### 2. Compute fingerprints
 
