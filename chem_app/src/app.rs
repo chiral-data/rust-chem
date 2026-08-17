@@ -12,11 +12,20 @@ use egui::{Color32, RichText};
 use web_time::{Duration, Instant};
 
 #[cfg(target_arch = "wasm32")]
+use chemgpu::{GpuMorganFingerprint, GpuTanimoto};
+#[cfg(target_arch = "wasm32")]
 use std::{cell::RefCell, rc::Rc};
 
 /// How long the query SMILES box must sit idle before we run fingerprint
 /// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
+
+// A pending async task's slot: `None` while in flight, filled with its
+// result (and how long it took, in ms) once `spawn_local`'s future resolves.
+#[cfg(target_arch = "wasm32")]
+type PendingSlot<T> = Rc<RefCell<Option<(anyhow::Result<T>, f64)>>>;
+#[cfg(target_arch = "wasm32")]
+type PendingGpuInit = Rc<RefCell<Option<Option<(GpuMorganFingerprint, GpuTanimoto)>>>>;
 
 /// Formats a duration for display, switching to microseconds below 1ms so
 /// fast operations (a single small-molecule fingerprint, say) don't just
@@ -53,12 +62,35 @@ pub struct ChemFpDemoApp {
     // to be picked up by the next `update()` poll.
     #[cfg(target_arch = "wasm32")]
     pending_file_load: Rc<RefCell<Option<Vec<u8>>>>,
+    // GPU init can't happen inside `FingerprintSearch::new()` on wasm32 (see
+    // its doc comment), so it's kicked off here instead and polled the same
+    // way. Outer Option = has the attempt resolved yet; inner Option = did
+    // it succeed.
+    #[cfg(target_arch = "wasm32")]
+    pending_gpu_init: PendingGpuInit,
+    #[cfg(target_arch = "wasm32")]
+    pending_dataset_fingerprints: PendingSlot<Vec<BitVec>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_query_fingerprint: PendingSlot<BitVec>,
+    #[cfg(target_arch = "wasm32")]
+    pending_search_results: PendingSlot<Vec<SearchResult>>,
 }
 
 impl ChemFpDemoApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let dataset = MoleculeDataset::example_dataset().unwrap_or_default();
         let dataset_status = format!("Loaded {} example molecules", dataset.len());
+
+        #[cfg(target_arch = "wasm32")]
+        let pending_gpu_init = Rc::new(RefCell::new(None));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let slot = pending_gpu_init.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = FingerprintSearch::try_init_gpu_async().await;
+                *slot.borrow_mut() = Some(result);
+            });
+        }
 
         Self {
             dataset,
@@ -81,6 +113,14 @@ impl ChemFpDemoApp {
             query_dirty_since: None,
             #[cfg(target_arch = "wasm32")]
             pending_file_load: Rc::new(RefCell::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            pending_gpu_init,
+            #[cfg(target_arch = "wasm32")]
+            pending_dataset_fingerprints: Rc::new(RefCell::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            pending_query_fingerprint: Rc::new(RefCell::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            pending_search_results: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -172,34 +212,68 @@ impl ChemFpDemoApp {
             self.dataset_status = "No dataset loaded".to_string();
             return;
         }
+        self.precompute_dataset_fingerprints_dispatch();
+    }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn precompute_dataset_fingerprints_dispatch(&mut self) {
         let start = Instant::now();
-
-        match self.search_engine.generate_fingerprints_batch(
+        let result = self.search_engine.generate_fingerprints_batch(
             &self.dataset.molecules,
             self.fp_radius,
             self.fp_size,
-        ) {
+        );
+        if let Ok(fps) = &result
+            && let Err(e) = self.search_engine.set_target_dataset(fps)
+        {
+            log::warn!("Failed to upload dataset to GPU: {}", e);
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        self.apply_dataset_fingerprints_result(result, elapsed_ms);
+    }
+
+    // Clones a snapshot of search_engine (cheap — see FingerprintSearch's
+    // doc comment) to move into the spawned future instead of borrowing
+    // `self` across the await boundary. The snapshot's own GPU-target-cache
+    // upload (if any) is discarded once the task completes — `search_async`
+    // re-uploads lazily as needed regardless, so this only costs one extra
+    // upload on the next search rather than any actual bug.
+    #[cfg(target_arch = "wasm32")]
+    fn precompute_dataset_fingerprints_dispatch(&mut self) {
+        let search_snapshot = self.search_engine.clone();
+        let molecules = self.dataset.molecules.clone();
+        let radius = self.fp_radius;
+        let fp_size = self.fp_size;
+        let slot = self.pending_dataset_fingerprints.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let start = Instant::now();
+            let result = search_snapshot
+                .generate_fingerprints_batch_async(&molecules, radius, fp_size)
+                .await;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            *slot.borrow_mut() = Some((result, elapsed_ms));
+        });
+    }
+
+    fn apply_dataset_fingerprints_result(
+        &mut self,
+        result: anyhow::Result<Vec<BitVec>>,
+        elapsed_ms: f64,
+    ) {
+        match result {
             Ok(fps) => {
                 self.dataset_fingerprints = fps;
-                if let Err(e) = self
-                    .search_engine
-                    .set_target_dataset(&self.dataset_fingerprints)
-                {
-                    log::warn!("Failed to upload dataset to GPU: {}", e);
-                }
-                let elapsed = start.elapsed().as_secs_f64();
                 self.dataset_status = format!(
                     "Computed {} fingerprints in {} ({} mode)",
                     self.dataset_fingerprints.len(),
-                    format_elapsed_ms(elapsed * 1000.0),
+                    format_elapsed_ms(elapsed_ms),
                     if self.search_engine.is_using_gpu() {
                         "GPU"
                     } else {
                         "CPU"
                     }
                 );
-                log::info!("Fingerprints computed in {:.2}ms", elapsed * 1000.0);
+                log::info!("Fingerprints computed in {:.2}ms", elapsed_ms);
             }
             Err(e) => {
                 self.dataset_status = format!("Failed to compute fingerprints: {}", e);
@@ -221,25 +295,50 @@ impl ChemFpDemoApp {
             Ok(mol) => {
                 self.query_molecule = Some(mol.clone());
                 self.query_error = None;
-
-                let start = Instant::now();
-                match self
-                    .search_engine
-                    .generate_fingerprint(&mol, self.fp_radius, self.fp_size)
-                {
-                    Ok(fp) => {
-                        self.query_fingerprint = Some(fp);
-                        self.last_fp_gen_time = Some(start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    Err(e) => {
-                        self.query_error = Some(format!("Fingerprint generation failed: {}", e));
-                        self.query_fingerprint = None;
-                    }
-                }
+                self.generate_query_fingerprint(mol);
             }
             Err(e) => {
                 self.query_error = Some(format!("Invalid SMILES: {}", e));
                 self.query_molecule = None;
+                self.query_fingerprint = None;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn generate_query_fingerprint(&mut self, mol: Molecule) {
+        let start = Instant::now();
+        let result = self
+            .search_engine
+            .generate_fingerprint(&mol, self.fp_radius, self.fp_size);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        self.apply_query_fingerprint_result(result, elapsed_ms);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn generate_query_fingerprint(&mut self, mol: Molecule) {
+        let search_snapshot = self.search_engine.clone();
+        let radius = self.fp_radius;
+        let fp_size = self.fp_size;
+        let slot = self.pending_query_fingerprint.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let start = Instant::now();
+            let result = search_snapshot
+                .generate_fingerprint_async(&mol, radius, fp_size)
+                .await;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            *slot.borrow_mut() = Some((result, elapsed_ms));
+        });
+    }
+
+    fn apply_query_fingerprint_result(&mut self, result: anyhow::Result<BitVec>, elapsed_ms: f64) {
+        match result {
+            Ok(fp) => {
+                self.query_fingerprint = Some(fp);
+                self.last_fp_gen_time = Some(elapsed_ms);
+            }
+            Err(e) => {
+                self.query_error = Some(format!("Fingerprint generation failed: {}", e));
                 self.query_fingerprint = None;
             }
         }
@@ -251,22 +350,47 @@ impl ChemFpDemoApp {
             return;
         }
 
-        if let Some(ref query_fp) = self.query_fingerprint {
-            let start = Instant::now();
+        if let Some(query_fp) = self.query_fingerprint.clone() {
+            self.run_search_dispatch(query_fp);
+        }
+    }
 
-            match self
-                .search_engine
-                .search(query_fp, &self.dataset_fingerprints, self.top_k)
-            {
-                Ok(results) => {
-                    self.search_results = results;
-                    self.last_search_time = Some(start.elapsed().as_secs_f64() * 1000.0);
-                    self.selected_result = None;
-                }
-                Err(e) => {
-                    self.query_error = Some(format!("Search failed: {}", e));
-                    self.search_results.clear();
-                }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_search_dispatch(&mut self, query_fp: BitVec) {
+        let start = Instant::now();
+        let result = self
+            .search_engine
+            .search(&query_fp, &self.dataset_fingerprints, self.top_k);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        self.apply_search_result(result, elapsed_ms);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn run_search_dispatch(&mut self, query_fp: BitVec) {
+        let mut search_snapshot = self.search_engine.clone();
+        let target_fps = self.dataset_fingerprints.clone();
+        let top_k = self.top_k;
+        let slot = self.pending_search_results.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let start = Instant::now();
+            let result = search_snapshot
+                .search_async(&query_fp, &target_fps, top_k)
+                .await;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            *slot.borrow_mut() = Some((result, elapsed_ms));
+        });
+    }
+
+    fn apply_search_result(&mut self, result: anyhow::Result<Vec<SearchResult>>, elapsed_ms: f64) {
+        match result {
+            Ok(results) => {
+                self.search_results = results;
+                self.last_search_time = Some(elapsed_ms);
+                self.selected_result = None;
+            }
+            Err(e) => {
+                self.query_error = Some(format!("Search failed: {}", e));
+                self.search_results.clear();
             }
         }
     }
@@ -524,6 +648,30 @@ impl eframe::App for ChemFpDemoApp {
             let loaded = self.pending_file_load.borrow_mut().take();
             if let Some(bytes) = loaded {
                 self.apply_loaded_file_bytes(bytes);
+            }
+
+            let gpu_init = self.pending_gpu_init.borrow_mut().take();
+            if let Some(Some((morgan, tanimoto))) = gpu_init {
+                self.search_engine.install_gpu(morgan, tanimoto);
+                self.dataset_status = "GPU acceleration is now active".to_string();
+            }
+            // Some(None) means init was attempted and failed (already logged
+            // inside try_init_gpu_async); None means still pending. Either
+            // way there's nothing further to do here.
+
+            let fingerprints = self.pending_dataset_fingerprints.borrow_mut().take();
+            if let Some((result, elapsed_ms)) = fingerprints {
+                self.apply_dataset_fingerprints_result(result, elapsed_ms);
+            }
+
+            let query_fp = self.pending_query_fingerprint.borrow_mut().take();
+            if let Some((result, elapsed_ms)) = query_fp {
+                self.apply_query_fingerprint_result(result, elapsed_ms);
+            }
+
+            let search_results = self.pending_search_results.borrow_mut().take();
+            if let Some((result, elapsed_ms)) = search_results {
+                self.apply_search_result(result, elapsed_ms);
             }
         }
 

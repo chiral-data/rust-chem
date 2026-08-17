@@ -21,6 +21,10 @@ pub struct TanimotoParams {
 // GPU TANIMOTO CALCULATOR
 // ============================================================================
 
+/// Cheaply `Clone`: every field is an `Arc`-backed wgpu handle (or a
+/// `GpuContext`, itself cheaply `Clone` for the same reason), so cloning
+/// shares the same pipelines/device rather than rebuilding them.
+#[derive(Clone)]
 pub struct GpuTanimoto {
     ctx: GpuContext,
     all_pairs_pipeline: wgpu::ComputePipeline,
@@ -33,6 +37,9 @@ pub struct GpuTanimoto {
 /// Search callers upload this once per dataset via [`GpuTanimoto::upload_targets`]
 /// and reuse it across many queries with [`GpuTanimoto::compute_single_query_against`],
 /// instead of re-uploading the whole dataset on every query.
+///
+/// Cheaply `Clone`: the buffer is an `Arc`-backed wgpu handle.
+#[derive(Clone)]
 pub struct GpuTargetSet {
     buffer: wgpu::Buffer,
     count: usize,
@@ -54,6 +61,13 @@ impl GpuTargetSet {
 impl GpuTanimoto {
     pub fn new() -> Result<Self, GpuError> {
         Self::from_context(GpuContext::new()?)
+    }
+
+    /// Async twin of [`Self::new`] for callers that can't block the current
+    /// thread while waiting on adapter/device requests (namely wasm32,
+    /// where blocking the browser's single JS thread would deadlock).
+    pub async fn new_async() -> Result<Self, GpuError> {
+        Self::from_context(GpuContext::new_async().await?)
     }
 
     /// Build from an already-initialized [`GpuContext`] instead of creating a
@@ -248,6 +262,18 @@ impl GpuTanimoto {
         query: &[u32],
         targets: &GpuTargetSet,
     ) -> Result<Vec<f32>, GpuError> {
+        pollster::block_on(self.compute_single_query_against_async(query, targets))
+    }
+
+    /// Async twin of [`Self::compute_single_query_against`] for callers that
+    /// can't block the current thread while waiting on the GPU (namely
+    /// wasm32, where blocking the browser's single JS thread would deadlock
+    /// — nothing could drive the readback future forward).
+    pub async fn compute_single_query_against_async(
+        &self,
+        query: &[u32],
+        targets: &GpuTargetSet,
+    ) -> Result<Vec<f32>, GpuError> {
         let fp_words = query.len();
         if fp_words == 0 {
             return Err(GpuError::BufferError(
@@ -330,7 +356,7 @@ impl GpuTanimoto {
         self.ctx.queue.submit(Some(encoder.finish()));
 
         // Read results
-        manager.read_buffer_blocking(&results_buffer, targets.count)
+        manager.read_buffer(&results_buffer, targets.count).await
     }
 
     /// Compute all-pairs Tanimoto similarity matrix
@@ -343,6 +369,19 @@ impl GpuTanimoto {
     /// # Returns
     /// Similarity matrix [num_queries × num_targets] in row-major order
     pub fn compute_all_pairs(
+        &self,
+        queries: &[u32],
+        targets: &[u32],
+        fp_size: u32,
+    ) -> Result<Vec<f32>, GpuError> {
+        pollster::block_on(self.compute_all_pairs_async(queries, targets, fp_size))
+    }
+
+    /// Async twin of [`Self::compute_all_pairs`] for callers that can't
+    /// block the current thread while waiting on the GPU (namely wasm32,
+    /// where blocking the browser's single JS thread would deadlock —
+    /// nothing could drive the readback future forward).
+    pub async fn compute_all_pairs_async(
         &self,
         queries: &[u32],
         targets: &[u32],
@@ -435,7 +474,9 @@ impl GpuTanimoto {
 
         self.ctx.queue.submit(Some(encoder.finish()));
 
-        manager.read_buffer_blocking(&results_buffer, num_queries * num_targets)
+        manager
+            .read_buffer(&results_buffer, num_queries * num_targets)
+            .await
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, manager: &BufferManager, data: &[T]) -> wgpu::Buffer {

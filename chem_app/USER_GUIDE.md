@@ -34,7 +34,7 @@ trunk build --release
 cd dist && python3 -m http.server 8080 --bind 0.0.0.0
 ```
 
-The web build currently always runs fingerprint search on the CPU — GPU acceleration via WebGPU isn't wired up yet (native still uses the GPU when available).
+The web build starts up on the CPU and upgrades to GPU acceleration via WebGPU a moment later if the browser supports it (see the status bar's **🚀 GPU** / **💻 CPU** indicator). Browsers without WebGPU, or whose adapter can't fit the fingerprinting shader's buffer requirements, stay on CPU automatically — no user action needed either way.
 
 ## Using the demo
 
@@ -81,5 +81,6 @@ Top-right of the window shows the current FPS and whether fingerprint search is 
 
 ## Known limitations (web build)
 
-- Fingerprint search always runs on CPU in the browser for now; GPU-accelerated search via WebGPU is planned but not yet implemented.
+- GPU acceleration on web depends on the browser and its adapter — Chrome/Edge with WebGPU enabled are the best bet today; browsers without WebGPU, or whose adapter reports too few storage-buffer bindings for the fingerprinting shader, run on CPU instead. Either way the app falls back automatically rather than failing.
+- Search re-uploads the target dataset to the GPU on every query in the web build, rather than reusing a cached upload the way native does — imperceptible at demo-scale dataset sizes, but a difference worth knowing about.
 - Very large datasets may be slower to fingerprint on CPU than they would be on a native GPU-enabled build.
