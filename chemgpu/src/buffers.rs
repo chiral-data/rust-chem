@@ -60,10 +60,35 @@ impl<'a> BufferManager<'a> {
             .write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
 
+    /// Write data to a buffer at a given byte offset — for populating one
+    /// region of a larger buffer shared by several logically distinct
+    /// arrays (see chemgpu/src/shaders/morgan.wgsl's combined `scratch`
+    /// binding).
+    pub fn write_buffer_at<T: bytemuck::Pod>(
+        &self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        data: &[T],
+    ) {
+        self.queue
+            .write_buffer(buffer, offset, bytemuck::cast_slice(data));
+    }
+
     /// Read data from a buffer (async operation).
     pub async fn read_buffer<T: bytemuck::Pod>(
         &self,
         buffer: &wgpu::Buffer,
+        size: usize,
+    ) -> Result<Vec<T>, GpuError> {
+        self.read_buffer_at(buffer, 0, size).await
+    }
+
+    /// Read data from a given byte offset within a buffer (async operation)
+    /// — for reading back one region of a larger combined buffer.
+    pub async fn read_buffer_at<T: bytemuck::Pod>(
+        &self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
         size: usize,
     ) -> Result<Vec<T>, GpuError> {
         let staging =
@@ -75,7 +100,7 @@ impl<'a> BufferManager<'a> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("read_encoder"),
             });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, staging.size());
+        encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, staging.size());
         self.queue.submit(Some(encoder.finish()));
 
         // Map staging buffer and read

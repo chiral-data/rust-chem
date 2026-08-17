@@ -14,6 +14,11 @@ struct BatchParams {
     use_chirality: u32,
     use_bond_types: u32,
     only_nonzero_invariants: u32,
+    // Aggregate sizes needed to compute the read-write scratch regions'
+    // offsets below — not derivable from the fields above alone, since they
+    // depend on each molecule's own bond count (see the offset functions).
+    total_neighborhood_words: u32,
+    total_seen_words: u32,
 }
 
 struct MoleculeOffset {
@@ -63,6 +68,25 @@ struct IterationParams {
 
 // ============================================================================
 // BUFFER BINDINGS
+//
+// All read-write working state (current/next invariants, fingerprints,
+// dedup bookkeeping, neighbor scratch — 9 logically separate arrays in the
+// original design) is packed into one combined `scratch` storage buffer
+// instead of one binding each. Some WebGPU implementations only guarantee 8
+// storage-buffer bindings per compute stage (the wgpu/WebGPU baseline;
+// browsers have been observed reporting as low as 8, see #50), well under
+// what 9 separate read-write buffers plus 5 read-only ones would need.
+// Every element uses atomic ops even where nothing actually contends for
+// it (each index is only ever touched by one invocation per pass) — that's
+// required for storage buffers, since a plain (non-atomic) read_write
+// binding can't be built from parts written by different logical "buffers"
+// without WGSL treating the whole declaration as one array of the same
+// scalar type throughout.
+//
+// The offset functions below (`*_base()`) are the single source of truth
+// for where each logical region starts; every kernel goes through them (or
+// wrapper accessors built on them) rather than recomputing offsets inline,
+// so all five kernels agree on the same layout.
 // ============================================================================
 
 @group(0) @binding(0)
@@ -84,50 +108,133 @@ var<storage, read> adjacency: array<Neighbor>;
 var<storage, read> adjacency_offsets: array<u32>;
 
 @group(0) @binding(6)
-var<storage, read_write> current_invariants: array<atomic<u32>>;
+var<storage, read_write> scratch: array<atomic<u32>>;
 
 @group(0) @binding(7)
-var<storage, read_write> next_invariants: array<atomic<u32>>;
-
-@group(0) @binding(8)
-var<storage, read_write> fingerprints: array<atomic<u32>>;
-
-@group(0) @binding(9)
 var<uniform> iter_params: IterationParams;
 
-// Per-atom bitset (one bit per bond in its molecule) of every bond reached so
-// far by this atom's expanding environment. Ping-ponged like the invariants,
-// so an atom's neighborhood growth only ever depends on the previous round's
-// committed state. Sized per-molecule via MoleculeOffset.neighborhood_start,
-// with (bond_count + 31) / 32 words per atom.
-@group(0) @binding(10)
-var<storage, read_write> dead_atoms: array<u32>;
+// ============================================================================
+// SCRATCH ARENA LAYOUT (offsets, in words, into `scratch`)
+// ============================================================================
 
-@group(0) @binding(11)
-var<storage, read_write> current_neighborhoods: array<u32>;
+fn current_invariants_base() -> u32 {
+    return 0u;
+}
 
-@group(0) @binding(12)
-var<storage, read_write> next_neighborhoods: array<u32>;
+fn next_invariants_base() -> u32 {
+    return params.max_atoms;
+}
 
-// Persistent, cumulative (across ALL layers, per molecule) set of every
-// distinct neighborhood bitset already accepted as a fingerprint contributor.
-// Mirrors chemfp's CPU-side `neighborhoods: FxHashSet<BitVec>` — this is what
-// makes an atom "redundant" (and therefore frozen via dead_atoms) once its
-// environment duplicates one already seen, on this round or an earlier one.
-@group(0) @binding(13)
-var<storage, read_write> seen_neighborhoods: array<u32>;
+fn fingerprints_base() -> u32 {
+    return 2u * params.max_atoms;
+}
 
-@group(0) @binding(14)
-var<storage, read_write> seen_count: array<u32>;
+fn dead_atoms_base() -> u32 {
+    return fingerprints_base() + params.num_molecules * params.fp_words;
+}
 
-// Scratch space for morgan_iteration_batch's per-atom (bond_inv, neighbor_inv)
-// candidate list, one slot per adjacency entry (indexed identically to the
-// `adjacency` buffer itself, so each atom's own slice is exactly
-// adjacency[atom_adj_start..atom_adj_end], no cap on degree — unlike a fixed-
-// size function-local array, which would silently truncate any atom with
-// more neighbors than the array's capacity.
-@group(0) @binding(15)
-var<storage, read_write> neighbor_scratch: array<vec2<u32>>;
+fn current_neighborhoods_base() -> u32 {
+    return dead_atoms_base() + params.max_atoms;
+}
+
+fn next_neighborhoods_base() -> u32 {
+    return current_neighborhoods_base() + params.total_neighborhood_words;
+}
+
+fn seen_neighborhoods_base() -> u32 {
+    return next_neighborhoods_base() + params.total_neighborhood_words;
+}
+
+fn seen_count_base() -> u32 {
+    return seen_neighborhoods_base() + params.total_seen_words;
+}
+
+fn neighbor_scratch_base() -> u32 {
+    return seen_count_base() + params.num_molecules;
+}
+
+// ============================================================================
+// SCRATCH ARENA ACCESSORS
+// ============================================================================
+
+fn get_current_invariant(idx: u32) -> u32 {
+    return atomicLoad(&scratch[current_invariants_base() + idx]);
+}
+
+fn set_current_invariant(idx: u32, value: u32) {
+    atomicStore(&scratch[current_invariants_base() + idx], value);
+}
+
+fn get_next_invariant(idx: u32) -> u32 {
+    return atomicLoad(&scratch[next_invariants_base() + idx]);
+}
+
+fn set_next_invariant(idx: u32, value: u32) {
+    atomicStore(&scratch[next_invariants_base() + idx], value);
+}
+
+fn set_fingerprint_bit(fp_start: u32, bit_pos: u32) {
+    let word_idx = fingerprints_base() + fp_start + (bit_pos / 32u);
+    let bit_idx = bit_pos % 32u;
+    atomicOr(&scratch[word_idx], 1u << bit_idx);
+}
+
+fn get_dead_atom(idx: u32) -> u32 {
+    return atomicLoad(&scratch[dead_atoms_base() + idx]);
+}
+
+fn set_dead_atom(idx: u32, value: u32) {
+    atomicStore(&scratch[dead_atoms_base() + idx], value);
+}
+
+fn get_current_neighborhood(idx: u32) -> u32 {
+    return atomicLoad(&scratch[current_neighborhoods_base() + idx]);
+}
+
+fn set_current_neighborhood(idx: u32, value: u32) {
+    atomicStore(&scratch[current_neighborhoods_base() + idx], value);
+}
+
+fn get_next_neighborhood(idx: u32) -> u32 {
+    return atomicLoad(&scratch[next_neighborhoods_base() + idx]);
+}
+
+fn set_next_neighborhood(idx: u32, value: u32) {
+    atomicStore(&scratch[next_neighborhoods_base() + idx], value);
+}
+
+fn or_next_neighborhood(idx: u32, mask: u32) {
+    atomicOr(&scratch[next_neighborhoods_base() + idx], mask);
+}
+
+fn get_seen_neighborhood(idx: u32) -> u32 {
+    return atomicLoad(&scratch[seen_neighborhoods_base() + idx]);
+}
+
+fn set_seen_neighborhood(idx: u32, value: u32) {
+    atomicStore(&scratch[seen_neighborhoods_base() + idx], value);
+}
+
+fn get_seen_count(idx: u32) -> u32 {
+    return atomicLoad(&scratch[seen_count_base() + idx]);
+}
+
+fn set_seen_count(idx: u32, value: u32) {
+    atomicStore(&scratch[seen_count_base() + idx], value);
+}
+
+fn get_neighbor_scratch_x(idx: u32) -> u32 {
+    return atomicLoad(&scratch[neighbor_scratch_base() + 2u * idx]);
+}
+
+fn get_neighbor_scratch_y(idx: u32) -> u32 {
+    return atomicLoad(&scratch[neighbor_scratch_base() + 2u * idx + 1u]);
+}
+
+fn set_neighbor_scratch(idx: u32, x: u32, y: u32) {
+    atomicStore(&scratch[neighbor_scratch_base() + 2u * idx], x);
+    atomicStore(&scratch[neighbor_scratch_base() + 2u * idx + 1u], y);
+}
 
 // ============================================================================
 // HASH FUNCTIONS
@@ -149,17 +256,6 @@ fn hash_pair(seed: ptr<function, u32>, first: i32, second: u32) {
 
 fn hash_to_bit_position(hash: u32, fp_size: u32) -> u32 {
     return hash % fp_size;
-}
-
-// ============================================================================
-// ATOMIC BIT OPERATIONS
-// ============================================================================
-
-fn set_bit_atomic(fp_start: u32, bit_pos: u32) {
-    let word_idx = fp_start + (bit_pos / 32u);
-    let bit_idx = bit_pos % 32u;
-    let mask = 1u << bit_idx;
-    atomicOr(&fingerprints[word_idx], mask);
 }
 
 // ============================================================================
@@ -205,7 +301,7 @@ fn init_invariants_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     inv = inv * 31u;
 
     // Store initial invariant (global position)
-    atomicStore(&current_invariants[mol.atom_start + local_atom_idx], inv);
+    set_current_invariant(mol.atom_start + local_atom_idx, inv);
 
     // Round 0 has no reachable-bond neighborhood yet (every atom starts with
     // an empty bitset), so — matching the CPU reference — it is never subject
@@ -213,7 +309,7 @@ fn init_invariants_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // contributes its round-0 bit.
     if (params.only_nonzero_invariants == 0u || inv != 0u) {
         let bit_pos = hash_to_bit_position(inv, params.fp_size);
-        set_bit_atomic(mol.fp_start, bit_pos);
+        set_fingerprint_bit(mol.fp_start, bit_pos);
     }
 }
 
@@ -260,11 +356,11 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Atoms frozen by a previous round's redundant-environment check (or a
     // previous round's degree-0 check, below) simply carry their state
     // forward unchanged — they contribute no further environments.
-    if (dead_atoms[global_idx] != 0u) {
-        let inv = atomicLoad(&current_invariants[global_idx]);
-        atomicStore(&next_invariants[global_idx], inv);
+    if (get_dead_atom(global_idx) != 0u) {
+        let inv = get_current_invariant(global_idx);
+        set_next_invariant(global_idx, inv);
         for (var w = 0u; w < bond_words; w = w + 1u) {
-            next_neighborhoods[neigh_base + w] = current_neighborhoods[neigh_base + w];
+            set_next_neighborhood(neigh_base + w, get_current_neighborhood(neigh_base + w));
         }
         return;
     }
@@ -273,8 +369,8 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let degree = atom.degree;
 
     if (degree == 0u) {
-        atomicStore(&next_invariants[global_idx], 0u);
-        dead_atoms[global_idx] = 1u;
+        set_next_invariant(global_idx, 0u);
+        set_dead_atom(global_idx, 1u);
         return;
     }
 
@@ -283,7 +379,7 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let atom_adj_end = adjacency_offsets[mol.atom_start + local_atom_idx + 1u];
 
     for (var w = 0u; w < bond_words; w = w + 1u) {
-        next_neighborhoods[neigh_base + w] = 0u;
+        set_next_neighborhood(neigh_base + w, 0u);
     }
 
     // Collect neighbor invariants directly into neighbor_scratch, indexed
@@ -297,45 +393,44 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Mark this incident bond as reached.
         let bit_word = neighbor.bond_idx / 32u;
         let bit_bit = neighbor.bond_idx % 32u;
-        next_neighborhoods[neigh_base + bit_word] =
-            next_neighborhoods[neigh_base + bit_word] | (1u << bit_bit);
+        or_next_neighborhood(neigh_base + bit_word, 1u << bit_bit);
 
         // Fold in the neighbor's own (previously committed) reachable-bond set.
         let neighbor_neigh_base = mol.neighborhood_start + neighbor.atom_idx * bond_words;
         for (var w = 0u; w < bond_words; w = w + 1u) {
-            next_neighborhoods[neigh_base + w] =
-                next_neighborhoods[neigh_base + w] | current_neighborhoods[neighbor_neigh_base + w];
+            or_next_neighborhood(neigh_base + w, get_current_neighborhood(neighbor_neigh_base + w));
         }
 
         var bond_inv = 1u;
         if (params.use_bond_types != 0u) {
             bond_inv = bond.order;
         }
-        let neighbor_inv = atomicLoad(&current_invariants[mol.atom_start + neighbor.atom_idx]);
-        neighbor_scratch[i] = vec2<u32>(bond_inv, neighbor_inv);
+        let neighbor_inv = get_current_invariant(mol.atom_start + neighbor.atom_idx);
+        set_neighbor_scratch(i, bond_inv, neighbor_inv);
     }
 
     // Sort this atom's neighbor_scratch slice in place.
     for (var i = atom_adj_start; i < atom_adj_end; i = i + 1u) {
         for (var j = i + 1u; j < atom_adj_end; j = j + 1u) {
-            let a = neighbor_scratch[i];
-            let b = neighbor_scratch[j];
-            if (a.x > b.x || (a.x == b.x && a.y > b.y)) {
-                neighbor_scratch[i] = b;
-                neighbor_scratch[j] = a;
+            let a_x = get_neighbor_scratch_x(i);
+            let a_y = get_neighbor_scratch_y(i);
+            let b_x = get_neighbor_scratch_x(j);
+            let b_y = get_neighbor_scratch_y(j);
+            if (a_x > b_x || (a_x == b_x && a_y > b_y)) {
+                set_neighbor_scratch(i, b_x, b_y);
+                set_neighbor_scratch(j, a_x, a_y);
             }
         }
     }
 
     // Hash the sorted neighborhood
-    let current_inv = atomicLoad(&current_invariants[global_idx]);
+    let current_inv = get_current_invariant(global_idx);
     var new_inv = iter_params.current_layer;
     hash_combine(&new_inv, current_inv);
 
     for (var i = atom_adj_start; i < atom_adj_end; i = i + 1u) {
-        let pair = neighbor_scratch[i];
-        let bond_inv = i32(pair.x);
-        let atom_inv = pair.y;
+        let bond_inv = i32(get_neighbor_scratch_x(i));
+        let atom_inv = get_neighbor_scratch_y(i);
         hash_pair(&new_inv, bond_inv, atom_inv);
     }
 
@@ -345,7 +440,7 @@ fn morgan_iteration_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Store new invariant; fingerprint-bit contribution happens later, in
     // dedup_environments_batch.
-    atomicStore(&next_invariants[global_idx], new_inv);
+    set_next_invariant(global_idx, new_inv);
 }
 
 // ============================================================================
@@ -367,15 +462,15 @@ fn candidate_less(mol: MoleculeOffset, bond_words: u32, a_local: u32, b_local: u
     let b_base = mol.neighborhood_start + b_local * bond_words;
 
     for (var w = 0u; w < bond_words; w = w + 1u) {
-        let av = next_neighborhoods[a_base + w];
-        let bv = next_neighborhoods[b_base + w];
+        let av = get_next_neighborhood(a_base + w);
+        let bv = get_next_neighborhood(b_base + w);
         if (av != bv) {
             return av < bv;
         }
     }
 
-    let a_inv = atomicLoad(&next_invariants[mol.atom_start + a_local]);
-    let b_inv = atomicLoad(&next_invariants[mol.atom_start + b_local]);
+    let a_inv = get_next_invariant(mol.atom_start + a_local);
+    let b_inv = get_next_invariant(mol.atom_start + b_local);
     if (a_inv != b_inv) {
         return a_inv < b_inv;
     }
@@ -409,7 +504,7 @@ fn dedup_environments_batch(@builtin(global_invocation_id) global_id: vec3<u32>)
             break;
         }
         let global_idx = mol.atom_start + i;
-        if (dead_atoms[global_idx] == 0u) {
+        if (get_dead_atom(global_idx) == 0u) {
             cand_atom[cand_count] = i;
             cand_count = cand_count + 1u;
         }
@@ -434,7 +529,7 @@ fn dedup_environments_batch(@builtin(global_invocation_id) global_id: vec3<u32>)
     // Walk in sorted order: the first atom to claim a given neighborhood
     // (this round, or a duplicate of one already accepted in an earlier
     // round) survives and contributes its bit; later duplicates are frozen.
-    var seen_c = seen_count[mol_idx];
+    var seen_c = get_seen_count(mol_idx);
 
     for (var k = 0u; k < cand_count; k = k + 1u) {
         let local_idx = cand_atom[k];
@@ -446,7 +541,7 @@ fn dedup_environments_batch(@builtin(global_invocation_id) global_id: vec3<u32>)
             let seen_base = mol.seen_start + s * bond_words;
             var equal = true;
             for (var w = 0u; w < bond_words; w = w + 1u) {
-                if (next_neighborhoods[neigh_base + w] != seen_neighborhoods[seen_base + w]) {
+                if (get_next_neighborhood(neigh_base + w) != get_seen_neighborhood(seen_base + w)) {
                     equal = false;
                     break;
                 }
@@ -458,23 +553,23 @@ fn dedup_environments_batch(@builtin(global_invocation_id) global_id: vec3<u32>)
         }
 
         if (is_redundant) {
-            dead_atoms[global_idx] = 1u;
+            set_dead_atom(global_idx, 1u);
         } else {
             let seen_base = mol.seen_start + seen_c * bond_words;
             for (var w = 0u; w < bond_words; w = w + 1u) {
-                seen_neighborhoods[seen_base + w] = next_neighborhoods[neigh_base + w];
+                set_seen_neighborhood(seen_base + w, get_next_neighborhood(neigh_base + w));
             }
             seen_c = seen_c + 1u;
 
-            let inv = atomicLoad(&next_invariants[global_idx]);
+            let inv = get_next_invariant(global_idx);
             if (params.only_nonzero_invariants == 0u || inv != 0u) {
                 let bit_pos = hash_to_bit_position(inv, params.fp_size);
-                set_bit_atomic(mol.fp_start, bit_pos);
+                set_fingerprint_bit(mol.fp_start, bit_pos);
             }
         }
     }
 
-    seen_count[mol_idx] = seen_c;
+    set_seen_count(mol_idx, seen_c);
 }
 
 // ============================================================================
@@ -488,15 +583,14 @@ fn copy_invariants(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (idx >= params.max_atoms) {
         return;
     }
-    let val = atomicLoad(&next_invariants[idx]);
-    atomicStore(&current_invariants[idx], val);
+    set_current_invariant(idx, get_next_invariant(idx));
 }
 
 @compute @workgroup_size(256)
 fn copy_neighborhoods(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let idx = global_id.x;
-    if (idx >= arrayLength(&current_neighborhoods)) {
+    if (idx >= params.total_neighborhood_words) {
         return;
     }
-    current_neighborhoods[idx] = next_neighborhoods[idx];
+    set_current_neighborhood(idx, get_next_neighborhood(idx));
 }
