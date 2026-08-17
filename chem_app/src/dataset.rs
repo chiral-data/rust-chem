@@ -1,5 +1,36 @@
 use chemcore::molecule::Molecule;
+use chemio::sdf::parse_sdf;
 use chemio::smiles::parse_smiles;
+
+/// Which file format a loaded dataset came from. Doesn't affect anything
+/// downstream (fingerprinting/search work the same either way) — it's
+/// tracked per `LoadedFile` purely so the Data window can label entries and
+/// status messages accurately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DatasetFormat {
+    Smiles,
+    Sdf,
+}
+
+impl DatasetFormat {
+    /// Picks a format from a filename's extension. Defaults to SMILES for
+    /// anything not recognized as SDF, matching the loader's prior behavior
+    /// (`.smi`/`.smiles`/`.txt`/no extension all went through the SMILES path).
+    pub fn from_filename(name: &str) -> Self {
+        if name.to_lowercase().ends_with(".sdf") {
+            DatasetFormat::Sdf
+        } else {
+            DatasetFormat::Smiles
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            DatasetFormat::Smiles => "SMILES",
+            DatasetFormat::Sdf => "SDF",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct MoleculeDataset {
@@ -67,6 +98,56 @@ impl MoleculeDataset {
         Ok(dataset)
     }
 
+    /// Parses a multi-molecule SDF dataset from already-loaded file content.
+    /// `chemio::sdf::parse_sdf` only parses a single `$$$$`-terminated
+    /// record, so this splits the file into records first (real-world SDF
+    /// files are almost always a batch of these), mirroring how
+    /// `load_from_smiles_str` splits its input into one molecule per line.
+    pub fn load_from_sdf_str(content: &str) -> anyhow::Result<Self> {
+        let mut dataset = Self::new();
+        let mut record_lines: Vec<&str> = Vec::new();
+        let mut record_num = 0;
+
+        for line in content.lines() {
+            record_lines.push(line);
+            if line.trim() == "$$$$" {
+                record_num += 1;
+                dataset.push_sdf_record(&record_lines, record_num);
+                record_lines.clear();
+            }
+        }
+        // A trailing record with no `$$$$` terminator (e.g. a single-molecule
+        // file) still has real content sitting in `record_lines`.
+        if record_lines.iter().any(|line| !line.trim().is_empty()) {
+            record_num += 1;
+            dataset.push_sdf_record(&record_lines, record_num);
+        }
+
+        log::info!("Loaded {} molecules from SDF file", dataset.molecules.len());
+        Ok(dataset)
+    }
+
+    fn push_sdf_record(&mut self, lines: &[&str], record_num: usize) {
+        let record = lines.join("\n");
+        match parse_sdf(&record) {
+            Ok(mol) => {
+                let name = mol
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{}", record_num));
+                self.molecules.push(mol);
+                // SDF stores 2D/3D coordinates and connectivity, not a SMILES
+                // string, so there's nothing to put here — a placeholder
+                // makes that clear rather than showing a blank code snippet.
+                self.smiles.push("(SDF)".to_string());
+                self.names.push(name);
+            }
+            Err(e) => {
+                log::warn!("Failed to parse SDF record {}: {}", record_num, e);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.molecules.len()
     }
@@ -121,6 +202,7 @@ impl Default for MoleculeDataset {
 pub struct LoadedFile {
     pub name: String,
     pub dataset: MoleculeDataset,
+    pub format: DatasetFormat,
 }
 
 /// Every dataset loaded this session, and which one is currently active.
@@ -133,11 +215,12 @@ pub struct LoadedFiles {
 }
 
 impl LoadedFiles {
-    pub fn new(initial_name: String, initial: MoleculeDataset) -> Self {
+    pub fn new(initial_name: String, initial: MoleculeDataset, format: DatasetFormat) -> Self {
         Self {
             entries: vec![LoadedFile {
                 name: initial_name,
                 dataset: initial,
+                format,
             }],
             active: 0,
         }
@@ -146,12 +229,22 @@ impl LoadedFiles {
     /// Adds a new entry and makes it active, or, if an entry with this name
     /// already exists (e.g. reloading the same file), replaces its dataset
     /// in place and activates that instead of appending a duplicate.
-    pub fn add_and_activate(&mut self, name: String, dataset: MoleculeDataset) {
+    pub fn add_and_activate(
+        &mut self,
+        name: String,
+        dataset: MoleculeDataset,
+        format: DatasetFormat,
+    ) {
         if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
             self.entries[idx].dataset = dataset;
+            self.entries[idx].format = format;
             self.active = idx;
         } else {
-            self.entries.push(LoadedFile { name, dataset });
+            self.entries.push(LoadedFile {
+                name,
+                dataset,
+                format,
+            });
             self.active = self.entries.len() - 1;
         }
     }
