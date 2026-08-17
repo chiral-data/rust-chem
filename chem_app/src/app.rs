@@ -1,4 +1,4 @@
-use crate::dataset::MoleculeDataset;
+use crate::dataset::{LoadedFiles, MoleculeDataset};
 use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
@@ -26,6 +26,8 @@ const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 type PendingSlot<T> = Rc<RefCell<Option<(anyhow::Result<T>, f64)>>>;
 #[cfg(target_arch = "wasm32")]
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
+#[cfg(target_arch = "wasm32")]
+type PendingFileLoad = Rc<RefCell<Option<(String, Vec<u8>)>>>;
 
 /// Formats a duration for display, switching to microseconds below 1ms so
 /// fast operations (a single small-molecule fingerprint, say) don't just
@@ -39,7 +41,7 @@ fn format_elapsed_ms(ms: f64) -> String {
 }
 
 pub struct ChemFpDemoApp {
-    dataset: MoleculeDataset,
+    loaded_files: LoadedFiles,
     dataset_fingerprints: Vec<BitVec>,
     dataset_status: String,
     search_engine: FingerprintSearch,
@@ -61,7 +63,7 @@ pub struct ChemFpDemoApp {
     // load has to happen on a spawned future and hand its result back here
     // to be picked up by the next `update()` poll.
     #[cfg(target_arch = "wasm32")]
-    pending_file_load: Rc<RefCell<Option<Vec<u8>>>>,
+    pending_file_load: PendingFileLoad,
     // GPU init can't happen inside `FingerprintSearch::new()` on wasm32 (see
     // its doc comment), so it's kicked off here instead and polled the same
     // way. Outer Option = has the attempt resolved yet; inner Option = did
@@ -80,6 +82,7 @@ impl ChemFpDemoApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let dataset = MoleculeDataset::example_dataset().unwrap_or_default();
         let dataset_status = format!("Loaded {} example molecules", dataset.len());
+        let loaded_files = LoadedFiles::new("Examples".to_string(), dataset);
 
         #[cfg(target_arch = "wasm32")]
         let pending_gpu_init = Rc::new(RefCell::new(None));
@@ -93,7 +96,7 @@ impl ChemFpDemoApp {
         }
 
         Self {
-            dataset,
+            loaded_files,
             dataset_fingerprints: Vec::new(),
             dataset_status,
             search_engine: FingerprintSearch::new(),
@@ -137,11 +140,12 @@ impl ChemFpDemoApp {
                 .add_filter("SMILES", &["smi", "smiles", "txt"])
                 .pick_file()
                 .await?;
-            Some(file.read().await)
+            let name = file.file_name();
+            Some((name, file.read().await))
         });
 
-        if let Some(bytes) = picked {
-            self.apply_loaded_file_bytes(bytes);
+        if let Some((name, bytes)) = picked {
+            self.apply_loaded_file_bytes(name, bytes);
         }
     }
 
@@ -158,13 +162,14 @@ impl ChemFpDemoApp {
                 .pick_file()
                 .await;
             if let Some(file) = file {
+                let name = file.file_name();
                 let bytes = file.read().await;
-                *slot.borrow_mut() = Some(bytes);
+                *slot.borrow_mut() = Some((name, bytes));
             }
         });
     }
 
-    fn apply_loaded_file_bytes(&mut self, bytes: Vec<u8>) {
+    fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) {
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(e) => {
@@ -176,8 +181,8 @@ impl ChemFpDemoApp {
 
         match MoleculeDataset::load_from_smiles_str(&content) {
             Ok(dataset) => {
-                self.dataset_status = format!("Loaded {} molecules from file", dataset.len());
-                self.dataset = dataset;
+                self.dataset_status = format!("Loaded {} molecules from '{}'", dataset.len(), name);
+                self.loaded_files.add_and_activate(name, dataset);
                 self.dataset_fingerprints.clear();
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
@@ -195,7 +200,8 @@ impl ChemFpDemoApp {
         match MoleculeDataset::example_dataset() {
             Ok(dataset) => {
                 self.dataset_status = format!("Loaded {} example molecules", dataset.len());
-                self.dataset = dataset;
+                self.loaded_files
+                    .add_and_activate("Examples".to_string(), dataset);
                 self.dataset_fingerprints.clear();
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
@@ -207,8 +213,25 @@ impl ChemFpDemoApp {
         }
     }
 
+    /// Switches the active dataset to an already-loaded entry, e.g. the user
+    /// clicking a name in the Data window's loaded-files list. Runs the same
+    /// reset as freshly loading a file, since fingerprints/search results
+    /// belong to whichever dataset was active when they were computed.
+    fn activate_loaded_file(&mut self, index: usize) {
+        self.loaded_files.activate(index);
+        self.dataset_status = format!(
+            "Switched to '{}' ({} molecules)",
+            self.loaded_files.names().nth(index).unwrap_or_default(),
+            self.loaded_files.active_dataset().len()
+        );
+        self.dataset_fingerprints.clear();
+        self.search_engine.invalidate_target_dataset();
+        self.search_results.clear();
+        self.selected_result = None;
+    }
+
     fn precompute_dataset_fingerprints(&mut self) {
-        if self.dataset.is_empty() {
+        if self.loaded_files.active_dataset().is_empty() {
             self.dataset_status = "No dataset loaded".to_string();
             return;
         }
@@ -219,7 +242,7 @@ impl ChemFpDemoApp {
     fn precompute_dataset_fingerprints_dispatch(&mut self) {
         let start = Instant::now();
         let result = self.search_engine.generate_fingerprints_batch(
-            &self.dataset.molecules,
+            &self.loaded_files.active_dataset().molecules,
             self.fp_radius,
             self.fp_size,
         );
@@ -241,7 +264,7 @@ impl ChemFpDemoApp {
     #[cfg(target_arch = "wasm32")]
     fn precompute_dataset_fingerprints_dispatch(&mut self) {
         let search_snapshot = self.search_engine.clone();
-        let molecules = self.dataset.molecules.clone();
+        let molecules = self.loaded_files.active_dataset().molecules.clone();
         let radius = self.fp_radius;
         let fp_size = self.fp_size;
         let slot = self.pending_dataset_fingerprints.clone();
@@ -486,6 +509,20 @@ impl ChemFpDemoApp {
                 ui.label(&self.dataset_status);
                 ui.separator();
 
+                ui.heading("Loaded Files");
+                let active_index = self.loaded_files.active_index();
+                let names: Vec<String> = self.loaded_files.names().map(str::to_owned).collect();
+                let mut clicked_index = None;
+                for (i, name) in names.iter().enumerate() {
+                    if ui.selectable_label(i == active_index, name).clicked() {
+                        clicked_index = Some(i);
+                    }
+                }
+                if let Some(i) = clicked_index {
+                    self.activate_loaded_file(i);
+                }
+                ui.separator();
+
                 ui.heading("Fingerprint Settings");
                 ui.add(egui::Slider::new(&mut self.fp_radius, 0..=5).text("Radius"));
                 ui.add(
@@ -500,8 +537,9 @@ impl ChemFpDemoApp {
 
                 ui.separator();
 
-                if !self.dataset.is_empty() {
-                    ui.label(format!("Molecules in dataset: {}", self.dataset.len()));
+                let active_dataset = self.loaded_files.active_dataset();
+                if !active_dataset.is_empty() {
+                    ui.label(format!("Molecules in dataset: {}", active_dataset.len()));
                     ui.label(format!(
                         "Fingerprints computed: {}",
                         self.dataset_fingerprints.len()
@@ -510,11 +548,10 @@ impl ChemFpDemoApp {
                     ui.separator();
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (i, (smiles, name)) in self
-                            .dataset
+                        for (i, (smiles, name)) in active_dataset
                             .smiles
                             .iter()
-                            .zip(self.dataset.names.iter())
+                            .zip(active_dataset.names.iter())
                             .enumerate()
                             .take(20)
                         {
@@ -524,8 +561,8 @@ impl ChemFpDemoApp {
                                 ui.label(RichText::new(name).small());
                             });
                         }
-                        if self.dataset.len() > 20 {
-                            ui.label(format!("... and {} more", self.dataset.len() - 20));
+                        if active_dataset.len() > 20 {
+                            ui.label(format!("... and {} more", active_dataset.len() - 20));
                         }
                     });
                 }
@@ -603,12 +640,13 @@ impl ChemFpDemoApp {
                     ui.label(RichText::new("No search results yet").size(20.0).weak());
                 });
             } else {
+                let active_dataset = self.loaded_files.active_dataset();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (rank, result) in self.search_results.iter().enumerate() {
                         let idx = result.index;
-                        let mol = &self.dataset.molecules[idx];
-                        let smiles = &self.dataset.smiles[idx];
-                        let name = &self.dataset.names[idx];
+                        let mol = &active_dataset.molecules[idx];
+                        let smiles = &active_dataset.smiles[idx];
+                        let name = &active_dataset.names[idx];
 
                         let is_selected = self.selected_result == Some(rank);
 
@@ -698,8 +736,8 @@ impl eframe::App for ChemFpDemoApp {
         #[cfg(target_arch = "wasm32")]
         {
             let loaded = self.pending_file_load.borrow_mut().take();
-            if let Some(bytes) = loaded {
-                self.apply_loaded_file_bytes(bytes);
+            if let Some((name, bytes)) = loaded {
+                self.apply_loaded_file_bytes(name, bytes);
             }
 
             let gpu_init = self.pending_gpu_init.borrow_mut().take();

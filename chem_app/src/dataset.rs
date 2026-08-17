@@ -117,3 +117,60 @@ impl Default for MoleculeDataset {
         Self::new()
     }
 }
+
+pub struct LoadedFile {
+    pub name: String,
+    pub dataset: MoleculeDataset,
+}
+
+/// Every dataset loaded this session, and which one is currently active.
+/// Loading a file or the example set adds an entry rather than replacing
+/// the previous one, so the Data window can switch back to something
+/// loaded earlier instead of losing it.
+pub struct LoadedFiles {
+    entries: Vec<LoadedFile>,
+    active: usize,
+}
+
+impl LoadedFiles {
+    pub fn new(initial_name: String, initial: MoleculeDataset) -> Self {
+        Self {
+            entries: vec![LoadedFile {
+                name: initial_name,
+                dataset: initial,
+            }],
+            active: 0,
+        }
+    }
+
+    /// Adds a new entry and makes it active, or, if an entry with this name
+    /// already exists (e.g. reloading the same file), replaces its dataset
+    /// in place and activates that instead of appending a duplicate.
+    pub fn add_and_activate(&mut self, name: String, dataset: MoleculeDataset) {
+        if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+            self.entries[idx].dataset = dataset;
+            self.active = idx;
+        } else {
+            self.entries.push(LoadedFile { name, dataset });
+            self.active = self.entries.len() - 1;
+        }
+    }
+
+    pub fn activate(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.active = index;
+        }
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn active_dataset(&self) -> &MoleculeDataset {
+        &self.entries[self.active].dataset
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.name.as_str())
+    }
+}
