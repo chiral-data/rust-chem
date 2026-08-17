@@ -427,34 +427,40 @@ impl ChemFpDemoApp {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
 
-                    if self.search_engine.is_using_gpu() {
-                        ui.label(RichText::new("🚀 GPU").color(Color32::from_rgb(50, 200, 50)));
-                        if ui.small_button("Use CPU").clicked() {
-                            self.search_engine.force_cpu();
-                        }
+                    let using_gpu = self.search_engine.is_using_gpu();
+                    let gpu_error = self.search_engine.gpu_init_error().map(str::to_owned);
+
+                    // GPU chip: green when active or available-but-unselected,
+                    // red when a real init attempt failed. Clicking switches
+                    // to it if a GPU context already exists, or kicks off a
+                    // (re)init attempt otherwise.
+                    let gpu_response = if let Some(err) = &gpu_error {
+                        ui.selectable_label(
+                            using_gpu,
+                            RichText::new("⚠ GPU").color(Color32::from_rgb(220, 50, 50)),
+                        )
+                        .on_hover_text(format!("GPU unavailable: {}", err))
                     } else {
-                        // CPU is the active, working mode here — always shown
-                        // plainly. If GPU is what's actually in a failed
-                        // state, that gets its own separate alert rather
-                        // than being smeared onto the CPU label.
-                        if let Some(err) = self.search_engine.gpu_init_error().map(str::to_owned) {
-                            if ui.small_button("Retry GPU").clicked() {
-                                self.retry_gpu();
-                            }
-                            ui.label(RichText::new("⚠ GPU").color(Color32::from_rgb(220, 50, 50)))
-                                .on_hover_text(format!("GPU unavailable: {}", err));
-                            ui.separator();
-                        } else {
-                            let label = if self.search_engine.has_gpu_available() {
-                                "Use GPU"
-                            } else {
-                                "Try GPU"
-                            };
-                            if ui.small_button(label).clicked() && !self.search_engine.force_gpu() {
-                                self.retry_gpu();
-                            }
-                        }
-                        ui.label(RichText::new("💻 CPU").color(Color32::from_rgb(200, 200, 50)));
+                        ui.selectable_label(
+                            using_gpu,
+                            RichText::new("🚀 GPU").color(Color32::from_rgb(50, 200, 50)),
+                        )
+                    };
+                    if gpu_response.clicked() && !self.search_engine.force_gpu() {
+                        self.retry_gpu();
+                    }
+
+                    // CPU chip: always available, never styled as an alert —
+                    // CPU is a working, legitimate mode, whether chosen
+                    // deliberately or by GPU being unavailable.
+                    if ui
+                        .selectable_label(
+                            !using_gpu,
+                            RichText::new("💻 CPU").color(Color32::from_rgb(50, 200, 50)),
+                        )
+                        .clicked()
+                    {
+                        self.search_engine.force_cpu();
                     }
                 });
             });
