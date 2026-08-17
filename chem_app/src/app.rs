@@ -28,8 +28,6 @@ type PendingSlot<T> = Rc<RefCell<Option<(anyhow::Result<T>, f64)>>>;
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
 #[cfg(target_arch = "wasm32")]
 type PendingFileLoad = Rc<RefCell<Option<(String, Vec<u8>)>>>;
-#[cfg(target_arch = "wasm32")]
-type PendingDatasetParse = Rc<RefCell<Option<(String, anyhow::Result<MoleculeDataset>)>>>;
 
 /// Formats a duration for display, switching to microseconds below 1ms so
 /// fast operations (a single small-molecule fingerprint, say) don't just
@@ -66,12 +64,6 @@ pub struct ChemFpDemoApp {
     // to be picked up by the next `update()` poll.
     #[cfg(target_arch = "wasm32")]
     pending_file_load: PendingFileLoad,
-    // Parsing a large dataset is CPU-bound with no yield points, so it's
-    // spawned the same way rather than run inline in `update()` — mainly so
-    // the "Loading '<name>'..." status actually gets painted before the
-    // parse starts, instead of both happening within the same frame.
-    #[cfg(target_arch = "wasm32")]
-    pending_dataset_parse: PendingDatasetParse,
     // GPU init can't happen inside `FingerprintSearch::new()` on wasm32 (see
     // its doc comment), so it's kicked off here instead and polled the same
     // way. Outer Option = has the attempt resolved yet; inner Option = did
@@ -124,8 +116,6 @@ impl ChemFpDemoApp {
             query_dirty_since: None,
             #[cfg(target_arch = "wasm32")]
             pending_file_load: Rc::new(RefCell::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            pending_dataset_parse: Rc::new(RefCell::new(None)),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
             #[cfg(target_arch = "wasm32")]
@@ -189,39 +179,7 @@ impl ChemFpDemoApp {
             }
         };
 
-        self.parse_dataset_dispatch(name, content);
-    }
-
-    // Parsing has no internal yield points, so on native it just runs
-    // in place — there's no browser tab to freeze.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn parse_dataset_dispatch(&mut self, name: String, content: String) {
-        let result = MoleculeDataset::load_from_smiles_str(&content);
-        self.apply_dataset_parse_result(name, result);
-    }
-
-    // Spawned so the "Loading '<name>'..." status set here actually gets
-    // painted before the parse runs, rather than both happening within the
-    // same `update()` frame with nothing rendered in between. Doesn't chunk
-    // the parse itself, so a very large file can still block the tab for its
-    // own duration once the spawned task starts — this only fixes the
-    // "nothing visibly happens first" part, not that deeper one.
-    #[cfg(target_arch = "wasm32")]
-    fn parse_dataset_dispatch(&mut self, name: String, content: String) {
-        self.dataset_status = format!("Loading '{}'...", name);
-        let slot = self.pending_dataset_parse.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = MoleculeDataset::load_from_smiles_str(&content);
-            *slot.borrow_mut() = Some((name, result));
-        });
-    }
-
-    fn apply_dataset_parse_result(
-        &mut self,
-        name: String,
-        result: anyhow::Result<MoleculeDataset>,
-    ) {
-        match result {
+        match MoleculeDataset::load_from_smiles_str(&content) {
             Ok(dataset) => {
                 self.dataset_status = format!("Loaded {} molecules from '{}'", dataset.len(), name);
                 self.loaded_files.add_and_activate(name, dataset);
@@ -780,11 +738,6 @@ impl eframe::App for ChemFpDemoApp {
             let loaded = self.pending_file_load.borrow_mut().take();
             if let Some((name, bytes)) = loaded {
                 self.apply_loaded_file_bytes(name, bytes);
-            }
-
-            let parsed = self.pending_dataset_parse.borrow_mut().take();
-            if let Some((name, result)) = parsed {
-                self.apply_dataset_parse_result(name, result);
             }
 
             let gpu_init = self.pending_gpu_init.borrow_mut().take();
