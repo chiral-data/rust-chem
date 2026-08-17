@@ -51,6 +51,10 @@ pub struct ChemFpDemoApp {
     query_error: Option<String>,
     search_results: Vec<SearchResult>,
     selected_result: Option<usize>,
+    // Which row in the Data window's molecule table is expanded to show its
+    // detail view. Indexes into the active dataset, so it's reset alongside
+    // dataset_fingerprints/search_results whenever the active dataset changes.
+    selected_dataset_row: Option<usize>,
     fp_radius: u32,
     fp_size: u32,
     top_k: usize,
@@ -106,6 +110,7 @@ impl ChemFpDemoApp {
             query_error: None,
             search_results: Vec::new(),
             selected_result: None,
+            selected_dataset_row: None,
             fp_radius: 2,
             fp_size: 2048,
             top_k: 10,
@@ -200,6 +205,7 @@ impl ChemFpDemoApp {
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
                 self.selected_result = None;
+                self.selected_dataset_row = None;
                 log::info!("Dataset loaded successfully");
             }
             Err(e) => {
@@ -222,6 +228,7 @@ impl ChemFpDemoApp {
                 self.search_engine.invalidate_target_dataset();
                 self.search_results.clear();
                 self.selected_result = None;
+                self.selected_dataset_row = None;
             }
             Err(e) => {
                 self.dataset_status = format!("Failed to load examples: {}", e);
@@ -244,6 +251,7 @@ impl ChemFpDemoApp {
         self.search_engine.invalidate_target_dataset();
         self.search_results.clear();
         self.selected_result = None;
+        self.selected_dataset_row = None;
     }
 
     fn precompute_dataset_fingerprints(&mut self) {
@@ -563,26 +571,101 @@ impl ChemFpDemoApp {
 
                     ui.separator();
 
+                    let num_fingerprints = self.dataset_fingerprints.len();
+                    let shown = active_dataset.len().min(20);
+                    let mut clicked_row = None;
+
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (i, (smiles, name)) in active_dataset
-                            .smiles
-                            .iter()
-                            .zip(active_dataset.names.iter())
-                            .enumerate()
-                            .take(20)
-                        {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{}.", i + 1));
-                                ui.label(RichText::new(smiles).code().small());
-                                ui.label(RichText::new(name).small());
+                        egui::Grid::new("dataset_table")
+                            .num_columns(5)
+                            .spacing([8.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Name").strong());
+                                ui.label(RichText::new("SMILES").strong());
+                                ui.label(RichText::new("Formula").strong());
+                                ui.label(RichText::new("MW").strong());
+                                ui.label(RichText::new("Fingerprint").strong());
+                                ui.end_row();
+
+                                for i in 0..shown {
+                                    let mol = &active_dataset.molecules[i];
+                                    let is_selected = self.selected_dataset_row == Some(i);
+
+                                    if ui
+                                        .selectable_label(is_selected, &active_dataset.names[i])
+                                        .clicked()
+                                    {
+                                        clicked_row = Some(i);
+                                    }
+                                    ui.label(
+                                        RichText::new(&active_dataset.smiles[i]).code().small(),
+                                    );
+                                    ui.label(mol.formula());
+                                    ui.label(format!("{:.2}", mol.molecular_weight()));
+                                    ui.label(if i < num_fingerprints { "Yes" } else { "No" });
+                                    ui.end_row();
+                                }
                             });
-                        }
-                        if active_dataset.len() > 20 {
-                            ui.label(format!("... and {} more", active_dataset.len() - 20));
+
+                        if active_dataset.len() > shown {
+                            ui.label(format!("... and {} more", active_dataset.len() - shown));
                         }
                     });
+
+                    if let Some(i) = clicked_row {
+                        self.selected_dataset_row = if self.selected_dataset_row == Some(i) {
+                            None
+                        } else {
+                            Some(i)
+                        };
+                    }
                 }
             });
+    }
+
+    // A floating window rather than an inline expand below the table: the
+    // Data window's side panel has a fixed height, and the detail view
+    // (info grid + atom list + bond list) can be taller than that on a
+    // short viewport with no way to scroll to the rest of it. A window is
+    // independently movable/resizable and scrolls on its own if needed.
+    fn molecule_detail_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.selected_dataset_row else {
+            return;
+        };
+        let active_dataset = self.loaded_files.active_dataset();
+        let Some(mol) = active_dataset.molecules.get(i) else {
+            return;
+        };
+        let name = active_dataset.names[i].clone();
+        let smiles = active_dataset.smiles[i].clone();
+        let mol = mol.clone();
+
+        // Caps the window itself to the available viewport height (minus
+        // some margin) so it can never grow past the screen on a short
+        // window/monitor — content beyond that scrolls inside instead of
+        // the window just growing off-screen with no way to reach it.
+        let max_height = (ctx.content_rect().height() - 80.0).max(200.0);
+
+        let mut open = true;
+        egui::Window::new(format!("Molecule: {}", name))
+            .id(egui::Id::new("molecule_detail_window"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(true)
+            .default_height(500.0)
+            .max_height(max_height)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    show_molecule_info(ui, &mol, &smiles, &name);
+                    show_atom_list(ui, &mol);
+                    show_bond_list(ui, &mol);
+                });
+            });
+
+        if !open {
+            self.selected_dataset_row = None;
+        }
     }
 
     fn query_panel(&mut self, ctx: &egui::Context) {
@@ -812,5 +895,6 @@ impl eframe::App for ChemFpDemoApp {
         self.dataset_panel(ctx);
         self.query_panel(ctx);
         self.results_panel(ctx);
+        self.molecule_detail_window(ctx);
     }
 }
