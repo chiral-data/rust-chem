@@ -51,8 +51,24 @@ fn main() {
             )
             .await;
 
-        if let Err(e) = start_result {
-            log::error!("Failed to start eframe: {e:?}");
+        let loading_overlay = document.get_element_by_id("loading_overlay");
+        match start_result {
+            // The app is about to render its first real frame — the plain
+            // HTML/CSS loading overlay (shown since page load, well before
+            // the wasm bundle finished downloading) has done its job.
+            Ok(()) => {
+                if let Some(el) = loading_overlay {
+                    el.remove();
+                }
+            }
+            // Leave the overlay up but show why, rather than a silently
+            // blank page.
+            Err(e) => {
+                log::error!("Failed to start eframe: {e:?}");
+                if let Some(el) = loading_overlay {
+                    el.set_text_content(Some(&format!("Failed to start ChemFP Demo: {e:?}")));
+                }
+            }
         }
     });
 }
