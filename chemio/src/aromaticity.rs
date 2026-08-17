@@ -180,7 +180,22 @@ fn is_aromatic_ring(mol: &Molecule, ring: &[usize]) -> bool {
         let atomic_num = atom.atomic_number();
 
         match atomic_num {
-            6 => pi_electrons += 1, // C contributes 1
+            // A ring carbon only has a p-orbital to contribute to a
+            // conjugated pi system if it's actually part of an in-ring
+            // double (or already-aromatic) bond -- a fully saturated
+            // carbon (e.g. every carbon in cyclohexane) has none, and its
+            // presence breaks conjugation around the whole ring, so the
+            // ring can't be aromatic regardless of what the other atoms
+            // are. Previously this contributed 1 pi-electron
+            // unconditionally, so any 6-membered all-carbon ring summed to
+            // exactly 6 and passed the Hückel check whether or not it had
+            // any unsaturation at all.
+            6 => {
+                if !has_in_ring_pi_bond(mol, atom_idx, ring) {
+                    return false;
+                }
+                pi_electrons += 1;
+            }
             7 => {
                 // N: check if it has lone pair or is sp2
                 if mol.degree(atom_idx) == 2 {
@@ -199,6 +214,20 @@ fn is_aromatic_ring(mol: &Molecule, ring: &[usize]) -> bool {
 
     // Hückel's rule: 4n + 2 pi electrons
     pi_electrons == 6 || pi_electrons == 10
+}
+
+/// Whether `atom_idx` has a double or aromatic bond to another atom that's
+/// also in `ring` -- i.e. an in-ring pi bond, not just any double bond
+/// (an exocyclic one, like a ring carbon's C=O in a cyclohexanone, doesn't
+/// make the ring's own bonds conjugated).
+fn has_in_ring_pi_bond(mol: &Molecule, atom_idx: usize, ring: &[usize]) -> bool {
+    mol.neighbors(atom_idx).iter().any(|neighbor| {
+        ring.contains(&neighbor.atom_idx)
+            && matches!(
+                mol.bond(neighbor.bond_idx).order(),
+                BondOrder::Double | BondOrder::Aromatic
+            )
+    })
 }
 
 /// Marks the atoms and bonds in a ring as aromatic.
@@ -247,6 +276,33 @@ mod tests {
         detect_aromaticity(&mut mol);
 
         assert!(!mol.atom(0).is_aromatic());
+    }
+
+    #[test]
+    fn test_cyclohexane_not_aromatic() {
+        // Fully saturated 6-membered all-carbon ring, no double bonds at
+        // all -- previously flagged aromatic because every carbon
+        // contributed a pi-electron unconditionally, landing on exactly 6
+        // (the same count real benzene gets) regardless of saturation.
+        let mut mol = crate::smiles::parse_smiles("C1CCCCC1").unwrap();
+        detect_aromaticity(&mut mol);
+
+        for i in 0..6 {
+            assert!(!mol.atom(i).is_aromatic(), "atom {} wrongly aromatic", i);
+        }
+    }
+
+    #[test]
+    fn test_cyclohexanone_not_aromatic() {
+        // A saturated ring carbon with an *exocyclic* double bond (the
+        // ketone's C=O) shouldn't count as an in-ring pi bond -- the ring's
+        // own bonds are still all single.
+        let mut mol = crate::smiles::parse_smiles("O=C1CCCCC1").unwrap();
+        detect_aromaticity(&mut mol);
+
+        for i in 0..mol.num_atoms() {
+            assert!(!mol.atom(i).is_aromatic(), "atom {} wrongly aromatic", i);
+        }
     }
 
     #[test]
