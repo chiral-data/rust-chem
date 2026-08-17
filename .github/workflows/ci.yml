@@ -99,3 +99,32 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  web:
+    name: Web (WASM) Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy (wasm32)
+        run: cargo clippy -p chem_app --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: Install trunk
+        uses: taiki-e/install-action@trunk
+
+      - name: Build web bundle
+        working-directory: chem_app
+        run: trunk build --release
