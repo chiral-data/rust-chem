@@ -4,6 +4,7 @@
 use chemcore::bond::BondOrder;
 use chemcore::geometry::{BoundingBox, Point2};
 use chemcore::molecule::Molecule;
+use chemcore::rings::find_sssr;
 use egui::{Align2, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, Widget};
 
 /// Rendering options for [`StructureView`].
@@ -37,14 +38,13 @@ pub struct StructureOptions {
     pub bond_spacing_ratio: f32,
     /// Bond stroke width in pixels (smilesDrawer's `bondThickness`).
     pub bond_thickness: f32,
-    /// Length of the inner line of an aromatic bond, as a fraction of the full
-    /// bond (smilesDrawer's `shortBondLength`). Trimming the inner line is the
-    /// usual convention and stops adjacent aromatic bonds in a ring from
-    /// running into each other at the vertices.
+    /// Length of the secondary line of a ring bond, as a fraction of the full
+    /// bond (smilesDrawer's `shortBondLength`). Trimming it stops adjacent ring
+    /// bonds from running into each other at the vertices.
     ///
-    /// Not applied to double bonds: those draw both lines symmetrically about
-    /// the bond axis, so neither is the "inner" one to shorten. Distinguishing
-    /// inner from outer needs ring perception (#81).
+    /// Applies only where there's an interior to draw into: a double or
+    /// aromatic bond *off* a ring puts its two lines symmetrically about the
+    /// bond axis, so neither is the inner one to shorten.
     pub short_bond_length: f32,
     /// Atom label height as a fraction of bond length.
     pub font_size_ratio: f32,
@@ -228,6 +228,44 @@ fn box_edge_distance(dir: Vec2, half_w: f32, half_h: f32) -> f32 {
     tx.min(ty)
 }
 
+/// For each bond, the screen-space centre of the ring it belongs to, or `None`
+/// if it isn't in one.
+///
+/// This is what tells a multiple bond which side of itself is the ring
+/// interior, so its second line can be drawn there rather than on an arbitrary
+/// side. A bond shared between fused rings gets the centre of the *smallest*
+/// ring containing it, matching how such bonds are conventionally drawn.
+fn ring_bond_centers(molecule: &Molecule, transform: &Transform) -> Vec<Option<Pos2>> {
+    let mut centers: Vec<Option<Pos2>> = vec![None; molecule.num_bonds()];
+    let mut chosen_ring_size: Vec<usize> = vec![usize::MAX; molecule.num_bonds()];
+
+    for ring in find_sssr(molecule) {
+        let positions: Vec<Pos2> = ring
+            .atoms()
+            .iter()
+            .filter_map(|&a| molecule.coord(a))
+            .map(|p| transform.apply(p))
+            .collect();
+        if positions.is_empty() {
+            continue;
+        }
+
+        let sum = positions
+            .iter()
+            .fold(Vec2::ZERO, |acc, p| acc + p.to_vec2());
+        let center = (sum / positions.len() as f32).to_pos2();
+
+        for &bond_idx in ring.bonds() {
+            if ring.len() < chosen_ring_size[bond_idx] {
+                chosen_ring_size[bond_idx] = ring.len();
+                centers[bond_idx] = Some(center);
+            }
+        }
+    }
+
+    centers
+}
+
 /// Mean distance between bonded atoms in the molecule's own coordinate space,
 /// or `None` if there are no bonds to measure.
 ///
@@ -335,8 +373,12 @@ impl Widget for StructureView<'_> {
 
         let painter = ui.painter();
 
+        // Which way is "into the ring" for each ring bond, so the second line
+        // of a multiple bond can be drawn on that side as convention requires.
+        let ring_centers = ring_bond_centers(self.molecule, &transform);
+
         // Bonds under labels, so the labels read cleanly on top.
-        for bond in self.molecule.bonds() {
+        for (bond_idx, bond) in self.molecule.bonds().iter().enumerate() {
             let (a, b) = bond.atoms();
             let (Some(pa), Some(pb)) = (self.molecule.coord(a), self.molecule.coord(b)) else {
                 continue;
@@ -367,17 +409,41 @@ impl Widget for StructureView<'_> {
             start += dir * inset_a;
             end -= dir * inset_b;
 
-            let offset = Vec2::new(-dir.y, dir.x) * bond_spacing;
+            let mut offset = Vec2::new(-dir.y, dir.x) * bond_spacing;
+
+            // On a ring bond, flip the offset if it points out of the ring, so
+            // the secondary line always lands in the interior.
+            let in_ring = match ring_centers.get(bond_idx).copied().flatten() {
+                Some(center) => {
+                    let midpoint = start + (end - start) * 0.5;
+                    if offset.dot(center - midpoint) < 0.0 {
+                        offset = -offset;
+                    }
+                    true
+                }
+                None => false,
+            };
+
+            // Trim applied to a secondary line drawn inside a ring, so adjacent
+            // ring bonds don't run into each other at the vertices.
+            let trim = (1.0 - self.options.short_bond_length).clamp(0.0, 1.0) / 2.0;
 
             match bond.order() {
                 BondOrder::Single => {
                     painter.line_segment([start, end], stroke);
                 }
+                BondOrder::Double if in_ring => {
+                    // Ring convention: one line on the ring perimeter, the
+                    // second inside it and shortened.
+                    painter.line_segment([start, end], stroke);
+                    let inner_a = start + offset;
+                    let inner_b = end + offset;
+                    let shrink = (inner_b - inner_a) * trim;
+                    painter.line_segment([inner_a + shrink, inner_b - shrink], stroke);
+                }
                 BondOrder::Double => {
-                    // Both lines offset symmetrically about the bond axis.
-                    // Convention would put the second line inside the ring for
-                    // ring bonds, which needs ring perception (#81) to know
-                    // which side that is.
+                    // Off a ring there's no interior to favour, so both lines
+                    // sit symmetrically about the bond axis.
                     painter.line_segment([start + offset * 0.5, end + offset * 0.5], stroke);
                     painter.line_segment([start - offset * 0.5, end - offset * 0.5], stroke);
                 }
@@ -387,18 +453,28 @@ impl Widget for StructureView<'_> {
                     painter.line_segment([start - offset, end - offset], stroke);
                 }
                 BondOrder::Aromatic => {
-                    // Solid outer line plus a dashed inner one. The alternative
-                    // convention — a circle inside the ring — also needs ring
-                    // perception (#81).
-                    painter.line_segment([start + offset * 0.5, end + offset * 0.5], stroke);
+                    // Solid line on the ring perimeter, dashed one inside it.
+                    // (The other common convention draws a single circle inside
+                    // the ring instead; this keeps the per-bond form.)
+                    let (solid_a, solid_b, inner_a, inner_b) = if in_ring {
+                        (start, end, start + offset, end + offset)
+                    } else {
+                        // Aromatic bonds do occur outside a perceived ring
+                        // (a lone aromatic-flagged bond, a ring the SSSR basis
+                        // didn't pick); fall back to a symmetric pair.
+                        (
+                            start + offset * 0.5,
+                            end + offset * 0.5,
+                            start - offset * 0.5,
+                            end - offset * 0.5,
+                        )
+                    };
 
-                    // The inner line is trimmed equally at both ends, so
-                    // adjacent aromatic bonds don't collide at ring vertices.
-                    let trim = (1.0 - self.options.short_bond_length).clamp(0.0, 1.0) / 2.0;
-                    let inner_a = start - offset * 0.5;
-                    let inner_b = end - offset * 0.5;
+                    painter.line_segment([solid_a, solid_b], stroke);
+
+                    // Trimmed equally at both ends, so adjacent aromatic bonds
+                    // don't collide at ring vertices.
                     let shrink = (inner_b - inner_a) * trim;
-
                     let dash = (bond_spacing * 1.5).max(2.0);
                     painter.extend(Shape::dashed_line(
                         &[inner_a + shrink, inner_b - shrink],
@@ -718,6 +794,133 @@ mod tests {
         let t = Transform::for_options(&mol, bbox_of(&mol), rect(100.0, 100.0), &options);
         // Same as fit(): one unit spans the 80px left after padding.
         assert!((t.scale - 80.0).abs() < 1e-4);
+    }
+
+    fn benzene_with_coords() -> Molecule {
+        use chemcore::prelude::*;
+
+        let mut mol = Molecule::new();
+        for _ in 0..6 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        for i in 0..6 {
+            mol.add_bond(Bond::new(i, (i + 1) % 6, BondOrder::Aromatic))
+                .unwrap();
+        }
+        chemcore::layout::layout(&mut mol);
+        mol
+    }
+
+    #[test]
+    fn test_ring_bonds_get_a_center() {
+        let mol = benzene_with_coords();
+        let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
+        let centers = ring_bond_centers(&mol, &t);
+
+        assert_eq!(centers.len(), mol.num_bonds());
+        for (bond_idx, center) in centers.iter().enumerate() {
+            assert!(
+                center.is_some(),
+                "ring bond {bond_idx} should have a centre"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ring_center_is_inside_the_ring() {
+        let mol = benzene_with_coords();
+        let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
+        let centers = ring_bond_centers(&mol, &t);
+        let center = centers[0].unwrap();
+
+        // The ring centre must be nearer every vertex than the vertices are to
+        // the far side of the ring — i.e. genuinely interior, not off to a side.
+        let ring_radius = (0..6)
+            .map(|i| t.apply(mol.coord(i).unwrap()).distance(center))
+            .fold(0.0f32, f32::max);
+        for i in 0..6 {
+            let p = t.apply(mol.coord(i).unwrap());
+            assert!((p.distance(center) - ring_radius).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn test_offset_flips_toward_the_ring_interior() {
+        // The whole point of the fix: whichever way the perpendicular happens
+        // to face, the secondary line ends up on the interior side.
+        let mol = benzene_with_coords();
+        let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
+        let centers = ring_bond_centers(&mol, &t);
+
+        for (bond_idx, bond) in mol.bonds().iter().enumerate() {
+            let (a, b) = bond.atoms();
+            let start = t.apply(mol.coord(a).unwrap());
+            let end = t.apply(mol.coord(b).unwrap());
+            let dir = (end - start).normalized_or_zero_check().unwrap();
+            let mut offset = Vec2::new(-dir.y, dir.x) * 5.0;
+
+            let center = centers[bond_idx].unwrap();
+            let midpoint = start + (end - start) * 0.5;
+            if offset.dot(center - midpoint) < 0.0 {
+                offset = -offset;
+            }
+
+            // After the flip, moving along the offset must get closer to the
+            // ring centre than the bond midpoint is.
+            assert!(
+                (midpoint + offset).distance(center) < midpoint.distance(center),
+                "bond {bond_idx} offset points away from the ring interior"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_ring_bonds_have_no_center() {
+        use chemcore::prelude::*;
+
+        // Ethane: one acyclic bond, so there's no interior to favour.
+        let mut mol = Molecule::new();
+        let a = mol.add_atom(Atom::new(Element::carbon()));
+        let b = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(a, b, BondOrder::Double)).unwrap();
+        chemcore::layout::layout(&mut mol);
+
+        let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
+        let centers = ring_bond_centers(&mol, &t);
+        assert_eq!(centers, vec![None]);
+    }
+
+    #[test]
+    fn test_fused_bond_uses_smallest_ring() {
+        use chemcore::prelude::*;
+
+        // Naphthalene: the shared bond belongs to both 6-rings, and either
+        // centre is valid; what matters is that it gets one at all rather than
+        // being treated as acyclic.
+        let mut mol = Molecule::new();
+        for _ in 0..10 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        for &(a, b) in &[
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (5, 0),
+            (1, 6),
+            (6, 7),
+            (7, 8),
+            (8, 9),
+            (9, 0),
+        ] {
+            mol.add_bond(Bond::new(a, b, BondOrder::Aromatic)).unwrap();
+        }
+        chemcore::layout::layout(&mut mol);
+
+        let t = Transform::fit(bbox_of(&mol), rect(300.0, 300.0), 10.0);
+        let centers = ring_bond_centers(&mol, &t);
+        assert!(centers.iter().all(|c| c.is_some()));
     }
 
     #[test]
