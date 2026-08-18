@@ -2,6 +2,7 @@ use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
 use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
+use crate::structure_view::structure_panel;
 use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
 use chemio::aromaticity::detect_aromaticity;
@@ -682,6 +683,7 @@ impl ChemFpDemoApp {
             .max_height(max_height)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    structure_panel(ui, &mol, 220.0);
                     show_molecule_info(ui, &mol, &smiles, &name);
                     show_atom_list(ui, &mol);
                     show_bond_list(ui, &mol);
