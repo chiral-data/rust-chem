@@ -1,6 +1,7 @@
 use crate::atom::Atom;
 use crate::bond::Bond;
 use crate::elements::ATOMIC_MASSES;
+use crate::geometry::Point2;
 use crate::graph::MoleculeGraph;
 
 use std::{collections::HashMap, fmt};
@@ -24,6 +25,9 @@ pub enum MoleculeError {
 
     #[error("Invalid valence for atom {0}")]
     InvalidValence(usize),
+
+    #[error("Expected {expected} coordinates (one per atom), got {got}")]
+    CoordinateCountMismatch { expected: usize, got: usize },
 }
 
 /// Represents a complete molecule with atoms, bonds, and connectivity.
@@ -34,6 +38,16 @@ pub struct Molecule {
     graph: MoleculeGraph,
     name: Option<String>,
     properties: HashMap<String, String>,
+    /// 2D coordinates for depiction, one per atom, indexed in parallel with
+    /// `atoms`. `None` when the molecule has no layout — SMILES carries no
+    /// coordinates, so this is the common case until a layout pass runs or
+    /// the molecule came from a format (SDF) that supplies them.
+    ///
+    /// Stored per-molecule rather than on [`Atom`] for two reasons: `Atom`
+    /// derives `Eq`, which floats can't satisfy, and coordinates are
+    /// all-or-nothing in practice — there's no meaningful state where only
+    /// some atoms have positions.
+    coords: Option<Vec<Point2>>,
 }
 
 impl Molecule {
@@ -44,6 +58,7 @@ impl Molecule {
             graph: MoleculeGraph::new(0),
             name: None,
             properties: HashMap::new(),
+            coords: None,
         }
     }
 
@@ -54,6 +69,7 @@ impl Molecule {
             graph: MoleculeGraph::new(0),
             name: None,
             properties: HashMap::new(),
+            coords: None,
         }
     }
 
@@ -68,6 +84,12 @@ impl Molecule {
     pub fn add_atom(&mut self, atom: Atom) -> usize {
         let idx = self.atoms.len();
         self.atoms.push(atom);
+
+        // The new atom has no position, so any existing coordinate set is now
+        // one short and no longer indexable in parallel with `atoms`. Drop it
+        // rather than leave the two out of sync — the layout has to be redone
+        // to place the new atom anyway.
+        self.coords = None;
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -130,6 +152,52 @@ impl Molecule {
 
     pub fn neighbors(&self, atom_idx: usize) -> &[crate::graph::Neighbor] {
         self.graph.neighbors(atom_idx)
+    }
+
+    /// This molecule's 2D coordinates, one per atom, or `None` if it has no
+    /// layout. See the [`Molecule::coords`] field docs for why coordinates
+    /// are all-or-nothing.
+    pub fn coords(&self) -> Option<&[Point2]> {
+        self.coords.as_deref()
+    }
+
+    /// The coordinate of a single atom, or `None` if this molecule has no
+    /// layout or `atom_idx` is out of range.
+    pub fn coord(&self, atom_idx: usize) -> Option<Point2> {
+        self.coords.as_ref()?.get(atom_idx).copied()
+    }
+
+    pub fn has_coords(&self) -> bool {
+        self.coords.is_some()
+    }
+
+    /// Sets this molecule's 2D coordinates.
+    ///
+    /// # Errors
+    /// [`MoleculeError::CoordinateCountMismatch`] if `coords.len()` isn't
+    /// exactly one per atom — coordinates are indexed in parallel with
+    /// `atoms`, so a mismatched length would silently misattribute positions.
+    pub fn set_coords(&mut self, coords: Vec<Point2>) -> Result<(), MoleculeError> {
+        if coords.len() != self.atoms.len() {
+            return Err(MoleculeError::CoordinateCountMismatch {
+                expected: self.atoms.len(),
+                got: coords.len(),
+            });
+        }
+        self.coords = Some(coords);
+        Ok(())
+    }
+
+    /// Discards any coordinates, e.g. to force a fresh layout.
+    pub fn clear_coords(&mut self) {
+        self.coords = None;
+    }
+
+    /// Mutable access to the coordinates, for a layout pass refining positions
+    /// in place. `None` if this molecule has no layout yet — use
+    /// [`Self::set_coords`] to establish one first.
+    pub fn coords_mut(&mut self) -> Option<&mut [Point2]> {
+        self.coords.as_deref_mut()
     }
 
     pub fn set_name(&mut self, name: String) {
@@ -346,5 +414,132 @@ mod tests {
         mol.add_bond(Bond::new(a1, a3, BondOrder::Single)).unwrap();
         assert_eq!(mol.degree(a1), 2);
         assert_eq!(mol.degree(a2), 1);
+    }
+
+    fn two_atom_molecule() -> Molecule {
+        let mut mol = Molecule::new();
+        let a1 = mol.add_atom(Atom::new(Element::carbon()));
+        let a2 = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(a1, a2, BondOrder::Single)).unwrap();
+        mol
+    }
+
+    #[test]
+    fn test_no_coords_by_default() {
+        let mol = two_atom_molecule();
+        assert!(!mol.has_coords());
+        assert!(mol.coords().is_none());
+        assert!(mol.coord(0).is_none());
+    }
+
+    #[test]
+    fn test_set_and_read_coords() {
+        let mut mol = two_atom_molecule();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+
+        assert!(mol.has_coords());
+        assert_eq!(mol.coords().unwrap().len(), 2);
+        assert_eq!(mol.coord(0), Some(Point2::new(0.0, 0.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
+        // Out of range, even though the molecule does have a layout.
+        assert!(mol.coord(2).is_none());
+    }
+
+    #[test]
+    fn test_set_coords_rejects_wrong_count() {
+        let mut mol = two_atom_molecule();
+
+        let too_few = mol.set_coords(vec![Point2::new(0.0, 0.0)]);
+        assert!(matches!(
+            too_few,
+            Err(MoleculeError::CoordinateCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+
+        let too_many = mol.set_coords(vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(1.0, 0.0),
+            Point2::new(2.0, 0.0),
+        ]);
+        assert!(matches!(
+            too_many,
+            Err(MoleculeError::CoordinateCountMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+
+        // A rejected set leaves the molecule without coordinates rather than
+        // half-applying them.
+        assert!(!mol.has_coords());
+    }
+
+    #[test]
+    fn test_adding_atom_invalidates_coords() {
+        let mut mol = two_atom_molecule();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+        assert!(mol.has_coords());
+
+        // The new atom has no position, so the coordinate set can no longer be
+        // indexed in parallel with `atoms` -- it's dropped rather than left
+        // one short.
+        mol.add_atom(Atom::new(Element::oxygen()));
+        assert!(!mol.has_coords());
+    }
+
+    #[test]
+    fn test_adding_bond_keeps_coords() {
+        let mut mol = two_atom_molecule();
+        let a3 = mol.add_atom(Atom::new(Element::carbon()));
+        mol.set_coords(vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(1.5, 0.0),
+            Point2::new(3.0, 0.0),
+        ])
+        .unwrap();
+
+        // A new bond doesn't change the atom count, so coordinates stay
+        // structurally valid (the geometry may be less ideal, but it's still
+        // one position per atom).
+        mol.add_bond(Bond::new(0, a3, BondOrder::Single)).unwrap();
+        assert!(mol.has_coords());
+        assert_eq!(mol.coord(2), Some(Point2::new(3.0, 0.0)));
+    }
+
+    #[test]
+    fn test_clear_coords() {
+        let mut mol = two_atom_molecule();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+        mol.clear_coords();
+        assert!(!mol.has_coords());
+    }
+
+    #[test]
+    fn test_coords_mut() {
+        let mut mol = two_atom_molecule();
+        assert!(mol.coords_mut().is_none());
+
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+        for p in mol.coords_mut().unwrap() {
+            p.x += 10.0;
+        }
+        assert_eq!(mol.coord(0), Some(Point2::new(10.0, 0.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(11.5, 0.0)));
+    }
+
+    #[test]
+    fn test_coords_survive_clone() {
+        let mut mol = two_atom_molecule();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+
+        let cloned = mol.clone();
+        assert_eq!(cloned.coord(1), Some(Point2::new(1.5, 0.0)));
     }
 }

@@ -17,6 +17,11 @@ const SDF_PROPERTY_PREFIX_LEN: usize = 3;
 /// Parses an SDF (Structure-Data File) string into a `Molecule` object.
 ///
 /// This parser handles real-world SDF files with flexible formatting.
+///
+/// Atom coordinates are preserved: SDF carries per-atom x/y/z, and the x/y are
+/// stored on the molecule for depiction. Coordinates are set only if every atom
+/// supplied a parseable pair — otherwise the molecule parses normally but
+/// without a layout.
 pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     let lines: Vec<&str> = sdf.lines().collect();
 
@@ -39,12 +44,29 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     let (num_atoms, num_bonds) = parse_counts_line(counts_line)?;
 
     // Parse atom block (starts at line 4)
+    let mut coords: Vec<Point2> = Vec::with_capacity(num_atoms);
+    let mut all_coords_parsed = true;
     for i in 0..num_atoms {
         let line_idx = SDF_ATOM_BLOCK_START + i;
         if line_idx >= lines.len() {
             return Err(SdfError::ParseError("Not enough atom lines".to_string()));
         }
-        parse_atom_line(&mut mol, lines[line_idx])?;
+        match parse_atom_line(&mut mol, lines[line_idx])? {
+            Some(point) => coords.push(point),
+            // An unparseable coordinate isn't fatal — the atom itself is
+            // still valid, so the molecule parses as it always did, just
+            // without a layout.
+            None => all_coords_parsed = false,
+        }
+    }
+
+    // Set coordinates before the bond block: `add_atom` discards them (the
+    // new atom has no position), while `add_bond` preserves them, so this has
+    // to come after every atom is added. Only set them if every atom supplied
+    // one, matching Molecule's all-or-nothing coordinate model.
+    if all_coords_parsed && coords.len() == num_atoms {
+        mol.set_coords(coords)
+            .map_err(|e| SdfError::ParseError(e.to_string()))?;
     }
 
     // Parse bond block (follows atom block)
@@ -111,7 +133,7 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 ///     ^^^^^^    ^^^^^^    ^^^^^^ ^
 ///        x         y         z   element
 /// ```
-fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
+fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point2>, SdfError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
 
     // Real-world SDF files typically have at least 4 fields: x, y, z, symbol
@@ -140,7 +162,17 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
     let atom = Atom::new(element);
     mol.add_atom(atom);
 
-    Ok(())
+    // Fields 0-2 are x, y, z. Only x/y are kept — coordinate storage is 2D,
+    // and for a 3D SDF this is a straight projection down the z axis, which is
+    // a serviceable starting depiction but can superimpose atoms that are only
+    // separated in z. A non-numeric coordinate yields None (no layout) rather
+    // than an error, so files that parsed before this change still parse.
+    let point = match (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+        (Ok(x), Ok(y)) => Some(Point2::new(x, y)),
+        _ => None,
+    };
+
+    Ok(point)
 }
 
 /// Parses a single bond line from the SDF bond block.
@@ -317,5 +349,106 @@ $$$$";
         assert_eq!(mol.num_atoms(), 10);
         assert_eq!(mol.num_bonds(), 9);
         assert_eq!(mol.name(), Some("C3H6O"));
+    }
+
+    #[test]
+    fn test_coordinates_are_preserved() {
+        let sdf = "\
+Ethane
+
+
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    1.5000    0.5000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+M  END
+$$$$";
+
+        let mol = parse_sdf(sdf).unwrap();
+        assert!(mol.has_coords());
+        assert_eq!(mol.coord(0), Some(Point2::new(0.0, 0.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.5)));
+    }
+
+    #[test]
+    fn test_negative_and_fractional_coordinates() {
+        // Real files routinely carry negative and multi-decimal coordinates.
+        let sdf = "\
+Acetone
+APtclcactv06051922463D 0   0.00000     0.00000
+
+  3  2  0  0  0  0  0  0  0  0999 V2000
+    1.3051    0.6772    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000   -0.0763   -0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.3051    0.6772   -0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+  2  3  1  0  0  0  0
+M  END
+$$$$";
+
+        let mol = parse_sdf(sdf).unwrap();
+        let coords = mol.coords().expect("coordinates");
+        assert_eq!(coords.len(), 3);
+        assert_eq!(coords[0], Point2::new(1.3051, 0.6772));
+        assert_eq!(coords[1], Point2::new(0.0, -0.0763));
+        assert_eq!(coords[2], Point2::new(-1.3051, 0.6772));
+    }
+
+    #[test]
+    fn test_coordinates_are_one_per_atom() {
+        let sdf = "\
+Acetone
+APtclcactv06051922463D 0   0.00000     0.00000
+
+ 10  9  0  0  0  0  0  0  0  0999 V2000
+    1.3051    0.6772    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000   -0.0763   -0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.3051    0.6772   -0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -0.0000   -1.2839   -0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+    1.1059    1.7488   -0.0000 H   0  0  0  0  0  0  0  0  0  0  0  0
+    1.8767    0.4138    0.8900 H   0  0  0  0  0  0  0  0  0  0  0  0
+    1.8767    0.4138   -0.8900 H   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.1059    1.7488    0.0000 H   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.8767    0.4138   -0.8900 H   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.8767    0.4138    0.8900 H   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+  2  3  1  0  0  0  0
+  2  4  2  0  0  0  0
+  1  5  1  0  0  0  0
+  1  6  1  0  0  0  0
+  1  7  1  0  0  0  0
+  3  8  1  0  0  0  0
+  3  9  1  0  0  0  0
+  3 10  1  0  0  0  0
+M  END
+$$$$";
+
+        let mol = parse_sdf(sdf).unwrap();
+        assert_eq!(mol.coords().expect("coordinates").len(), mol.num_atoms());
+        // A 3D file: z differs between atoms 6 and 7, but only x/y is stored,
+        // so they project onto the same 2D point.
+        assert_eq!(mol.coord(5), mol.coord(6));
+    }
+
+    #[test]
+    fn test_unparseable_coordinate_yields_no_layout() {
+        // "abc" in the x field: the atom is still valid (the symbol parses),
+        // so the molecule parses as before -- just without coordinates,
+        // rather than failing outright.
+        let sdf = "\
+Broken
+
+
+  2  1  0  0  0  0  0  0  0  0999 V2000
+      abc    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    1.5000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+M  END
+$$$$";
+
+        let mol = parse_sdf(sdf).unwrap();
+        assert_eq!(mol.num_atoms(), 2);
+        assert_eq!(mol.num_bonds(), 1);
+        assert!(!mol.has_coords());
     }
 }

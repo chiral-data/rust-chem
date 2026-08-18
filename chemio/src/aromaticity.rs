@@ -1,7 +1,4 @@
-use chemcore::{bond::BondOrder, molecule::Molecule};
-
-const MIN_RING_SIZE: usize = 3;
-const MAX_RING_SIZE: usize = 7;
+use chemcore::{bond::BondOrder, molecule::Molecule, rings::find_sssr};
 
 /// Detects aromatic rings in the given molecule and marks
 /// both the atoms and bonds belonging to aromatic rings.
@@ -18,125 +15,11 @@ const MAX_RING_SIZE: usize = 7;
 /// - This uses a lightweight ring-search and aromaticity heuristic.
 /// - It is NOT a full, industry-grade aromaticity model.
 pub fn detect_aromaticity(mol: &mut Molecule) {
-    let rings = find_rings(mol);
+    let rings = find_sssr(mol);
 
     for ring in rings {
-        if is_aromatic_ring(mol, &ring) {
-            mark_ring_aromatic(mol, &ring);
-        }
-    }
-}
-
-/// Finds all unique rings in the molecule.
-///
-/// # Parameters
-/// - `mol`: The molecule to search for rings.
-///
-/// # Returns
-/// A `Vec<Vec<usize>>` where each inner vector is a sequence of atom indices
-/// representing a detected ring.
-///
-/// # Notes
-/// - Calls `find_rings_from` starting at every atom.
-/// - Rings are deduplicated and sorted to remove duplicates (e.g. rotated versions).
-fn find_rings(mol: &Molecule) -> Vec<Vec<usize>> {
-    let mut rings = Vec::new();
-
-    for start in 0..mol.num_atoms() {
-        let paths = find_rings_from(mol, start, MIN_RING_SIZE, MAX_RING_SIZE);
-        rings.extend(paths);
-    }
-
-    rings.sort();
-    rings.dedup();
-    rings
-}
-
-/// Attempts to detect all rings reachable from a given start atom.
-///
-/// # Parameters
-/// - `mol`: Molecule being analyzed.
-/// - `start`: Atom index at which DFS ring detection begins.
-/// - `min_size`: Minimum allowed ring size.
-/// - `max_size`: Maximum allowed ring size.
-///
-/// # Returns
-/// A vector of atom-index sequences, each representing a ring found starting from `start`.
-///
-/// # Behavior
-/// - Performs DFS via `dfs_rings`.
-/// - Filters out rings that do not satisfy the size constraints.
-fn find_rings_from(
-    mol: &Molecule,
-    start: usize,
-    min_size: usize,
-    max_size: usize,
-) -> Vec<Vec<usize>> {
-    let mut rings = Vec::new();
-    let mut path = vec![start];
-    let mut visited = vec![false; mol.num_atoms()];
-    visited[start] = true;
-
-    dfs_rings(
-        mol,
-        start,
-        start,
-        &mut path,
-        &mut visited,
-        &mut rings,
-        max_size,
-    );
-
-    // Filter out rings that are too small or too large
-    rings
-        .into_iter()
-        .filter(|r| r.len() > min_size && r.len() <= max_size)
-        .collect()
-}
-
-/// Depth-first search for cyclic paths (rings).
-///
-/// # Parameters
-/// - `mol`: Molecule graph to traverse.
-/// - `current`: Current atom index in DFS traversal.
-/// - `start`: Atom index where the DFS began (potential ring closure point).
-/// - `path`: Mutable list of visited atoms in the current DFS path.
-/// - `visited`: Boolean flag vector preventing revisiting atoms in the same DFS branch.
-/// - `rings`: Accumulator for detected rings.
-/// - `max_size`: Maximum allowed ring size.
-///
-/// # Behavior
-/// - Explores neighbors recursively.
-/// - If a neighbor equals `start`, and path length ≥ 3, a ring is detected.
-/// - Avoids infinite recursion by marking atoms as visited only during the path.
-fn dfs_rings(
-    mol: &Molecule,
-    current: usize,
-    start: usize,
-    path: &mut Vec<usize>,
-    visited: &mut [bool],
-    rings: &mut Vec<Vec<usize>>,
-    max_size: usize,
-) {
-    if path.len() > max_size {
-        return;
-    }
-
-    for neighbour in mol.neighbors(current) {
-        let next = neighbour.atom_idx;
-
-        // If current_atom == atom we started with |> We found a Ring
-        if next == start && path.len() >= 3 {
-            rings.push(path.clone());
-            continue;
-        }
-
-        if !visited[next] && path.len() <= max_size {
-            visited[next] = true;
-            path.push(next);
-            dfs_rings(mol, next, start, path, visited, rings, max_size);
-            path.pop();
-            visited[next] = false;
+        if is_aromatic_ring(mol, ring.atoms()) {
+            mark_ring_aromatic(mol, ring.atoms());
         }
     }
 }
@@ -356,7 +239,7 @@ mod tests {
         }
 
         // Test ring detection specifically
-        let rings = find_rings(&mol);
+        let rings = find_sssr(&mol);
 
         // Should find at least 2 rings (the two fused benzenes)
         // Might find more depending on the algorithm (e.g., outer perimeter)
@@ -378,13 +261,13 @@ mod tests {
         // Verify each 6-membered ring is aromatic
         for ring in six_membered_rings {
             assert!(
-                is_aromatic_ring(&mol, ring),
+                is_aromatic_ring(&mol, ring.atoms()),
                 "Six-membered ring {:?} should be aromatic",
                 ring
             );
 
             // Verify all atoms in the ring are marked aromatic
-            for &atom_idx in ring.iter() {
+            for &atom_idx in ring.atoms() {
                 assert!(
                     mol.atom(atom_idx).is_aromatic(),
                     "Atom {} in aromatic ring should be marked aromatic",

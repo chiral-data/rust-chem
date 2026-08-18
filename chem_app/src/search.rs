@@ -180,17 +180,11 @@ impl FingerprintSearch {
     // (blocking would deadlock the browser's single JS thread — see
     // Self::new). Still part of the public API and exercised by tests.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub fn generate_fingerprint(
-        &self,
-        mol: &Molecule,
-        radius: u32,
-        fp_size: u32,
-    ) -> anyhow::Result<BitVec> {
-        pollster::block_on(self.generate_fingerprint_async(mol, radius, fp_size))
-    }
-
-    /// Async twin of [`Self::generate_fingerprint`] for callers that can't
-    /// block the current thread (namely wasm32).
+    /// Generates a fingerprint, on the GPU where one is available.
+    ///
+    /// Async on every platform: wasm32 can't block, and native callers go
+    /// through `task::Task`, which does the blocking in one place rather than
+    /// each operation carrying a sync twin of itself.
     pub async fn generate_fingerprint_async(
         &self,
         mol: &Molecule,
@@ -205,19 +199,7 @@ impl FingerprintSearch {
         }
     }
 
-    // Unused on wasm32 — see the note on generate_fingerprint above.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub fn generate_fingerprints_batch(
-        &self,
-        molecules: &[Molecule],
-        radius: u32,
-        fp_size: u32,
-    ) -> anyhow::Result<Vec<BitVec>> {
-        pollster::block_on(self.generate_fingerprints_batch_async(molecules, radius, fp_size))
-    }
-
-    /// Async twin of [`Self::generate_fingerprints_batch`] for callers that
-    /// can't block the current thread (namely wasm32).
+    /// Batch form of [`Self::generate_fingerprint_async`].
     pub async fn generate_fingerprints_batch_async(
         &self,
         molecules: &[Molecule],
@@ -255,19 +237,9 @@ impl FingerprintSearch {
         self.gpu_targets = None;
     }
 
-    // Unused on wasm32 — see the note on generate_fingerprint above.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub fn search(
-        &mut self,
-        query_fp: &BitVec,
-        target_fps: &[BitVec],
-        top_k: usize,
-    ) -> anyhow::Result<Vec<SearchResult>> {
-        pollster::block_on(self.search_async(query_fp, target_fps, top_k))
-    }
-
-    /// Async twin of [`Self::search`] for callers that can't block the
-    /// current thread (namely wasm32).
+    /// Ranks `target_fps` against `query_fp`, on the GPU where one is
+    /// available. Async for the same reason as
+    /// [`Self::generate_fingerprint_async`].
     pub async fn search_async(
         &mut self,
         query_fp: &BitVec,
@@ -462,6 +434,12 @@ impl Default for FingerprintSearch {
 mod tests {
     use super::*;
 
+    /// The tests are sync, so they do the blocking the app delegates to
+    /// `task::Task`.
+    fn block<T>(future: impl std::future::Future<Output = T>) -> T {
+        pollster::block_on(future)
+    }
+
     #[test]
     fn test_gpu_search_rejects_mismatched_fingerprint_size() {
         let mut search = FingerprintSearch::new();
@@ -477,7 +455,7 @@ mod tests {
         let query_fp = BitVec::repeat(false, 2048);
         let mismatched_targets = vec![BitVec::repeat(false, 1024), BitVec::repeat(false, 1024)];
 
-        let result = search.search(&query_fp, &mismatched_targets, 2);
+        let result = block(search.search_async(&query_fp, &mismatched_targets, 2));
         assert!(
             result.is_err(),
             "expected a size-mismatch error, got {:?}",
@@ -499,7 +477,7 @@ mod tests {
         let query_fp = BitVec::repeat(false, 2048);
         let mismatched_targets = vec![BitVec::repeat(false, 1024), BitVec::repeat(false, 1024)];
 
-        let result = search.search(&query_fp, &mismatched_targets, 2);
+        let result = block(search.search_async(&query_fp, &mismatched_targets, 2));
         assert!(
             result.is_err(),
             "expected a size-mismatch error, got {:?}",
@@ -514,7 +492,7 @@ mod tests {
         let query_fp = BitVec::repeat(true, 2048);
 
         let dataset_a = vec![BitVec::repeat(true, 2048)];
-        let results_a = search.search(&query_fp, &dataset_a, 1).unwrap();
+        let results_a = block(search.search_async(&query_fp, &dataset_a, 1)).unwrap();
         assert!(
             (results_a[0].similarity - 1.0).abs() < 1e-6,
             "expected perfect self-similarity, got {:?}",
@@ -522,7 +500,7 @@ mod tests {
         );
 
         let dataset_b = vec![BitVec::repeat(false, 2048)];
-        let results_b = search.search(&query_fp, &dataset_b, 1).unwrap();
+        let results_b = block(search.search_async(&query_fp, &dataset_b, 1)).unwrap();
         assert!(
             results_b[0].similarity.abs() < 1e-6,
             "expected zero similarity against an all-zero target, got {:?}",
@@ -535,14 +513,13 @@ mod tests {
         let search = FingerprintSearch::new_cpu_only();
         let mol = chemio::smiles::parse_smiles("c1ccccc1").expect("valid SMILES");
 
-        let fp = search
-            .generate_fingerprint(&mol, 2, 2048)
+        let fp = block(search.generate_fingerprint_async(&mol, 2, 2048))
             .expect("CPU fingerprint generation should succeed");
         assert_eq!(fp.len(), 2048);
 
-        let batch = search
-            .generate_fingerprints_batch(std::slice::from_ref(&mol), 2, 2048)
-            .expect("CPU batch fingerprint generation should succeed");
+        let batch =
+            block(search.generate_fingerprints_batch_async(std::slice::from_ref(&mol), 2, 2048))
+                .expect("CPU batch fingerprint generation should succeed");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].len(), 2048);
     }
@@ -562,7 +539,7 @@ mod tests {
 
         let dataset_a = vec![BitVec::repeat(true, 2048)];
         search.set_target_dataset(&dataset_a).unwrap();
-        let results_a = search.search(&query_fp, &dataset_a, 1).unwrap();
+        let results_a = block(search.search_async(&query_fp, &dataset_a, 1)).unwrap();
         assert!(
             (results_a[0].similarity - 1.0).abs() < 1e-6,
             "expected perfect self-similarity against dataset A, got {:?}",
@@ -571,7 +548,7 @@ mod tests {
 
         let dataset_b = vec![BitVec::repeat(false, 2048)];
         search.set_target_dataset(&dataset_b).unwrap();
-        let results_b = search.search(&query_fp, &dataset_b, 1).unwrap();
+        let results_b = block(search.search_async(&query_fp, &dataset_b, 1)).unwrap();
         assert!(
             results_b[0].similarity.abs() < 1e-6,
             "expected zero similarity against dataset B, got a stale result from dataset A: {:?}",

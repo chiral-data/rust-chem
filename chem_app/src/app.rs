@@ -2,11 +2,17 @@ use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
 use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
+use crate::structure_view::{
+    ShowCarbons, StructureOptions, StructureView, structure_display_section,
+    structure_panel_with_options,
+};
+use crate::task::Task;
 use bitvec::prelude::BitVec;
+use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
 use chemio::aromaticity::detect_aromaticity;
 use chemio::smiles::parse_smiles;
-use egui::{Color32, RichText};
+use egui::{Color32, RichText, Vec2};
 // std::time::Instant panics at runtime on wasm32-unknown-unknown (no clock
 // source there); web-time is a drop-in replacement that re-exports std on
 // native and uses performance.now() on web.
@@ -17,14 +23,15 @@ use chemgpu::{GpuMorganFingerprint, GpuTanimoto};
 #[cfg(target_arch = "wasm32")]
 use std::{cell::RefCell, rc::Rc};
 
+/// Rows of the dataset table drawn at once. Datasets run to tens of thousands
+/// of molecules, so the table shows a window rather than all of them — and it
+/// bounds how many structures a thumbnail pass has to lay out.
+const MAX_TABLE_ROWS: usize = 20;
+
 /// How long the query SMILES box must sit idle before we run fingerprint
 /// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 
-// A pending async task's slot: `None` while in flight, filled with its
-// result (and how long it took, in ms) once `spawn_local`'s future resolves.
-#[cfg(target_arch = "wasm32")]
-type PendingSlot<T> = Rc<RefCell<Option<(anyhow::Result<T>, f64)>>>;
 #[cfg(target_arch = "wasm32")]
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
 #[cfg(target_arch = "wasm32")]
@@ -56,6 +63,17 @@ pub struct ChemFpDemoApp {
     // detail view. Indexes into the active dataset, so it's reset alongside
     // dataset_fingerprints/search_results whenever the active dataset changes.
     selected_dataset_row: Option<usize>,
+    // The detail window rebuilds its contents every frame, and a molecule from
+    // SMILES has to be laid out before it can be drawn, so the laid-out copy is
+    // cached against the row it came from rather than recomputed each frame.
+    detail_molecule: Option<(usize, Molecule)>,
+    // Atom-display settings for the structure view, held here so they persist
+    // across selections rather than resetting each time a molecule is opened.
+    structure_options: StructureOptions,
+    /// Whether the dataset table draws a structure per row. Off by default:
+    /// it's a per-row render, and most of the time the table is being scanned
+    /// for names and numbers rather than shapes.
+    show_thumbnails: bool,
     fp_radius: u32,
     fp_size: u32,
     top_k: usize,
@@ -75,12 +93,11 @@ pub struct ChemFpDemoApp {
     // it succeed.
     #[cfg(target_arch = "wasm32")]
     pending_gpu_init: PendingGpuInit,
-    #[cfg(target_arch = "wasm32")]
-    pending_dataset_fingerprints: PendingSlot<Vec<BitVec>>,
-    #[cfg(target_arch = "wasm32")]
-    pending_query_fingerprint: PendingSlot<BitVec>,
-    #[cfg(target_arch = "wasm32")]
-    pending_search_results: PendingSlot<Vec<SearchResult>>,
+    // GPU-capable work, which is async on wasm32. Each is started in one
+    // place and collected in `update()`; see `task::Task`.
+    dataset_fingerprint_task: Task<Vec<BitVec>>,
+    query_fingerprint_task: Task<BitVec>,
+    search_task: Task<Vec<SearchResult>>,
 }
 
 impl ChemFpDemoApp {
@@ -112,6 +129,9 @@ impl ChemFpDemoApp {
             search_results: Vec::new(),
             selected_result: None,
             selected_dataset_row: None,
+            detail_molecule: None,
+            structure_options: StructureOptions::default(),
+            show_thumbnails: false,
             fp_radius: 2,
             fp_size: 2048,
             top_k: 10,
@@ -124,12 +144,9 @@ impl ChemFpDemoApp {
             pending_file_load: Rc::new(RefCell::new(None)),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
-            #[cfg(target_arch = "wasm32")]
-            pending_dataset_fingerprints: Rc::new(RefCell::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            pending_query_fingerprint: Rc::new(RefCell::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            pending_search_results: Rc::new(RefCell::new(None)),
+            dataset_fingerprint_task: Task::new(),
+            query_fingerprint_task: Task::new(),
+            search_task: Task::new(),
         }
     }
 
@@ -207,6 +224,7 @@ impl ChemFpDemoApp {
                 self.search_results.clear();
                 self.selected_result = None;
                 self.selected_dataset_row = None;
+                self.detail_molecule = None;
                 log::info!("Dataset loaded successfully");
             }
             Err(e) => {
@@ -230,6 +248,7 @@ impl ChemFpDemoApp {
                 self.search_results.clear();
                 self.selected_result = None;
                 self.selected_dataset_row = None;
+                self.detail_molecule = None;
             }
             Err(e) => {
                 self.dataset_status = format!("Failed to load examples: {}", e);
@@ -253,6 +272,7 @@ impl ChemFpDemoApp {
         self.search_results.clear();
         self.selected_result = None;
         self.selected_dataset_row = None;
+        self.detail_molecule = None;
     }
 
     fn precompute_dataset_fingerprints(&mut self) {
@@ -280,43 +300,21 @@ impl ChemFpDemoApp {
         self.dataset_status = format!("Detected aromaticity for {} molecules", dataset.len());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Clones a snapshot of the search engine to hand to the task rather than
+    /// borrowing `self`, which a spawned future can't do. The clone is cheap —
+    /// the GPU handles behind it are `Arc`-backed — and its own GPU target
+    /// cache is discarded when the task ends, costing one extra upload on the
+    /// next search rather than any wrong answer.
     fn precompute_dataset_fingerprints_dispatch(&mut self) {
-        let start = Instant::now();
-        let result = self.search_engine.generate_fingerprints_batch(
-            &self.loaded_files.active_dataset().molecules,
-            self.fp_radius,
-            self.fp_size,
-        );
-        if let Ok(fps) = &result
-            && let Err(e) = self.search_engine.set_target_dataset(fps)
-        {
-            log::warn!("Failed to upload dataset to GPU: {}", e);
-        }
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.apply_dataset_fingerprints_result(result, elapsed_ms);
-    }
-
-    // Clones a snapshot of search_engine (cheap — see FingerprintSearch's
-    // doc comment) to move into the spawned future instead of borrowing
-    // `self` across the await boundary. The snapshot's own GPU-target-cache
-    // upload (if any) is discarded once the task completes — `search_async`
-    // re-uploads lazily as needed regardless, so this only costs one extra
-    // upload on the next search rather than any actual bug.
-    #[cfg(target_arch = "wasm32")]
-    fn precompute_dataset_fingerprints_dispatch(&mut self) {
-        let search_snapshot = self.search_engine.clone();
+        let engine = self.search_engine.clone();
         let molecules = self.loaded_files.active_dataset().molecules.clone();
         let radius = self.fp_radius;
         let fp_size = self.fp_size;
-        let slot = self.pending_dataset_fingerprints.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let start = Instant::now();
-            let result = search_snapshot
+
+        self.dataset_fingerprint_task.start(async move {
+            engine
                 .generate_fingerprints_batch_async(&molecules, radius, fp_size)
-                .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            *slot.borrow_mut() = Some((result, elapsed_ms));
+                .await
         });
     }
 
@@ -357,7 +355,11 @@ impl ChemFpDemoApp {
         }
 
         match parse_smiles(smiles) {
-            Ok(mol) => {
+            Ok(mut mol) => {
+                // SMILES has no geometry. Laying out here rather than at draw
+                // time means it happens once per parse (already debounced)
+                // instead of every frame.
+                ensure_coords(&mut mol);
                 self.query_molecule = Some(mol.clone());
                 self.query_error = None;
                 self.generate_query_fingerprint(mol);
@@ -370,29 +372,15 @@ impl ChemFpDemoApp {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn generate_query_fingerprint(&mut self, mol: Molecule) {
-        let start = Instant::now();
-        let result = self
-            .search_engine
-            .generate_fingerprint(&mol, self.fp_radius, self.fp_size);
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.apply_query_fingerprint_result(result, elapsed_ms);
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn generate_query_fingerprint(&mut self, mol: Molecule) {
-        let search_snapshot = self.search_engine.clone();
+        let engine = self.search_engine.clone();
         let radius = self.fp_radius;
         let fp_size = self.fp_size;
-        let slot = self.pending_query_fingerprint.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let start = Instant::now();
-            let result = search_snapshot
+
+        self.query_fingerprint_task.start(async move {
+            engine
                 .generate_fingerprint_async(&mol, radius, fp_size)
-                .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            *slot.borrow_mut() = Some((result, elapsed_ms));
+                .await
         });
     }
 
@@ -420,30 +408,13 @@ impl ChemFpDemoApp {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn run_search_dispatch(&mut self, query_fp: BitVec) {
-        let start = Instant::now();
-        let result = self
-            .search_engine
-            .search(&query_fp, &self.dataset_fingerprints, self.top_k);
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.apply_search_result(result, elapsed_ms);
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn run_search_dispatch(&mut self, query_fp: BitVec) {
-        let mut search_snapshot = self.search_engine.clone();
+        let mut engine = self.search_engine.clone();
         let target_fps = self.dataset_fingerprints.clone();
         let top_k = self.top_k;
-        let slot = self.pending_search_results.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let start = Instant::now();
-            let result = search_snapshot
-                .search_async(&query_fp, &target_fps, top_k)
-                .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            *slot.borrow_mut() = Some((result, elapsed_ms));
-        });
+
+        self.search_task
+            .start(async move { engine.search_async(&query_fp, &target_fps, top_k).await });
     }
 
     fn apply_search_result(&mut self, result: anyhow::Result<Vec<SearchResult>>, elapsed_ms: f64) {
@@ -589,19 +560,46 @@ impl ChemFpDemoApp {
                         "Fingerprints computed: {}",
                         self.dataset_fingerprints.len()
                     ));
+                    structure_display_section(
+                        ui,
+                        &mut self.structure_options,
+                        &mut self.show_thumbnails,
+                    );
 
                     ui.separator();
 
                     let num_fingerprints = self.dataset_fingerprints.len();
-                    let shown = active_dataset.len().min(20);
+                    let shown = active_dataset.len().min(MAX_TABLE_ROWS);
+
+                    // A thumbnail is ~64x48, so it's read as a shape rather
+                    // than for its labels: hydrogens are dropped and the
+                    // structure fits its cell rather than using a shared bond
+                    // length. Fixed-length sizing keeps a column comparable
+                    // (#78) but lets a large molecule overflow, and at this
+                    // size containment matters more.
+                    //
+                    // Carbons stay on Default rather than None: None would
+                    // leave a lone carbon with neither a label nor a bond, so
+                    // methane's cell would draw empty.
+                    let thumbnail_options = StructureOptions {
+                        padding: 2.0,
+                        show_carbons: ShowCarbons::Default,
+                        explicit_hydrogens: false,
+                        scale: 0.0,
+                        bond_length: 0.0,
+                        ..self.structure_options
+                    };
                     let mut clicked_row = None;
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         egui::Grid::new("dataset_table")
-                            .num_columns(6)
+                            .num_columns(if self.show_thumbnails { 7 } else { 6 })
                             .spacing([8.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
+                                if self.show_thumbnails {
+                                    ui.label(RichText::new("Structure").strong());
+                                }
                                 ui.label(RichText::new("Name").strong());
                                 ui.label(RichText::new("SMILES").strong());
                                 ui.label(RichText::new("Formula").strong());
@@ -614,6 +612,12 @@ impl ChemFpDemoApp {
                                     let mol = &active_dataset.molecules[i];
                                     let is_selected = self.selected_dataset_row == Some(i);
 
+                                    if self.show_thumbnails {
+                                        ui.add(
+                                            StructureView::new(mol, Vec2::new(64.0, 48.0))
+                                                .with_options(thumbnail_options),
+                                        );
+                                    }
                                     if ui
                                         .selectable_label(is_selected, &active_dataset.names[i])
                                         .clicked()
@@ -654,16 +658,47 @@ impl ChemFpDemoApp {
     // (info grid + atom list + bond list) can be taller than that on a
     // short viewport with no way to scroll to the rest of it. A window is
     // independently movable/resizable and scrolls on its own if needed.
+    /// Lays out the molecules the dataset table is about to draw.
+    ///
+    /// Only the visible window is touched — a dataset can hold tens of
+    /// thousands of molecules, and laying all of them out to show twenty would
+    /// stall the frame. `ensure_coords` returns immediately for anything
+    /// already positioned, so this costs nothing after the first frame and
+    /// leaves SDF-supplied coordinates alone.
+    fn prepare_thumbnails(&mut self) {
+        if !self.show_thumbnails {
+            return;
+        }
+        let dataset = self.loaded_files.active_dataset_mut();
+        for mol in dataset.molecules.iter_mut().take(MAX_TABLE_ROWS) {
+            ensure_coords(mol);
+        }
+    }
+
     fn molecule_detail_window(&mut self, ctx: &egui::Context) {
         let Some(i) = self.selected_dataset_row else {
             return;
         };
         let active_dataset = self.loaded_files.active_dataset();
-        let Some(mol) = active_dataset.molecules.get(i) else {
+        let Some(source) = active_dataset.molecules.get(i) else {
             return;
         };
         let name = active_dataset.names[i].clone();
         let smiles = active_dataset.smiles[i].clone();
+
+        // Molecules parsed from SMILES carry no coordinates, so one is
+        // generated here; SDF-sourced molecules keep the layout their file
+        // supplied. Done once per selected row rather than every frame, since
+        // laying out a large molecule isn't free.
+        let needs_layout = !matches!(&self.detail_molecule, Some((cached, _)) if *cached == i);
+        if needs_layout {
+            let mut prepared = source.clone();
+            ensure_coords(&mut prepared);
+            self.detail_molecule = Some((i, prepared));
+        }
+        let Some((_, mol)) = &self.detail_molecule else {
+            return;
+        };
         let mol = mol.clone();
 
         // Caps the window itself to the available viewport height (minus
@@ -682,6 +717,7 @@ impl ChemFpDemoApp {
             .max_height(max_height)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    structure_panel_with_options(ui, &mol, 220.0, self.structure_options);
                     show_molecule_info(ui, &mol, &smiles, &name);
                     show_atom_list(ui, &mol);
                     show_bond_list(ui, &mol);
@@ -690,6 +726,7 @@ impl ChemFpDemoApp {
 
         if !open {
             self.selected_dataset_row = None;
+            self.detail_molecule = None;
         }
     }
 
@@ -717,9 +754,13 @@ impl ChemFpDemoApp {
                     ui.colored_label(Color32::RED, error);
                 }
 
-                if let Some(ref mol) = self.query_molecule {
+                if let Some(mol) = self.query_molecule.clone() {
                     ui.separator();
-                    show_molecule_info(ui, mol, &self.query_smiles, "Query");
+                    // Above the text details: seeing the structure is how you
+                    // tell at a glance whether the SMILES you typed is the
+                    // molecule you meant.
+                    structure_panel_with_options(ui, &mol, 180.0, self.structure_options);
+                    show_molecule_info(ui, &mol, &self.query_smiles, "Query");
                 }
 
                 if let Some(ref fp) = self.query_fingerprint {
@@ -875,21 +916,19 @@ impl eframe::App for ChemFpDemoApp {
                 }
                 None => {} // still pending
             }
+        }
 
-            let fingerprints = self.pending_dataset_fingerprints.borrow_mut().take();
-            if let Some((result, elapsed_ms)) = fingerprints {
-                self.apply_dataset_fingerprints_result(result, elapsed_ms);
-            }
-
-            let query_fp = self.pending_query_fingerprint.borrow_mut().take();
-            if let Some((result, elapsed_ms)) = query_fp {
-                self.apply_query_fingerprint_result(result, elapsed_ms);
-            }
-
-            let search_results = self.pending_search_results.borrow_mut().take();
-            if let Some((result, elapsed_ms)) = search_results {
-                self.apply_search_result(result, elapsed_ms);
-            }
+        // Collected on both platforms alike: the task ran on a spawned future
+        // (wasm32) or inline (native), but either way its result is applied
+        // here rather than at the call site.
+        if let Some((result, elapsed_ms)) = self.dataset_fingerprint_task.poll() {
+            self.apply_dataset_fingerprints_result(result, elapsed_ms);
+        }
+        if let Some((result, elapsed_ms)) = self.query_fingerprint_task.poll() {
+            self.apply_query_fingerprint_result(result, elapsed_ms);
+        }
+        if let Some((result, elapsed_ms)) = self.search_task.poll() {
+            self.apply_search_result(result, elapsed_ms);
         }
 
         let frame_time = ctx.input(|i| i.stable_dt as f64);
@@ -915,6 +954,8 @@ impl eframe::App for ChemFpDemoApp {
                 ctx.request_repaint_after(QUERY_DEBOUNCE - elapsed);
             }
         }
+
+        self.prepare_thumbnails();
 
         self.top_panel(ctx);
         self.dataset_panel(ctx);
