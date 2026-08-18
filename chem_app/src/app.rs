@@ -4,6 +4,7 @@ use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, sho
 use crate::search::{FingerprintSearch, SearchResult};
 use crate::structure_view::structure_panel;
 use bitvec::prelude::BitVec;
+use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
 use chemio::aromaticity::detect_aromaticity;
 use chemio::smiles::parse_smiles;
@@ -57,6 +58,10 @@ pub struct ChemFpDemoApp {
     // detail view. Indexes into the active dataset, so it's reset alongside
     // dataset_fingerprints/search_results whenever the active dataset changes.
     selected_dataset_row: Option<usize>,
+    // The detail window rebuilds its contents every frame, and a molecule from
+    // SMILES has to be laid out before it can be drawn, so the laid-out copy is
+    // cached against the row it came from rather than recomputed each frame.
+    detail_molecule: Option<(usize, Molecule)>,
     fp_radius: u32,
     fp_size: u32,
     top_k: usize,
@@ -113,6 +118,7 @@ impl ChemFpDemoApp {
             search_results: Vec::new(),
             selected_result: None,
             selected_dataset_row: None,
+            detail_molecule: None,
             fp_radius: 2,
             fp_size: 2048,
             top_k: 10,
@@ -208,6 +214,7 @@ impl ChemFpDemoApp {
                 self.search_results.clear();
                 self.selected_result = None;
                 self.selected_dataset_row = None;
+                self.detail_molecule = None;
                 log::info!("Dataset loaded successfully");
             }
             Err(e) => {
@@ -231,6 +238,7 @@ impl ChemFpDemoApp {
                 self.search_results.clear();
                 self.selected_result = None;
                 self.selected_dataset_row = None;
+                self.detail_molecule = None;
             }
             Err(e) => {
                 self.dataset_status = format!("Failed to load examples: {}", e);
@@ -254,6 +262,7 @@ impl ChemFpDemoApp {
         self.search_results.clear();
         self.selected_result = None;
         self.selected_dataset_row = None;
+        self.detail_molecule = None;
     }
 
     fn precompute_dataset_fingerprints(&mut self) {
@@ -660,11 +669,25 @@ impl ChemFpDemoApp {
             return;
         };
         let active_dataset = self.loaded_files.active_dataset();
-        let Some(mol) = active_dataset.molecules.get(i) else {
+        let Some(source) = active_dataset.molecules.get(i) else {
             return;
         };
         let name = active_dataset.names[i].clone();
         let smiles = active_dataset.smiles[i].clone();
+
+        // Molecules parsed from SMILES carry no coordinates, so one is
+        // generated here; SDF-sourced molecules keep the layout their file
+        // supplied. Done once per selected row rather than every frame, since
+        // laying out a large molecule isn't free.
+        let needs_layout = !matches!(&self.detail_molecule, Some((cached, _)) if *cached == i);
+        if needs_layout {
+            let mut prepared = source.clone();
+            ensure_coords(&mut prepared);
+            self.detail_molecule = Some((i, prepared));
+        }
+        let Some((_, mol)) = &self.detail_molecule else {
+            return;
+        };
         let mol = mol.clone();
 
         // Caps the window itself to the available viewport height (minus
@@ -692,6 +715,7 @@ impl ChemFpDemoApp {
 
         if !open {
             self.selected_dataset_row = None;
+            self.detail_molecule = None;
         }
     }
 
