@@ -6,6 +6,39 @@ use chemcore::geometry::{BoundingBox, Point2};
 use chemcore::molecule::Molecule;
 use chemcore::rings::find_sssr;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, Widget};
+use std::collections::HashSet;
+
+/// Which carbons get a visible label.
+///
+/// Chemical convention leaves carbons as implicit vertices — a benzene ring is
+/// six lines, not six "C" glyphs — so the useful question is which ones are
+/// exceptions. Mirrors smilesDrawer's `showCarbons`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowCarbons {
+    /// Never, even where nothing else marks the atom's position.
+    None,
+    /// Only where the vertex alone wouldn't show the atom exists — an isolated
+    /// carbon with no bonds, which would otherwise draw as an empty panel.
+    Default,
+    /// Also chain ends, which the eye can otherwise miscount.
+    Terminal,
+    /// Also every carbon outside a ring.
+    Acyclic,
+    /// Every carbon.
+    All,
+}
+
+/// How atoms are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomVisualization {
+    /// Element symbol as text.
+    Default,
+    /// A filled dot, coloured by element — legible at thumbnail sizes where
+    /// text would be unreadable.
+    Balls,
+    /// Nothing; bonds only.
+    None,
+}
 
 /// Rendering options for [`StructureView`].
 ///
@@ -46,8 +79,20 @@ pub struct StructureOptions {
     /// aromatic bond *off* a ring puts its two lines symmetrically about the
     /// bond axis, so neither is the inner one to shorten.
     pub short_bond_length: f32,
+    /// Which carbons get a label.
+    pub show_carbons: ShowCarbons,
+    /// Whether hydrogens present as atoms in the graph are drawn. SDF files
+    /// usually carry them explicitly, and a structure reads more cleanly
+    /// without them; SMILES generally leaves them implicit, so this has no
+    /// effect there. smilesDrawer's `explicitHydrogens`.
+    pub explicit_hydrogens: bool,
+    /// How atoms are drawn (smilesDrawer's `atomVisualization`).
+    pub atom_visualization: AtomVisualization,
     /// Atom label height as a fraction of bond length.
     pub font_size_ratio: f32,
+    /// Charge and isotope annotation height, as a fraction of the main label
+    /// (smilesDrawer splits these as `fontSizeLarge`/`fontSizeSmall`).
+    pub font_size_small_ratio: f32,
     /// Clamp for the derived font size, so labels stay legible on very small
     /// renders and don't dominate very large ones.
     pub font_size_range: (f32, f32),
@@ -65,7 +110,11 @@ impl Default for StructureOptions {
             bond_spacing_ratio: 0.17,
             bond_thickness: 1.0,
             short_bond_length: 0.8,
+            show_carbons: ShowCarbons::Default,
+            explicit_hydrogens: true,
+            atom_visualization: AtomVisualization::Default,
             font_size_ratio: 0.42,
+            font_size_small_ratio: 0.62,
             font_size_range: (7.0, 22.0),
             label_margin_ratio: 0.18,
         }
@@ -282,18 +331,76 @@ impl StructureTheme {
     }
 }
 
-/// Whether this atom gets a drawn label.
+/// Whether an atom is drawn at all.
 ///
-/// Carbons are implicit vertices — a benzene ring is six lines, not six "C"
-/// glyphs — so only heteroatoms are labeled. Making this configurable
-/// (smilesDrawer's `showCarbons` modes, explicit hydrogens) is #80's job; this
-/// is the baseline chemical convention it will override.
-fn is_labeled(molecule: &Molecule, atom_idx: usize) -> bool {
-    molecule.atom(atom_idx).atomic_number() != 6
+/// Hidden atoms take their bonds with them — a dangling bond to nothing reads
+/// as a mistake rather than as an omitted hydrogen.
+fn is_hidden(molecule: &Molecule, atom_idx: usize, options: &StructureOptions) -> bool {
+    !options.explicit_hydrogens && molecule.atom(atom_idx).atomic_number() == 1
 }
 
+/// Whether this atom gets a drawn label.
+///
+/// Heteroatoms always do. Carbons follow [`ShowCarbons`], since convention
+/// leaves them as implicit vertices.
+fn is_labeled(
+    molecule: &Molecule,
+    atom_idx: usize,
+    options: &StructureOptions,
+    ring_atoms: &HashSet<usize>,
+) -> bool {
+    if is_hidden(molecule, atom_idx, options) {
+        return false;
+    }
+    if molecule.atom(atom_idx).atomic_number() != 6 {
+        return true;
+    }
+
+    // Bonds to hidden hydrogens don't count towards the degree used here: with
+    // hydrogens off, a methyl carbon is visually terminal even though the graph
+    // still says otherwise.
+    let visible_degree = molecule
+        .neighbors(atom_idx)
+        .iter()
+        .filter(|n| !is_hidden(molecule, n.atom_idx, options))
+        .count();
+
+    match options.show_carbons {
+        ShowCarbons::None => false,
+        // An isolated carbon has no vertex to imply it, so without a label it
+        // would draw as nothing at all.
+        ShowCarbons::Default => visible_degree == 0,
+        ShowCarbons::Terminal => visible_degree <= 1,
+        ShowCarbons::Acyclic => visible_degree <= 1 || !ring_atoms.contains(&atom_idx),
+        ShowCarbons::All => true,
+    }
+}
+
+/// The element symbol drawn for an atom.
 fn atom_label(molecule: &Molecule, atom_idx: usize) -> String {
     molecule.atom(atom_idx).element().symbol().to_string()
+}
+
+/// The charge/isotope annotation drawn beside an atom, if it has one.
+///
+/// Rendered smaller and offset rather than inline, so `O` with a negative
+/// charge reads as an annotated oxygen rather than as a two-character element.
+fn atom_annotation(molecule: &Molecule, atom_idx: usize) -> Option<String> {
+    let atom = molecule.atom(atom_idx);
+    let mut out = String::new();
+
+    if let Some(isotope) = atom.isotope() {
+        out.push_str(&isotope.to_string());
+    }
+    match atom.formal_charge() {
+        0 => {}
+        1 => out.push('+'),
+        -1 => out.push('-'),
+        c if c > 0 => out.push_str(&format!("{c}+")),
+        c => out.push_str(&format!("{}-", -c)),
+    }
+
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Distance from the center of an axis-aligned box with the given half-extents
@@ -323,11 +430,16 @@ fn box_edge_distance(dir: Vec2, half_w: f32, half_h: f32) -> f32 {
 /// interior, so its second line can be drawn there rather than on an arbitrary
 /// side. A bond shared between fused rings gets the centre of the *smallest*
 /// ring containing it, matching how such bonds are conventionally drawn.
-fn ring_bond_centers(molecule: &Molecule, transform: &Transform) -> Vec<Option<Pos2>> {
+fn ring_bond_centers(
+    molecule: &Molecule,
+    transform: &Transform,
+) -> (Vec<Option<Pos2>>, HashSet<usize>) {
     let mut centers: Vec<Option<Pos2>> = vec![None; molecule.num_bonds()];
     let mut chosen_ring_size: Vec<usize> = vec![usize::MAX; molecule.num_bonds()];
+    let mut ring_atoms: HashSet<usize> = HashSet::new();
 
     for ring in find_sssr(molecule) {
+        ring_atoms.extend(ring.atoms().iter().copied());
         let positions: Vec<Pos2> = ring
             .atoms()
             .iter()
@@ -351,7 +463,7 @@ fn ring_bond_centers(molecule: &Molecule, transform: &Transform) -> Vec<Option<P
         }
     }
 
-    centers
+    (centers, ring_atoms)
 }
 
 /// Mean distance between bonded atoms in the molecule's own coordinate space,
@@ -446,12 +558,18 @@ impl Widget for StructureView<'_> {
         let font_id = FontId::proportional(font_size);
         let stroke = Stroke::new(self.options.bond_thickness, color);
 
+        // Ring membership drives both which carbons get labelled and which way
+        // is "into the ring" for a multiple bond's second line.
+        let (ring_centers, ring_atoms) = ring_bond_centers(self.molecule, &transform);
+
         // Lay out the labels first: their sizes determine how far to pull the
         // bond endpoints back, which has to be known before any bond is drawn.
         let label_margin = font_size * self.options.label_margin_ratio;
         let label_half_extents: Vec<Option<Vec2>> = (0..self.molecule.num_atoms())
             .map(|atom_idx| {
-                if !is_labeled(self.molecule, atom_idx) {
+                if self.options.atom_visualization != AtomVisualization::Default
+                    || !is_labeled(self.molecule, atom_idx, &self.options, &ring_atoms)
+                {
                     return None;
                 }
                 let galley = ui.painter().layout_no_wrap(
@@ -465,13 +583,14 @@ impl Widget for StructureView<'_> {
 
         let painter = ui.painter();
 
-        // Which way is "into the ring" for each ring bond, so the second line
-        // of a multiple bond can be drawn on that side as convention requires.
-        let ring_centers = ring_bond_centers(self.molecule, &transform);
-
         // Bonds under labels, so the labels read cleanly on top.
         for (bond_idx, bond) in self.molecule.bonds().iter().enumerate() {
             let (a, b) = bond.atoms();
+            if is_hidden(self.molecule, a, &self.options)
+                || is_hidden(self.molecule, b, &self.options)
+            {
+                continue;
+            }
             let (Some(pa), Some(pb)) = (self.molecule.coord(a), self.molecule.coord(b)) else {
                 continue;
             };
@@ -584,20 +703,53 @@ impl Widget for StructureView<'_> {
             }
         }
 
+        let small_font = FontId::proportional(font_size * self.options.font_size_small_ratio);
+
         for (atom_idx, half_extent) in label_half_extents.iter().enumerate() {
-            if half_extent.is_none() {
+            if is_hidden(self.molecule, atom_idx, &self.options) {
                 continue;
             }
             let Some(p) = self.molecule.coord(atom_idx) else {
                 continue;
             };
-            painter.text(
-                transform.apply(p),
+            let pos = transform.apply(p);
+            let element_color = theme.element_color(self.molecule.atom(atom_idx).atomic_number());
+
+            match self.options.atom_visualization {
+                AtomVisualization::None => continue,
+                AtomVisualization::Balls => {
+                    // Sized off the bond length so dots stay proportionate at
+                    // any scale, same reasoning as the font size.
+                    painter.circle_filled(pos, (bond_len * 0.16).max(1.5), element_color);
+                    continue;
+                }
+                AtomVisualization::Default => {}
+            }
+
+            if half_extent.is_none() {
+                continue;
+            }
+
+            let label_rect = painter.text(
+                pos,
                 Align2::CENTER_CENTER,
                 atom_label(self.molecule, atom_idx),
                 font_id.clone(),
-                theme.element_color(self.molecule.atom(atom_idx).atomic_number()),
+                element_color,
             );
+
+            // Charge and isotope go above-right of the symbol, smaller — the
+            // superscript position chemists expect, and it keeps `O` with a
+            // charge from reading as a two-character element symbol.
+            if let Some(annotation) = atom_annotation(self.molecule, atom_idx) {
+                painter.text(
+                    label_rect.right_top(),
+                    Align2::LEFT_CENTER,
+                    annotation,
+                    small_font.clone(),
+                    element_color,
+                );
+            }
         }
 
         response
@@ -622,13 +774,72 @@ impl NormalizedOrZero for Vec2 {
     }
 }
 
-/// Draws a molecule's structure in a bordered group with a heading, fitted to
-/// the available width.
-pub fn structure_panel(ui: &mut Ui, molecule: &Molecule, height: f32) {
-    structure_panel_with_options(ui, molecule, height, StructureOptions::default());
+impl ShowCarbons {
+    pub const ALL: [ShowCarbons; 5] = [
+        ShowCarbons::None,
+        ShowCarbons::Default,
+        ShowCarbons::Terminal,
+        ShowCarbons::Acyclic,
+        ShowCarbons::All,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ShowCarbons::None => "None",
+            ShowCarbons::Default => "Default",
+            ShowCarbons::Terminal => "Terminal",
+            ShowCarbons::Acyclic => "Acyclic",
+            ShowCarbons::All => "All",
+        }
+    }
 }
 
-/// [`structure_panel`] with explicit rendering options.
+impl AtomVisualization {
+    pub const ALL: [AtomVisualization; 3] = [
+        AtomVisualization::Default,
+        AtomVisualization::Balls,
+        AtomVisualization::None,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AtomVisualization::Default => "Labels",
+            AtomVisualization::Balls => "Balls",
+            AtomVisualization::None => "None",
+        }
+    }
+}
+
+/// Controls for the atom-display options, for a caller that wants to expose
+/// them alongside a structure.
+pub fn structure_option_controls(ui: &mut Ui, options: &mut StructureOptions) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Carbons:");
+        egui::ComboBox::from_id_salt("show_carbons")
+            .selected_text(options.show_carbons.label())
+            .show_ui(ui, |ui| {
+                for mode in ShowCarbons::ALL {
+                    ui.selectable_value(&mut options.show_carbons, mode, mode.label());
+                }
+            });
+
+        ui.separator();
+        ui.label("Atoms:");
+        egui::ComboBox::from_id_salt("atom_visualization")
+            .selected_text(options.atom_visualization.label())
+            .show_ui(ui, |ui| {
+                for mode in AtomVisualization::ALL {
+                    ui.selectable_value(&mut options.atom_visualization, mode, mode.label());
+                }
+            });
+
+        ui.separator();
+        ui.checkbox(&mut options.explicit_hydrogens, "Hydrogens");
+    });
+}
+
+/// Draws a molecule's structure in a bordered group with a heading, fitted to
+/// the available width.
 pub fn structure_panel_with_options(
     ui: &mut Ui,
     molecule: &Molecule,
@@ -760,12 +971,20 @@ mod tests {
     fn test_is_labeled_skips_carbon() {
         use chemcore::prelude::*;
 
+        // Bonded, so the carbon has a vertex to imply it -- an isolated carbon
+        // is labelled instead, since otherwise nothing would mark it.
         let mut mol = Molecule::new();
-        mol.add_atom(Atom::new(Element::carbon()));
-        mol.add_atom(Atom::new(Element::oxygen()));
+        let c = mol.add_atom(Atom::new(Element::carbon()));
+        let o = mol.add_atom(Atom::new(Element::oxygen()));
+        mol.add_bond(Bond::new(c, o, BondOrder::Single)).unwrap();
 
-        assert!(!is_labeled(&mol, 0), "carbon is an implicit vertex");
-        assert!(is_labeled(&mol, 1), "heteroatoms are labeled");
+        let opts = StructureOptions::default();
+        let ring = HashSet::new();
+        assert!(
+            !is_labeled(&mol, 0, &opts, &ring),
+            "a bonded carbon is an implicit vertex"
+        );
+        assert!(is_labeled(&mol, 1, &opts, &ring), "heteroatoms are labeled");
         assert_eq!(atom_label(&mol, 1), "O");
     }
 
@@ -907,7 +1126,7 @@ mod tests {
     fn test_ring_bonds_get_a_center() {
         let mol = benzene_with_coords();
         let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
-        let centers = ring_bond_centers(&mol, &t);
+        let (centers, _) = ring_bond_centers(&mol, &t);
 
         assert_eq!(centers.len(), mol.num_bonds());
         for (bond_idx, center) in centers.iter().enumerate() {
@@ -922,7 +1141,7 @@ mod tests {
     fn test_ring_center_is_inside_the_ring() {
         let mol = benzene_with_coords();
         let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
-        let centers = ring_bond_centers(&mol, &t);
+        let (centers, _) = ring_bond_centers(&mol, &t);
         let center = centers[0].unwrap();
 
         // The ring centre must be nearer every vertex than the vertices are to
@@ -942,7 +1161,7 @@ mod tests {
         // to face, the secondary line ends up on the interior side.
         let mol = benzene_with_coords();
         let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
-        let centers = ring_bond_centers(&mol, &t);
+        let (centers, _) = ring_bond_centers(&mol, &t);
 
         for (bond_idx, bond) in mol.bonds().iter().enumerate() {
             let (a, b) = bond.atoms();
@@ -978,7 +1197,7 @@ mod tests {
         chemcore::layout::layout(&mut mol);
 
         let t = Transform::fit(bbox_of(&mol), rect(200.0, 200.0), 10.0);
-        let centers = ring_bond_centers(&mol, &t);
+        let (centers, _) = ring_bond_centers(&mol, &t);
         assert_eq!(centers, vec![None]);
     }
 
@@ -1011,8 +1230,138 @@ mod tests {
         chemcore::layout::layout(&mut mol);
 
         let t = Transform::fit(bbox_of(&mol), rect(300.0, 300.0), 10.0);
-        let centers = ring_bond_centers(&mol, &t);
+        let (centers, _) = ring_bond_centers(&mol, &t);
         assert!(centers.iter().all(|c| c.is_some()));
+    }
+
+    /// Propane with an explicit hydrogen on the middle carbon, plus a ring
+    /// carbon, so every ShowCarbons mode has something to discriminate on.
+    fn display_test_molecule() -> (Molecule, HashSet<usize>) {
+        use chemcore::prelude::*;
+
+        // Cyclopropane (0,1,2) with a methyl (3) on atom 0, and an H (4) on 3.
+        let mut mol = Molecule::new();
+        for _ in 0..4 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        mol.add_atom(Atom::new(Element::hydrogen()));
+        for &(a, b) in &[(0, 1), (1, 2), (2, 0), (0, 3), (3, 4)] {
+            mol.add_bond(Bond::new(a, b, BondOrder::Single)).unwrap();
+        }
+        let ring: HashSet<usize> = [0usize, 1, 2].into_iter().collect();
+        (mol, ring)
+    }
+
+    #[test]
+    fn test_show_carbons_none_labels_nothing() {
+        let (mol, ring) = display_test_molecule();
+        let opts = StructureOptions {
+            show_carbons: ShowCarbons::None,
+            ..Default::default()
+        };
+        for i in 0..4 {
+            assert!(!is_labeled(&mol, i, &opts, &ring), "carbon {i}");
+        }
+        // Hydrogen is not a carbon, so it's unaffected by the mode.
+        assert!(is_labeled(&mol, 4, &opts, &ring));
+    }
+
+    #[test]
+    fn test_show_carbons_default_labels_only_isolated() {
+        use chemcore::prelude::*;
+
+        let (mol, ring) = display_test_molecule();
+        let opts = StructureOptions::default();
+        for i in 0..4 {
+            assert!(!is_labeled(&mol, i, &opts, &ring), "bonded carbon {i}");
+        }
+
+        // Methane: a lone carbon with no bonds. Without a label there'd be no
+        // vertex either, so the panel would draw completely empty.
+        let mut lone = Molecule::new();
+        lone.add_atom(Atom::new(Element::carbon()));
+        assert!(is_labeled(&lone, 0, &opts, &HashSet::new()));
+    }
+
+    #[test]
+    fn test_show_carbons_terminal() {
+        let (mol, ring) = display_test_molecule();
+        let opts = StructureOptions {
+            show_carbons: ShowCarbons::Terminal,
+            ..Default::default()
+        };
+        // Atom 3 is the methyl -- bonded to atom 0 and to the H, so degree 2.
+        assert!(!is_labeled(&mol, 3, &opts, &ring));
+        // With hydrogens hidden it becomes visually terminal.
+        let opts_no_h = StructureOptions {
+            explicit_hydrogens: false,
+            ..opts
+        };
+        assert!(
+            is_labeled(&mol, 3, &opts_no_h, &ring),
+            "a methyl is terminal once its hydrogens are hidden"
+        );
+    }
+
+    #[test]
+    fn test_show_carbons_acyclic() {
+        let (mol, ring) = display_test_molecule();
+        let opts = StructureOptions {
+            show_carbons: ShowCarbons::Acyclic,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            assert!(!is_labeled(&mol, i, &opts, &ring), "ring carbon {i}");
+        }
+        assert!(is_labeled(&mol, 3, &opts, &ring), "acyclic carbon");
+    }
+
+    #[test]
+    fn test_show_carbons_all() {
+        let (mol, ring) = display_test_molecule();
+        let opts = StructureOptions {
+            show_carbons: ShowCarbons::All,
+            ..Default::default()
+        };
+        for i in 0..4 {
+            assert!(is_labeled(&mol, i, &opts, &ring), "carbon {i}");
+        }
+    }
+
+    #[test]
+    fn test_hidden_hydrogens_are_not_labeled() {
+        let (mol, ring) = display_test_molecule();
+        let shown = StructureOptions::default();
+        let hidden = StructureOptions {
+            explicit_hydrogens: false,
+            ..Default::default()
+        };
+
+        assert!(is_labeled(&mol, 4, &shown, &ring));
+        assert!(!is_labeled(&mol, 4, &hidden, &ring));
+        assert!(!is_hidden(&mol, 4, &shown));
+        assert!(is_hidden(&mol, 4, &hidden));
+        // Only hydrogens are affected.
+        assert!(!is_hidden(&mol, 0, &hidden));
+    }
+
+    #[test]
+    fn test_atom_annotation() {
+        use chemcore::prelude::*;
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::oxygen()).with_charge(-1));
+        mol.add_atom(Atom::new(Element::nitrogen()).with_charge(1));
+        mol.add_atom(Atom::new(Element::carbon()).with_isotope(13));
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()).with_charge(-2));
+
+        assert_eq!(atom_annotation(&mol, 0).as_deref(), Some("-"));
+        assert_eq!(atom_annotation(&mol, 1).as_deref(), Some("+"));
+        assert_eq!(atom_annotation(&mol, 2).as_deref(), Some("13"));
+        // Neutral, natural isotope: nothing to annotate.
+        assert_eq!(atom_annotation(&mol, 3), None);
+        assert_eq!(atom_annotation(&mol, 4).as_deref(), Some("2-"));
     }
 
     #[test]

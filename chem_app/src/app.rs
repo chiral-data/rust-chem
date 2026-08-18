@@ -2,7 +2,9 @@ use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
 use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
-use crate::structure_view::structure_panel;
+use crate::structure_view::{
+    StructureOptions, structure_option_controls, structure_panel_with_options,
+};
 use bitvec::prelude::BitVec;
 use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
@@ -62,6 +64,9 @@ pub struct ChemFpDemoApp {
     // SMILES has to be laid out before it can be drawn, so the laid-out copy is
     // cached against the row it came from rather than recomputed each frame.
     detail_molecule: Option<(usize, Molecule)>,
+    // Atom-display settings for the structure view, held here so they persist
+    // across selections rather than resetting each time a molecule is opened.
+    structure_options: StructureOptions,
     fp_radius: u32,
     fp_size: u32,
     top_k: usize,
@@ -119,6 +124,7 @@ impl ChemFpDemoApp {
             selected_result: None,
             selected_dataset_row: None,
             detail_molecule: None,
+            structure_options: StructureOptions::default(),
             fp_radius: 2,
             fp_size: 2048,
             top_k: 10,
@@ -706,7 +712,8 @@ impl ChemFpDemoApp {
             .max_height(max_height)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    structure_panel(ui, &mol, 220.0);
+                    structure_panel_with_options(ui, &mol, 220.0, self.structure_options);
+                    structure_option_controls(ui, &mut self.structure_options);
                     show_molecule_info(ui, &mol, &smiles, &name);
                     show_atom_list(ui, &mol);
                     show_bond_list(ui, &mol);
