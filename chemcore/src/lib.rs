@@ -3,6 +3,7 @@ pub mod bond;
 pub mod geometry;
 pub mod graph;
 pub mod molecule;
+pub mod rings;
 
 pub mod elements;
 
@@ -13,6 +14,7 @@ pub mod prelude {
     pub use crate::geometry::{BoundingBox, Point2};
     pub use crate::graph::{MoleculeGraph, Neighbor};
     pub use crate::molecule::{Molecule, MoleculeError};
+    pub use crate::rings::{Ring, find_sssr, perceive_rings, ring_count};
 }
 
 #[cfg(test)]
