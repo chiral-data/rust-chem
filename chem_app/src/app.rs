@@ -3,14 +3,15 @@ use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
 use crate::structure_view::{
-    StructureOptions, structure_option_controls, structure_panel_with_options,
+    ShowCarbons, StructureOptions, StructureView, structure_display_section,
+    structure_panel_with_options,
 };
 use bitvec::prelude::BitVec;
 use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
 use chemio::aromaticity::detect_aromaticity;
 use chemio::smiles::parse_smiles;
-use egui::{Color32, RichText};
+use egui::{Color32, RichText, Vec2};
 // std::time::Instant panics at runtime on wasm32-unknown-unknown (no clock
 // source there); web-time is a drop-in replacement that re-exports std on
 // native and uses performance.now() on web.
@@ -20,6 +21,11 @@ use web_time::{Duration, Instant};
 use chemgpu::{GpuMorganFingerprint, GpuTanimoto};
 #[cfg(target_arch = "wasm32")]
 use std::{cell::RefCell, rc::Rc};
+
+/// Rows of the dataset table drawn at once. Datasets run to tens of thousands
+/// of molecules, so the table shows a window rather than all of them — and it
+/// bounds how many structures a thumbnail pass has to lay out.
+const MAX_TABLE_ROWS: usize = 20;
 
 /// How long the query SMILES box must sit idle before we run fingerprint
 /// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
@@ -67,6 +73,10 @@ pub struct ChemFpDemoApp {
     // Atom-display settings for the structure view, held here so they persist
     // across selections rather than resetting each time a molecule is opened.
     structure_options: StructureOptions,
+    /// Whether the dataset table draws a structure per row. Off by default:
+    /// it's a per-row render, and most of the time the table is being scanned
+    /// for names and numbers rather than shapes.
+    show_thumbnails: bool,
     fp_radius: u32,
     fp_size: u32,
     top_k: usize,
@@ -125,6 +135,7 @@ impl ChemFpDemoApp {
             selected_dataset_row: None,
             detail_molecule: None,
             structure_options: StructureOptions::default(),
+            show_thumbnails: false,
             fp_radius: 2,
             fp_size: 2048,
             top_k: 10,
@@ -373,7 +384,11 @@ impl ChemFpDemoApp {
         }
 
         match parse_smiles(smiles) {
-            Ok(mol) => {
+            Ok(mut mol) => {
+                // SMILES has no geometry. Laying out here rather than at draw
+                // time means it happens once per parse (already debounced)
+                // instead of every frame.
+                ensure_coords(&mut mol);
                 self.query_molecule = Some(mol.clone());
                 self.query_error = None;
                 self.generate_query_fingerprint(mol);
@@ -605,19 +620,46 @@ impl ChemFpDemoApp {
                         "Fingerprints computed: {}",
                         self.dataset_fingerprints.len()
                     ));
+                    structure_display_section(
+                        ui,
+                        &mut self.structure_options,
+                        &mut self.show_thumbnails,
+                    );
 
                     ui.separator();
 
                     let num_fingerprints = self.dataset_fingerprints.len();
-                    let shown = active_dataset.len().min(20);
+                    let shown = active_dataset.len().min(MAX_TABLE_ROWS);
+
+                    // A thumbnail is ~64x48, so it's read as a shape rather
+                    // than for its labels: hydrogens are dropped and the
+                    // structure fits its cell rather than using a shared bond
+                    // length. Fixed-length sizing keeps a column comparable
+                    // (#78) but lets a large molecule overflow, and at this
+                    // size containment matters more.
+                    //
+                    // Carbons stay on Default rather than None: None would
+                    // leave a lone carbon with neither a label nor a bond, so
+                    // methane's cell would draw empty.
+                    let thumbnail_options = StructureOptions {
+                        padding: 2.0,
+                        show_carbons: ShowCarbons::Default,
+                        explicit_hydrogens: false,
+                        scale: 0.0,
+                        bond_length: 0.0,
+                        ..self.structure_options
+                    };
                     let mut clicked_row = None;
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         egui::Grid::new("dataset_table")
-                            .num_columns(6)
+                            .num_columns(if self.show_thumbnails { 7 } else { 6 })
                             .spacing([8.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
+                                if self.show_thumbnails {
+                                    ui.label(RichText::new("Structure").strong());
+                                }
                                 ui.label(RichText::new("Name").strong());
                                 ui.label(RichText::new("SMILES").strong());
                                 ui.label(RichText::new("Formula").strong());
@@ -630,6 +672,12 @@ impl ChemFpDemoApp {
                                     let mol = &active_dataset.molecules[i];
                                     let is_selected = self.selected_dataset_row == Some(i);
 
+                                    if self.show_thumbnails {
+                                        ui.add(
+                                            StructureView::new(mol, Vec2::new(64.0, 48.0))
+                                                .with_options(thumbnail_options),
+                                        );
+                                    }
                                     if ui
                                         .selectable_label(is_selected, &active_dataset.names[i])
                                         .clicked()
@@ -670,6 +718,23 @@ impl ChemFpDemoApp {
     // (info grid + atom list + bond list) can be taller than that on a
     // short viewport with no way to scroll to the rest of it. A window is
     // independently movable/resizable and scrolls on its own if needed.
+    /// Lays out the molecules the dataset table is about to draw.
+    ///
+    /// Only the visible window is touched — a dataset can hold tens of
+    /// thousands of molecules, and laying all of them out to show twenty would
+    /// stall the frame. `ensure_coords` returns immediately for anything
+    /// already positioned, so this costs nothing after the first frame and
+    /// leaves SDF-supplied coordinates alone.
+    fn prepare_thumbnails(&mut self) {
+        if !self.show_thumbnails {
+            return;
+        }
+        let dataset = self.loaded_files.active_dataset_mut();
+        for mol in dataset.molecules.iter_mut().take(MAX_TABLE_ROWS) {
+            ensure_coords(mol);
+        }
+    }
+
     fn molecule_detail_window(&mut self, ctx: &egui::Context) {
         let Some(i) = self.selected_dataset_row else {
             return;
@@ -713,7 +778,6 @@ impl ChemFpDemoApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     structure_panel_with_options(ui, &mol, 220.0, self.structure_options);
-                    structure_option_controls(ui, &mut self.structure_options);
                     show_molecule_info(ui, &mol, &smiles, &name);
                     show_atom_list(ui, &mol);
                     show_bond_list(ui, &mol);
@@ -750,9 +814,13 @@ impl ChemFpDemoApp {
                     ui.colored_label(Color32::RED, error);
                 }
 
-                if let Some(ref mol) = self.query_molecule {
+                if let Some(mol) = self.query_molecule.clone() {
                     ui.separator();
-                    show_molecule_info(ui, mol, &self.query_smiles, "Query");
+                    // Above the text details: seeing the structure is how you
+                    // tell at a glance whether the SMILES you typed is the
+                    // molecule you meant.
+                    structure_panel_with_options(ui, &mol, 180.0, self.structure_options);
+                    show_molecule_info(ui, &mol, &self.query_smiles, "Query");
                 }
 
                 if let Some(ref fp) = self.query_fingerprint {
@@ -948,6 +1016,8 @@ impl eframe::App for ChemFpDemoApp {
                 ctx.request_repaint_after(QUERY_DEBOUNCE - elapsed);
             }
         }
+
+        self.prepare_thumbnails();
 
         self.top_panel(ctx);
         self.dataset_panel(ctx);
