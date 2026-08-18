@@ -6,6 +6,7 @@ use crate::structure_view::{
     ShowCarbons, StructureOptions, StructureView, structure_display_section,
     structure_panel_with_options,
 };
+use crate::task::Task;
 use bitvec::prelude::BitVec;
 use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
@@ -31,10 +32,6 @@ const MAX_TABLE_ROWS: usize = 20;
 /// generation, so a blocking GPU dispatch doesn't fire on every keystroke.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 
-// A pending async task's slot: `None` while in flight, filled with its
-// result (and how long it took, in ms) once `spawn_local`'s future resolves.
-#[cfg(target_arch = "wasm32")]
-type PendingSlot<T> = Rc<RefCell<Option<(anyhow::Result<T>, f64)>>>;
 #[cfg(target_arch = "wasm32")]
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
 #[cfg(target_arch = "wasm32")]
@@ -96,12 +93,11 @@ pub struct ChemFpDemoApp {
     // it succeed.
     #[cfg(target_arch = "wasm32")]
     pending_gpu_init: PendingGpuInit,
-    #[cfg(target_arch = "wasm32")]
-    pending_dataset_fingerprints: PendingSlot<Vec<BitVec>>,
-    #[cfg(target_arch = "wasm32")]
-    pending_query_fingerprint: PendingSlot<BitVec>,
-    #[cfg(target_arch = "wasm32")]
-    pending_search_results: PendingSlot<Vec<SearchResult>>,
+    // GPU-capable work, which is async on wasm32. Each is started in one
+    // place and collected in `update()`; see `task::Task`.
+    dataset_fingerprint_task: Task<Vec<BitVec>>,
+    query_fingerprint_task: Task<BitVec>,
+    search_task: Task<Vec<SearchResult>>,
 }
 
 impl ChemFpDemoApp {
@@ -148,12 +144,9 @@ impl ChemFpDemoApp {
             pending_file_load: Rc::new(RefCell::new(None)),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
-            #[cfg(target_arch = "wasm32")]
-            pending_dataset_fingerprints: Rc::new(RefCell::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            pending_query_fingerprint: Rc::new(RefCell::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            pending_search_results: Rc::new(RefCell::new(None)),
+            dataset_fingerprint_task: Task::new(),
+            query_fingerprint_task: Task::new(),
+            search_task: Task::new(),
         }
     }
 
@@ -307,43 +300,21 @@ impl ChemFpDemoApp {
         self.dataset_status = format!("Detected aromaticity for {} molecules", dataset.len());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Clones a snapshot of the search engine to hand to the task rather than
+    /// borrowing `self`, which a spawned future can't do. The clone is cheap —
+    /// the GPU handles behind it are `Arc`-backed — and its own GPU target
+    /// cache is discarded when the task ends, costing one extra upload on the
+    /// next search rather than any wrong answer.
     fn precompute_dataset_fingerprints_dispatch(&mut self) {
-        let start = Instant::now();
-        let result = self.search_engine.generate_fingerprints_batch(
-            &self.loaded_files.active_dataset().molecules,
-            self.fp_radius,
-            self.fp_size,
-        );
-        if let Ok(fps) = &result
-            && let Err(e) = self.search_engine.set_target_dataset(fps)
-        {
-            log::warn!("Failed to upload dataset to GPU: {}", e);
-        }
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.apply_dataset_fingerprints_result(result, elapsed_ms);
-    }
-
-    // Clones a snapshot of search_engine (cheap — see FingerprintSearch's
-    // doc comment) to move into the spawned future instead of borrowing
-    // `self` across the await boundary. The snapshot's own GPU-target-cache
-    // upload (if any) is discarded once the task completes — `search_async`
-    // re-uploads lazily as needed regardless, so this only costs one extra
-    // upload on the next search rather than any actual bug.
-    #[cfg(target_arch = "wasm32")]
-    fn precompute_dataset_fingerprints_dispatch(&mut self) {
-        let search_snapshot = self.search_engine.clone();
+        let engine = self.search_engine.clone();
         let molecules = self.loaded_files.active_dataset().molecules.clone();
         let radius = self.fp_radius;
         let fp_size = self.fp_size;
-        let slot = self.pending_dataset_fingerprints.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let start = Instant::now();
-            let result = search_snapshot
+
+        self.dataset_fingerprint_task.start(async move {
+            engine
                 .generate_fingerprints_batch_async(&molecules, radius, fp_size)
-                .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            *slot.borrow_mut() = Some((result, elapsed_ms));
+                .await
         });
     }
 
@@ -401,29 +372,15 @@ impl ChemFpDemoApp {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn generate_query_fingerprint(&mut self, mol: Molecule) {
-        let start = Instant::now();
-        let result = self
-            .search_engine
-            .generate_fingerprint(&mol, self.fp_radius, self.fp_size);
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.apply_query_fingerprint_result(result, elapsed_ms);
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn generate_query_fingerprint(&mut self, mol: Molecule) {
-        let search_snapshot = self.search_engine.clone();
+        let engine = self.search_engine.clone();
         let radius = self.fp_radius;
         let fp_size = self.fp_size;
-        let slot = self.pending_query_fingerprint.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let start = Instant::now();
-            let result = search_snapshot
+
+        self.query_fingerprint_task.start(async move {
+            engine
                 .generate_fingerprint_async(&mol, radius, fp_size)
-                .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            *slot.borrow_mut() = Some((result, elapsed_ms));
+                .await
         });
     }
 
@@ -451,30 +408,13 @@ impl ChemFpDemoApp {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn run_search_dispatch(&mut self, query_fp: BitVec) {
-        let start = Instant::now();
-        let result = self
-            .search_engine
-            .search(&query_fp, &self.dataset_fingerprints, self.top_k);
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.apply_search_result(result, elapsed_ms);
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn run_search_dispatch(&mut self, query_fp: BitVec) {
-        let mut search_snapshot = self.search_engine.clone();
+        let mut engine = self.search_engine.clone();
         let target_fps = self.dataset_fingerprints.clone();
         let top_k = self.top_k;
-        let slot = self.pending_search_results.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let start = Instant::now();
-            let result = search_snapshot
-                .search_async(&query_fp, &target_fps, top_k)
-                .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            *slot.borrow_mut() = Some((result, elapsed_ms));
-        });
+
+        self.search_task
+            .start(async move { engine.search_async(&query_fp, &target_fps, top_k).await });
     }
 
     fn apply_search_result(&mut self, result: anyhow::Result<Vec<SearchResult>>, elapsed_ms: f64) {
@@ -976,21 +916,19 @@ impl eframe::App for ChemFpDemoApp {
                 }
                 None => {} // still pending
             }
+        }
 
-            let fingerprints = self.pending_dataset_fingerprints.borrow_mut().take();
-            if let Some((result, elapsed_ms)) = fingerprints {
-                self.apply_dataset_fingerprints_result(result, elapsed_ms);
-            }
-
-            let query_fp = self.pending_query_fingerprint.borrow_mut().take();
-            if let Some((result, elapsed_ms)) = query_fp {
-                self.apply_query_fingerprint_result(result, elapsed_ms);
-            }
-
-            let search_results = self.pending_search_results.borrow_mut().take();
-            if let Some((result, elapsed_ms)) = search_results {
-                self.apply_search_result(result, elapsed_ms);
-            }
+        // Collected on both platforms alike: the task ran on a spawned future
+        // (wasm32) or inline (native), but either way its result is applied
+        // here rather than at the call site.
+        if let Some((result, elapsed_ms)) = self.dataset_fingerprint_task.poll() {
+            self.apply_dataset_fingerprints_result(result, elapsed_ms);
+        }
+        if let Some((result, elapsed_ms)) = self.query_fingerprint_task.poll() {
+            self.apply_query_fingerprint_result(result, elapsed_ms);
+        }
+        if let Some((result, elapsed_ms)) = self.search_task.poll() {
+            self.apply_search_result(result, elapsed_ms);
         }
 
         let frame_time = ctx.input(|i| i.stable_dt as f64);

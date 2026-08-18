@@ -4,6 +4,7 @@ mod fingerprint_view;
 mod molecule_view;
 mod search;
 mod structure_view;
+mod task;
 
 pub use app::ChemFpDemoApp;
 
