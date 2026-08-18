@@ -5,7 +5,7 @@ use chemcore::bond::BondOrder;
 use chemcore::geometry::{BoundingBox, Point2};
 use chemcore::molecule::Molecule;
 use chemcore::rings::find_sssr;
-use egui::{Align2, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, Widget};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, Widget};
 
 /// Rendering options for [`StructureView`].
 ///
@@ -96,6 +96,10 @@ impl<'a> StructureView<'a> {
         self.options = options;
         self
     }
+
+    // A `with_theme` builder for pinning a fixed palette (rather than
+    // following the app's light/dark setting) belongs here, but nothing needs
+    // it until there's an export path; adding it now would just be dead code.
 }
 
 /// Maps molecule coordinates onto screen positions.
@@ -191,6 +195,90 @@ impl Transform {
         let dx = (p.x - self.src_center.x) as f32 * self.scale;
         let dy = (p.y - self.src_center.y) as f32 * self.scale;
         Pos2::new(self.dst_center.x + dx, self.dst_center.y - dy)
+    }
+}
+
+/// Per-element label colours, following smilesDrawer's palette.
+///
+/// Colouring heteroatoms is how a structure is read at a glance — an oxygen
+/// has to be findable without spelling out the formula. Carbon and anything
+/// unlisted take the theme's foreground rather than a colour of their own,
+/// since they're the background against which the rest stands out.
+#[derive(Debug, Clone, Copy)]
+pub struct StructureTheme {
+    pub foreground: Color32,
+    pub oxygen: Color32,
+    pub nitrogen: Color32,
+    pub fluorine: Color32,
+    pub chlorine: Color32,
+    pub bromine: Color32,
+    pub iodine: Color32,
+    pub phosphorus: Color32,
+    pub sulfur: Color32,
+    pub boron: Color32,
+    pub silicon: Color32,
+    pub hydrogen: Color32,
+}
+
+impl StructureTheme {
+    /// smilesDrawer's `light` theme.
+    pub fn light() -> Self {
+        Self {
+            foreground: Color32::from_rgb(0x22, 0x22, 0x22),
+            oxygen: Color32::from_rgb(0xe7, 0x4c, 0x3c),
+            nitrogen: Color32::from_rgb(0x34, 0x98, 0xdb),
+            fluorine: Color32::from_rgb(0x27, 0xae, 0x60),
+            chlorine: Color32::from_rgb(0x16, 0xa0, 0x85),
+            bromine: Color32::from_rgb(0xd3, 0x54, 0x00),
+            iodine: Color32::from_rgb(0x8e, 0x44, 0xad),
+            phosphorus: Color32::from_rgb(0xd3, 0x54, 0x00),
+            sulfur: Color32::from_rgb(0xf1, 0xc4, 0x0f),
+            boron: Color32::from_rgb(0xe6, 0x7e, 0x22),
+            silicon: Color32::from_rgb(0xe6, 0x7e, 0x22),
+            hydrogen: Color32::from_rgb(0x66, 0x66, 0x66),
+        }
+    }
+
+    /// smilesDrawer's `dark` theme — the heteroatom hues are shared with
+    /// [`Self::light`]; only foreground and hydrogen differ, since those are
+    /// the ones that have to contrast with the background.
+    pub fn dark() -> Self {
+        Self {
+            foreground: Color32::from_rgb(0xff, 0xff, 0xff),
+            hydrogen: Color32::from_rgb(0xaa, 0xaa, 0xaa),
+            ..Self::light()
+        }
+    }
+
+    /// Follows egui's current visuals, so structures track the app's theme
+    /// rather than needing a setting of their own.
+    pub fn from_visuals(visuals: &egui::Visuals) -> Self {
+        if visuals.dark_mode {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+
+    /// Colour for an element by atomic number.
+    ///
+    /// Carbon deliberately isn't special-cased to a hue: it takes the
+    /// foreground, which is also what any element outside the palette gets.
+    pub fn element_color(&self, atomic_number: u8) -> Color32 {
+        match atomic_number {
+            1 => self.hydrogen,
+            5 => self.boron,
+            7 => self.nitrogen,
+            8 => self.oxygen,
+            9 => self.fluorine,
+            14 => self.silicon,
+            15 => self.phosphorus,
+            16 => self.sulfur,
+            17 => self.chlorine,
+            35 => self.bromine,
+            53 => self.iodine,
+            _ => self.foreground,
+        }
     }
 }
 
@@ -319,7 +407,11 @@ impl Widget for StructureView<'_> {
             return response;
         }
 
-        let color = ui.visuals().text_color();
+        let theme = StructureTheme::from_visuals(ui.visuals());
+        // Bonds are drawn in the foreground rather than per-element: colouring
+        // a bond by its atoms would need a gradient, and it's the atom labels
+        // that carry the identity anyway.
+        let color = theme.foreground;
         let weak_color = ui.visuals().weak_text_color();
 
         let Some(coords) = self.molecule.coords() else {
@@ -365,7 +457,7 @@ impl Widget for StructureView<'_> {
                 let galley = ui.painter().layout_no_wrap(
                     atom_label(self.molecule, atom_idx),
                     font_id.clone(),
-                    color,
+                    theme.element_color(self.molecule.atom(atom_idx).atomic_number()),
                 );
                 Some(galley.size() / 2.0 + Vec2::splat(label_margin))
             })
@@ -504,7 +596,7 @@ impl Widget for StructureView<'_> {
                 Align2::CENTER_CENTER,
                 atom_label(self.molecule, atom_idx),
                 font_id.clone(),
-                color,
+                theme.element_color(self.molecule.atom(atom_idx).atomic_number()),
             );
         }
 
@@ -921,6 +1013,68 @@ mod tests {
         let t = Transform::fit(bbox_of(&mol), rect(300.0, 300.0), 10.0);
         let centers = ring_bond_centers(&mol, &t);
         assert!(centers.iter().all(|c| c.is_some()));
+    }
+
+    #[test]
+    fn test_heteroatoms_get_distinct_colors() {
+        let theme = StructureTheme::light();
+        // The point of the palette: an O and an N must be tellable apart, and
+        // apart from the carbon skeleton.
+        let o = theme.element_color(8);
+        let n = theme.element_color(7);
+        let c = theme.element_color(6);
+        assert_ne!(o, n);
+        assert_ne!(o, c);
+        assert_ne!(n, c);
+    }
+
+    #[test]
+    fn test_carbon_and_unknown_elements_take_the_foreground() {
+        let theme = StructureTheme::light();
+        // Carbon is the skeleton everything else stands out against, so it
+        // isn't given a hue of its own -- and anything outside the palette
+        // falls back the same way rather than being invisible.
+        assert_eq!(theme.element_color(6), theme.foreground);
+        assert_eq!(theme.element_color(92), theme.foreground); // uranium
+        assert_eq!(theme.element_color(0), theme.foreground);
+    }
+
+    #[test]
+    fn test_dark_theme_inverts_foreground_only() {
+        let light = StructureTheme::light();
+        let dark = StructureTheme::dark();
+
+        // Foreground and hydrogen have to contrast with the background, so
+        // they differ; the heteroatom hues are shared so a structure reads the
+        // same either way.
+        assert_ne!(light.foreground, dark.foreground);
+        assert_ne!(light.hydrogen, dark.hydrogen);
+        assert_eq!(light.oxygen, dark.oxygen);
+        assert_eq!(light.nitrogen, dark.nitrogen);
+        assert_eq!(light.sulfur, dark.sulfur);
+    }
+
+    #[test]
+    fn test_theme_follows_visuals() {
+        assert_eq!(
+            StructureTheme::from_visuals(&egui::Visuals::dark()).foreground,
+            StructureTheme::dark().foreground
+        );
+        assert_eq!(
+            StructureTheme::from_visuals(&egui::Visuals::light()).foreground,
+            StructureTheme::light().foreground
+        );
+    }
+
+    #[test]
+    fn test_palette_matches_smilesdrawer() {
+        // Spot-check against the values in smilesDrawer's themes object, since
+        // matching a known palette is the point rather than inventing one.
+        let t = StructureTheme::light();
+        assert_eq!(t.oxygen, Color32::from_rgb(0xe7, 0x4c, 0x3c));
+        assert_eq!(t.nitrogen, Color32::from_rgb(0x34, 0x98, 0xdb));
+        assert_eq!(t.sulfur, Color32::from_rgb(0xf1, 0xc4, 0x0f));
+        assert_eq!(t.chlorine, Color32::from_rgb(0x16, 0xa0, 0x85));
     }
 
     #[test]
