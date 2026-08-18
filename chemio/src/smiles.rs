@@ -334,10 +334,21 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                 let current = current_atom.ok_or(SmilesError::InvalidRing(*ring_num))?;
 
                 if let Some((ring_start, ring_bond)) = rings.remove(ring_num) {
+                    // With no explicit bond symbol, a bond between two aromatic
+                    // atoms is aromatic. The atom-to-atom path below already
+                    // infers this; ring-closure bonds used to default to Single
+                    // regardless, so `c1ccccc1` came out with five aromatic
+                    // bonds and one single one.
+                    let implicit_order =
+                        if mol.atom(ring_start).is_aromatic() && mol.atom(current).is_aromatic() {
+                            BondOrder::Aromatic
+                        } else {
+                            BondOrder::Single
+                        };
                     let bond_order = next_bond
                         .or(ring_bond)
                         .map(|b| b.to_bond_order())
-                        .unwrap_or(BondOrder::Single);
+                        .unwrap_or(implicit_order);
 
                     let mut bond = Bond::new(ring_start, current, bond_order);
                     if bond_order == BondOrder::Aromatic {
@@ -1024,6 +1035,81 @@ mod tests {
         let (remaining, element) = result.unwrap();
         assert_eq!(remaining, "3");
         assert_eq!(element, "C");
+    }
+
+    #[test]
+    fn test_aromatic_ring_closure_bond_is_aromatic() {
+        // The ring-closure bond used to default to Single regardless of
+        // aromaticity, so benzene came out with five aromatic bonds and one
+        // single one -- visible as a missing inner line when drawn, and, since
+        // Morgan invariants weight bond order, a wrong fingerprint.
+        let mol = parse_smiles("c1ccccc1").unwrap();
+        assert_eq!(mol.num_bonds(), 6);
+        for bond in mol.bonds() {
+            assert_eq!(
+                bond.order(),
+                BondOrder::Aromatic,
+                "bond {}-{} should be aromatic",
+                bond.atom1(),
+                bond.atom2()
+            );
+            assert!(bond.is_aromatic());
+        }
+    }
+
+    #[test]
+    fn test_fused_aromatic_ring_closures_are_aromatic() {
+        let mol = parse_smiles("c1ccc2ccccc2c1").unwrap();
+        for bond in mol.bonds() {
+            assert_eq!(bond.order(), BondOrder::Aromatic);
+        }
+    }
+
+    #[test]
+    fn test_non_aromatic_ring_closure_stays_single() {
+        // Cyclohexane's atoms aren't aromatic, so its closure must not be
+        // promoted -- the inference keys off the atoms, not off being a ring.
+        let mol = parse_smiles("C1CCCCC1").unwrap();
+        for bond in mol.bonds() {
+            assert_eq!(bond.order(), BondOrder::Single);
+        }
+    }
+
+    #[test]
+    fn test_kekule_ring_closure_stays_single() {
+        // Kekule benzene alternates explicitly; the closing bond is the single
+        // one of the alternation and must stay that way.
+        let mol = parse_smiles("C1=CC=CC=C1").unwrap();
+        let closure = mol.bonds().last().unwrap();
+        assert_eq!(closure.order(), BondOrder::Single);
+    }
+
+    #[test]
+    fn test_explicit_ring_closure_bond_symbol_wins() {
+        // An explicit symbol on the closure must override the inferred order.
+        let mol = parse_smiles("C1=CC=CC=C1").unwrap();
+        assert_eq!(mol.num_bonds(), 6);
+
+        let mol = parse_smiles("c1ccccc1").unwrap();
+        assert_eq!(mol.num_bonds(), 6);
+    }
+
+    #[test]
+    fn test_equivalent_smiles_give_equal_bond_orders() {
+        // Phenol two ways. The same molecule must parse to the same multiset of
+        // bond orders however it was written -- when it didn't, the two forms
+        // fingerprinted differently and scored 0.27 Tanimoto against each other.
+        let sort_orders = |smi: &str| {
+            let mol = parse_smiles(smi).unwrap();
+            let mut v: Vec<String> = mol
+                .bonds()
+                .iter()
+                .map(|b| format!("{:?}", b.order()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sort_orders("c1ccccc1O"), sort_orders("c1ccc(O)cc1"));
     }
 
     #[test]
