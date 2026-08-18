@@ -17,6 +17,19 @@ use egui::{Align2, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2,
 /// hairline in a large detail view.
 #[derive(Debug, Clone, Copy)]
 pub struct StructureOptions {
+    /// Pixels per coordinate unit. `0.0` means derive one instead — see
+    /// [`StructureOptions::bond_length`]. smilesDrawer's `scale` defaults to
+    /// `0.0` with the same meaning.
+    pub scale: f32,
+    /// Target on-screen bond length in pixels, used when [`Self::scale`] is
+    /// `0.0` and this is greater than `0.0`. Drawing every molecule at the
+    /// same bond length keeps a row of structures visually consistent, which
+    /// fit-to-rect can't do — it sizes each molecule to its own box, so a
+    /// two-atom molecule and a thirty-atom one come out the same width and
+    /// read as though they were the same size.
+    ///
+    /// `0.0` falls back to fitting the structure to its rect.
+    pub bond_length: f32,
     /// Margin between the structure's bounding box and the edge of its rect.
     pub padding: f32,
     /// Gap between the parallel lines of a double/triple/aromatic bond, as a
@@ -24,6 +37,15 @@ pub struct StructureOptions {
     pub bond_spacing_ratio: f32,
     /// Bond stroke width in pixels (smilesDrawer's `bondThickness`).
     pub bond_thickness: f32,
+    /// Length of the inner line of an aromatic bond, as a fraction of the full
+    /// bond (smilesDrawer's `shortBondLength`). Trimming the inner line is the
+    /// usual convention and stops adjacent aromatic bonds in a ring from
+    /// running into each other at the vertices.
+    ///
+    /// Not applied to double bonds: those draw both lines symmetrically about
+    /// the bond axis, so neither is the "inner" one to shorten. Distinguishing
+    /// inner from outer needs ring perception (#81).
+    pub short_bond_length: f32,
     /// Atom label height as a fraction of bond length.
     pub font_size_ratio: f32,
     /// Clamp for the derived font size, so labels stay legible on very small
@@ -37,9 +59,12 @@ pub struct StructureOptions {
 impl Default for StructureOptions {
     fn default() -> Self {
         Self {
+            scale: 0.0,
+            bond_length: 0.0,
             padding: 10.0,
             bond_spacing_ratio: 0.17,
             bond_thickness: 1.0,
+            short_bond_length: 0.8,
             font_size_ratio: 0.42,
             font_size_range: (7.0, 22.0),
             label_margin_ratio: 0.18,
@@ -67,9 +92,10 @@ impl<'a> StructureView<'a> {
         }
     }
 
-    // A `with_options` builder belongs here, but there's no caller for it
-    // until #78 exposes the sizing options; adding it now would just be dead
-    // code. `options` is populated from `StructureOptions::default()` meanwhile.
+    pub fn with_options(mut self, options: StructureOptions) -> Self {
+        self.options = options;
+        self
+    }
 }
 
 /// Maps molecule coordinates onto screen positions.
@@ -122,6 +148,40 @@ impl Transform {
         }
     }
 
+    /// A fixed number of pixels per coordinate unit, centered on `rect`.
+    fn fixed(bbox: BoundingBox, rect: Rect, scale: f32) -> Self {
+        Self {
+            scale,
+            src_center: bbox.center(),
+            dst_center: rect.center(),
+        }
+    }
+
+    /// Picks a transform per the sizing options: an explicit `scale` wins, then
+    /// a target `bond_length`, otherwise fit-to-rect.
+    ///
+    /// A target bond length can't be honoured for a molecule with no bonds to
+    /// measure, or whose bonds are all zero-length; those fall back to fitting.
+    fn for_options(
+        molecule: &Molecule,
+        bbox: BoundingBox,
+        rect: Rect,
+        options: &StructureOptions,
+    ) -> Self {
+        if options.scale > 0.0 {
+            return Self::fixed(bbox, rect, options.scale);
+        }
+
+        if options.bond_length > 0.0
+            && let Some(src_len) = mean_source_bond_length(molecule)
+            && src_len > f64::EPSILON
+        {
+            return Self::fixed(bbox, rect, options.bond_length / src_len as f32);
+        }
+
+        Self::fit(bbox, rect, options.padding)
+    }
+
     /// Molecule coordinate to screen position.
     ///
     /// The y axis is negated: chemistry coordinates put +y upward, screen
@@ -166,6 +226,30 @@ fn box_edge_distance(dir: Vec2, half_w: f32, half_h: f32) -> f32 {
         f32::INFINITY
     };
     tx.min(ty)
+}
+
+/// Mean distance between bonded atoms in the molecule's own coordinate space,
+/// or `None` if there are no bonds to measure.
+///
+/// Deriving a scale from a target on-screen bond length needs the source
+/// length to divide by, before any transform exists.
+fn mean_source_bond_length(molecule: &Molecule) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0usize;
+
+    for bond in molecule.bonds() {
+        let (a, b) = bond.atoms();
+        if let (Some(pa), Some(pb)) = (molecule.coord(a), molecule.coord(b)) {
+            total += pa.distance(pb);
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some(total / count as f64)
+    }
 }
 
 /// Mean distance between bonded atoms on screen, or `None` if there are no
@@ -218,7 +302,7 @@ impl Widget for StructureView<'_> {
             return response;
         };
 
-        let transform = Transform::fit(bbox, rect, self.options.padding);
+        let transform = Transform::for_options(self.molecule, bbox, rect, &self.options);
 
         // Derive the proportional options from the bond length this molecule
         // actually ended up with on screen. A single-atom molecule has no bonds
@@ -307,9 +391,17 @@ impl Widget for StructureView<'_> {
                     // convention — a circle inside the ring — also needs ring
                     // perception (#81).
                     painter.line_segment([start + offset * 0.5, end + offset * 0.5], stroke);
+
+                    // The inner line is trimmed equally at both ends, so
+                    // adjacent aromatic bonds don't collide at ring vertices.
+                    let trim = (1.0 - self.options.short_bond_length).clamp(0.0, 1.0) / 2.0;
+                    let inner_a = start - offset * 0.5;
+                    let inner_b = end - offset * 0.5;
+                    let shrink = (inner_b - inner_a) * trim;
+
                     let dash = (bond_spacing * 1.5).max(2.0);
                     painter.extend(Shape::dashed_line(
-                        &[start - offset * 0.5, end - offset * 0.5],
+                        &[inner_a + shrink, inner_b - shrink],
                         stroke,
                         dash,
                         dash,
@@ -362,12 +454,23 @@ impl NormalizedOrZero for Vec2 {
     }
 }
 
-/// Draws a molecule's structure in a bordered group with a heading.
+/// Draws a molecule's structure in a bordered group with a heading, fitted to
+/// the available width.
 pub fn structure_panel(ui: &mut Ui, molecule: &Molecule, height: f32) {
+    structure_panel_with_options(ui, molecule, height, StructureOptions::default());
+}
+
+/// [`structure_panel`] with explicit rendering options.
+pub fn structure_panel_with_options(
+    ui: &mut Ui,
+    molecule: &Molecule,
+    height: f32,
+    options: StructureOptions,
+) {
     ui.group(|ui| {
         ui.label(egui::RichText::new("Structure").strong());
         let width = ui.available_width();
-        ui.add(StructureView::new(molecule, Vec2::new(width, height)));
+        ui.add(StructureView::new(molecule, Vec2::new(width, height)).with_options(options));
     });
 }
 
@@ -514,6 +617,123 @@ mod tests {
         // One coordinate unit maps to 80px, and the bond spans exactly one.
         let len = mean_bond_length(&mol, &t).unwrap();
         assert!((len - 80.0).abs() < 1e-3);
+    }
+
+    /// Two carbons a fixed distance apart, for exercising the sizing modes.
+    fn linear_molecule(coord_bond_length: f64) -> Molecule {
+        use chemcore::prelude::*;
+
+        let mut mol = Molecule::new();
+        let a = mol.add_atom(Atom::new(Element::carbon()));
+        let b = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(a, b, BondOrder::Single)).unwrap();
+        mol.set_coords(vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(coord_bond_length, 0.0),
+        ])
+        .unwrap();
+        mol
+    }
+
+    fn bbox_of(mol: &Molecule) -> BoundingBox {
+        BoundingBox::from_points(mol.coords().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_explicit_scale_overrides_fit() {
+        let mol = linear_molecule(2.0);
+        let options = StructureOptions {
+            scale: 12.0,
+            ..Default::default()
+        };
+        let t = Transform::for_options(&mol, bbox_of(&mol), rect(100.0, 100.0), &options);
+        // Honoured verbatim, not recomputed to fill the rect.
+        assert!((t.scale - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_bond_length_derives_scale() {
+        // Source bonds are 2.0 units; asking for 30px on screen means 15px per
+        // unit, regardless of how big the rect is.
+        let mol = linear_molecule(2.0);
+        let options = StructureOptions {
+            bond_length: 30.0,
+            ..Default::default()
+        };
+        let t = Transform::for_options(&mol, bbox_of(&mol), rect(500.0, 500.0), &options);
+        assert!((t.scale - 15.0).abs() < 1e-4);
+
+        let rendered = mean_bond_length(&mol, &t).unwrap();
+        assert!((rendered - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_bond_length_is_independent_of_rect() {
+        // The point of a target bond length: molecules render at a consistent
+        // size across differently-shaped rects, which fit-to-rect can't do.
+        let mol = linear_molecule(1.5);
+        let options = StructureOptions {
+            bond_length: 24.0,
+            ..Default::default()
+        };
+        let small = Transform::for_options(&mol, bbox_of(&mol), rect(80.0, 60.0), &options);
+        let large = Transform::for_options(&mol, bbox_of(&mol), rect(900.0, 700.0), &options);
+        assert!((small.scale - large.scale).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_explicit_scale_beats_bond_length() {
+        let mol = linear_molecule(2.0);
+        let options = StructureOptions {
+            scale: 7.0,
+            bond_length: 30.0,
+            ..Default::default()
+        };
+        let t = Transform::for_options(&mol, bbox_of(&mol), rect(100.0, 100.0), &options);
+        assert!((t.scale - 7.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_bond_length_falls_back_to_fit_without_bonds() {
+        use chemcore::prelude::*;
+
+        // A lone atom has no bond to measure, so a target bond length can't be
+        // honoured — it fits instead of dividing by zero.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.set_coords(vec![Point2::new(0.0, 0.0)]).unwrap();
+
+        let options = StructureOptions {
+            bond_length: 30.0,
+            ..Default::default()
+        };
+        let t = Transform::for_options(&mol, bbox_of(&mol), rect(100.0, 100.0), &options);
+        assert!(t.scale.is_finite() && t.scale > 0.0);
+    }
+
+    #[test]
+    fn test_default_options_fit_to_rect() {
+        let mol = linear_molecule(1.0);
+        let options = StructureOptions::default();
+        let t = Transform::for_options(&mol, bbox_of(&mol), rect(100.0, 100.0), &options);
+        // Same as fit(): one unit spans the 80px left after padding.
+        assert!((t.scale - 80.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_mean_source_bond_length() {
+        let mol = linear_molecule(2.5);
+        assert!((mean_source_bond_length(&mol).unwrap() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_mean_source_bond_length_no_bonds() {
+        use chemcore::prelude::*;
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.set_coords(vec![Point2::new(0.0, 0.0)]).unwrap();
+        assert!(mean_source_bond_length(&mol).is_none());
     }
 
     #[test]
