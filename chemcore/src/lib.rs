@@ -2,6 +2,7 @@ pub mod atom;
 pub mod bond;
 pub mod geometry;
 pub mod graph;
+pub mod layout;
 pub mod molecule;
 pub mod rings;
 
@@ -13,6 +14,7 @@ pub mod prelude {
     pub use crate::elements::{ATOMIC_MASSES, ELEMENT_NAMES, ELEMENT_SYMBOLS};
     pub use crate::geometry::{BoundingBox, Point2};
     pub use crate::graph::{MoleculeGraph, Neighbor};
+    pub use crate::layout::{ensure_coords, layout};
     pub use crate::molecule::{Molecule, MoleculeError};
     pub use crate::rings::{Ring, find_sssr, perceive_rings, ring_count};
 }
