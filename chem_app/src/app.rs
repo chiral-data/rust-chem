@@ -3,7 +3,7 @@ use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::search::{FingerprintSearch, SearchResult};
 use crate::structure_view::{
-    ShowCarbons, StructureOptions, StructureView, structure_option_controls,
+    ShowCarbons, StructureOptions, StructureView, structure_display_section,
     structure_panel_with_options,
 };
 use bitvec::prelude::BitVec;
@@ -620,7 +620,11 @@ impl ChemFpDemoApp {
                         "Fingerprints computed: {}",
                         self.dataset_fingerprints.len()
                     ));
-                    ui.checkbox(&mut self.show_thumbnails, "Show structures");
+                    structure_display_section(
+                        ui,
+                        &mut self.structure_options,
+                        &mut self.show_thumbnails,
+                    );
 
                     ui.separator();
 
@@ -774,7 +778,6 @@ impl ChemFpDemoApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     structure_panel_with_options(ui, &mol, 220.0, self.structure_options);
-                    structure_option_controls(ui, &mut self.structure_options);
                     show_molecule_info(ui, &mol, &smiles, &name);
                     show_atom_list(ui, &mol);
                     show_bond_list(ui, &mol);

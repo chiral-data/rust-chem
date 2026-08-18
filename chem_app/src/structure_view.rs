@@ -810,6 +810,26 @@ impl AtomVisualization {
     }
 }
 
+/// Every setting affecting how structures are drawn, in one collapsible
+/// section.
+///
+/// These apply everywhere a structure appears — table thumbnails, the query
+/// panel, the detail window — so they belong in one findable place rather than
+/// scattered next to each thing they affect. `show_thumbnails` rides along
+/// because it's a display choice too, even though it only bears on the table.
+pub fn structure_display_section(
+    ui: &mut Ui,
+    options: &mut StructureOptions,
+    show_thumbnails: &mut bool,
+) {
+    egui::CollapsingHeader::new("Structure display")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.checkbox(show_thumbnails, "Show structures in table");
+            structure_option_controls(ui, options);
+        });
+}
+
 /// Controls for the atom-display options, for a caller that wants to expose
 /// them alongside a structure.
 pub fn structure_option_controls(ui: &mut Ui, options: &mut StructureOptions) {
