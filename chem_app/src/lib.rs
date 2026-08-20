@@ -3,8 +3,10 @@ mod dataset;
 mod fingerprint_view;
 mod molecule_view;
 mod search;
+mod state;
 mod structure_view;
 mod task;
+mod views;
 
 pub use app::ChemFpDemoApp;
 
