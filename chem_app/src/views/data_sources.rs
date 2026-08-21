@@ -9,9 +9,7 @@
 //! [`OperationsView::fp_params`]: crate::views::OperationsView::fp_params
 
 use crate::state::AppState;
-use crate::structure_view::{
-    ShowCarbons, StructureOptions, StructureView, structure_display_section,
-};
+use crate::structure_view::{ShowCarbons, StructureOptions, StructureView};
 use chemcore::layout::ensure_coords;
 use egui::{RichText, Vec2};
 
@@ -77,10 +75,12 @@ impl DataSourcesView {
             "Fingerprints computed: {}",
             state.dataset_fingerprints.len()
         ));
-        structure_display_section(
-            ui,
-            &mut state.display.structure,
+        // Only the toggle, not the structure options: this governs this
+        // table, and #106 moved the options that govern every structure
+        // everywhere into the window that owns them.
+        ui.checkbox(
             &mut state.display.show_thumbnails,
+            "Show structures in table",
         );
 
         ui.separator();

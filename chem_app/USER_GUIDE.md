@@ -42,7 +42,7 @@ A menu bar sits above a workspace that three floating windows sit on:
 
 - **Data Sources** — loaded files and the dataset table
 - **Operations** — everything you run against the dataset
-- **Data Visualization** — ranked search results
+- **Data Visualization** — how structures are drawn, the query, and ranked results
 
 Each is movable and resizable, and each can be closed from its own **✕** or toggled from the **View** menu. Close the last one and the empty workspace tells you where to get them back. Window content is still being reorganised across v0.5.0, so a control described under one window may move to a neighbouring one in a later release.
 
@@ -88,13 +88,19 @@ You need to do this at least once before you can search.
 
 - Type a SMILES string in the text box, e.g. `c1ccccc1O` (phenol) or `CC(=O)Oc1ccccc1C(=O)O` (aspirin-like).
 - Click **Parse**, or just stop typing — it auto-parses after a short idle delay (debounced so it doesn't re-parse on every keystroke).
-- On success you'll see the parsed molecule drawn, its info, and its fingerprint as a bit grid. Invalid SMILES shows an error instead.
+- On success the parsed molecule is drawn in the **Data Visualization** window's *Query* section, with its details and its fingerprint. Invalid SMILES shows an error here, beside the box you typed it in.
 - **Top K** — how many ranked results to return.
 - **🔍 Search** — ranked by Tanimoto similarity. It needs both a parsed query and computed dataset fingerprints; if either is missing, the section says which.
 
-### 3. Explore results
+### 3. Look at the results
 
-In the **Data Visualization** window, each hit shows its rank, structure summary, and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query molecule. Click **▲ Hide** to collapse it again.
+The **Data Visualization** window has three sections.
+
+**Display** — how structures are drawn, everywhere: which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure in the app, which is why they live here rather than beside any one of them. Closed by default, since it is configuration rather than something to read. The one display choice that is *not* here is the dataset table's thumbnail toggle, which stays beside the table it governs.
+
+**Query** — the parsed query molecule drawn, its details, and its fingerprint as a bit grid. It is labelled with the SMILES it was parsed from, which is not necessarily what is currently in the box in Operations.
+
+**Results** — each hit with its rank, summary and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query. Click **▲ Hide** to collapse it again.
 
 ### Backend chips
 
