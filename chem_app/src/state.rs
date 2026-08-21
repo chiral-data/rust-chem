@@ -168,6 +168,14 @@ pub struct AppState {
     pub query_molecule: Option<Molecule>,
     pub query_fingerprint: Option<BitVec>,
     pub query_error: Option<String>,
+    /// The SMILES that produced [`AppState::query_molecule`].
+    ///
+    /// Not the same thing as the text in the query box, which belongs to the
+    /// view that owns the box and differs from this the moment you start
+    /// typing. This is part of the *output*: whatever is drawing the parsed
+    /// molecule needs the string it came from, and shouldn't have to reach into
+    /// another view for it.
+    pub query_source: String,
 
     /// Last outcome of each operation, reported by its own section.
     pub fingerprints: OperationOutcome,
@@ -255,6 +263,7 @@ impl AppState {
             query_molecule: None,
             query_fingerprint: None,
             query_error: None,
+            query_source: String::new(),
             fingerprints: OperationOutcome::default(),
             aromaticity: OperationOutcome::default(),
             coordinates: OperationOutcome::default(),
@@ -493,6 +502,7 @@ impl AppState {
             self.query = OperationOutcome::failure("No query");
             self.query_molecule = None;
             self.query_fingerprint = None;
+            self.query_source.clear();
             return;
         }
 
@@ -503,6 +513,7 @@ impl AppState {
                 // instead of every frame.
                 ensure_coords(&mut mol);
                 self.query_molecule = Some(mol.clone());
+                self.query_source = smiles.to_string();
                 self.query_error = None;
                 self.generate_query_fingerprint(mol, params);
             }
@@ -511,6 +522,7 @@ impl AppState {
                 self.query = OperationOutcome::failure("Invalid SMILES");
                 self.query_molecule = None;
                 self.query_fingerprint = None;
+                self.query_source.clear();
             }
         }
     }
@@ -814,6 +826,39 @@ mod tests {
         // And not into the dataset's status line, which belongs to another
         // window now.
         assert!(!state.dataset_status.contains("No dataset"));
+    }
+
+    #[test]
+    fn test_a_parsed_query_remembers_the_smiles_it_came_from() {
+        let mut state = AppState::cpu_only();
+        state.parse_query("c1ccccc1", FingerprintParams::default());
+
+        // Whatever draws the parsed molecule needs the string it came from, and
+        // shouldn't have to reach into the view that owns the text box for it.
+        assert!(state.query_molecule.is_some());
+        assert_eq!(state.query_source, "c1ccccc1");
+    }
+
+    #[test]
+    fn test_a_failed_parse_leaves_no_stale_query_source() {
+        let mut state = AppState::cpu_only();
+        state.parse_query("c1ccccc1", FingerprintParams::default());
+        assert_eq!(state.query_source, "c1ccccc1");
+
+        state.parse_query("not a molecule", FingerprintParams::default());
+
+        // Otherwise the Query section would label an absent structure with the
+        // last SMILES that happened to work.
+        assert!(state.query_molecule.is_none());
+        assert!(state.query_source.is_empty());
+        assert!(state.query.failed());
+    }
+
+    #[test]
+    fn test_the_parsed_smiles_is_trimmed_not_the_raw_box_contents() {
+        let mut state = AppState::cpu_only();
+        state.parse_query("  c1ccccc1  ", FingerprintParams::default());
+        assert_eq!(state.query_source, "c1ccccc1");
     }
 
     #[test]

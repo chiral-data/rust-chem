@@ -8,10 +8,7 @@
 //!
 //! Owns the parameters. [`AppState`] owns what running an operation produces.
 
-use crate::fingerprint_view::fingerprint_full;
-use crate::molecule_view::show_molecule_info;
 use crate::state::{AppState, FingerprintParams, OperationOutcome};
-use crate::structure_view::structure_panel_with_options;
 use egui::{Color32, RichText};
 use web_time::{Duration, Instant};
 
@@ -158,12 +155,10 @@ impl OperationsView {
     fn search_section(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         let outcome = outcome_line(&state.search);
         section(ui, "Similarity Search", true, outcome, |ui| {
-            // Controls first and contiguous: the query, then what to do with
-            // it. The structure and the fingerprint grid below are this
-            // operation's *output*, and putting them in between left Search
-            // several hundred pixels beneath the box that feeds it — a scroll
-            // past the answer to reach the question. #106 takes the output out
-            // of here altogether.
+            // Controls only. The query's structure and fingerprint are drawn
+            // in the Data Visualization window, which owns everything the
+            // display options govern — so this section stays two rows however
+            // large the molecule is.
             ui.horizontal(|ui| {
                 ui.label("SMILES:");
                 let response = ui.text_edit_singleline(&mut self.query_smiles);
@@ -203,22 +198,6 @@ impl OperationsView {
                     "Needs dataset fingerprints — run Fingerprints above"
                 };
                 ui.label(RichText::new(missing).small().weak());
-            }
-
-            let has_output = state.query_molecule.is_some() || state.query_fingerprint.is_some();
-            if has_output {
-                ui.separator();
-            }
-
-            if let Some(mol) = state.query_molecule.clone() {
-                // Seeing the structure is how you tell at a glance whether the
-                // SMILES you typed is the molecule you meant.
-                structure_panel_with_options(ui, &mol, 180.0, state.display.structure);
-                show_molecule_info(ui, &mol, &self.query_smiles, "Query");
-            }
-
-            if let Some(fp) = &state.query_fingerprint {
-                fingerprint_full(ui, fp);
             }
         });
     }
