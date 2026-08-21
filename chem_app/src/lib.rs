@@ -7,8 +7,9 @@ mod state;
 mod structure_view;
 mod task;
 mod views;
+mod windows;
 
-pub use app::ChemFpDemoApp;
+pub use app::WorkbenchApp;
 
 /// Id of the `<canvas>` element eframe renders into on web builds (see
 /// chem_app/index.html).

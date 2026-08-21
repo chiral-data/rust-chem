@@ -60,9 +60,18 @@ impl OperationsView {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
-        ui.heading("Query Molecule");
-        ui.separator();
+        // As a side panel this was full height and never needed to scroll. As a
+        // window it does: a structure, a full fingerprint grid and the search
+        // controls together exceed any reasonable default height. Both axes,
+        // since a wide fingerprint grid would otherwise widen the window rather
+        // than scroll inside it.
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.contents(ui, state));
+    }
 
+    fn contents(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
+        // No heading: the window's title bar names it now.
         ui.horizontal(|ui| {
             ui.label("SMILES:");
             let response = ui.text_edit_singleline(&mut self.query_smiles);

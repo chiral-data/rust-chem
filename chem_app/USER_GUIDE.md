@@ -1,6 +1,6 @@
-# ChemFP Demo — User Guide
+# Chem Workbench — User Guide
 
-`chem_app` is a molecular fingerprint search demo built on `chemcore`, `chemio`, `chemfp`, and `chemgpu`. It runs both as a native desktop app and as a browser (WASM) build.
+`chem_app` is a cheminformatics workbench built on `chemcore`, `chemio`, `chemfp`, and `chemgpu`: it loads SMILES and SDF datasets, draws structures, computes Morgan fingerprints, detects aromaticity, and searches by Tanimoto similarity. It runs both as a native desktop app and as a browser (WASM) build.
 
 ## Running it
 
@@ -34,15 +34,27 @@ trunk build --release
 cd dist && python3 -m http.server 8080 --bind 0.0.0.0
 ```
 
-The web build starts up on the CPU and upgrades to GPU acceleration via WebGPU a moment later if the browser supports it (see the status bar's **🚀 GPU** / **💻 CPU** indicator). Browsers without WebGPU, or whose adapter can't fit the fingerprinting shader's buffer requirements, stay on CPU automatically — no user action needed either way.
+The web build starts up on the CPU and upgrades to GPU acceleration via WebGPU a moment later if the browser supports it (see the menu bar's **🚀 GPU** / **💻 CPU** indicator). Browsers without WebGPU, or whose adapter can't fit the fingerprinting shader's buffer requirements, stay on CPU automatically — no user action needed either way.
 
-## Using the demo
+## Using it
 
-The window is split into four panels: **Dataset** (left), **Query Molecule** (right), **Search Results** (center), and a status bar (top).
+A menu bar sits above a workspace that three floating windows sit on:
+
+- **Data Sources** — loaded files and the dataset table
+- **Operations** — the query molecule and similarity search
+- **Data Visualization** — ranked search results
+
+Each is movable and resizable, and each can be closed from its own **✕** or toggled from the **View** menu. Close the last one and the empty workspace tells you where to get them back. Window content is still being reorganised across v0.5.0, so a control described under one window may move to a neighbouring one in a later release.
+
+### The menu bar
+
+- **File** — Load File, Load Examples (the same actions as the buttons in Data Sources).
+- **View** — one checkbox per window.
+- **Right-hand side** — current FPS, and the **GPU** / **CPU** chips described below.
 
 ### 1. Load a dataset
 
-In the **Dataset** panel:
+In the **Data Sources** window, or from the **File** menu:
 
 - **📋 Load Examples** — loads 15 built-in molecules (methane, benzene, phenol, aniline, aspirin-adjacent structures, etc.) instantly. Good default if you just want to try things out.
 - **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file, or a `.sdf` file, from disk.
@@ -52,7 +64,7 @@ In the **Dataset** panel:
 
 ### 2. Compute fingerprints
 
-Still in the **Dataset** panel:
+Still in the **Data Sources** window:
 
 - **Radius** — Morgan fingerprint radius (0–5). Higher values capture larger structural neighborhoods around each atom.
 - **Size** — fingerprint length in bits (512–4096, logarithmic slider).
@@ -62,7 +74,7 @@ You need to do this at least once before you can search.
 
 ### 3. Enter a query molecule
 
-In the **Query Molecule** panel:
+In the **Operations** window:
 
 - Type a SMILES string in the text box, e.g. `c1ccccc1O` (phenol) or `CC(=O)Oc1ccccc1C(=O)O` (aspirin-like).
 - Click **Parse**, or just stop typing — it auto-parses after a short idle delay (debounced so it doesn't re-parse on every keystroke).
@@ -76,11 +88,11 @@ In the **Query Molecule** panel:
 
 ### 5. Explore results
 
-In the **Search Results** panel, each hit shows its rank, structure summary, and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query molecule. Click **▲ Hide** to collapse it again.
+In the **Data Visualization** window, each hit shows its rank, structure summary, and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query molecule. Click **▲ Hide** to collapse it again.
 
-### Status bar
+### Backend chips
 
-Top-right of the window shows the current FPS and a **CPU** / **GPU** selector — click either one to switch. The one currently in use is highlighted.
+Top-right of the menu bar shows the current FPS and a **CPU** / **GPU** selector — click either one to switch. The one currently in use is highlighted.
 
 - **💻 CPU** — always available; click it any time to force CPU-only fingerprinting/search.
 - **🚀 GPU** (green) — GPU is available. Click it to switch to (or back to) GPU acceleration — switching back after having used it once is instant, no re-init needed.
