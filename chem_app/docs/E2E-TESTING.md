@@ -117,9 +117,10 @@ iterating, not fine as evidence.
 
 ### Settings (#121)
 
-- **The gear toggles the window**, and lights while it is open. It is not a menu:
-  a menu would overlay the canvas and close the moment you clicked a control,
-  which is the opposite of what these settings need.
+- **⚙ Settings sits beside File and View**, and lights while the window is open.
+  It is not a menu: a menu would overlay the canvas and close the moment you
+  clicked a control, which is the opposite of what these settings need. It was
+  a bare gear at the far right first, which nobody would have found.
 - **Settings also appears in the View menu.** A window unreachable from there
   would be the worse inconsistency; the gear is a shortcut, not the only door.
 - **Change the theme.** The whole app switches, and structure colours follow —

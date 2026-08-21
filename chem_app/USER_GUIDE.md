@@ -51,7 +51,7 @@ Each is movable and resizable, and each can be closed from its own **✕** or to
 
 - **File** — Load File, Load Examples (the same actions as the buttons in Datasets).
 - **View** — one checkbox per window, and **Close all molecule windows**.
-- **⚙** — opens and closes **Settings**, at the right-hand end.
+- **⚙ Settings** — opens and closes the Settings window. It stays lit while the window is open.
 - **Right-hand side** — current FPS, and the **GPU** / **CPU** chips described below.
 
 ### 1. Load a dataset
@@ -110,7 +110,7 @@ The **Inspector** window has two sections.
 
 ### Settings
 
-Open it with the **⚙** at the right of the menu bar, or from the **View** menu. It stays open while you work, so a change can be watched taking effect rather than applied blind.
+Open it with **⚙ Settings** in the menu bar, or from the **View** menu. It stays open while you work, so a change can be watched taking effect rather than applied blind.
 
 - **Theme** — Light, Dark, or follow the system. Structure colours follow it: the same molecule is drawn with a light or dark palette to match.
 - **Structures** — which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure the app draws, which is why they are here rather than beside any one of them.

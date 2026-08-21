@@ -105,23 +105,27 @@ impl WorkbenchApp {
                     }
                 });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // A toggle for the Settings window, not a menu of its own: a
-                    // menu would overlay the canvas and close on interaction,
-                    // and the point of a window is adjusting a setting while
-                    // watching a structure change. Styled like the backend
-                    // chips beside it, since it is the same kind of thing — a
-                    // control that shows its state.
-                    let settings_open = self.windows.settings.open;
-                    if ui
-                        .selectable_label(settings_open, "⚙")
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
-                        self.windows.settings.open = !settings_open;
-                    }
-                    ui.separator();
+                // Beside the menus rather than out at the right-hand edge,
+                // where it was findable only by someone who already knew to
+                // look for it. Emoji plus text, as the app labels its other
+                // actions.
+                //
+                // A toggle for the Settings window, not a menu of its own: a
+                // menu would overlay the canvas and close the moment a control
+                // was touched, and the whole point of a window is adjusting a
+                // setting while watching a structure change. It is a
+                // `selectable_label` rather than a button so it still shows
+                // whether the window is open.
+                let settings_open = self.windows.settings.open;
+                if ui
+                    .selectable_label(settings_open, "⚙ Settings")
+                    .on_hover_text("Theme, and how structures are drawn")
+                    .clicked()
+                {
+                    self.windows.settings.open = !settings_open;
+                }
 
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
                     // Set by chem_app/e2e.sh, absent from an ordinary build.
