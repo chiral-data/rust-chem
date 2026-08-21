@@ -69,6 +69,9 @@ pub struct WindowRegistry {
     pub datasets: WindowEntry,
     pub operations: WindowEntry,
     pub inspector: WindowEntry,
+    /// Preferences. Closed by default and outside the default layout, so the
+    /// workspace still opens as the three content windows.
+    pub settings: WindowEntry,
     /// Whether [`WindowRegistry::ensure_layout`] has run. The default rects
     /// depend on the viewport, which egui doesn't know on the very first frame.
     laid_out: bool,
@@ -100,6 +103,12 @@ impl Default for WindowRegistry {
                 title: "Inspector",
                 open: true,
                 default_rect: Rect::from_min_size(pos2(120.0, 380.0), vec2(560.0, 260.0)),
+            },
+            settings: WindowEntry {
+                id: "window_settings",
+                title: "Settings",
+                open: false,
+                default_rect: Rect::from_min_size(pos2(180.0, 120.0), vec2(420.0, 300.0)),
             },
             laid_out: false,
         }
@@ -168,22 +177,33 @@ impl WindowRegistry {
             size(COLUMN_W, LEFT_ROW_H),
         );
         self.inspector.default_rect = Rect::from_min_size(at(right_x, y0), size(COLUMN_W, FULL_H));
+
+        // Not part of the tiling: Settings opens *over* the workspace rather
+        // than taking a share of it, since it is closed until asked for. It is
+        // therefore allowed to overlap the content windows, which is why the
+        // no-overlap guarantees below are about the tiled three.
+        self.settings.default_rect = Rect::from_min_size(at(0.30, 0.22), size(0.38, 0.44));
     }
 
     /// Every window, in menu order. What the View menu is built from, and what
     /// #108 will iterate to save open state and geometry.
-    pub fn entries_mut(&mut self) -> [&mut WindowEntry; 3] {
+    pub fn entries_mut(&mut self) -> [&mut WindowEntry; 4] {
         [
             &mut self.datasets,
             &mut self.operations,
             &mut self.inspector,
+            &mut self.settings,
         ]
     }
 
-    /// True when the workspace has nothing on it. The canvas draws a way back
-    /// in that case, since a bare canvas offers no clue that the View menu is
-    /// where windows come from.
-    pub fn all_closed(&self) -> bool {
+    /// True when the workspace has no *content* window on it. The canvas draws a
+    /// way back in that case, since a bare canvas offers no clue that the View
+    /// menu is where windows come from.
+    ///
+    /// Settings deliberately doesn't count. It holds preferences rather than
+    /// data, so a workspace showing only Settings is still a workspace with
+    /// nothing to look at, and suppressing the hint there would strand you.
+    pub fn all_content_closed(&self) -> bool {
         !self.datasets.open && !self.operations.open && !self.inspector.open
     }
 }
@@ -195,8 +215,47 @@ mod tests {
     #[test]
     fn test_every_window_starts_open() {
         let mut registry = WindowRegistry::default();
-        assert!(!registry.all_closed());
-        assert!(registry.entries_mut().iter().all(|e| e.open));
+        assert!(!registry.all_content_closed());
+        assert!(content_entries(&mut registry).iter().all(|e| e.open));
+    }
+
+    #[test]
+    fn test_settings_starts_closed_and_the_content_windows_open() {
+        let registry = WindowRegistry::default();
+
+        // The default layout is the three content windows; preferences open
+        // when asked for.
+        assert!(registry.datasets.open);
+        assert!(registry.operations.open);
+        assert!(registry.inspector.open);
+        assert!(!registry.settings.open);
+    }
+
+    #[test]
+    fn test_settings_alone_still_counts_as_an_empty_workspace() {
+        let mut registry = WindowRegistry::default();
+        registry.datasets.open = false;
+        registry.operations.open = false;
+        registry.inspector.open = false;
+        registry.settings.open = true;
+
+        // A workspace showing only preferences has nothing to look at, so the
+        // canvas must still say where windows come from — otherwise opening
+        // Settings would strand you.
+        assert!(registry.all_content_closed());
+    }
+
+    #[test]
+    fn test_settings_appears_in_the_view_menu() {
+        let mut registry = WindowRegistry::default();
+        let titles: Vec<&str> = registry.entries_mut().iter().map(|e| e.title()).collect();
+
+        // A window unreachable from the View menu would be the worse
+        // inconsistency; the gear is a shortcut, not the only door.
+        assert_eq!(
+            titles,
+            vec!["Datasets", "Operations", "Inspector", "Settings"]
+        );
     }
 
     #[test]
@@ -207,7 +266,7 @@ mod tests {
         }
         // Otherwise the canvas would sit blank with nothing pointing at the
         // View menu.
-        assert!(registry.all_closed());
+        assert!(registry.all_content_closed());
     }
 
     /// Common viewport sizes: the native build's request, a 1366x768 laptop, a
@@ -218,6 +277,24 @@ mod tests {
         (1024.0, 640.0),
         (800.0, 500.0),
     ];
+
+    /// The three windows the default layout tiles. Settings is placed over the
+    /// workspace rather than given a share of it, so the no-overlap and margin
+    /// guarantees are about these.
+    fn content_entries(registry: &mut WindowRegistry) -> [&mut WindowEntry; 3] {
+        [
+            &mut registry.datasets,
+            &mut registry.operations,
+            &mut registry.inspector,
+        ]
+    }
+
+    fn tiled_rects(registry: &mut WindowRegistry) -> Vec<Rect> {
+        content_entries(registry)
+            .iter()
+            .map(|e| e.default_rect)
+            .collect()
+    }
 
     fn tiled(width: f32, height: f32) -> (Rect, WindowRegistry) {
         // y offset stands in for the menu bar above the workspace.
@@ -231,11 +308,7 @@ mod tests {
     fn test_default_layout_never_overlaps() {
         for (w, h) in VIEWPORTS {
             let (_, mut registry) = tiled(w, h);
-            let rects: Vec<Rect> = registry
-                .entries_mut()
-                .iter()
-                .map(|e| e.default_rect)
-                .collect();
+            let rects: Vec<Rect> = tiled_rects(&mut registry);
 
             for i in 0..rects.len() {
                 for j in (i + 1)..rects.len() {
@@ -266,11 +339,7 @@ mod tests {
     fn test_windows_leave_visible_space_between_them() {
         for (w, h) in VIEWPORTS {
             let (_, mut registry) = tiled(w, h);
-            let rects: Vec<Rect> = registry
-                .entries_mut()
-                .iter()
-                .map(|e| e.default_rect)
-                .collect();
+            let rects: Vec<Rect> = tiled_rects(&mut registry);
             // Free canvas is the point of the arrangement: windows that merely
             // fail to overlap still read as panels butted together.
             let min_gap = w.min(h) * 0.04;
@@ -298,7 +367,7 @@ mod tests {
         for (w, h) in VIEWPORTS {
             let (workspace, mut registry) = tiled(w, h);
             let inset = workspace.shrink(w.min(h) * 0.04);
-            for entry in registry.entries_mut() {
+            for entry in content_entries(&mut registry) {
                 assert!(
                     inset.contains_rect(entry.default_rect),
                     "{} reaches the workspace edge at {}x{}: {:?}",

@@ -115,6 +115,24 @@ iterating, not fine as evidence.
   left it, not to the cascade position — each window keeps its own geometry
   because each has its own id.
 
+### Settings (#121)
+
+- **The gear toggles the window**, and lights while it is open. It is not a menu:
+  a menu would overlay the canvas and close the moment you clicked a control,
+  which is the opposite of what these settings need.
+- **Settings also appears in the View menu.** A window unreachable from there
+  would be the worse inconsistency; the gear is a shortcut, not the only door.
+- **Change the theme.** The whole app switches, and structure colours follow —
+  check a drawn molecule in the Inspector, not just the chrome.
+- **Change a structure option with a structure visible.** That is the entire
+  reason this is a window rather than a modal: the query structure, the table
+  thumbnails and any open detail window should all follow, while you watch.
+- **Close every content window but leave Settings open.** The canvas must still
+  say where windows come from — Settings holding preferences rather than data is
+  why it doesn't count as something to look at.
+- **The thumbnail toggle is here now**, back alongside the structure options
+  rather than beside the table.
+
 ### Inspector (#106)
 
 - **Change a Display option** — turn on explicit hydrogens, say. Every structure

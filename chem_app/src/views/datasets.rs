@@ -77,11 +77,6 @@ impl DatasetsView {
                 if let Some(i) = clicked {
                     state.activate_loaded_file(i);
                 }
-
-                ui.checkbox(
-                    &mut state.display.show_thumbnails,
-                    "Show structures in table",
-                );
             });
     }
 

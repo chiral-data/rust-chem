@@ -152,6 +152,13 @@ impl Default for FingerprintParams {
 /// private business.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DisplaySettings {
+    /// Light, dark, or follow the system.
+    ///
+    /// egui's own type, so `Context::set_theme` takes it directly and the
+    /// picker is egui's own widget. Held here rather than read back out of
+    /// egui because #108 persists this struct, and a preference has to be
+    /// somewhere it can be saved from.
+    pub theme: egui::ThemePreference,
     pub structure: StructureOptions,
     /// Whether the dataset table draws a structure per row. Off by default:
     /// it's a per-row render, and most of the time the table is being scanned

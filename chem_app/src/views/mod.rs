@@ -5,22 +5,23 @@
 //! against a `&mut AppState` for everything shared. Nothing here reaches into
 //! another view.
 //!
-//! The module names are the windows v0.5.0 is heading for
-//! ([tracking issue #112]), not the panels that exist today: the four files
-//! below still hold today's panel boundaries, and #104/#105/#106 move content
-//! between them as the windows take shape. `operations.rs` in particular does
-//! not yet hold the fingerprint controls — those are still drawn by the data
-//! panel that has always drawn them, reading parameters the operations view
-//! owns, until #105 moves them.
+//! One module per window, plus `detail` for the molecule windows, of which
+//! there may be several at once.
 //!
-//! [tracking issue #112]: https://github.com/chiral-data/rust-chem/issues/112
+//! Nothing here reaches into another view. That was not free: moving the query's
+//! structure into the Inspector needed `AppState` to remember the SMILES it
+//! parsed (#106), because the alternative was reading the text box that belongs
+//! to `operations`. Where two views need the same fact, the fact belongs in
+//! [`crate::state::AppState`].
 
 pub mod datasets;
 pub mod detail;
 pub mod inspector;
 pub mod operations;
+pub mod settings;
 
 pub use datasets::DatasetsView;
 pub use detail::DetailView;
 pub use inspector::InspectorView;
 pub use operations::OperationsView;
+pub use settings::SettingsView;
