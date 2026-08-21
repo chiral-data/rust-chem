@@ -50,7 +50,6 @@ Each is movable and resizable, and each can be closed from its own **✕** or to
 
 - **File** — Load File, Load Examples (the same actions as the buttons in Data Sources).
 - **View** — one checkbox per window.
-- **Compute** — pick **🚀 GPU** or **💻 CPU** explicitly, read why GPU is unavailable if it is, and retry initialisation.
 - **Right-hand side** — current FPS, and the **GPU** / **CPU** chips described below.
 
 ### 1. Load a dataset
@@ -93,7 +92,7 @@ In the **Data Visualization** window, each hit shows its rank, structure summary
 
 ### Backend chips
 
-Top-right of the menu bar shows the current FPS and a **CPU** / **GPU** selector — click either one to switch. The one currently in use is highlighted. The **Compute** menu offers the same choice by name, plus the failure reason as readable text and an explicit retry.
+Top-right of the menu bar shows the current FPS and a **CPU** / **GPU** selector — click either one to switch. The one currently in use is highlighted.
 
 - **💻 CPU** — always available; click it any time to force CPU-only fingerprinting/search.
 - **🚀 GPU** (green) — GPU is available. Click it to switch to (or back to) GPU acceleration — switching back after having used it once is instant, no re-init needed.

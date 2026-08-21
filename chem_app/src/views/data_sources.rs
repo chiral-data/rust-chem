@@ -30,10 +30,16 @@ impl DataSourcesView {
         state: &mut AppState,
         fp_params: &mut FingerprintParams,
     ) {
-        // One scroll region for the whole window, rather than a scrolling table
-        // inside a full-height panel. As a resizable window this can be short,
-        // and the controls above the table would otherwise be unreachable.
-        egui::ScrollArea::vertical().show(ui, |ui| self.contents(ui, state, fp_params));
+        // Both axes, and no auto-shrink. `ScrollArea::vertical` leaves the
+        // horizontal axis disabled, and egui sizes a disabled axis to its
+        // content — so the seven-column table widened the window until it
+        // covered its neighbour instead of scrolling. One region for the whole
+        // window, too, rather than a scrolling table inside it: as a resizable
+        // window this can be short, and the controls above the table would
+        // otherwise be unreachable.
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.contents(ui, state, fp_params));
     }
 
     fn contents(

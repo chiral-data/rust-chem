@@ -62,8 +62,12 @@ impl OperationsView {
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         // As a side panel this was full height and never needed to scroll. As a
         // window it does: a structure, a full fingerprint grid and the search
-        // controls together exceed any reasonable default height.
-        egui::ScrollArea::vertical().show(ui, |ui| self.contents(ui, state));
+        // controls together exceed any reasonable default height. Both axes,
+        // since a wide fingerprint grid would otherwise widen the window rather
+        // than scroll inside it.
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.contents(ui, state));
     }
 
     fn contents(&mut self, ui: &mut egui::Ui, state: &mut AppState) {

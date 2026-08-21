@@ -87,8 +87,6 @@ impl WorkbenchApp {
                     }
                 });
 
-                ui.menu_button("Compute", |ui| self.compute_menu(ui));
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
@@ -96,49 +94,6 @@ impl WorkbenchApp {
                 });
             });
         });
-    }
-
-    /// The Compute menu: the same two choices the chips offer, plus the two
-    /// things a chip can't carry — the reason GPU is unavailable as readable
-    /// text rather than a tooltip you have to know to hover for, and an
-    /// explicit retry. #105 moves backend selection into the Operations window,
-    /// next to the operations it governs.
-    fn compute_menu(&mut self, ui: &mut egui::Ui) {
-        let using_gpu = self.state.search_engine.is_using_gpu();
-
-        // Radio rather than the chips' toggle: a menu is where you go to be
-        // shown what the options are, so both are named and the live one marked.
-        if ui.radio(using_gpu, "🚀 GPU").clicked() {
-            // `force_gpu` reports false when there is no GPU context to switch
-            // to, which makes this a first (or renewed) init attempt.
-            if !self.state.search_engine.force_gpu() {
-                self.state.retry_gpu();
-            }
-            ui.close();
-        }
-        if ui.radio(!using_gpu, "💻 CPU").clicked() {
-            self.state.search_engine.force_cpu();
-            ui.close();
-        }
-
-        ui.separator();
-
-        if let Some(err) = self.state.search_engine.gpu_init_error() {
-            ui.label(
-                RichText::new(format!("GPU unavailable: {}", err))
-                    .small()
-                    .weak(),
-            );
-            if ui.button("Retry GPU init").clicked() {
-                self.state.retry_gpu();
-                ui.close();
-            }
-        } else if self.state.search_engine.has_gpu_available() {
-            ui.label(RichText::new("GPU ready").small().weak());
-        } else if ui.button("Initialise GPU").clicked() {
-            self.state.retry_gpu();
-            ui.close();
-        }
     }
 
     /// GPU/CPU status and quick toggle, right-aligned in the menu bar where it
@@ -245,6 +200,9 @@ impl eframe::App for WorkbenchApp {
         self.views.operations.tick(ctx, &mut self.state);
 
         self.menu_bar(ctx);
+        // After the menu bar has taken its strip, so the windows tile the space
+        // actually left for them.
+        self.windows.ensure_layout(ctx.available_rect());
         self.workspace(ctx);
         self.show_windows(ctx);
     }
