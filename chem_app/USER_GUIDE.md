@@ -41,7 +41,7 @@ The web build starts up on the CPU and upgrades to GPU acceleration via WebGPU a
 A menu bar sits above a workspace that three floating windows sit on:
 
 - **Data Sources** — loaded files and the dataset table
-- **Operations** — the query molecule and similarity search
+- **Operations** — everything you run against the dataset
 - **Data Visualization** — ranked search results
 
 Each is movable and resizable, and each can be closed from its own **✕** or toggled from the **View** menu. Close the last one and the empty workspace tells you where to get them back. Window content is still being reorganised across v0.5.0, so a control described under one window may move to a neighbouring one in a later release.
@@ -62,37 +62,43 @@ In the **Data Sources** window, or from the **File** menu:
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
   - Each load adds a new entry to the **Loaded Files** list rather than replacing what's already there — click any entry to switch back to it. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
 
-### 2. Compute fingerprints
+### 2. Run an operation
 
-Still in the **Data Sources** window:
+The **Operations** window holds everything that computes, one collapsing section each. Each section's header carries what happened last time it ran — what it produced, how long it took, and whether GPU or CPU did it — so a collapsed section still reports itself. Switching datasets clears those, since they describe data that is no longer active.
+
+**Backend**, at the top, picks **🚀 GPU** or **💻 CPU** for the operations that can use either (fingerprints and search). If GPU initialisation failed, the reason is shown here in full, with a **Retry**.
+
+**Fingerprints**
 
 - **Radius** — Morgan fingerprint radius (0–5). Higher values capture larger structural neighborhoods around each atom.
 - **Size** — fingerprint length in bits (512–4096, logarithmic slider).
-- **⚡ Compute Fingerprints** — generates a fingerprint for every molecule in the loaded dataset. The status line reports how long it took and whether it ran on GPU or CPU.
+- **⚡ Compute Fingerprints** — generates a fingerprint for every molecule in the loaded dataset.
 
 You need to do this at least once before you can search.
 
-### 3. Enter a query molecule
+**Aromaticity**
 
-In the **Operations** window:
+- **🔬 Detect Aromaticity** — runs ring perception across the dataset and flags aromatic atoms, which the dataset table's *Aromatic* column then reflects.
+
+**2D Coordinates**
+
+- **📐 Generate Coordinates** — lays out every molecule that doesn't already have coordinates, so it can be drawn. Molecules whose coordinates came from an SDF file keep them, and the section says how many it generated against how many it kept. Structures are also laid out on demand when you open one, so this is for doing the whole dataset at once.
+
+**Similarity Search**
 
 - Type a SMILES string in the text box, e.g. `c1ccccc1O` (phenol) or `CC(=O)Oc1ccccc1C(=O)O` (aspirin-like).
 - Click **Parse**, or just stop typing — it auto-parses after a short idle delay (debounced so it doesn't re-parse on every keystroke).
-- On success, you'll see the parsed molecule's info and its fingerprint rendered as a bit grid.
-- Invalid SMILES shows an error message instead.
+- On success you'll see the parsed molecule drawn, its info, and its fingerprint as a bit grid. Invalid SMILES shows an error instead.
+- **Top K** — how many ranked results to return.
+- **🔍 Search** — ranked by Tanimoto similarity. It needs both a parsed query and computed dataset fingerprints; if either is missing, the section says which.
 
-### 4. Search
-
-- Set **Top K** — how many ranked results to return.
-- Click **🔍 Search** (enabled once you have both a parsed query and computed dataset fingerprints). Results are ranked by Tanimoto similarity.
-
-### 5. Explore results
+### 3. Explore results
 
 In the **Data Visualization** window, each hit shows its rank, structure summary, and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query molecule. Click **▲ Hide** to collapse it again.
 
 ### Backend chips
 
-Top-right of the menu bar shows the current FPS and a **CPU** / **GPU** selector — click either one to switch. The one currently in use is highlighted.
+Top-right of the menu bar shows the current FPS and a **CPU** / **GPU** selector — click either one to switch, from anywhere, without opening a window. The one currently in use is highlighted. The Operations window's **Backend** section is the same setting with more detail.
 
 - **💻 CPU** — always available; click it any time to force CPU-only fingerprinting/search.
 - **🚀 GPU** (green) — GPU is available. Click it to switch to (or back to) GPU acceleration — switching back after having used it once is instant, no re-init needed.

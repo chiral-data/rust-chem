@@ -167,9 +167,8 @@ impl WorkbenchApp {
     }
 
     fn show_windows(&mut self, ctx: &egui::Context) {
-        // Destructured so each window's contents can borrow the views it needs
-        // without borrowing the whole app: `data_sources` still draws controls
-        // whose parameters `operations` owns, until #105 moves them.
+        // Destructured so each window's contents can borrow just the view it
+        // needs rather than the whole app.
         let Self {
             state,
             views,
@@ -183,9 +182,9 @@ impl WorkbenchApp {
             detail,
         } = views;
 
-        windows.data_sources.show(ctx, |ui| {
-            data_sources.ui(ui, state, &mut operations.fp_params)
-        });
+        windows
+            .data_sources
+            .show(ctx, |ui| data_sources.ui(ui, state));
         windows.operations.show(ctx, |ui| operations.ui(ui, state));
         windows
             .visualization
