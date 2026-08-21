@@ -158,6 +158,12 @@ impl OperationsView {
     fn search_section(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         let outcome = outcome_line(&state.search);
         section(ui, "Similarity Search", true, outcome, |ui| {
+            // Controls first and contiguous: the query, then what to do with
+            // it. The structure and the fingerprint grid below are this
+            // operation's *output*, and putting them in between left Search
+            // several hundred pixels beneath the box that feeds it — a scroll
+            // past the answer to reach the question. #106 takes the output out
+            // of here altogether.
             ui.horizontal(|ui| {
                 ui.label("SMILES:");
                 let response = ui.text_edit_singleline(&mut self.query_smiles);
@@ -170,8 +176,38 @@ impl OperationsView {
                 }
             });
 
+            // With the input, since it is about what was typed.
             if let Some(error) = &state.query_error {
                 ui.colored_label(Color32::RED, error);
+            }
+
+            let can_search = state.can_search();
+            ui.horizontal(|ui| {
+                ui.label("Top K:");
+                ui.add(egui::Slider::new(&mut self.top_k, 1..=50));
+                if ui
+                    .add_enabled(can_search, egui::Button::new("🔍 Search"))
+                    .clicked()
+                {
+                    state.run_search(self.top_k);
+                }
+            });
+
+            // Says which prerequisite is missing rather than presenting a greyed
+            // button and leaving you to work it out. Search needs two things,
+            // and one of them is another operation in this same window.
+            if !can_search {
+                let missing = if state.query_fingerprint.is_none() {
+                    "Needs a parsed query molecule"
+                } else {
+                    "Needs dataset fingerprints — run Fingerprints above"
+                };
+                ui.label(RichText::new(missing).small().weak());
+            }
+
+            let has_output = state.query_molecule.is_some() || state.query_fingerprint.is_some();
+            if has_output {
+                ui.separator();
             }
 
             if let Some(mol) = state.query_molecule.clone() {
@@ -183,30 +219,6 @@ impl OperationsView {
 
             if let Some(fp) = &state.query_fingerprint {
                 fingerprint_full(ui, fp);
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Top K:");
-                ui.add(egui::Slider::new(&mut self.top_k, 1..=50));
-            });
-
-            // Says which prerequisite is missing rather than presenting a greyed
-            // button and leaving you to work it out. Search needs two things,
-            // and one of them is another operation in this same window.
-            let can_search = state.can_search();
-            if ui
-                .add_enabled(can_search, egui::Button::new("🔍 Search"))
-                .clicked()
-            {
-                state.run_search(self.top_k);
-            }
-            if !can_search {
-                let missing = if state.query_fingerprint.is_none() {
-                    "Needs a parsed query molecule"
-                } else {
-                    "Needs dataset fingerprints — run Fingerprints above"
-                };
-                ui.label(RichText::new(missing).small().weak());
             }
         });
     }
