@@ -42,6 +42,79 @@ pub fn format_elapsed_ms(ms: f64) -> String {
     }
 }
 
+/// What happened the last time one operation ran.
+///
+/// The app used to carry a single `dataset_status` string that loading, both
+/// fingerprint paths, aromaticity and GPU init all wrote to, and one label read.
+/// With an operation per section that's wrong twice over: running aromaticity
+/// wiped the fingerprint result off the screen, and an operation that has moved
+/// to another window was still reporting into the one it left.
+#[derive(Clone, Debug, Default)]
+pub struct OperationOutcome {
+    /// What happened, in words. Empty until the operation has run at all.
+    message: String,
+    elapsed_ms: Option<f64>,
+    /// Which backend ran it, where there is a choice. `None` for the CPU-only
+    /// operations, whose backend isn't news.
+    used_gpu: Option<bool>,
+    failed: bool,
+}
+
+impl OperationOutcome {
+    fn ok(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            ..Default::default()
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            failed: true,
+            ..Default::default()
+        }
+    }
+
+    fn timed(mut self, elapsed_ms: f64) -> Self {
+        self.elapsed_ms = Some(elapsed_ms);
+        self
+    }
+
+    fn on_gpu(mut self, used_gpu: bool) -> Self {
+        self.used_gpu = Some(used_gpu);
+        self
+    }
+
+    pub fn has_run(&self) -> bool {
+        !self.message.is_empty()
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// One line for a collapsed section's header: what happened, how long it
+    /// took, and which backend ran it, to whatever extent those are known.
+    pub fn summary(&self) -> String {
+        if !self.has_run() {
+            return "\u{2014}".to_string(); // em dash: hasn't run
+        }
+        let mut summary = self.message.clone();
+        if let Some(ms) = self.elapsed_ms {
+            summary.push_str(&format!(" \u{b7} {}", format_elapsed_ms(ms)));
+        }
+        if let Some(used_gpu) = self.used_gpu {
+            summary.push_str(if used_gpu {
+                " \u{b7} GPU"
+            } else {
+                " \u{b7} CPU"
+            });
+        }
+        summary
+    }
+}
+
 /// Radius and bit-width for Morgan fingerprint generation.
 ///
 /// Owned by whichever view offers the controls, and passed to the operations
@@ -81,6 +154,8 @@ pub struct DisplaySettings {
 pub struct AppState {
     pub loaded_files: LoadedFiles,
     pub dataset_fingerprints: Vec<BitVec>,
+    /// Dataset-level messages only — loaded, switched, failed to load. What the
+    /// operations report goes in their own outcome, below.
     pub dataset_status: String,
     pub search_engine: FingerprintSearch,
     pub search_results: Vec<SearchResult>,
@@ -94,8 +169,12 @@ pub struct AppState {
     pub query_fingerprint: Option<BitVec>,
     pub query_error: Option<String>,
 
-    pub last_fp_gen_time: Option<f64>,
-    pub last_search_time: Option<f64>,
+    /// Last outcome of each operation, reported by its own section.
+    pub fingerprints: OperationOutcome,
+    pub aromaticity: OperationOutcome,
+    pub coordinates: OperationOutcome,
+    pub query: OperationOutcome,
+    pub search: OperationOutcome,
 
     pub display: DisplaySettings,
 
@@ -176,8 +255,11 @@ impl AppState {
             query_molecule: None,
             query_fingerprint: None,
             query_error: None,
-            last_fp_gen_time: None,
-            last_search_time: None,
+            fingerprints: OperationOutcome::default(),
+            aromaticity: OperationOutcome::default(),
+            coordinates: OperationOutcome::default(),
+            query: OperationOutcome::default(),
+            search: OperationOutcome::default(),
             display: DisplaySettings::default(),
             selected_row: None,
             dataset_epoch: 0,
@@ -209,6 +291,14 @@ impl AppState {
         self.search_engine.invalidate_target_dataset();
         self.search_results.clear();
         self.selected_row = None;
+        // These describe a dataset that is no longer active — "2048
+        // fingerprints · GPU" against a dataset that has been swapped out is
+        // worse than saying nothing. The query outcome survives: it is about
+        // the query, not the dataset.
+        self.fingerprints = OperationOutcome::default();
+        self.aromaticity = OperationOutcome::default();
+        self.coordinates = OperationOutcome::default();
+        self.search = OperationOutcome::default();
         self.dataset_epoch += 1;
         self.results_epoch += 1;
     }
@@ -325,7 +415,7 @@ impl AppState {
 
     pub fn precompute_dataset_fingerprints(&mut self, params: FingerprintParams) {
         if self.loaded_files.active_dataset().is_empty() {
-            self.dataset_status = "No dataset loaded".to_string();
+            self.fingerprints = OperationOutcome::failure("No dataset loaded");
             return;
         }
 
@@ -351,19 +441,56 @@ impl AppState {
     pub fn detect_aromaticity_for_dataset(&mut self) {
         let dataset = self.loaded_files.active_dataset_mut();
         if dataset.is_empty() {
-            self.dataset_status = "No dataset loaded".to_string();
+            self.aromaticity = OperationOutcome::failure("No dataset loaded");
             return;
         }
         for mol in dataset.molecules.iter_mut() {
             detect_aromaticity(mol);
         }
-        self.dataset_status = format!("Detected aromaticity for {} molecules", dataset.len());
+        let aromatic = dataset
+            .molecules
+            .iter()
+            .filter(|mol| mol.atoms().iter().any(|atom| atom.is_aromatic()))
+            .count();
+        self.aromaticity =
+            OperationOutcome::ok(format!("{} of {} aromatic", aromatic, dataset.len()));
+    }
+
+    /// Generates 2D coordinates across the dataset.
+    ///
+    /// Was never an action: coordinates appeared as a side effect of selecting a
+    /// row or turning on thumbnails, which made it the one operation of the four
+    /// with no way to run it. Reports how many it generated against how many it
+    /// left alone, since coordinates a file supplied are deliberately kept
+    /// (#88) and that is otherwise invisible.
+    pub fn generate_coordinates_for_dataset(&mut self) {
+        let dataset = self.loaded_files.active_dataset_mut();
+        if dataset.is_empty() {
+            self.coordinates = OperationOutcome::failure("No dataset loaded");
+            return;
+        }
+
+        let mut generated = 0;
+        let mut kept = 0;
+        for mol in dataset.molecules.iter_mut() {
+            if mol.has_coords() {
+                kept += 1;
+            } else if ensure_coords(mol) {
+                generated += 1;
+            }
+        }
+        self.coordinates = OperationOutcome::ok(if kept > 0 {
+            format!("{} generated, {} kept from file", generated, kept)
+        } else {
+            format!("{} generated", generated)
+        });
     }
 
     pub fn parse_query(&mut self, smiles: &str, params: FingerprintParams) {
         let smiles = smiles.trim();
         if smiles.is_empty() {
             self.query_error = Some("SMILES string is empty".to_string());
+            self.query = OperationOutcome::failure("No query");
             self.query_molecule = None;
             self.query_fingerprint = None;
             return;
@@ -381,6 +508,7 @@ impl AppState {
             }
             Err(e) => {
                 self.query_error = Some(format!("Invalid SMILES: {}", e));
+                self.query = OperationOutcome::failure("Invalid SMILES");
                 self.query_molecule = None;
                 self.query_fingerprint = None;
             }
@@ -399,7 +527,7 @@ impl AppState {
 
     pub fn run_search(&mut self, top_k: usize) {
         if self.dataset_fingerprints.is_empty() {
-            self.query_error = Some("Please compute dataset fingerprints first".to_string());
+            self.search = OperationOutcome::failure("No dataset fingerprints");
             return;
         }
 
@@ -427,10 +555,11 @@ impl AppState {
     // way.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn retry_gpu(&mut self) {
+        // No status message: which backend is live is shown by the Operations
+        // window's backend section and the menu bar chips, so it doesn't need
+        // to be announced into a dataset's status line.
         if let Err(e) = self.search_engine.retry_gpu_init() {
             log::warn!("GPU retry failed: {}", e);
-        } else {
-            self.dataset_status = "GPU acceleration is now active".to_string();
         }
     }
 
@@ -459,7 +588,6 @@ impl AppState {
             match gpu_init {
                 Some(Ok((morgan, tanimoto))) => {
                     self.search_engine.install_gpu(morgan, tanimoto);
-                    self.dataset_status = "GPU acceleration is now active".to_string();
                 }
                 Some(Err(e)) => {
                     self.search_engine.record_gpu_init_failure(e);
@@ -490,20 +618,16 @@ impl AppState {
         match result {
             Ok(fps) => {
                 self.dataset_fingerprints = fps;
-                self.dataset_status = format!(
-                    "Computed {} fingerprints in {} ({} mode)",
-                    self.dataset_fingerprints.len(),
-                    format_elapsed_ms(elapsed_ms),
-                    if self.search_engine.is_using_gpu() {
-                        "GPU"
-                    } else {
-                        "CPU"
-                    }
-                );
+                self.fingerprints = OperationOutcome::ok(format!(
+                    "{} fingerprints",
+                    self.dataset_fingerprints.len()
+                ))
+                .timed(elapsed_ms)
+                .on_gpu(self.search_engine.is_using_gpu());
                 log::info!("Fingerprints computed in {:.2}ms", elapsed_ms);
             }
             Err(e) => {
-                self.dataset_status = format!("Failed to compute fingerprints: {}", e);
+                self.fingerprints = OperationOutcome::failure(format!("Failed: {}", e));
                 log::error!("Fingerprint computation failed: {}", e);
             }
         }
@@ -513,10 +637,13 @@ impl AppState {
         match result {
             Ok(fp) => {
                 self.query_fingerprint = Some(fp);
-                self.last_fp_gen_time = Some(elapsed_ms);
+                self.query = OperationOutcome::ok("Parsed")
+                    .timed(elapsed_ms)
+                    .on_gpu(self.search_engine.is_using_gpu());
             }
             Err(e) => {
                 self.query_error = Some(format!("Fingerprint generation failed: {}", e));
+                self.query = OperationOutcome::failure("Fingerprint failed");
                 self.query_fingerprint = None;
             }
         }
@@ -525,11 +652,14 @@ impl AppState {
     fn apply_search_result(&mut self, result: anyhow::Result<Vec<SearchResult>>, elapsed_ms: f64) {
         match result {
             Ok(results) => {
+                self.search = OperationOutcome::ok(format!("{} hits", results.len()))
+                    .timed(elapsed_ms)
+                    .on_gpu(self.search_engine.is_using_gpu());
                 self.search_results = results;
-                self.last_search_time = Some(elapsed_ms);
             }
             Err(e) => {
                 self.query_error = Some(format!("Search failed: {}", e));
+                self.search = OperationOutcome::failure(format!("Failed: {}", e));
                 self.search_results.clear();
             }
         }
@@ -623,6 +753,70 @@ mod tests {
     }
 
     #[test]
+    fn test_switching_dataset_clears_what_the_operations_reported() {
+        let mut state = AppState::cpu_only();
+        state.detect_aromaticity_for_dataset();
+        state.generate_coordinates_for_dataset();
+        assert!(state.aromaticity.has_run());
+        assert!(state.coordinates.has_run());
+
+        state.load_example_dataset();
+
+        // "15 of 15 aromatic" against a dataset that has been swapped out is
+        // worse than saying nothing.
+        assert!(!state.aromaticity.has_run());
+        assert!(!state.coordinates.has_run());
+        assert!(!state.fingerprints.has_run());
+        assert!(!state.search.has_run());
+    }
+
+    #[test]
+    fn test_generating_coordinates_reports_generated_against_kept() {
+        let mut state = AppState::cpu_only();
+        let total = state.loaded_files.active_dataset().len();
+
+        // The example set is SMILES, so nothing arrives with coordinates.
+        state.generate_coordinates_for_dataset();
+        let first = state.coordinates.summary();
+        assert!(first.contains(&format!("{} generated", total)), "{}", first);
+        assert!(!first.contains("kept"), "{}", first);
+
+        // Second time everything already has them, which is the same branch
+        // that keeps coordinates an SDF supplied (#88).
+        state.generate_coordinates_for_dataset();
+        let second = state.coordinates.summary();
+        assert!(second.contains("0 generated"), "{}", second);
+        assert!(
+            second.contains(&format!("{} kept from file", total)),
+            "{}",
+            second
+        );
+    }
+
+    #[test]
+    fn test_an_operation_that_has_not_run_says_so() {
+        let state = AppState::cpu_only();
+        assert!(!state.fingerprints.has_run());
+        // An em dash, not an empty header line.
+        assert_eq!(state.fingerprints.summary(), "\u{2014}");
+    }
+
+    #[test]
+    fn test_an_operation_on_an_empty_dataset_fails_in_its_own_section() {
+        let mut state = AppState::cpu_only();
+        state.loaded_files.active_dataset_mut().molecules.clear();
+        state.loaded_files.active_dataset_mut().smiles.clear();
+        state.loaded_files.active_dataset_mut().names.clear();
+
+        state.detect_aromaticity_for_dataset();
+
+        assert!(state.aromaticity.failed());
+        // And not into the dataset's status line, which belongs to another
+        // window now.
+        assert!(!state.dataset_status.contains("No dataset"));
+    }
+
+    #[test]
     fn test_search_needs_both_a_query_and_a_fingerprinted_dataset() {
         let mut state = AppState::cpu_only();
         assert!(!state.can_search());
@@ -648,7 +842,9 @@ mod tests {
         );
 
         assert_eq!(state.search_results.len(), 1);
-        assert_eq!(state.last_search_time, Some(1.0));
+        assert!(state.search.summary().contains("1 hits"));
+        assert!(state.search.summary().contains("1.00ms"));
+        assert!(!state.search.failed());
         assert!(state.results_epoch() > epoch);
     }
 
@@ -670,6 +866,7 @@ mod tests {
         // whether the new search succeeded or not.
         assert!(state.search_results.is_empty());
         assert!(state.query_error.is_some());
+        assert!(state.search.failed());
         assert!(state.results_epoch() > epoch);
     }
 }

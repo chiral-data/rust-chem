@@ -8,7 +8,7 @@
 //!
 //! [`OperationsView::fp_params`]: crate::views::OperationsView::fp_params
 
-use crate::state::{AppState, FingerprintParams};
+use crate::state::AppState;
 use crate::structure_view::{
     ShowCarbons, StructureOptions, StructureView, structure_display_section,
 };
@@ -24,12 +24,7 @@ const MAX_TABLE_ROWS: usize = 20;
 pub struct DataSourcesView;
 
 impl DataSourcesView {
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        state: &mut AppState,
-        fp_params: &mut FingerprintParams,
-    ) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         // Both axes, and no auto-shrink. `ScrollArea::vertical` leaves the
         // horizontal axis disabled, and egui sizes a disabled axis to its
         // content — so the seven-column table widened the window until it
@@ -39,15 +34,10 @@ impl DataSourcesView {
         // otherwise be unreachable.
         egui::ScrollArea::both()
             .auto_shrink([false, false])
-            .show(ui, |ui| self.contents(ui, state, fp_params));
+            .show(ui, |ui| self.contents(ui, state));
     }
 
-    fn contents(
-        &mut self,
-        ui: &mut egui::Ui,
-        state: &mut AppState,
-        fp_params: &mut FingerprintParams,
-    ) {
+    fn contents(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         // No heading: the window's title bar names it now.
         ui.horizontal(|ui| {
             if ui.button("📂 Load File").clicked() {
@@ -73,23 +63,6 @@ impl DataSourcesView {
         if let Some(i) = clicked_index {
             state.activate_loaded_file(i);
         }
-        ui.separator();
-
-        ui.heading("Fingerprint Settings");
-        ui.add(egui::Slider::new(&mut fp_params.radius, 0..=5).text("Radius"));
-        ui.add(
-            egui::Slider::new(&mut fp_params.size, 512..=4096)
-                .text("Size")
-                .logarithmic(true),
-        );
-
-        if ui.button("⚡ Compute Fingerprints").clicked() {
-            state.precompute_dataset_fingerprints(*fp_params);
-        }
-        if ui.button("🔬 Detect Aromaticity").clicked() {
-            state.detect_aromaticity_for_dataset();
-        }
-
         ui.separator();
 
         if state.loaded_files.active_dataset().is_empty() {
