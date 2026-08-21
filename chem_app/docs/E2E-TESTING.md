@@ -117,7 +117,8 @@ iterating, not fine as evidence.
 
 ### Settings (#121)
 
-- **⚙ Settings sits beside File and View**, and lights while the window is open.
+- **Settings sits beside File and View**, plain text like they are, and lights
+  while the window is open.
   It is not a menu: a menu would overlay the canvas and close the moment you
   clicked a control, which is the opposite of what these settings need. It was
   a bare gear at the far right first, which nobody would have found.

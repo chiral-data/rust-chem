@@ -107,8 +107,11 @@ impl WorkbenchApp {
 
                 // Beside the menus rather than out at the right-hand edge,
                 // where it was findable only by someone who already knew to
-                // look for it. Emoji plus text, as the app labels its other
-                // actions.
+                // look for it.
+                //
+                // Plain text, like File and View. The app does put emoji on
+                // labels — but on action buttons inside windows and on the
+                // status chips, not on items in this bar.
                 //
                 // A toggle for the Settings window, not a menu of its own: a
                 // menu would overlay the canvas and close the moment a control
@@ -118,7 +121,7 @@ impl WorkbenchApp {
                 // whether the window is open.
                 let settings_open = self.windows.settings.open;
                 if ui
-                    .selectable_label(settings_open, "⚙ Settings")
+                    .selectable_label(settings_open, "Settings")
                     .on_hover_text("Theme, and how structures are drawn")
                     .clicked()
                 {
