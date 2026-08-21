@@ -8,14 +8,21 @@
 //! polygons, then hang acyclic substituents off them at tetrahedral-ish
 //! angles, then push apart anything that landed on top of something else.
 //!
+//! A refinement pass follows, for the systems the constructive placement
+//! cannot satisfy. Placing each ring as its own regular polygon works whenever
+//! rings share at most an edge — fused systems and spiro centres come out
+//! exactly right — but a bridged or cage system has rings sharing more than
+//! that, and no arrangement of independent regular polygons satisfies it. The
+//! symptom is not overlap, which measurement shows does not happen: it is
+//! stretched bonds. Adamantane came out with a bond 4.4x its target length,
+//! drawn as a long spurious line across the molecule.
+//!
 //! # Limitations
 //!
-//! There's no force-directed refinement pass (the Kamada-Kawai step
-//! smilesDrawer exposes through its `kk*` options). Ordinary drug-like
-//! molecules — rings, fused rings, chains, substituents — come out fine.
-//! Heavily bridged, spiro or cage systems can still overlap, because placing
-//! each ring as its own regular polygon can't satisfy several rings sharing
-//! atoms in three dimensions. That's a known gap, not a bug.
+//! A cage cannot have uniform bond lengths *and* no crossings in two
+//! dimensions, so refinement is a trade rather than a fix. It is only applied
+//! where bond lengths are actually bad, and only kept if it improves them
+//! without introducing an overlap.
 
 use crate::geometry::Point2;
 use crate::molecule::Molecule;
@@ -35,9 +42,39 @@ const COMPONENT_GAP: f64 = 2.0;
 /// smilesDrawer's equivalent knob is `overlapSensitivity`, defaulting to 0.42.
 const OVERLAP_THRESHOLD: f64 = 0.42;
 
+/// How far past the threshold [`separate`] pushes a clashing pair.
+///
+/// Landing them exactly on it makes the geometry balance on a knife edge: a
+/// later translation is supposed to preserve distances, but in the last bits it
+/// can drop a boundary pair back under, so the pair reads as a clash again and
+/// a refinement gets rejected for a rounding error. Cubane did exactly that.
+/// One percent clear is invisible and decisive.
+const SEPARATION_MARGIN: f64 = 1.01;
+
 /// Number of overlap-resolution passes (smilesDrawer's
 /// `overlapResolutionIterations`).
 const OVERLAP_ITERATIONS: usize = 12;
+
+/// Bond-length coefficient of variation above which a component is refined.
+///
+/// Measured against the cases that motivated the pass: benzene, decalin,
+/// spiro[5.5]undecane and gonane all come out of the constructive pass at
+/// exactly 0.0%, while norbornane is 44.5%, bicyclo[2.2.2]octane 63.5% and
+/// adamantane 70.3%. Anything in between separates them; 10% leaves generous
+/// headroom above the good cases without coming close to the bad ones, so a
+/// layout that is already conventional is provably left alone.
+const REFINE_CV_THRESHOLD: f64 = 0.10;
+
+/// Stress-majorization iterations. Each is O(n²) over one component's atoms.
+const REFINE_ITERATIONS: usize = 200;
+
+/// Stop early once an iteration improves stress by less than this fraction.
+const REFINE_TOLERANCE: f64 = 1e-4;
+
+/// Components larger than this are left alone: refinement needs all-pairs
+/// graph distances, and past this size the cost stops being worth a layout
+/// nobody was going to find conventional anyway.
+const REFINE_MAX_ATOMS: usize = 256;
 
 /// Generates 2D coordinates, replacing any the molecule already has.
 ///
@@ -94,22 +131,29 @@ impl<'a> Layout<'a> {
         let components = self.molecule.graph().connected_components();
         let mut x_offset = 0.0;
 
-        for component in components {
-            self.layout_component(&component);
+        for component in &components {
+            self.layout_component(component);
 
             // Shift this component clear of everything already placed.
             if x_offset > 0.0 {
-                for &atom in &component {
+                for &atom in component {
                     if let Some(p) = self.coords[atom].as_mut() {
                         p.x += x_offset;
                     }
                 }
             }
-            let width = self.component_width(&component);
+            let width = self.component_width(component);
             x_offset += width + COMPONENT_GAP * BOND_LENGTH;
         }
 
         self.resolve_overlaps();
+
+        // Last, and per component: refinement needs graph distances, which are
+        // only defined within a component, and it is judged against the layout
+        // the earlier passes produced.
+        for component in &components {
+            self.refine_component(component);
+        }
     }
 
     fn component_width(&self, component: &[usize]) -> f64 {
@@ -400,44 +444,118 @@ impl<'a> Layout<'a> {
     /// spot. This doesn't fix the underlying geometry — that's what a
     /// force-directed pass would do — but it stops atoms from being exactly
     /// coincident, which would otherwise render as a bond of zero length.
-    fn resolve_overlaps(&mut self) {
-        let threshold = BOND_LENGTH * OVERLAP_THRESHOLD;
-        let n = self.coords.len();
+    /// Relaxes a component's atoms toward uniform bond lengths, if its bonds
+    /// are bad enough to be worth it and the result is an improvement.
+    ///
+    /// Stress majorization on the Kamada-Kawai energy: every pair of atoms gets
+    /// an ideal distance of its graph distance times [`BOND_LENGTH`], weighted
+    /// by the inverse square of that ideal, and each iteration moves every atom
+    /// to the weighted position its pairs agree on. That decreases stress
+    /// monotonically, so there is no step size to tune and no risk of it
+    /// diverging.
+    ///
+    /// Three things keep it a refinement rather than a replacement:
+    ///
+    /// - It starts from the constructive layout, so it settles into the nearest
+    ///   good arrangement rather than an arbitrary one.
+    /// - It only runs where bond lengths are already bad
+    ///   ([`REFINE_CV_THRESHOLD`]), so conventional layouts are untouched.
+    /// - The result is kept only if bond lengths improved *and* no new clash
+    ///   appeared. A cage cannot have both in two dimensions, so this makes the
+    ///   trade explicit: uniformity is only bought where it costs nothing.
+    fn refine_component(&mut self, component: &[usize]) {
+        if component.len() < 4 || component.len() > REFINE_MAX_ATOMS {
+            return;
+        }
 
-        for _ in 0..OVERLAP_ITERATIONS {
-            let mut moved = false;
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let (Some(pi), Some(pj)) = (self.coords[i], self.coords[j]) else {
+        let before: Vec<Point2> = match component.iter().map(|&a| self.coords[a]).collect() {
+            Some(points) => points,
+            // An unplaced atom means the constructive pass gave up; refining
+            // around the hole would only spread the damage.
+            None => return,
+        };
+
+        let cv_before = bond_length_cv(self.molecule, component, &before);
+        if cv_before <= REFINE_CV_THRESHOLD {
+            return;
+        }
+
+        let ideal = self.graph_distances(component);
+        // Majorization pulls bonds toward uniform length and will happily let
+        // two non-bonded atoms sit on top of each other doing it, so the same
+        // push-apart the constructive pass uses runs over the result before it
+        // is judged. Without this every cage was rejected for clashes that this
+        // clears completely.
+        let relaxed = separate(self.molecule, component, &majorize(&before, &ideal));
+
+        // Components were offset along x to keep them apart; majorization is
+        // free to translate, so put the centroid back where it was rather than
+        // letting a refined component drift into its neighbour.
+        //
+        // Applied *before* judging, not after: a translation is supposed to
+        // preserve distances, but a pair sitting exactly on the overlap
+        // threshold can tip either side of it in the last bits, so the guard has
+        // to see the geometry that will actually be stored.
+        let shift = centroid(&before) - centroid(&relaxed);
+        let after: Vec<Point2> = relaxed.iter().map(|&p| p + shift).collect();
+
+        let cv_after = bond_length_cv(self.molecule, component, &after);
+        let clashes_before = clash_count(self.molecule, component, &before);
+        let clashes_after = clash_count(self.molecule, component, &after);
+
+        if cv_after >= cv_before || clashes_after > clashes_before {
+            return;
+        }
+
+        for (&atom, point) in component.iter().zip(after) {
+            self.coords[atom] = Some(point);
+        }
+    }
+
+    /// Shortest-path distances between every pair in a component, in bonds.
+    ///
+    /// `f64::INFINITY` cannot occur — a component is connected by definition —
+    /// so this is a plain matrix rather than an optional one.
+    fn graph_distances(&self, component: &[usize]) -> Vec<Vec<f64>> {
+        let index: std::collections::HashMap<usize, usize> = component
+            .iter()
+            .enumerate()
+            .map(|(i, &atom)| (atom, i))
+            .collect();
+        let n = component.len();
+        let mut distances = vec![vec![0.0; n]; n];
+
+        for (row, &start) in component.iter().enumerate() {
+            let mut seen = vec![false; n];
+            seen[row] = true;
+            let mut queue = VecDeque::from([(start, 0usize)]);
+
+            while let Some((atom, depth)) = queue.pop_front() {
+                for neighbor in self.molecule.graph().neighbors(atom) {
+                    let Some(&col) = index.get(&neighbor.atom_idx) else {
                         continue;
                     };
-                    // Bonded atoms are meant to be one bond apart; only
-                    // non-bonded pairs count as overlapping.
-                    if self.molecule.graph().has_edge(i, j) {
+                    if seen[col] {
                         continue;
                     }
-
-                    let dist = pi.distance(pj);
-                    if dist >= threshold {
-                        continue;
-                    }
-
-                    let push = match (pj - pi).normalized() {
-                        Some(dir) => dir,
-                        // Exactly coincident: no direction to separate along,
-                        // so pick one deterministically rather than randomly,
-                        // which would make layouts unreproducible.
-                        None => Point2::new(1.0, 0.0),
-                    };
-                    let shift = push * ((threshold - dist) / 2.0);
-                    self.coords[i] = Some(pi - shift);
-                    self.coords[j] = Some(pj + shift);
-                    moved = true;
+                    seen[col] = true;
+                    distances[row][col] = (depth + 1) as f64;
+                    queue.push_back((neighbor.atom_idx, depth + 1));
                 }
             }
-            if !moved {
-                break;
-            }
+        }
+
+        distances
+    }
+
+    fn resolve_overlaps(&mut self) {
+        let placed: Vec<usize> = (0..self.coords.len())
+            .filter(|&i| self.coords[i].is_some())
+            .collect();
+        let points: Vec<Point2> = placed.iter().map(|&i| self.coords[i].unwrap()).collect();
+
+        for (&atom, point) in placed.iter().zip(separate(self.molecule, &placed, &points)) {
+            self.coords[atom] = Some(point);
         }
     }
 
@@ -449,6 +567,186 @@ impl<'a> Layout<'a> {
             .map(|c| c.unwrap_or(Point2::ORIGIN))
             .collect()
     }
+}
+
+/// One pass of stress majorization until it stops paying, returning the relaxed
+/// positions.
+///
+/// The update moves each point to the weighted mean of where every other point
+/// would like it, which is the standard SMACOF step for the Kamada-Kawai stress
+/// function. Weights are `1 / ideal²`, so a pair one bond apart matters far more
+/// than a pair four bonds apart — which is what keeps bonds uniform rather than
+/// merely spreading atoms out evenly.
+fn majorize(start: &[Point2], ideal: &[Vec<f64>]) -> Vec<Point2> {
+    let n = start.len();
+    let mut points = start.to_vec();
+    let mut previous = stress(&points, ideal);
+
+    for _ in 0..REFINE_ITERATIONS {
+        let mut next = points.clone();
+
+        for i in 0..n {
+            let mut weight_sum = 0.0;
+            let mut target = Point2::new(0.0, 0.0);
+
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let l = ideal[i][j];
+                if l <= 0.0 {
+                    continue;
+                }
+                let w = 1.0 / (l * l);
+                let delta = points[i] - points[j];
+                // Coincident points have no direction to separate along; the
+                // pair contributes its weight without a direction rather than
+                // producing a NaN.
+                let unit = delta.normalized().unwrap_or(Point2::new(1.0, 0.0));
+                target = target + (points[j] + unit * l) * w;
+                weight_sum += w;
+            }
+
+            if weight_sum > 0.0 {
+                next[i] = target / weight_sum;
+            }
+        }
+
+        points = next;
+        let current = stress(&points, ideal);
+        // Monotone by construction, so this is a convergence test rather than a
+        // guard against getting worse.
+        if previous - current <= previous.abs() * REFINE_TOLERANCE {
+            break;
+        }
+        previous = current;
+    }
+
+    points
+}
+
+/// Pushes non-bonded pairs at least [`OVERLAP_THRESHOLD`] of a bond length
+/// apart, iterating until nothing moves.
+///
+/// smilesDrawer's equivalent knobs are `overlapSensitivity` and
+/// `overlapResolutionIterations`. Used twice: once on the constructive layout,
+/// and once on a refined component before deciding whether to keep it.
+fn separate(molecule: &Molecule, indices: &[usize], points: &[Point2]) -> Vec<Point2> {
+    let threshold = BOND_LENGTH * OVERLAP_THRESHOLD;
+    let target = threshold * SEPARATION_MARGIN;
+    let mut points = points.to_vec();
+
+    for _ in 0..OVERLAP_ITERATIONS {
+        let mut moved = false;
+        for i in 0..indices.len() {
+            for j in (i + 1)..indices.len() {
+                // Bonded atoms are meant to be one bond apart; only non-bonded
+                // pairs count as overlapping.
+                if molecule.graph().has_edge(indices[i], indices[j]) {
+                    continue;
+                }
+                let distance = points[i].distance(points[j]);
+                if distance >= threshold {
+                    continue;
+                }
+                let push = (points[j] - points[i])
+                    .normalized()
+                    // Exactly coincident: no direction to separate along, so
+                    // pick one deterministically rather than randomly, which
+                    // would make layouts unreproducible.
+                    .unwrap_or(Point2::new(1.0, 0.0));
+                let shift = push * ((target - distance) / 2.0);
+                points[i] = points[i] - shift;
+                points[j] = points[j] + shift;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    points
+}
+
+/// Kamada-Kawai stress: weighted squared error between actual and ideal
+/// distances over every pair.
+fn stress(points: &[Point2], ideal: &[Vec<f64>]) -> f64 {
+    let mut total = 0.0;
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            let l = ideal[i][j];
+            if l <= 0.0 {
+                continue;
+            }
+            let d = points[i].distance(points[j]);
+            total += (d - l) * (d - l) / (l * l);
+        }
+    }
+    total
+}
+
+/// Coefficient of variation of bond length within a component: the spread of
+/// bond lengths relative to their mean.
+///
+/// Scale-free on purpose, so it says "these bonds disagree with each other"
+/// rather than "these bonds are the wrong size" — which is the actual defect in
+/// a bridged system, where some bonds are right and others are stretched.
+fn bond_length_cv(molecule: &Molecule, component: &[usize], points: &[Point2]) -> f64 {
+    let index: std::collections::HashMap<usize, usize> = component
+        .iter()
+        .enumerate()
+        .map(|(i, &atom)| (atom, i))
+        .collect();
+
+    let mut lengths = Vec::new();
+    for bond in molecule.bonds() {
+        let (u, v) = bond.atoms();
+        if let (Some(&i), Some(&j)) = (index.get(&u), index.get(&v)) {
+            lengths.push(points[i].distance(points[j]));
+        }
+    }
+
+    if lengths.is_empty() {
+        return 0.0;
+    }
+    let mean = lengths.iter().sum::<f64>() / lengths.len() as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let variance =
+        lengths.iter().map(|l| (l - mean) * (l - mean)).sum::<f64>() / lengths.len() as f64;
+    variance.sqrt() / mean
+}
+
+/// Non-bonded pairs within a component closer than [`OVERLAP_THRESHOLD`].
+///
+/// The same threshold `resolve_overlaps` works to, deliberately. A second,
+/// stricter definition of "too close" was tried and rejected: it vetoed every
+/// cage refinement on the grounds of distances the rest of the module considers
+/// acceptable.
+fn clash_count(molecule: &Molecule, component: &[usize], points: &[Point2]) -> usize {
+    let threshold = BOND_LENGTH * OVERLAP_THRESHOLD;
+    let mut count = 0;
+    for i in 0..component.len() {
+        for j in (i + 1)..component.len() {
+            if molecule.graph().has_edge(component[i], component[j]) {
+                continue;
+            }
+            if points[i].distance(points[j]) < threshold {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn centroid(points: &[Point2]) -> Point2 {
+    if points.is_empty() {
+        return Point2::ORIGIN;
+    }
+    let sum = points.iter().fold(Point2::new(0.0, 0.0), |acc, &p| acc + p);
+    sum / points.len() as f64
 }
 
 /// Distance from a regular polygon's center to a vertex, for unit bond length.
@@ -535,6 +833,257 @@ mod tests {
             }
         }
         min
+    }
+
+    /// Bond-length spread, the metric the refinement exists to reduce.
+    fn bond_cv(mol: &Molecule) -> f64 {
+        let all: Vec<usize> = (0..mol.num_atoms()).collect();
+        let points: Vec<Point2> = all.iter().map(|&a| mol.coord(a).unwrap()).collect();
+        bond_length_cv(mol, &all, &points)
+    }
+
+    fn clashes(mol: &Molecule) -> usize {
+        let all: Vec<usize> = (0..mol.num_atoms()).collect();
+        let points: Vec<Point2> = all.iter().map(|&a| mol.coord(a).unwrap()).collect();
+        clash_count(mol, &all, &points)
+    }
+
+    fn norbornane() -> Molecule {
+        carbon_skeleton(
+            7,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 0),
+                (0, 6),
+                (6, 3),
+            ],
+        )
+    }
+
+    fn bicyclo222octane() -> Molecule {
+        carbon_skeleton(
+            8,
+            &[
+                (0, 2),
+                (2, 3),
+                (3, 1),
+                (0, 4),
+                (4, 5),
+                (5, 1),
+                (0, 6),
+                (6, 7),
+                (7, 1),
+            ],
+        )
+    }
+
+    /// Each of the six CH2 groups bridges a distinct pair of the four CH atoms,
+    /// which is the whole of adamantane's connectivity.
+    fn adamantane() -> Molecule {
+        carbon_skeleton(
+            10,
+            &[
+                (0, 4),
+                (1, 4),
+                (0, 5),
+                (2, 5),
+                (0, 6),
+                (3, 6),
+                (1, 7),
+                (2, 7),
+                (1, 8),
+                (3, 8),
+                (2, 9),
+                (3, 9),
+            ],
+        )
+    }
+
+    fn cubane() -> Molecule {
+        carbon_skeleton(
+            8,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 4),
+                (0, 4),
+                (1, 5),
+                (2, 6),
+                (3, 7),
+            ],
+        )
+    }
+
+    fn spiro55undecane() -> Molecule {
+        carbon_skeleton(
+            11,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 0),
+                (0, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9),
+                (9, 10),
+                (10, 0),
+            ],
+        )
+    }
+
+    fn decalin() -> Molecule {
+        carbon_skeleton(
+            10,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 9),
+                (9, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9),
+            ],
+        )
+    }
+
+    /// The gonane skeleton: three fused six-rings and a five-ring.
+    fn gonane() -> Molecule {
+        carbon_skeleton(
+            17,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 9),
+                (9, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9),
+                (7, 13),
+                (13, 12),
+                (12, 11),
+                (11, 10),
+                (10, 8),
+                (12, 16),
+                (16, 15),
+                (15, 14),
+                (14, 13),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_bridged_and_cage_systems_get_usable_bond_lengths() {
+        // Without refinement these came out at 44.5%, 63.5%, 70.3% and 48.8%,
+        // with adamantane drawing a bond 4.4x its target length — a long
+        // spurious line across the molecule. Placing each ring as its own
+        // regular polygon cannot satisfy rings that share more than an edge.
+        for (name, mut mol) in [
+            ("norbornane", norbornane()),
+            ("bicyclo[2.2.2]octane", bicyclo222octane()),
+            ("adamantane", adamantane()),
+            ("cubane", cubane()),
+        ] {
+            layout(&mut mol);
+            let cv = bond_cv(&mol);
+            assert!(
+                cv < 0.15,
+                "{name} bond length CV is {:.1}%, want under 15%",
+                cv * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_bond_is_wildly_longer_than_the_others() {
+        // The CV check can be satisfied by many slightly-wrong bonds; this
+        // catches the single glaring one, which is what actually looks broken.
+        for (name, mut mol) in [
+            ("norbornane", norbornane()),
+            ("bicyclo[2.2.2]octane", bicyclo222octane()),
+            ("adamantane", adamantane()),
+            ("cubane", cubane()),
+        ] {
+            layout(&mut mol);
+            let longest = bond_lengths(&mol).into_iter().fold(0.0f64, f64::max);
+            assert!(
+                longest < BOND_LENGTH * 1.5,
+                "{name}'s longest bond is {longest:.3}, want under {:.3}",
+                BOND_LENGTH * 1.5
+            );
+        }
+    }
+
+    #[test]
+    fn test_refinement_leaves_conventional_layouts_alone() {
+        // These come out of the constructive pass exactly right, and
+        // majorization would make every one of them slightly worse — 1.7%, 1.9%
+        // and 2.9% respectively when tried. The threshold gate is what protects
+        // them, so this is the test that it is doing its job.
+        for (name, mut mol) in [
+            ("decalin", decalin()),
+            ("spiro[5.5]undecane", spiro55undecane()),
+            ("gonane", gonane()),
+        ] {
+            layout(&mut mol);
+            let cv = bond_cv(&mol);
+            assert!(
+                cv < 1e-9,
+                "{name} should be untouched, but its bond CV is {:.3}%",
+                cv * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_refinement_introduces_no_overlaps() {
+        for (name, mut mol) in [
+            ("norbornane", norbornane()),
+            ("bicyclo[2.2.2]octane", bicyclo222octane()),
+            ("adamantane", adamantane()),
+            ("cubane", cubane()),
+            ("decalin", decalin()),
+            ("spiro[5.5]undecane", spiro55undecane()),
+            ("gonane", gonane()),
+        ] {
+            layout(&mut mol);
+            assert_eq!(clashes(&mol), 0, "{name} has overlapping atoms");
+        }
+    }
+
+    #[test]
+    fn test_layout_is_reproducible() {
+        // Majorization has no random component, so the same molecule must lay
+        // out identically every time — otherwise a rendered structure would
+        // shift between runs.
+        let mut first = adamantane();
+        let mut second = adamantane();
+        layout(&mut first);
+        layout(&mut second);
+
+        for i in 0..first.num_atoms() {
+            let (a, b) = (first.coord(i).unwrap(), second.coord(i).unwrap());
+            assert!((a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12);
+        }
     }
 
     #[test]
