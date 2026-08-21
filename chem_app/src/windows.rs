@@ -109,31 +109,42 @@ impl Default for WindowRegistry {
 /// fallback rects and `constrain` handle it instead.
 const MIN_TILEABLE: f32 = 240.0;
 
-// The default layout, as fractions of the workspace. The windows deliberately
-// don't fill it: free canvas between and around them is what makes them read as
-// floating windows rather than panels that happen to have title bars, and it
-// leaves somewhere to drop a molecule detail window (#107) without it landing
-// on top of something.
+// The default layout, as fractions of the workspace: two columns, the left one
+// stacked, the right one full height.
 //
-// Whatever these leave unused becomes margin, split evenly, so the cluster sits
-// in the middle of any canvas rather than hugging a corner.
-const DATA_SOURCES_W: f32 = 0.34;
-const OPERATIONS_W: f32 = 0.28;
-const VISUALIZATION_W: f32 = 0.46;
+// Matched to what the windows hold. Data Sources is a list and a table, and
+// Operations collapsed to a handful of sections and a two-row search once #105
+// and #106 were done — neither needs height. Data Visualization carries a
+// structure, a fingerprint grid and the results list, all at once, and is the
+// only one that does.
+//
+// The windows deliberately don't fill the workspace: free canvas between and
+// around them is what makes them read as floating windows rather than panels
+// that happen to have title bars, and it leaves somewhere to open a molecule
+// detail window (#107) without it landing on top of something. Whatever these
+// leave unused becomes margin, split evenly, so the arrangement is centred on
+// any canvas rather than hugging a corner.
+const COLUMN_W: f32 = 0.43;
 const COL_GAP: f32 = 0.06;
-const TOP_ROW_H: f32 = 0.40;
-const BOTTOM_ROW_H: f32 = 0.30;
-const ROW_GAP: f32 = 0.08;
+/// Each window in the left stack.
+const LEFT_ROW_H: f32 = 0.42;
+const ROW_GAP: f32 = 0.06;
+/// The right column, and so also the height the left stack adds up to:
+/// `LEFT_ROW_H * 2 + ROW_GAP == FULL_H`, which is what makes the two columns
+/// start and finish level. Enforced by a test.
+const FULL_H: f32 = 0.90;
 
 impl WindowRegistry {
-    /// Tiles the three windows across the workspace, once, on the first frame
+    /// Lays the three windows out across the workspace, once, on the first frame
     /// that reports a usable size.
     ///
-    /// The defaults used to be hard-coded against the native build's 1400x900
-    /// viewport, which meant they were wrong everywhere else — a 1366x768 laptop
-    /// or a browser canvas put Data Visualization partly off the bottom, and
-    /// `constrain` then pulled it back on top of its neighbours. Deriving the
-    /// layout from the real workspace tiles any size without overlap.
+    /// Two columns: Data Sources above Operations on the left, Data
+    /// Visualization taking the right on its own.
+    ///
+    /// Derived from the real workspace rather than hard-coded. The first version
+    /// was pinned to the native build's 1400x900 viewport, which made it wrong
+    /// everywhere else — on a 1366x768 laptop Data Visualization ran off the
+    /// bottom, and `constrain` then dragged it back on top of its neighbours.
     pub fn ensure_layout(&mut self, workspace: Rect) {
         if self.laid_out || workspace.width() < MIN_TILEABLE || workspace.height() < MIN_TILEABLE {
             return;
@@ -145,25 +156,19 @@ impl WindowRegistry {
         let at = |fx: f32, fy: f32| workspace.min + vec2(w * fx, h * fy);
         let size = |fw: f32, fh: f32| vec2(w * fw, h * fh);
 
-        // Data Sources and Operations side by side, Data Visualization centred
-        // beneath the pair. Unused fractions become even margins.
-        let top_row_w = DATA_SOURCES_W + COL_GAP + OPERATIONS_W;
-        let x0 = (1.0 - top_row_w) / 2.0;
-        let y0 = (1.0 - (TOP_ROW_H + ROW_GAP + BOTTOM_ROW_H)) / 2.0;
+        // Unused fractions become even margins.
+        let x0 = (1.0 - (COLUMN_W * 2.0 + COL_GAP)) / 2.0;
+        let y0 = (1.0 - FULL_H) / 2.0;
+        let right_x = x0 + COLUMN_W + COL_GAP;
 
         self.data_sources.default_rect =
-            Rect::from_min_size(at(x0, y0), size(DATA_SOURCES_W, TOP_ROW_H));
+            Rect::from_min_size(at(x0, y0), size(COLUMN_W, LEFT_ROW_H));
         self.operations.default_rect = Rect::from_min_size(
-            at(x0 + DATA_SOURCES_W + COL_GAP, y0),
-            size(OPERATIONS_W, TOP_ROW_H),
+            at(x0, y0 + LEFT_ROW_H + ROW_GAP),
+            size(COLUMN_W, LEFT_ROW_H),
         );
-        self.visualization.default_rect = Rect::from_min_size(
-            at(
-                x0 + (top_row_w - VISUALIZATION_W) / 2.0,
-                y0 + TOP_ROW_H + ROW_GAP,
-            ),
-            size(VISUALIZATION_W, BOTTOM_ROW_H),
-        );
+        self.visualization.default_rect =
+            Rect::from_min_size(at(right_x, y0), size(COLUMN_W, FULL_H));
     }
 
     /// Every window, in menu order. What the View menu is built from, and what
@@ -304,6 +309,36 @@ mod tests {
                     entry.default_rect
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_the_two_columns_start_and_finish_level() {
+        for (w, h) in VIEWPORTS {
+            let (_, mut registry) = tiled(w, h);
+            let sources = registry.data_sources.default_rect;
+            let operations = registry.operations.default_rect;
+            let visualization = registry.visualization.default_rect;
+
+            // The left stack has to add up to the right column exactly, or the
+            // arrangement looks accidental — the constants encode that, and
+            // changing one without the others would break it silently.
+            assert!(
+                (sources.top() - visualization.top()).abs() < 0.5,
+                "tops differ at {}x{}",
+                w,
+                h
+            );
+            assert!(
+                (operations.bottom() - visualization.bottom()).abs() < 0.5,
+                "bottoms differ at {}x{}",
+                w,
+                h
+            );
+            // And the columns are the same width, this being a half-and-half
+            // split rather than a weighted one.
+            assert!((sources.width() - visualization.width()).abs() < 0.5);
+            assert!((sources.width() - operations.width()).abs() < 0.5);
         }
     }
 
