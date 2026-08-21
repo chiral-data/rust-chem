@@ -62,7 +62,9 @@ In the **Datasets** window, or from the **File** menu:
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
   - Each load adds a new entry to the **Files** list rather than replacing what's already there — click any entry to switch back to it. Each is shown with its format and molecule count, so two SMILES files are told apart without switching between them. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
 
-The table below lists the active dataset's molecules and scrolls through all of them, however many there are — only the rows on screen are drawn. Click a name to open that molecule's detail window.
+The table below lists the active dataset's molecules and scrolls through all of them, however many there are — only the rows on screen are drawn. Click a name to open that molecule's detail window; click it again to close it. A row stays highlighted while its window is open.
+
+Several detail windows can be open at once, so two molecules can be compared side by side rather than remembered. Eight is the limit: opening a ninth closes the oldest, since rows can be clicked much faster than windows can be closed. **View → Close all molecule windows** clears them.
 
 **Show structures in table** adds a structure column. A structure is drawn where the molecule has coordinates: SDF files bring their own, and for anything parsed from SMILES, run **2D Coordinates** in Operations to generate them. Rows without coordinates show a dash rather than a blank cell.
 

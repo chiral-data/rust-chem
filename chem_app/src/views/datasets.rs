@@ -118,7 +118,6 @@ impl DatasetsView {
         ui.label(RichText::new(format!("{} molecules", total)).small().weak());
 
         let mut clicked_row = None;
-        let selected = state.selected_row;
 
         let mut table = TableBuilder::new(ui)
             .striped(true)
@@ -178,8 +177,10 @@ impl DatasetsView {
                     }
 
                     row.col(|ui| {
+                        // Lit while this molecule's detail window is open — with
+                        // several open at once, the highlight is what says which.
                         if ui
-                            .selectable_label(selected == Some(i), &dataset.names[i])
+                            .selectable_label(state.is_detail_open(i), &dataset.names[i])
                             .clicked()
                         {
                             clicked_row = Some(i);
@@ -205,7 +206,7 @@ impl DatasetsView {
             });
 
         if let Some(i) = clicked_row {
-            state.selected_row = if selected == Some(i) { None } else { Some(i) };
+            state.toggle_detail(i);
         }
     }
 }
