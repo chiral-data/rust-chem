@@ -40,21 +40,21 @@ The web build starts up on the CPU and upgrades to GPU acceleration via WebGPU a
 
 A menu bar sits above a workspace that three floating windows sit on:
 
-- **Data Sources** — loaded files and the dataset table
+- **Datasets** — loaded files and the dataset table
 - **Operations** — everything you run against the dataset
-- **Data Visualization** — how structures are drawn, the query, and ranked results
+- **Inspector** — how structures are drawn, the query, and ranked results
 
 Each is movable and resizable, and each can be closed from its own **✕** or toggled from the **View** menu. Close the last one and the empty workspace tells you where to get them back. Window content is still being reorganised across v0.5.0, so a control described under one window may move to a neighbouring one in a later release.
 
 ### The menu bar
 
-- **File** — Load File, Load Examples (the same actions as the buttons in Data Sources).
+- **File** — Load File, Load Examples (the same actions as the buttons in Datasets).
 - **View** — one checkbox per window.
 - **Right-hand side** — current FPS, and the **GPU** / **CPU** chips described below.
 
 ### 1. Load a dataset
 
-In the **Data Sources** window, or from the **File** menu:
+In the **Datasets** window, or from the **File** menu:
 
 - **📋 Load Examples** — loads 15 built-in molecules (methane, benzene, phenol, aniline, aspirin-adjacent structures, etc.) instantly. Good default if you just want to try things out.
 - **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file, or a `.sdf` file, from disk.
@@ -88,13 +88,13 @@ You need to do this at least once before you can search.
 
 - Type a SMILES string in the text box, e.g. `c1ccccc1O` (phenol) or `CC(=O)Oc1ccccc1C(=O)O` (aspirin-like).
 - Click **Parse**, or just stop typing — it auto-parses after a short idle delay (debounced so it doesn't re-parse on every keystroke).
-- On success the parsed molecule is drawn in the **Data Visualization** window's *Query* section, with its details and its fingerprint. Invalid SMILES shows an error here, beside the box you typed it in.
+- On success the parsed molecule is drawn in the **Inspector** window's *Query* section, with its details and its fingerprint. Invalid SMILES shows an error here, beside the box you typed it in.
 - **Top K** — how many ranked results to return.
 - **🔍 Search** — ranked by Tanimoto similarity. It needs both a parsed query and computed dataset fingerprints; if either is missing, the section says which.
 
 ### 3. Look at the results
 
-The **Data Visualization** window has three sections.
+The **Inspector** window has three sections.
 
 **Display** — how structures are drawn, everywhere: which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure in the app, which is why they live here rather than beside any one of them. Closed by default, since it is configuration rather than something to read. The one display choice that is *not* here is the dataset table's thumbnail toggle, which stays beside the table it governs.
 

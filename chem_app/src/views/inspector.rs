@@ -16,7 +16,7 @@ use crate::structure_view::{structure_option_controls, structure_panel_with_opti
 use egui::{Color32, RichText};
 
 #[derive(Default)]
-pub struct VisualizationView {
+pub struct InspectorView {
     /// Which result row is expanded, and the results epoch it refers to.
     ///
     /// Indexes into `AppState::search_results`, which is replaced wholesale
@@ -26,7 +26,7 @@ pub struct VisualizationView {
     results_epoch: u64,
 }
 
-impl VisualizationView {
+impl InspectorView {
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         self.sync(state);
 

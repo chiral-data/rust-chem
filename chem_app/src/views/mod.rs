@@ -15,12 +15,12 @@
 //!
 //! [tracking issue #112]: https://github.com/chiral-data/rust-chem/issues/112
 
-pub mod data_sources;
+pub mod datasets;
 pub mod detail;
+pub mod inspector;
 pub mod operations;
-pub mod visualization;
 
-pub use data_sources::DataSourcesView;
+pub use datasets::DatasetsView;
 pub use detail::DetailView;
+pub use inspector::InspectorView;
 pub use operations::OperationsView;
-pub use visualization::VisualizationView;

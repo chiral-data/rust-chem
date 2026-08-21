@@ -7,7 +7,7 @@
 //! view's job.
 
 use crate::state::AppState;
-use crate::views::{DataSourcesView, DetailView, OperationsView, VisualizationView};
+use crate::views::{DatasetsView, DetailView, InspectorView, OperationsView};
 use crate::windows::WindowRegistry;
 use egui::{Color32, RichText};
 
@@ -20,9 +20,9 @@ const FPS_WINDOW: usize = 60;
 /// are drawn into: a view doesn't know or care whether it's in a window.
 #[derive(Default)]
 struct Views {
-    data_sources: DataSourcesView,
+    datasets: DatasetsView,
     operations: OperationsView,
-    visualization: VisualizationView,
+    inspector: InspectorView,
     detail: DetailView,
 }
 
@@ -176,19 +176,15 @@ impl WorkbenchApp {
             ..
         } = self;
         let Views {
-            data_sources,
+            datasets,
             operations,
-            visualization,
+            inspector,
             detail,
         } = views;
 
-        windows
-            .data_sources
-            .show(ctx, |ui| data_sources.ui(ui, state));
+        windows.datasets.show(ctx, |ui| datasets.ui(ui, state));
         windows.operations.show(ctx, |ui| operations.ui(ui, state));
-        windows
-            .visualization
-            .show(ctx, |ui| visualization.ui(ui, state));
+        windows.inspector.show(ctx, |ui| inspector.ui(ui, state));
 
         // Not in the registry, and not in the View menu: it isn't a toggleable
         // singleton. It opens by clicking a table row, closes with its own

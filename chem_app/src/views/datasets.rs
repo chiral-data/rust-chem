@@ -19,9 +19,9 @@ use egui::{RichText, Vec2};
 const MAX_TABLE_ROWS: usize = 20;
 
 #[derive(Default)]
-pub struct DataSourcesView;
+pub struct DatasetsView;
 
-impl DataSourcesView {
+impl DatasetsView {
     pub fn ui(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         // Both axes, and no auto-shrink. `ScrollArea::vertical` leaves the
         // horizontal axis disabled, and egui sizes a disabled axis to its
