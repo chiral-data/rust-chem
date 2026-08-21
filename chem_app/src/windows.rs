@@ -5,14 +5,26 @@
 //! Holding it as data instead is what lets the View menu be generated rather
 //! than hand-written, and gives #108 one place to save and restore.
 //!
-//! Deliberately *not* a `dyn Window` trait, though it could be one now. When
-//! this was written the views' `ui` signatures didn't match — Datasets drew the
-//! fingerprint controls whose parameters Operations owned — so a trait would
-//! have had to carry that argument to every view to suit one caller, which is
-//! what #99 turned down an abstraction for. #105 moved those widgets and the
-//! signatures match, so the question is live again and tracked in #118; what
-//! these windows share for now is their *shell*, so that is what this holds,
-//! and the calls that draw their contents stay concrete and typed in `app.rs`.
+//! Deliberately *not* a `dyn Window` trait. It could be one — the four views do
+//! share `fn ui(&mut self, ui: &mut Ui, state: &mut AppState)`, once #105 moved
+//! the fingerprint controls that had made one of them different. #118 asked
+//! whether it should be, and the answer was no, for three reasons that are
+//! easier to see here than in an issue:
+//!
+//! - It would unify **four** call sites in `app.rs`. That is the whole of the
+//!   repetition available to remove.
+//! - The molecule detail windows cannot join it. They take the `Context` rather
+//!   than a `Ui`, there are between zero and `MAX_OPEN_DETAILS` of them, and
+//!   they have no place in the View menu — so a `Window` trait would cover four
+//!   of the five window kinds and leave the fifth special anyway.
+//! - Something needs named access. The menu bar's Settings item toggles
+//!   `windows.settings.open` directly; behind a boxed collection that becomes a
+//!   lookup by id that can fail, where a field access cannot.
+//!
+//! So it would add a layer without removing one, which is the test #99 applied
+//! to the `Operation` trait and reached the same answer. What these windows
+//! genuinely share is their *shell*, so that is what this holds, and the calls
+//! that draw their contents stay concrete and typed.
 
 use egui::{Rect, pos2, vec2};
 
