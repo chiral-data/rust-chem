@@ -7,17 +7,17 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
-            .with_title("ChemFP Demo - Molecular Fingerprint Search"),
+            .with_title("Chem Workbench"),
         //renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
     eframe::run_native(
-        "ChemFP Demo",
+        "Chem Workbench",
         options,
         Box::new(|cc| {
             //cc.egui_ctx.set_pixels_per_point(1.25);
-            Ok(Box::new(chem_app::ChemFpDemoApp::new(cc)))
+            Ok(Box::new(chem_app::WorkbenchApp::new(cc)))
         }),
     )
 }
@@ -47,7 +47,7 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(chem_app::ChemFpDemoApp::new(cc)))),
+                Box::new(|cc| Ok(Box::new(chem_app::WorkbenchApp::new(cc)))),
             )
             .await;
 
@@ -66,7 +66,7 @@ fn main() {
             Err(e) => {
                 log::error!("Failed to start eframe: {e:?}");
                 if let Some(el) = loading_overlay {
-                    el.set_text_content(Some(&format!("Failed to start ChemFP Demo: {e:?}")));
+                    el.set_text_content(Some(&format!("Failed to start Chem Workbench: {e:?}")));
                 }
             }
         }

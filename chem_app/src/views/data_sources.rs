@@ -30,9 +30,19 @@ impl DataSourcesView {
         state: &mut AppState,
         fp_params: &mut FingerprintParams,
     ) {
-        ui.heading("Dataset");
-        ui.separator();
+        // One scroll region for the whole window, rather than a scrolling table
+        // inside a full-height panel. As a resizable window this can be short,
+        // and the controls above the table would otherwise be unreachable.
+        egui::ScrollArea::vertical().show(ui, |ui| self.contents(ui, state, fp_params));
+    }
 
+    fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &mut AppState,
+        fp_params: &mut FingerprintParams,
+    ) {
+        // No heading: the window's title bar names it now.
         ui.horizontal(|ui| {
             if ui.button("📂 Load File").clicked() {
                 state.load_dataset_from_file();
@@ -128,53 +138,51 @@ impl DataSourcesView {
         let show_thumbnails = state.display.show_thumbnails;
         let mut clicked_row = None;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("dataset_table")
-                .num_columns(if show_thumbnails { 7 } else { 6 })
-                .spacing([8.0, 4.0])
-                .striped(true)
-                .show(ui, |ui| {
+        egui::Grid::new("dataset_table")
+            .num_columns(if show_thumbnails { 7 } else { 6 })
+            .spacing([8.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                if show_thumbnails {
+                    ui.label(RichText::new("Structure").strong());
+                }
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("SMILES").strong());
+                ui.label(RichText::new("Formula").strong());
+                ui.label(RichText::new("MW").strong());
+                ui.label(RichText::new("Fingerprint").strong());
+                ui.label(RichText::new("Aromatic").strong());
+                ui.end_row();
+
+                for i in 0..shown {
+                    let mol = &active_dataset.molecules[i];
+                    let is_selected = selected_row == Some(i);
+
                     if show_thumbnails {
-                        ui.label(RichText::new("Structure").strong());
+                        ui.add(
+                            StructureView::new(mol, Vec2::new(64.0, 48.0))
+                                .with_options(thumbnail_options),
+                        );
                     }
-                    ui.label(RichText::new("Name").strong());
-                    ui.label(RichText::new("SMILES").strong());
-                    ui.label(RichText::new("Formula").strong());
-                    ui.label(RichText::new("MW").strong());
-                    ui.label(RichText::new("Fingerprint").strong());
-                    ui.label(RichText::new("Aromatic").strong());
+                    if ui
+                        .selectable_label(is_selected, &active_dataset.names[i])
+                        .clicked()
+                    {
+                        clicked_row = Some(i);
+                    }
+                    ui.label(RichText::new(&active_dataset.smiles[i]).code().small());
+                    ui.label(mol.formula());
+                    ui.label(format!("{:.2}", mol.molecular_weight()));
+                    ui.label(if i < num_fingerprints { "Yes" } else { "No" });
+                    let is_aromatic = mol.atoms().iter().any(|atom| atom.is_aromatic());
+                    ui.label(if is_aromatic { "Yes" } else { "No" });
                     ui.end_row();
+                }
+            });
 
-                    for i in 0..shown {
-                        let mol = &active_dataset.molecules[i];
-                        let is_selected = selected_row == Some(i);
-
-                        if show_thumbnails {
-                            ui.add(
-                                StructureView::new(mol, Vec2::new(64.0, 48.0))
-                                    .with_options(thumbnail_options),
-                            );
-                        }
-                        if ui
-                            .selectable_label(is_selected, &active_dataset.names[i])
-                            .clicked()
-                        {
-                            clicked_row = Some(i);
-                        }
-                        ui.label(RichText::new(&active_dataset.smiles[i]).code().small());
-                        ui.label(mol.formula());
-                        ui.label(format!("{:.2}", mol.molecular_weight()));
-                        ui.label(if i < num_fingerprints { "Yes" } else { "No" });
-                        let is_aromatic = mol.atoms().iter().any(|atom| atom.is_aromatic());
-                        ui.label(if is_aromatic { "Yes" } else { "No" });
-                        ui.end_row();
-                    }
-                });
-
-            if active_dataset.len() > shown {
-                ui.label(format!("... and {} more", active_dataset.len() - shown));
-            }
-        });
+        if active_dataset.len() > shown {
+            ui.label(format!("... and {} more", active_dataset.len() - shown));
+        }
 
         if let Some(i) = clicked_row {
             state.selected_row = if selected_row == Some(i) {
