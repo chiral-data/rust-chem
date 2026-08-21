@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn test_the_two_columns_start_and_finish_level() {
         for (w, h) in VIEWPORTS {
-            let (_, mut registry) = tiled(w, h);
+            let (_, registry) = tiled(w, h);
             let sources = registry.data_sources.default_rect;
             let operations = registry.operations.default_rect;
             let visualization = registry.visualization.default_rect;
