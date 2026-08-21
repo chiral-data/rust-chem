@@ -1,18 +1,16 @@
 //! Where you look at your data.
 //!
-//! Owns the display options *and* the things they govern, which is the point:
-//! before this the options that decide how every structure in the app is drawn
-//! lived in the data panel, under the dataset table, while the structures
-//! themselves were in two other panels and a floating window.
+//! The query and the ranking a search produced.
 //!
-//! Three sections — how to draw, the query, and the ranking a search produced.
-//! The per-molecule structures stay in detail windows, which #107 turns into one
-//! window per molecule; drawing them here as well would only duplicate that.
+//! Held the display options too, briefly. They govern three surfaces and only
+//! one of them is this window, so #121 moved them to Settings; what is left here
+//! is the data itself. The per-molecule structures live in detail windows, one
+//! per molecule, rather than being duplicated here.
 
 use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_atom_list, show_bond_list, show_molecule_info};
 use crate::state::AppState;
-use crate::structure_view::{structure_option_controls, structure_panel_with_options};
+use crate::structure_view::structure_panel_with_options;
 use egui::{Color32, RichText};
 
 #[derive(Default)]
@@ -36,7 +34,6 @@ impl InspectorView {
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                display_section(ui, state);
                 query_section(ui, state);
                 self.results_section(ui, state);
             });
@@ -155,17 +152,6 @@ impl InspectorView {
             self.selected_result = None;
         }
     }
-}
-
-/// How structures are drawn, everywhere.
-///
-/// Closed by default: it is configuration you set once, not something to read.
-/// The one display choice *not* here is the dataset table's thumbnail toggle,
-/// which stays beside the table it governs.
-fn display_section(ui: &mut egui::Ui, state: &mut AppState) {
-    collapsing(ui, "Display", false, "all structures", |ui| {
-        structure_option_controls(ui, &mut state.display.structure);
-    });
 }
 
 /// The parsed query: its structure, its details, and its fingerprint.

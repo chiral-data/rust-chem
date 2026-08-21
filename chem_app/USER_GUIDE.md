@@ -42,14 +42,16 @@ A menu bar sits above a workspace that three floating windows sit on:
 
 - **Datasets** — the datasets you have loaded, and the active one's molecules
 - **Operations** — everything you run against the dataset
-- **Inspector** — how structures are drawn, the query, and ranked results
+- **Inspector** — the query and ranked results
+- **Settings** — preferences: theme, and how structures are drawn (closed until you open it)
 
 Each is movable and resizable, and each can be closed from its own **✕** or toggled from the **View** menu. Close the last one and the empty workspace tells you where to get them back. Window content is still being reorganised across v0.5.0, so a control described under one window may move to a neighbouring one in a later release.
 
 ### The menu bar
 
 - **File** — Load File, Load Examples (the same actions as the buttons in Datasets).
-- **View** — one checkbox per window.
+- **View** — one checkbox per window, and **Close all molecule windows**.
+- **Settings** — opens and closes the Settings window. It stays lit while the window is open.
 - **Right-hand side** — current FPS, and the **GPU** / **CPU** chips described below.
 
 ### 1. Load a dataset
@@ -100,13 +102,19 @@ You need to do this at least once before you can search.
 
 ### 3. Look at the results
 
-The **Inspector** window has three sections.
-
-**Display** — how structures are drawn, everywhere: which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure in the app, which is why they live here rather than beside any one of them. Closed by default, since it is configuration rather than something to read. The one display choice that is *not* here is the dataset table's thumbnail toggle, which stays beside the table it governs.
+The **Inspector** window has two sections.
 
 **Query** — the parsed query molecule drawn, its details, and its fingerprint as a bit grid. It is labelled with the SMILES it was parsed from, which is not necessarily what is currently in the box in Operations.
 
 **Results** — each hit with its rank, summary and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query. Click **▲ Hide** to collapse it again.
+
+### Settings
+
+Open it with **Settings** in the menu bar, or from the **View** menu. It stays open while you work, so a change can be watched taking effect rather than applied blind.
+
+- **Theme** — Light, Dark, or follow the system. Structure colours follow it: the same molecule is drawn with a light or dark palette to match.
+- **Structures** — which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure the app draws, which is why they are here rather than beside any one of them.
+- **Show structures in the dataset table** — the thumbnail column. A structure is drawn where the molecule has coordinates; run **2D Coordinates** in Operations for anything parsed from SMILES.
 
 ### Backend chips
 

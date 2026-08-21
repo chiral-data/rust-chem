@@ -7,7 +7,7 @@
 //! view's job.
 
 use crate::state::AppState;
-use crate::views::{DatasetsView, DetailView, InspectorView, OperationsView};
+use crate::views::{DatasetsView, DetailView, InspectorView, OperationsView, SettingsView};
 use crate::windows::WindowRegistry;
 use egui::{Color32, RichText};
 
@@ -23,6 +23,7 @@ struct Views {
     datasets: DatasetsView,
     operations: OperationsView,
     inspector: InspectorView,
+    settings: SettingsView,
     detail: DetailView,
 }
 
@@ -104,6 +105,29 @@ impl WorkbenchApp {
                     }
                 });
 
+                // Beside the menus rather than out at the right-hand edge,
+                // where it was findable only by someone who already knew to
+                // look for it.
+                //
+                // Plain text, like File and View. The app does put emoji on
+                // labels — but on action buttons inside windows and on the
+                // status chips, not on items in this bar.
+                //
+                // A toggle for the Settings window, not a menu of its own: a
+                // menu would overlay the canvas and close the moment a control
+                // was touched, and the whole point of a window is adjusting a
+                // setting while watching a structure change. It is a
+                // `selectable_label` rather than a button so it still shows
+                // whether the window is open.
+                let settings_open = self.windows.settings.open;
+                if ui
+                    .selectable_label(settings_open, "Settings")
+                    .on_hover_text("Theme, and how structures are drawn")
+                    .clicked()
+                {
+                    self.windows.settings.open = !settings_open;
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
@@ -171,7 +195,7 @@ impl WorkbenchApp {
             // The one exception, and it isn't content: a bare canvas gives no
             // clue that the View menu is where windows come back from, so
             // closing the last one would otherwise look like a broken app.
-            if self.windows.all_closed() {
+            if self.windows.all_content_closed() {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         RichText::new("No windows open — reopen them from the View menu")
@@ -196,16 +220,20 @@ impl WorkbenchApp {
             datasets,
             operations,
             inspector,
+            settings,
             detail,
         } = views;
 
         windows.datasets.show(ctx, |ui| datasets.ui(ui, state));
         windows.operations.show(ctx, |ui| operations.ui(ui, state));
         windows.inspector.show(ctx, |ui| inspector.ui(ui, state));
+        windows.settings.show(ctx, |ui| settings.ui(ui, state));
 
-        // Not in the registry, and not in the View menu: it isn't a toggleable
-        // singleton. It opens by clicking a table row, closes with its own
-        // button, and #107 turns it into one window per selected molecule.
+        // Not in the registry and not in the View menu: these aren't toggleable
+        // singletons. They open by clicking a table row, close with their own
+        // button, and there are between zero and MAX_OPEN_DETAILS of them.
+        // "Close all molecule windows" in the View menu is how they are
+        // represented among the window controls at all.
         detail.show(ctx, state);
     }
 }
@@ -215,6 +243,10 @@ impl eframe::App for WorkbenchApp {
         // Results of anything that finished since the last frame are applied
         // before a view can read them, so no view sees half of one.
         self.state.poll_pending_work();
+        // Applied every frame rather than on change: it is one comparison, and
+        // it means the preference is the single source of truth even if egui's
+        // own theme is altered from elsewhere.
+        ctx.set_theme(self.state.display.theme);
         self.track_frame_rate(ctx);
         // Deliberately not inside the operations view's `ui`: a debounce that
         // only ran while its view was drawn would stop the moment that window
