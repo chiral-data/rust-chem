@@ -50,7 +50,7 @@ Each is movable and resizable, and each can be closed from its own **✕** or to
 ### The menu bar
 
 - **File** — Load File, Load Examples (the same actions as the buttons in Datasets).
-- **View** — one checkbox per window, and **Close all molecule windows**.
+- **View** — one checkbox per window, **Reset layout**, and **Close all molecule windows**.
 - **Settings** — opens and closes the Settings window. It stays lit while the window is open.
 - **Right-hand side** — current FPS, and the **GPU** / **CPU** chips described below.
 
@@ -107,6 +107,14 @@ The **Inspector** window has two sections.
 **Query** — the parsed query molecule drawn, its details, and its fingerprint as a bit grid. It is labelled with the SMILES it was parsed from, which is not necessarily what is currently in the box in Operations.
 
 **Results** — each hit with its rank, summary and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query. Click **▲ Hide** to collapse it again.
+
+### What is remembered
+
+The workspace comes back the way you left it. Window positions and sizes, which windows were open, the theme, the structure display options, and the fingerprint radius, size and top-k all survive a restart — on the desktop build, and on web across a reload of the same browser.
+
+What is *not* remembered is the data: loaded files, computed fingerprints, search results, the query text, and which molecule windows were open. Those are re-made each session rather than restored, so a fingerprint is never shown that was computed under settings you can no longer see.
+
+**View → Reset layout** puts the windows back where a first launch has them, which is the way out if one has been dragged somewhere unreachable.
 
 ### Settings
 

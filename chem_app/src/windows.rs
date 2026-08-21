@@ -232,6 +232,53 @@ mod tests {
     }
 
     #[test]
+    fn test_open_flags_round_trip() {
+        let mut registry = WindowRegistry::default();
+        registry.datasets.open = false;
+        registry.settings.open = true;
+
+        let saved = registry.open_windows();
+        let mut restored = WindowRegistry::default();
+        restored.set_open_windows(saved);
+
+        assert!(!restored.datasets.open);
+        assert!(restored.operations.open);
+        assert!(restored.inspector.open);
+        assert!(restored.settings.open);
+    }
+
+    #[test]
+    fn test_reset_restores_the_first_launch_arrangement() {
+        let mut registry = WindowRegistry::default();
+        registry.datasets.open = false;
+        registry.operations.open = false;
+        registry.inspector.open = false;
+        registry.settings.open = true;
+
+        registry.reset_open_windows();
+
+        // Which is the three content windows open and preferences closed —
+        // whatever a saved session happened to leave behind.
+        assert!(registry.datasets.open);
+        assert!(registry.operations.open);
+        assert!(registry.inspector.open);
+        assert!(!registry.settings.open);
+    }
+
+    #[test]
+    fn test_default_open_windows_matches_a_fresh_registry() {
+        let registry = WindowRegistry::default();
+        let defaults = OpenWindows::default();
+
+        // `serde(default)` fills missing fields from this, so a saved file from
+        // an older schema must land on the same arrangement a first launch has.
+        assert_eq!(registry.datasets.open, defaults.datasets);
+        assert_eq!(registry.operations.open, defaults.operations);
+        assert_eq!(registry.inspector.open, defaults.inspector);
+        assert_eq!(registry.settings.open, defaults.settings);
+    }
+
+    #[test]
     fn test_settings_starts_closed_and_the_content_windows_open() {
         let registry = WindowRegistry::default();
 
@@ -473,5 +520,58 @@ mod tests {
         // A shared id would make two windows share one position in egui's
         // memory, and would collide again in #108's saved layout.
         assert_eq!(ids.len(), deduped.len(), "duplicate window id: {:?}", ids);
+    }
+}
+
+/// Which windows were open, for saving and restoring.
+///
+/// Only the flags: geometry is egui's, persisted through its own memory, so
+/// there is nothing here to keep in step with where a window actually is.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct OpenWindows {
+    pub datasets: bool,
+    pub operations: bool,
+    pub inspector: bool,
+    pub settings: bool,
+}
+
+impl Default for OpenWindows {
+    fn default() -> Self {
+        let registry = WindowRegistry::default();
+        Self {
+            datasets: registry.datasets.open,
+            operations: registry.operations.open,
+            inspector: registry.inspector.open,
+            settings: registry.settings.open,
+        }
+    }
+}
+
+impl WindowRegistry {
+    pub fn open_windows(&self) -> OpenWindows {
+        OpenWindows {
+            datasets: self.datasets.open,
+            operations: self.operations.open,
+            inspector: self.inspector.open,
+            settings: self.settings.open,
+        }
+    }
+
+    pub fn set_open_windows(&mut self, open: OpenWindows) {
+        self.datasets.open = open.datasets;
+        self.operations.open = open.operations;
+        self.inspector.open = open.inspector;
+        self.settings.open = open.settings;
+    }
+
+    /// Puts the windows back the way a first launch has them.
+    ///
+    /// Geometry is egui's, so the caller clears that separately with
+    /// `Memory::reset_areas`; after which each window falls back to the
+    /// `default_rect` this registry computed, which is why a reset does not have
+    /// to re-derive the layout.
+    pub fn reset_open_windows(&mut self) {
+        self.set_open_windows(OpenWindows::default());
     }
 }

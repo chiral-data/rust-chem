@@ -14,6 +14,30 @@ use egui::{Color32, RichText};
 /// How many frames the FPS readout averages over.
 const FPS_WINDOW: usize = 60;
 
+/// Storage key for [`Persisted`]. Changing it discards saved state rather than
+/// misreading it.
+const PERSISTED_KEY: &str = "chem_workbench_v1";
+
+/// What survives a restart.
+///
+/// Deliberately not here: loaded datasets, computed fingerprints, search
+/// results, the query text, and which molecule windows were open. Those are
+/// data rather than preferences, and restoring a fingerprint cache raises
+/// questions a layout does not — one computed under a different radius is worse
+/// than none.
+///
+/// Window geometry is also absent, because it is egui's: `Memory::areas` is
+/// persisted by egui itself, so there is no second copy here to fall out of step
+/// with where a window actually is.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Persisted {
+    open_windows: crate::windows::OpenWindows,
+    display: crate::state::DisplaySettings,
+    fingerprint: crate::state::FingerprintParams,
+    top_k: usize,
+}
+
 /// The views, each owning its own UI state.
 ///
 /// Held separately from [`WindowRegistry`], which owns the *shells* those views
@@ -36,14 +60,42 @@ pub struct WorkbenchApp {
 }
 
 impl WorkbenchApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self {
             state: AppState::new(),
             views: Views::default(),
             windows: WindowRegistry::default(),
             fps_counter: 0.0,
             frame_times: Vec::with_capacity(FPS_WINDOW),
+        };
+
+        // A stored value from an older build must not wedge the app, so a failed
+        // decode is simply nothing: `eframe::get_value` returns None and the
+        // defaults already in place stand.
+        if let Some(saved) = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<Persisted>(storage, PERSISTED_KEY))
+        {
+            app.windows.set_open_windows(saved.open_windows);
+            app.state.display = saved.display;
+            app.views.operations.fp_params = saved.fingerprint;
+            // Zero would mean a search that returns nothing, which a saved
+            // file from a future schema could otherwise impose.
+            app.views.operations.top_k = saved.top_k.max(1);
         }
+
+        app
+    }
+
+    /// Restores the default arrangement.
+    ///
+    /// Two halves, because the two halves are owned by different places: the
+    /// open flags are ours, and the geometry is egui's. Without the second, a
+    /// window dragged mostly off-screen would come back exactly where it was,
+    /// which is the situation this exists for.
+    fn reset_layout(&mut self, ctx: &egui::Context) {
+        self.windows.reset_open_windows();
+        ctx.memory_mut(|memory| memory.reset_areas());
     }
 
     fn track_frame_rate(&mut self, ctx: &egui::Context) {
@@ -85,6 +137,12 @@ impl WorkbenchApp {
                     for entry in self.windows.entries_mut() {
                         let title = entry.title();
                         ui.checkbox(&mut entry.open, title);
+                    }
+
+                    ui.separator();
+                    if ui.button("Reset layout").clicked() {
+                        self.reset_layout(ui.ctx());
+                        ui.close();
                     }
 
                     // Molecule detail windows are not in the registry — they
@@ -239,6 +297,20 @@ impl WorkbenchApp {
 }
 
 impl eframe::App for WorkbenchApp {
+    /// Called by eframe periodically and on exit.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(
+            storage,
+            PERSISTED_KEY,
+            &Persisted {
+                open_windows: self.windows.open_windows(),
+                display: self.state.display,
+                fingerprint: self.views.operations.fp_params,
+                top_k: self.views.operations.top_k,
+            },
+        );
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Results of anything that finished since the last frame are applied
         // before a view can read them, so no view sees half of one.

@@ -129,7 +129,8 @@ pub const MAX_OPEN_DETAILS: usize = 8;
 /// that need it — a dataset's fingerprints and a query's have to be generated
 /// under the same parameters to be comparable, so there is one set of them
 /// rather than one per operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct FingerprintParams {
     pub radius: u32,
     pub size: u32,
@@ -150,7 +151,8 @@ impl Default for FingerprintParams {
 /// thumbnails, the query structure and every detail window all draw with these,
 /// so the controls being in one place doesn't make the values that view's
 /// private business.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DisplaySettings {
     /// Light, dark, or follow the system.
     ///
