@@ -5,13 +5,14 @@
 //! Holding it as data instead is what lets the View menu be generated rather
 //! than hand-written, and gives #108 one place to save and restore.
 //!
-//! Deliberately *not* a `dyn Window` trait. The views' `ui` signatures aren't
-//! uniform yet — Data Sources still draws the fingerprint controls whose
-//! parameters Operations owns, until #105 moves those widgets — so a trait
-//! would have to carry that argument to every view to accommodate one caller.
-//! #99 turned down an abstraction for the same reason. What every window really
-//! does share is its *shell*, so that is what this holds; the calls that draw
-//! their contents stay concrete and typed in `app.rs`.
+//! Deliberately *not* a `dyn Window` trait, though it could be one now. When
+//! this was written the views' `ui` signatures didn't match — Datasets drew the
+//! fingerprint controls whose parameters Operations owned — so a trait would
+//! have had to carry that argument to every view to suit one caller, which is
+//! what #99 turned down an abstraction for. #105 moved those widgets and the
+//! signatures match, so the question is live again and tracked in #118; what
+//! these windows share for now is their *shell*, so that is what this holds,
+//! and the calls that draw their contents stay concrete and typed in `app.rs`.
 
 use egui::{Rect, pos2, vec2};
 
@@ -65,9 +66,9 @@ impl WindowEntry {
 }
 
 pub struct WindowRegistry {
-    pub data_sources: WindowEntry,
+    pub datasets: WindowEntry,
     pub operations: WindowEntry,
-    pub visualization: WindowEntry,
+    pub inspector: WindowEntry,
     /// Whether [`WindowRegistry::ensure_layout`] has run. The default rects
     /// depend on the viewport, which egui doesn't know on the very first frame.
     laid_out: bool,
@@ -82,9 +83,9 @@ impl Default for WindowRegistry {
         // `ensure_layout` replaces them with a tiling of the real workspace
         // before any window is shown for the first time.
         Self {
-            data_sources: WindowEntry {
-                id: "window_data_sources",
-                title: "Data Sources",
+            datasets: WindowEntry {
+                id: "window_datasets",
+                title: "Datasets",
                 open: true,
                 default_rect: Rect::from_min_size(pos2(24.0, 48.0), vec2(400.0, 300.0)),
             },
@@ -94,9 +95,9 @@ impl Default for WindowRegistry {
                 open: true,
                 default_rect: Rect::from_min_size(pos2(448.0, 48.0), vec2(340.0, 300.0)),
             },
-            visualization: WindowEntry {
-                id: "window_visualization",
-                title: "Data Visualization",
+            inspector: WindowEntry {
+                id: "window_inspector",
+                title: "Inspector",
                 open: true,
                 default_rect: Rect::from_min_size(pos2(120.0, 380.0), vec2(560.0, 260.0)),
             },
@@ -112,9 +113,9 @@ const MIN_TILEABLE: f32 = 240.0;
 // The default layout, as fractions of the workspace: two columns, the left one
 // stacked, the right one full height.
 //
-// Matched to what the windows hold. Data Sources is a list and a table, and
+// Matched to what the windows hold. Datasets is a list and a table, and
 // Operations collapsed to a handful of sections and a two-row search once #105
-// and #106 were done — neither needs height. Data Visualization carries a
+// and #106 were done — neither needs height. Inspector carries a
 // structure, a fingerprint grid and the results list, all at once, and is the
 // only one that does.
 //
@@ -138,12 +139,12 @@ impl WindowRegistry {
     /// Lays the three windows out across the workspace, once, on the first frame
     /// that reports a usable size.
     ///
-    /// Two columns: Data Sources above Operations on the left, Data
-    /// Visualization taking the right on its own.
+    /// Two columns: Datasets above Operations on the left, Inspector taking the
+    /// right on its own.
     ///
     /// Derived from the real workspace rather than hard-coded. The first version
     /// was pinned to the native build's 1400x900 viewport, which made it wrong
-    /// everywhere else — on a 1366x768 laptop Data Visualization ran off the
+    /// everywhere else — on a 1366x768 laptop Inspector ran off the
     /// bottom, and `constrain` then dragged it back on top of its neighbours.
     pub fn ensure_layout(&mut self, workspace: Rect) {
         if self.laid_out || workspace.width() < MIN_TILEABLE || workspace.height() < MIN_TILEABLE {
@@ -161,23 +162,21 @@ impl WindowRegistry {
         let y0 = (1.0 - FULL_H) / 2.0;
         let right_x = x0 + COLUMN_W + COL_GAP;
 
-        self.data_sources.default_rect =
-            Rect::from_min_size(at(x0, y0), size(COLUMN_W, LEFT_ROW_H));
+        self.datasets.default_rect = Rect::from_min_size(at(x0, y0), size(COLUMN_W, LEFT_ROW_H));
         self.operations.default_rect = Rect::from_min_size(
             at(x0, y0 + LEFT_ROW_H + ROW_GAP),
             size(COLUMN_W, LEFT_ROW_H),
         );
-        self.visualization.default_rect =
-            Rect::from_min_size(at(right_x, y0), size(COLUMN_W, FULL_H));
+        self.inspector.default_rect = Rect::from_min_size(at(right_x, y0), size(COLUMN_W, FULL_H));
     }
 
     /// Every window, in menu order. What the View menu is built from, and what
     /// #108 will iterate to save open state and geometry.
     pub fn entries_mut(&mut self) -> [&mut WindowEntry; 3] {
         [
-            &mut self.data_sources,
+            &mut self.datasets,
             &mut self.operations,
-            &mut self.visualization,
+            &mut self.inspector,
         ]
     }
 
@@ -185,7 +184,7 @@ impl WindowRegistry {
     /// in that case, since a bare canvas offers no clue that the View menu is
     /// where windows come from.
     pub fn all_closed(&self) -> bool {
-        !self.data_sources.open && !self.operations.open && !self.visualization.open
+        !self.datasets.open && !self.operations.open && !self.inspector.open
     }
 }
 
@@ -316,28 +315,28 @@ mod tests {
     fn test_the_two_columns_start_and_finish_level() {
         for (w, h) in VIEWPORTS {
             let (_, registry) = tiled(w, h);
-            let sources = registry.data_sources.default_rect;
+            let sources = registry.datasets.default_rect;
             let operations = registry.operations.default_rect;
-            let visualization = registry.visualization.default_rect;
+            let inspector = registry.inspector.default_rect;
 
             // The left stack has to add up to the right column exactly, or the
             // arrangement looks accidental — the constants encode that, and
             // changing one without the others would break it silently.
             assert!(
-                (sources.top() - visualization.top()).abs() < 0.5,
+                (sources.top() - inspector.top()).abs() < 0.5,
                 "tops differ at {}x{}",
                 w,
                 h
             );
             assert!(
-                (operations.bottom() - visualization.bottom()).abs() < 0.5,
+                (operations.bottom() - inspector.bottom()).abs() < 0.5,
                 "bottoms differ at {}x{}",
                 w,
                 h
             );
             // And the columns are the same width, this being a half-and-half
             // split rather than a weighted one.
-            assert!((sources.width() - visualization.width()).abs() < 0.5);
+            assert!((sources.width() - inspector.width()).abs() < 0.5);
             assert!((sources.width() - operations.width()).abs() < 0.5);
         }
     }
@@ -365,22 +364,22 @@ mod tests {
     #[test]
     fn test_a_workspace_too_small_to_tile_is_left_alone() {
         let mut registry = WindowRegistry::default();
-        let before = registry.data_sources.default_rect;
+        let before = registry.datasets.default_rect;
         // egui reports a degenerate rect before it knows the viewport; laying
         // out against that would place every window at the origin.
         registry.ensure_layout(Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0)));
-        assert_eq!(registry.data_sources.default_rect, before);
+        assert_eq!(registry.datasets.default_rect, before);
         assert!(!registry.laid_out, "should retry on a later frame");
     }
 
     #[test]
     fn test_layout_is_computed_once() {
         let (_, mut registry) = tiled(1400.0, 874.0);
-        let first = registry.data_sources.default_rect;
+        let first = registry.datasets.default_rect;
         // Re-tiling every frame would yank a window the user had dragged back
         // to where it started.
         registry.ensure_layout(Rect::from_min_size(pos2(0.0, 26.0), vec2(600.0, 400.0)));
-        assert_eq!(registry.data_sources.default_rect, first);
+        assert_eq!(registry.datasets.default_rect, first);
     }
 
     #[test]

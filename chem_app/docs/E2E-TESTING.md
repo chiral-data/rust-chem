@@ -58,7 +58,7 @@ iterating, not fine as evidence.
   the viewport, so resize the browser and reload.
 - **Drag a window mostly off-screen.** It should be held back. There is no
   "reset layout" yet (#108), so a window that escapes is unrecoverable.
-- **Narrow Data Sources until the table won't fit.** The table must scroll
+- **Narrow Datasets until the table won't fit.** The table must scroll
   sideways *inside* the window. If the window widens to fit the table instead,
   that is the `ScrollArea` regression from #115 returning: `ScrollArea::vertical`
   sizes a disabled axis to its content, and only `both()` clamps it. **This one
@@ -82,12 +82,12 @@ iterating, not fine as evidence.
   The debounce ticks from the frame loop precisely so that closing its window
   doesn't stop it, and nothing else verifies that.
 
-### Data Visualization (#106)
+### Inspector (#106)
 
 - **Change a Display option** — turn on explicit hydrogens, say. Every structure
   in the app should follow: the query, the table thumbnails, and any open detail
   window. That is the whole reason the options moved here from beside the table.
-- **The thumbnail toggle stayed behind**, in Data Sources, next to the table it
+- **The thumbnail toggle stayed behind**, in Datasets, next to the table it
   governs. Confirm it still works from there.
 - **The Query section labels itself with what was parsed**, not with what is in
   the box. Parse a SMILES, then type something different without pressing Parse

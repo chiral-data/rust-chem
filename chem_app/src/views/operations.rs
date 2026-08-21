@@ -156,7 +156,7 @@ impl OperationsView {
         let outcome = outcome_line(&state.search);
         section(ui, "Similarity Search", true, outcome, |ui| {
             // Controls only. The query's structure and fingerprint are drawn
-            // in the Data Visualization window, which owns everything the
+            // in the Inspector window, which owns everything the
             // display options govern — so this section stays two rows however
             // large the molecule is.
             ui.horizontal(|ui| {
