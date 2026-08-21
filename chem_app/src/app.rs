@@ -85,6 +85,23 @@ impl WorkbenchApp {
                         let title = entry.title();
                         ui.checkbox(&mut entry.open, title);
                     }
+
+                    // Molecule detail windows are not in the registry — they
+                    // aren't toggleable singletons — so this is how they are
+                    // represented among the window controls at all. Rows can be
+                    // clicked much faster than windows can be closed.
+                    ui.separator();
+                    let open = self.state.open_details().len();
+                    if ui
+                        .add_enabled(
+                            open > 0,
+                            egui::Button::new(format!("Close all molecule windows ({})", open)),
+                        )
+                        .clicked()
+                    {
+                        self.state.close_all_details();
+                        ui.close();
+                    }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

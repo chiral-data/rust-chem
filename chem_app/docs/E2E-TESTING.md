@@ -99,6 +99,22 @@ iterating, not fine as evidence.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
 
+### Molecule detail windows (#107)
+
+- **Click three different molecule names.** Three windows, cascaded so each is
+  visible rather than exactly beneath the last, and all three rows highlighted.
+  Opening a second used to close the first.
+- **Click an open row again.** Its window closes and the row un-highlights. The
+  others are untouched.
+- **Open nine.** The oldest closes rather than the click being refused, and its
+  row un-highlights — which is what tells you which one went.
+- **View → Close all molecule windows** shows the count and clears them.
+- **Switch dataset with several open.** All of them close: they are keyed by row
+  index, which means nothing against a different dataset.
+- **Drag two windows apart, then close and reopen one.** It returns where you
+  left it, not to the cascade position — each window keeps its own geometry
+  because each has its own id.
+
 ### Inspector (#106)
 
 - **Change a Display option** — turn on explicit hydrogens, say. Every structure

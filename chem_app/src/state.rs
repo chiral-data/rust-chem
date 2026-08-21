@@ -115,6 +115,14 @@ impl OperationOutcome {
     }
 }
 
+/// How many molecule detail windows may be open at once.
+///
+/// Table rows can be clicked far faster than windows can be closed, so this is
+/// bounded. Opening one past the cap closes the oldest rather than refusing the
+/// click: a click that silently does nothing reads as a bug, and the window you
+/// opened first is the one you are least likely to still be reading.
+pub const MAX_OPEN_DETAILS: usize = 8;
+
 /// Radius and bit-width for Morgan fingerprint generation.
 ///
 /// Owned by whichever view offers the controls, and passed to the operations
@@ -186,10 +194,13 @@ pub struct AppState {
 
     pub display: DisplaySettings,
 
-    /// Which row of the active dataset is selected. Shared because the table
-    /// highlights it and the detail window draws it; #107 replaces it with a
-    /// collection, once more than one molecule can be open at a time.
-    pub selected_row: Option<usize>,
+    /// Rows of the active dataset whose detail window is open, in the order
+    /// they were opened.
+    ///
+    /// Shared because two views need it: the table highlights these rows, and
+    /// the detail windows draw them. Order matters — it is what makes the cap
+    /// close the *oldest* window rather than an arbitrary one.
+    open_details: Vec<usize>,
 
     /// Bumped whenever the active dataset is replaced or swapped.
     ///
@@ -270,7 +281,7 @@ impl AppState {
             query: OperationOutcome::default(),
             search: OperationOutcome::default(),
             display: DisplaySettings::default(),
-            selected_row: None,
+            open_details: Vec::new(),
             dataset_epoch: 0,
             results_epoch: 0,
             dataset_fingerprint_task: Task::new(),
@@ -281,6 +292,39 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
         }
+    }
+
+    /// Rows whose detail window is open, oldest first.
+    pub fn open_details(&self) -> &[usize] {
+        &self.open_details
+    }
+
+    pub fn is_detail_open(&self, row: usize) -> bool {
+        self.open_details.contains(&row)
+    }
+
+    /// Opens a row's detail window, or closes it if it is already open.
+    ///
+    /// Toggling rather than raising an existing window: the table row is lit
+    /// while its window is open, so a second click on a lit row reads as
+    /// "put that away".
+    pub fn toggle_detail(&mut self, row: usize) {
+        if let Some(pos) = self.open_details.iter().position(|&r| r == row) {
+            self.open_details.remove(pos);
+        } else {
+            if self.open_details.len() >= MAX_OPEN_DETAILS {
+                self.open_details.remove(0);
+            }
+            self.open_details.push(row);
+        }
+    }
+
+    pub fn close_detail(&mut self, row: usize) {
+        self.open_details.retain(|&r| r != row);
+    }
+
+    pub fn close_all_details(&mut self) {
+        self.open_details.clear();
     }
 
     /// Version of the active dataset. See [`AppState::dataset_epoch`] field docs.
@@ -299,7 +343,8 @@ impl AppState {
         self.dataset_fingerprints.clear();
         self.search_engine.invalidate_target_dataset();
         self.search_results.clear();
-        self.selected_row = None;
+        // Keyed by row index, which means nothing against a different dataset.
+        self.open_details.clear();
         // These describe a dataset that is no longer active — "2048
         // fingerprints · GPU" against a dataset that has been swapped out is
         // worse than saying nothing. The query outcome survives: it is about
@@ -699,7 +744,88 @@ mod tests {
             index: 0,
             similarity: 1.0,
         }];
-        state.selected_row = Some(0);
+        state.toggle_detail(0);
+    }
+
+    #[test]
+    fn test_a_row_opens_and_a_second_click_closes_it() {
+        let mut state = AppState::cpu_only();
+
+        state.toggle_detail(3);
+        assert!(state.is_detail_open(3));
+        assert_eq!(state.open_details(), [3]);
+
+        state.toggle_detail(3);
+        assert!(!state.is_detail_open(3));
+        assert!(state.open_details().is_empty());
+    }
+
+    #[test]
+    fn test_several_rows_stay_open_together() {
+        let mut state = AppState::cpu_only();
+        for row in [4, 1, 7] {
+            state.toggle_detail(row);
+        }
+
+        // Comparing two molecules is the point; opening a second must not
+        // evict the first, which is what one shared slot used to do.
+        assert_eq!(state.open_details(), [4, 1, 7]);
+    }
+
+    #[test]
+    fn test_closing_one_leaves_the_others() {
+        let mut state = AppState::cpu_only();
+        for row in [4, 1, 7] {
+            state.toggle_detail(row);
+        }
+
+        state.close_detail(1);
+
+        assert_eq!(state.open_details(), [4, 7]);
+    }
+
+    #[test]
+    fn test_past_the_cap_the_oldest_window_closes() {
+        let mut state = AppState::cpu_only();
+        for row in 0..MAX_OPEN_DETAILS {
+            state.toggle_detail(row);
+        }
+        assert_eq!(state.open_details().len(), MAX_OPEN_DETAILS);
+
+        state.toggle_detail(99);
+
+        // The click is never refused; the oldest gives way.
+        assert_eq!(state.open_details().len(), MAX_OPEN_DETAILS);
+        assert!(!state.is_detail_open(0), "the oldest should have closed");
+        assert!(state.is_detail_open(99));
+        assert!(state.is_detail_open(1), "the second-oldest should remain");
+    }
+
+    #[test]
+    fn test_reopening_an_open_row_does_not_reorder_the_rest() {
+        let mut state = AppState::cpu_only();
+        for row in [2, 5] {
+            state.toggle_detail(row);
+        }
+
+        // Closing and reopening moves it to the back of the queue, which is
+        // what decides who the cap evicts next.
+        state.toggle_detail(2);
+        state.toggle_detail(2);
+
+        assert_eq!(state.open_details(), [5, 2]);
+    }
+
+    #[test]
+    fn test_close_all_clears_every_window() {
+        let mut state = AppState::cpu_only();
+        for row in 0..5 {
+            state.toggle_detail(row);
+        }
+
+        state.close_all_details();
+
+        assert!(state.open_details().is_empty());
     }
 
     #[test]
@@ -709,7 +835,7 @@ mod tests {
         assert!(!state.loaded_files.active_dataset().is_empty());
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
-        assert_eq!(state.selected_row, None);
+        assert!(state.open_details().is_empty());
     }
 
     #[test]
@@ -725,7 +851,7 @@ mod tests {
         // dataset.
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
-        assert_eq!(state.selected_row, None);
+        assert!(state.open_details().is_empty());
         // Views hold indices too, and find out the same way.
         assert!(state.dataset_epoch() > epoch);
     }
@@ -742,7 +868,7 @@ mod tests {
         assert_eq!(state.loaded_files.active_index(), 0);
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
-        assert_eq!(state.selected_row, None);
+        assert!(state.open_details().is_empty());
         assert!(state.dataset_epoch() > epoch);
     }
 
@@ -760,7 +886,7 @@ mod tests {
         // Nothing was replaced, so nothing derived from it is stale.
         assert_eq!(state.loaded_files.names().count(), files_before);
         assert_eq!(state.dataset_epoch(), epoch);
-        assert_eq!(state.selected_row, Some(0));
+        assert_eq!(state.open_details(), [0]);
         assert!(!state.dataset_fingerprints.is_empty());
     }
 
