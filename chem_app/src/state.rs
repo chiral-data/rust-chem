@@ -1,0 +1,675 @@
+//! Data shared by every view, and the operations that produce it.
+//!
+//! The app used to be one struct: 30 fields, and every panel a method taking
+//! `&mut self`. That works for panels drawn in a fixed order and nothing else —
+//! a view can't own its own state if all state lives on the app, and two views
+//! of the same kind can't exist at all.
+//!
+//! What's here is the half that really is shared: the loaded datasets, what has
+//! been computed from them, and the operations that do the computing. What's
+//! *not* here is any view's own state — a text box's contents, a slider's
+//! value, which row is expanded. Those live with the view that owns them, in
+//! [`crate::views`], and are handed to these operations as arguments.
+
+use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
+use crate::search::{FingerprintSearch, SearchResult};
+use crate::structure_view::StructureOptions;
+use crate::task::Task;
+use bitvec::prelude::BitVec;
+use chemcore::layout::ensure_coords;
+use chemcore::molecule::Molecule;
+use chemio::aromaticity::detect_aromaticity;
+use chemio::smiles::parse_smiles;
+
+#[cfg(target_arch = "wasm32")]
+use chemgpu::{GpuMorganFingerprint, GpuTanimoto};
+#[cfg(target_arch = "wasm32")]
+use std::{cell::RefCell, rc::Rc};
+
+#[cfg(target_arch = "wasm32")]
+type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
+#[cfg(target_arch = "wasm32")]
+type PendingFileLoad = Rc<RefCell<Option<(String, Vec<u8>)>>>;
+
+/// Formats a duration for display, switching to microseconds below 1ms so fast
+/// operations (a single small-molecule fingerprint, say) don't just show as
+/// "0.00ms".
+pub fn format_elapsed_ms(ms: f64) -> String {
+    if ms < 1.0 {
+        format!("{:.1}\u{b5}s", ms * 1000.0)
+    } else {
+        format!("{:.2}ms", ms)
+    }
+}
+
+/// Radius and bit-width for Morgan fingerprint generation.
+///
+/// Owned by whichever view offers the controls, and passed to the operations
+/// that need it — a dataset's fingerprints and a query's have to be generated
+/// under the same parameters to be comparable, so there is one set of them
+/// rather than one per operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FingerprintParams {
+    pub radius: u32,
+    pub size: u32,
+}
+
+impl Default for FingerprintParams {
+    fn default() -> Self {
+        Self {
+            radius: 2,
+            size: 2048,
+        }
+    }
+}
+
+/// How structures are drawn, anywhere in the app.
+///
+/// Shared rather than owned by the view that edits them: the dataset table's
+/// thumbnails, the query structure and every detail window all draw with these,
+/// so the controls being in one place doesn't make the values that view's
+/// private business.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisplaySettings {
+    pub structure: StructureOptions,
+    /// Whether the dataset table draws a structure per row. Off by default:
+    /// it's a per-row render, and most of the time the table is being scanned
+    /// for names and numbers rather than shapes.
+    pub show_thumbnails: bool,
+}
+
+pub struct AppState {
+    pub loaded_files: LoadedFiles,
+    pub dataset_fingerprints: Vec<BitVec>,
+    pub dataset_status: String,
+    pub search_engine: FingerprintSearch,
+    pub search_results: Vec<SearchResult>,
+
+    /// The parsed query, its fingerprint, and why parsing failed if it did.
+    ///
+    /// Outputs, not inputs: the SMILES text being typed belongs to the view
+    /// with the text box, but the molecule it parses to is drawn in one place
+    /// and searched with in another.
+    pub query_molecule: Option<Molecule>,
+    pub query_fingerprint: Option<BitVec>,
+    pub query_error: Option<String>,
+
+    pub last_fp_gen_time: Option<f64>,
+    pub last_search_time: Option<f64>,
+
+    pub display: DisplaySettings,
+
+    /// Which row of the active dataset is selected. Shared because the table
+    /// highlights it and the detail window draws it; #107 replaces it with a
+    /// collection, once more than one molecule can be open at a time.
+    pub selected_row: Option<usize>,
+
+    /// Bumped whenever the active dataset is replaced or swapped.
+    ///
+    /// Row indices, fingerprints and results all belong to whichever dataset
+    /// was active when they were made. Rather than every dataset-changing path
+    /// reaching into every view to clear what it holds — which is what the old
+    /// single struct did, in a six-line block duplicated three times — the
+    /// paths bump this, and a view holding indices notices its own state is
+    /// stale. That also means a view which isn't being drawn this frame still
+    /// finds out.
+    dataset_epoch: u64,
+    /// Bumped whenever new search results land, for the same reason.
+    results_epoch: u64,
+
+    // GPU-capable work, which is async on wasm32. Each is started in one place
+    // and collected in `update()`; see `task::Task`.
+    dataset_fingerprint_task: Task<Vec<BitVec>>,
+    query_fingerprint_task: Task<BitVec>,
+    search_task: Task<Vec<SearchResult>>,
+
+    // Browsers have no blocking main-thread file picker, so the wasm file load
+    // has to happen on a spawned future and hand its result back here to be
+    // picked up by the next `update()` poll.
+    #[cfg(target_arch = "wasm32")]
+    pending_file_load: PendingFileLoad,
+    // GPU init can't happen inside `FingerprintSearch::new()` on wasm32 (see
+    // its doc comment), so it's kicked off here instead and polled the same
+    // way. Outer Option = has the attempt resolved yet; inner Option = did it
+    // succeed.
+    #[cfg(target_arch = "wasm32")]
+    pending_gpu_init: PendingGpuInit,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self::with_engine(FingerprintSearch::new())
+    }
+
+    /// A CPU-only instance, for tests that exercise state transitions and have
+    /// no business depending on whether the machine running them has a GPU —
+    /// or on GPU init running at all, which does not take kindly to being
+    /// driven from parallel tests (#19). Mirrors
+    /// [`FingerprintSearch::new_cpu_only`], which exists for the same reason.
+    #[cfg(test)]
+    fn cpu_only() -> Self {
+        Self::with_engine(FingerprintSearch::new_cpu_only())
+    }
+
+    fn with_engine(search_engine: FingerprintSearch) -> Self {
+        let dataset = MoleculeDataset::example_dataset().unwrap_or_default();
+        let dataset_status = format!("Loaded {} example molecules", dataset.len());
+        let loaded_files = LoadedFiles::new("Examples".to_string(), dataset, DatasetFormat::Smiles);
+
+        #[cfg(target_arch = "wasm32")]
+        let pending_gpu_init = Rc::new(RefCell::new(None));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let slot = pending_gpu_init.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = FingerprintSearch::try_init_gpu_async().await;
+                *slot.borrow_mut() = Some(result);
+            });
+        }
+
+        Self {
+            loaded_files,
+            dataset_fingerprints: Vec::new(),
+            dataset_status,
+            search_engine,
+            search_results: Vec::new(),
+            query_molecule: None,
+            query_fingerprint: None,
+            query_error: None,
+            last_fp_gen_time: None,
+            last_search_time: None,
+            display: DisplaySettings::default(),
+            selected_row: None,
+            dataset_epoch: 0,
+            results_epoch: 0,
+            dataset_fingerprint_task: Task::new(),
+            query_fingerprint_task: Task::new(),
+            search_task: Task::new(),
+            #[cfg(target_arch = "wasm32")]
+            pending_file_load: Rc::new(RefCell::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            pending_gpu_init,
+        }
+    }
+
+    /// Version of the active dataset. See [`AppState::dataset_epoch`] field docs.
+    pub fn dataset_epoch(&self) -> u64 {
+        self.dataset_epoch
+    }
+
+    /// Version of [`AppState::search_results`].
+    pub fn results_epoch(&self) -> u64 {
+        self.results_epoch
+    }
+
+    /// Drops everything derived from the dataset that just went away, and tells
+    /// the views holding indices into it to do the same.
+    fn invalidate_active_dataset(&mut self) {
+        self.dataset_fingerprints.clear();
+        self.search_engine.invalidate_target_dataset();
+        self.search_results.clear();
+        self.selected_row = None;
+        self.dataset_epoch += 1;
+        self.results_epoch += 1;
+    }
+
+    // Goes through AsyncFileDialog and reads content as bytes (rather than
+    // FileDialog + a path) so file loading works on both native and web, where
+    // there's no filesystem to read a path from.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_dataset_from_file(&mut self) {
+        // pollster::block_on keeps the dialog's existing blocking-call UX; this
+        // is safe on native since blocking the calling thread doesn't stop
+        // other threads from driving the future forward.
+        let picked = pollster::block_on(async {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("SMILES", &["smi", "smiles", "txt"])
+                .add_filter("SDF", &["sdf"])
+                .pick_file()
+                .await?;
+            let name = file.file_name();
+            Some((name, file.read().await))
+        });
+
+        if let Some((name, bytes)) = picked {
+            self.apply_loaded_file_bytes(name, bytes);
+        }
+    }
+
+    // Browsers have only one JS thread, and it also drives the file picker's
+    // Promise machinery, so blocking on it would deadlock the tab. Spawn the
+    // dialog as a non-blocking task instead and hand its result to
+    // `pending_file_load`, polled from `update()` on the next frame.
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_dataset_from_file(&mut self) {
+        let slot = self.pending_file_load.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("SMILES", &["smi", "smiles", "txt"])
+                .add_filter("SDF", &["sdf"])
+                .pick_file()
+                .await;
+            if let Some(file) = file {
+                let name = file.file_name();
+                let bytes = file.read().await;
+                *slot.borrow_mut() = Some((name, bytes));
+            }
+        });
+    }
+
+    pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(e) => {
+                self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
+                log::error!("Dataset load failed: {}", e);
+                return;
+            }
+        };
+
+        let format = DatasetFormat::from_filename(&name);
+        let result = match format {
+            DatasetFormat::Sdf => MoleculeDataset::load_from_sdf_str(&content),
+            DatasetFormat::Smiles => MoleculeDataset::load_from_smiles_str(&content),
+        };
+
+        match result {
+            Ok(dataset) => {
+                self.dataset_status = format!(
+                    "Loaded {} molecules from '{}' ({})",
+                    dataset.len(),
+                    name,
+                    format.label()
+                );
+                self.loaded_files.add_and_activate(name, dataset, format);
+                self.invalidate_active_dataset();
+                log::info!("Dataset loaded successfully");
+            }
+            Err(e) => {
+                self.dataset_status = format!("Failed to load file: {}", e);
+                log::error!("Dataset load failed: {}", e);
+            }
+        }
+    }
+
+    pub fn load_example_dataset(&mut self) {
+        match MoleculeDataset::example_dataset() {
+            Ok(dataset) => {
+                self.dataset_status = format!("Loaded {} example molecules", dataset.len());
+                self.loaded_files.add_and_activate(
+                    "Examples".to_string(),
+                    dataset,
+                    DatasetFormat::Smiles,
+                );
+                self.invalidate_active_dataset();
+            }
+            Err(e) => {
+                self.dataset_status = format!("Failed to load examples: {}", e);
+            }
+        }
+    }
+
+    /// Switches the active dataset to an already-loaded entry, e.g. the user
+    /// clicking a name in the loaded-files list. Runs the same invalidation as
+    /// freshly loading a file, since fingerprints and search results belong to
+    /// whichever dataset was active when they were computed.
+    pub fn activate_loaded_file(&mut self, index: usize) {
+        self.loaded_files.activate(index);
+        self.dataset_status = format!(
+            "Switched to '{}' ({} molecules)",
+            self.loaded_files.names().nth(index).unwrap_or_default(),
+            self.loaded_files.active_dataset().len()
+        );
+        self.invalidate_active_dataset();
+    }
+
+    pub fn precompute_dataset_fingerprints(&mut self, params: FingerprintParams) {
+        if self.loaded_files.active_dataset().is_empty() {
+            self.dataset_status = "No dataset loaded".to_string();
+            return;
+        }
+
+        // Clones a snapshot of the search engine to hand to the task rather
+        // than borrowing `self`, which a spawned future can't do. The clone is
+        // cheap — the GPU handles behind it are `Arc`-backed — and its own GPU
+        // target cache is discarded when the task ends, costing one extra
+        // upload on the next search rather than any wrong answer.
+        let engine = self.search_engine.clone();
+        let molecules = self.loaded_files.active_dataset().molecules.clone();
+
+        self.dataset_fingerprint_task.start(async move {
+            engine
+                .generate_fingerprints_batch_async(&molecules, params.radius, params.size)
+                .await
+        });
+    }
+
+    // CPU-only, no GPU implementation exists or is needed for this — it's a
+    // simple ring search, nowhere near the cost of fingerprint generation.
+    // Wired directly rather than through any operation abstraction: #99 found
+    // that the four operations' signatures share nothing worth a trait.
+    pub fn detect_aromaticity_for_dataset(&mut self) {
+        let dataset = self.loaded_files.active_dataset_mut();
+        if dataset.is_empty() {
+            self.dataset_status = "No dataset loaded".to_string();
+            return;
+        }
+        for mol in dataset.molecules.iter_mut() {
+            detect_aromaticity(mol);
+        }
+        self.dataset_status = format!("Detected aromaticity for {} molecules", dataset.len());
+    }
+
+    pub fn parse_query(&mut self, smiles: &str, params: FingerprintParams) {
+        let smiles = smiles.trim();
+        if smiles.is_empty() {
+            self.query_error = Some("SMILES string is empty".to_string());
+            self.query_molecule = None;
+            self.query_fingerprint = None;
+            return;
+        }
+
+        match parse_smiles(smiles) {
+            Ok(mut mol) => {
+                // SMILES has no geometry. Laying out here rather than at draw
+                // time means it happens once per parse (already debounced)
+                // instead of every frame.
+                ensure_coords(&mut mol);
+                self.query_molecule = Some(mol.clone());
+                self.query_error = None;
+                self.generate_query_fingerprint(mol, params);
+            }
+            Err(e) => {
+                self.query_error = Some(format!("Invalid SMILES: {}", e));
+                self.query_molecule = None;
+                self.query_fingerprint = None;
+            }
+        }
+    }
+
+    fn generate_query_fingerprint(&mut self, mol: Molecule, params: FingerprintParams) {
+        let engine = self.search_engine.clone();
+
+        self.query_fingerprint_task.start(async move {
+            engine
+                .generate_fingerprint_async(&mol, params.radius, params.size)
+                .await
+        });
+    }
+
+    pub fn run_search(&mut self, top_k: usize) {
+        if self.dataset_fingerprints.is_empty() {
+            self.query_error = Some("Please compute dataset fingerprints first".to_string());
+            return;
+        }
+
+        let Some(query_fp) = self.query_fingerprint.clone() else {
+            return;
+        };
+
+        let mut engine = self.search_engine.clone();
+        let target_fps = self.dataset_fingerprints.clone();
+
+        self.search_task
+            .start(async move { engine.search_async(&query_fp, &target_fps, top_k).await });
+    }
+
+    /// True once a search has everything it needs: a query fingerprint to look
+    /// for, and dataset fingerprints to look through.
+    pub fn can_search(&self) -> bool {
+        self.query_fingerprint.is_some() && !self.dataset_fingerprints.is_empty()
+    }
+
+    // Kicks off a (re)attempt at GPU init, e.g. from the top bar's GPU chip.
+    // Native does this synchronously (matching new()'s own startup behavior);
+    // wasm32 can't block the browser's single JS thread, so it spawns the same
+    // async task new() kicks off at startup and polls pending_gpu_init the same
+    // way.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn retry_gpu(&mut self) {
+        if let Err(e) = self.search_engine.retry_gpu_init() {
+            log::warn!("GPU retry failed: {}", e);
+        } else {
+            self.dataset_status = "GPU acceleration is now active".to_string();
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn retry_gpu(&mut self) {
+        let slot = self.pending_gpu_init.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = FingerprintSearch::try_init_gpu_async().await;
+            *slot.borrow_mut() = Some(result);
+        });
+    }
+
+    /// Collects anything that finished since the last frame.
+    ///
+    /// Called once per frame, before any view is drawn, so a view never sees a
+    /// half-applied result.
+    pub fn poll_pending_work(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let loaded = self.pending_file_load.borrow_mut().take();
+            if let Some((name, bytes)) = loaded {
+                self.apply_loaded_file_bytes(name, bytes);
+            }
+
+            let gpu_init = self.pending_gpu_init.borrow_mut().take();
+            match gpu_init {
+                Some(Ok((morgan, tanimoto))) => {
+                    self.search_engine.install_gpu(morgan, tanimoto);
+                    self.dataset_status = "GPU acceleration is now active".to_string();
+                }
+                Some(Err(e)) => {
+                    self.search_engine.record_gpu_init_failure(e);
+                }
+                None => {} // still pending
+            }
+        }
+
+        // Collected on both platforms alike: the task ran on a spawned future
+        // (wasm32) or inline (native), but either way its result is applied
+        // here rather than at the call site.
+        if let Some((result, elapsed_ms)) = self.dataset_fingerprint_task.poll() {
+            self.apply_dataset_fingerprints_result(result, elapsed_ms);
+        }
+        if let Some((result, elapsed_ms)) = self.query_fingerprint_task.poll() {
+            self.apply_query_fingerprint_result(result, elapsed_ms);
+        }
+        if let Some((result, elapsed_ms)) = self.search_task.poll() {
+            self.apply_search_result(result, elapsed_ms);
+        }
+    }
+
+    fn apply_dataset_fingerprints_result(
+        &mut self,
+        result: anyhow::Result<Vec<BitVec>>,
+        elapsed_ms: f64,
+    ) {
+        match result {
+            Ok(fps) => {
+                self.dataset_fingerprints = fps;
+                self.dataset_status = format!(
+                    "Computed {} fingerprints in {} ({} mode)",
+                    self.dataset_fingerprints.len(),
+                    format_elapsed_ms(elapsed_ms),
+                    if self.search_engine.is_using_gpu() {
+                        "GPU"
+                    } else {
+                        "CPU"
+                    }
+                );
+                log::info!("Fingerprints computed in {:.2}ms", elapsed_ms);
+            }
+            Err(e) => {
+                self.dataset_status = format!("Failed to compute fingerprints: {}", e);
+                log::error!("Fingerprint computation failed: {}", e);
+            }
+        }
+    }
+
+    fn apply_query_fingerprint_result(&mut self, result: anyhow::Result<BitVec>, elapsed_ms: f64) {
+        match result {
+            Ok(fp) => {
+                self.query_fingerprint = Some(fp);
+                self.last_fp_gen_time = Some(elapsed_ms);
+            }
+            Err(e) => {
+                self.query_error = Some(format!("Fingerprint generation failed: {}", e));
+                self.query_fingerprint = None;
+            }
+        }
+    }
+
+    fn apply_search_result(&mut self, result: anyhow::Result<Vec<SearchResult>>, elapsed_ms: f64) {
+        match result {
+            Ok(results) => {
+                self.search_results = results;
+                self.last_search_time = Some(elapsed_ms);
+            }
+            Err(e) => {
+                self.query_error = Some(format!("Search failed: {}", e));
+                self.search_results.clear();
+            }
+        }
+        // Either way the old results are gone, so a view holding an index into
+        // them has to let go of it.
+        self.results_epoch += 1;
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stands in for real derived data — the tests here care about *whether*
+    /// it survives a dataset change, not what's in it.
+    fn with_derived_data(state: &mut AppState) {
+        state.dataset_fingerprints = vec![BitVec::new()];
+        state.search_results = vec![SearchResult {
+            index: 0,
+            similarity: 1.0,
+        }];
+        state.selected_row = Some(0);
+    }
+
+    #[test]
+    fn test_starts_on_the_example_dataset_with_nothing_derived() {
+        let state = AppState::cpu_only();
+
+        assert!(!state.loaded_files.active_dataset().is_empty());
+        assert!(state.dataset_fingerprints.is_empty());
+        assert!(state.search_results.is_empty());
+        assert_eq!(state.selected_row, None);
+    }
+
+    #[test]
+    fn test_loading_a_dataset_drops_what_the_old_one_derived() {
+        let mut state = AppState::cpu_only();
+        with_derived_data(&mut state);
+        let epoch = state.dataset_epoch();
+
+        state.load_example_dataset();
+
+        // Fingerprints and results belong to whichever dataset was active when
+        // they were computed, and a row index means nothing against a different
+        // dataset.
+        assert!(state.dataset_fingerprints.is_empty());
+        assert!(state.search_results.is_empty());
+        assert_eq!(state.selected_row, None);
+        // Views hold indices too, and find out the same way.
+        assert!(state.dataset_epoch() > epoch);
+    }
+
+    #[test]
+    fn test_switching_between_loaded_files_invalidates_the_same_way() {
+        let mut state = AppState::cpu_only();
+        state.load_example_dataset(); // a second entry to switch between
+        with_derived_data(&mut state);
+        let epoch = state.dataset_epoch();
+
+        state.activate_loaded_file(0);
+
+        assert_eq!(state.loaded_files.active_index(), 0);
+        assert!(state.dataset_fingerprints.is_empty());
+        assert!(state.search_results.is_empty());
+        assert_eq!(state.selected_row, None);
+        assert!(state.dataset_epoch() > epoch);
+    }
+
+    #[test]
+    fn test_a_failed_load_leaves_the_active_dataset_alone() {
+        let mut state = AppState::cpu_only();
+        with_derived_data(&mut state);
+        let epoch = state.dataset_epoch();
+        let files_before = state.loaded_files.names().count();
+
+        // Not valid UTF-8, so it never reaches a parser.
+        state.apply_loaded_file_bytes("broken.smi".to_string(), vec![0xff, 0xfe]);
+
+        assert!(state.dataset_status.contains("Failed to load"));
+        // Nothing was replaced, so nothing derived from it is stale.
+        assert_eq!(state.loaded_files.names().count(), files_before);
+        assert_eq!(state.dataset_epoch(), epoch);
+        assert_eq!(state.selected_row, Some(0));
+        assert!(!state.dataset_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn test_search_needs_both_a_query_and_a_fingerprinted_dataset() {
+        let mut state = AppState::cpu_only();
+        assert!(!state.can_search());
+
+        state.query_fingerprint = Some(BitVec::new());
+        assert!(!state.can_search(), "nothing to search through yet");
+
+        state.dataset_fingerprints = vec![BitVec::new()];
+        assert!(state.can_search());
+    }
+
+    #[test]
+    fn test_new_results_invalidate_a_view_holding_an_index_into_the_old_ones() {
+        let mut state = AppState::cpu_only();
+        let epoch = state.results_epoch();
+
+        state.apply_search_result(
+            Ok(vec![SearchResult {
+                index: 0,
+                similarity: 0.5,
+            }]),
+            1.0,
+        );
+
+        assert_eq!(state.search_results.len(), 1);
+        assert_eq!(state.last_search_time, Some(1.0));
+        assert!(state.results_epoch() > epoch);
+    }
+
+    #[test]
+    fn test_a_failed_search_also_invalidates_the_results() {
+        let mut state = AppState::cpu_only();
+        state.apply_search_result(
+            Ok(vec![SearchResult {
+                index: 0,
+                similarity: 0.5,
+            }]),
+            1.0,
+        );
+        let epoch = state.results_epoch();
+
+        state.apply_search_result(Err(anyhow::anyhow!("boom")), 1.0);
+
+        // The old results are gone either way, so an index into them is stale
+        // whether the new search succeeded or not.
+        assert!(state.search_results.is_empty());
+        assert!(state.query_error.is_some());
+        assert!(state.results_epoch() > epoch);
+    }
+}
