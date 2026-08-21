@@ -270,4 +270,77 @@ impl LoadedFiles {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|e| e.name.as_str())
     }
+
+    /// Every loaded dataset, in load order.
+    ///
+    /// [`LoadedFiles::names`] was enough while the list showed only names.
+    /// Showing what each entry *is* — its format, how many molecules it holds —
+    /// needs the entries themselves, and both facts are already here.
+    pub fn entries(&self) -> &[LoadedFile] {
+        &self.entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dataset_of(smiles: &[&str]) -> MoleculeDataset {
+        let content = smiles.join("\n");
+        MoleculeDataset::load_from_smiles_str(&content).expect("valid SMILES")
+    }
+
+    #[test]
+    fn test_entries_report_name_format_and_size() {
+        let mut files = LoadedFiles::new(
+            "first.smi".to_string(),
+            dataset_of(&["C", "CC"]),
+            DatasetFormat::Smiles,
+        );
+        files.add_and_activate(
+            "second.sdf".to_string(),
+            dataset_of(&["c1ccccc1"]),
+            DatasetFormat::Sdf,
+        );
+
+        // The list shows all three of these per entry; before `entries` it
+        // could only show the name.
+        let described: Vec<(&str, &str, usize)> = files
+            .entries()
+            .iter()
+            .map(|e| (e.name.as_str(), e.format.label(), e.dataset.len()))
+            .collect();
+
+        assert_eq!(
+            described,
+            vec![("first.smi", "SMILES", 2), ("second.sdf", "SDF", 1)]
+        );
+    }
+
+    #[test]
+    fn test_entries_are_in_load_order_not_activation_order() {
+        let mut files =
+            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::Smiles);
+        files.add_and_activate("b".to_string(), dataset_of(&["CC"]), DatasetFormat::Smiles);
+        files.activate(0);
+
+        // Switching back must not reorder the list under the user.
+        let names: Vec<&str> = files.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(files.active_index(), 0);
+    }
+
+    #[test]
+    fn test_reloading_a_name_replaces_it_rather_than_appending() {
+        let mut files =
+            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::Smiles);
+        files.add_and_activate(
+            "a".to_string(),
+            dataset_of(&["C", "CC", "CCC"]),
+            DatasetFormat::Smiles,
+        );
+
+        assert_eq!(files.entries().len(), 1);
+        assert_eq!(files.entries()[0].dataset.len(), 3);
+    }
 }

@@ -82,6 +82,23 @@ iterating, not fine as evidence.
   The debounce ticks from the frame loop precisely so that closing its window
   doesn't stop it, and nothing else verifies that.
 
+### Datasets (#104)
+
+- **Load the examples, then scroll the table.** All 15 rows reachable. The table
+  used to stop at 20 whatever the dataset held, so on a large file the check is
+  that scrolling keeps going — only the visible rows are drawn, and a bug there
+  shows as blank or repeated rows while scrolling fast.
+- **Each file in the list shows its format and molecule count.** Load a `.smi`
+  and a `.sdf` and confirm both are labelled correctly.
+- **Drag a column edge.** Columns are resizable now; SMILES is the one worth
+  widening.
+- **Turn on "Show structures in table" with a SMILES dataset.** Cells show a dash,
+  not a structure — coordinates don't exist yet. Run **2D Coordinates** in
+  Operations and they appear. With an SDF file they should be there immediately,
+  since the file supplies them.
+- **Collapse the Files section.** The table takes the whole window. This is the
+  escape hatch when the window is too short for both.
+
 ### Inspector (#106)
 
 - **Change a Display option** — turn on explicit hydrogens, say. Every structure

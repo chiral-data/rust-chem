@@ -40,7 +40,7 @@ The web build starts up on the CPU and upgrades to GPU acceleration via WebGPU a
 
 A menu bar sits above a workspace that three floating windows sit on:
 
-- **Datasets** — loaded files and the dataset table
+- **Datasets** — the datasets you have loaded, and the active one's molecules
 - **Operations** — everything you run against the dataset
 - **Inspector** — how structures are drawn, the query, and ranked results
 
@@ -60,7 +60,11 @@ In the **Datasets** window, or from the **File** menu:
 - **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file, or a `.sdf` file, from disk.
   - SMILES format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
-  - Each load adds a new entry to the **Loaded Files** list rather than replacing what's already there — click any entry to switch back to it. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
+  - Each load adds a new entry to the **Files** list rather than replacing what's already there — click any entry to switch back to it. Each is shown with its format and molecule count, so two SMILES files are told apart without switching between them. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
+
+The table below lists the active dataset's molecules and scrolls through all of them, however many there are — only the rows on screen are drawn. Click a name to open that molecule's detail window.
+
+**Show structures in table** adds a structure column. A structure is drawn where the molecule has coordinates: SDF files bring their own, and for anything parsed from SMILES, run **2D Coordinates** in Operations to generate them. Rows without coordinates show a dash rather than a blank cell.
 
 ### 2. Run an operation
 
