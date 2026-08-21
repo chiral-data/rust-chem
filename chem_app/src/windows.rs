@@ -13,7 +13,7 @@
 //! does share is its *shell*, so that is what this holds; the calls that draw
 //! their contents stay concrete and typed in `app.rs`.
 
-use egui::{Rect, Vec2, pos2, vec2};
+use egui::{Rect, pos2, vec2};
 
 /// One window's shell: identity, title, whether it is open, and where it opens
 /// the first time.
@@ -86,31 +86,44 @@ impl Default for WindowRegistry {
                 id: "window_data_sources",
                 title: "Data Sources",
                 open: true,
-                default_rect: Rect::from_min_size(pos2(16.0, 44.0), vec2(540.0, 400.0)),
+                default_rect: Rect::from_min_size(pos2(24.0, 48.0), vec2(400.0, 300.0)),
             },
             operations: WindowEntry {
                 id: "window_operations",
                 title: "Operations",
                 open: true,
-                default_rect: Rect::from_min_size(pos2(572.0, 44.0), vec2(420.0, 400.0)),
+                default_rect: Rect::from_min_size(pos2(448.0, 48.0), vec2(340.0, 300.0)),
             },
             visualization: WindowEntry {
                 id: "window_visualization",
                 title: "Data Visualization",
                 open: true,
-                default_rect: Rect::from_min_size(pos2(16.0, 464.0), vec2(976.0, 400.0)),
+                default_rect: Rect::from_min_size(pos2(120.0, 380.0), vec2(560.0, 260.0)),
             },
             laid_out: false,
         }
     }
 }
 
-/// Gap between tiled windows, and between a window and the workspace edge.
-const PAD: f32 = 8.0;
-
-/// A workspace smaller than this in either direction isn't worth tiling; the
+/// A workspace smaller than this in either direction isn't worth laying out; the
 /// fallback rects and `constrain` handle it instead.
 const MIN_TILEABLE: f32 = 240.0;
+
+// The default layout, as fractions of the workspace. The windows deliberately
+// don't fill it: free canvas between and around them is what makes them read as
+// floating windows rather than panels that happen to have title bars, and it
+// leaves somewhere to drop a molecule detail window (#107) without it landing
+// on top of something.
+//
+// Whatever these leave unused becomes margin, split evenly, so the cluster sits
+// in the middle of any canvas rather than hugging a corner.
+const DATA_SOURCES_W: f32 = 0.34;
+const OPERATIONS_W: f32 = 0.28;
+const VISUALIZATION_W: f32 = 0.46;
+const COL_GAP: f32 = 0.06;
+const TOP_ROW_H: f32 = 0.40;
+const BOTTOM_ROW_H: f32 = 0.30;
+const ROW_GAP: f32 = 0.08;
 
 impl WindowRegistry {
     /// Tiles the three windows across the workspace, once, on the first frame
@@ -127,21 +140,29 @@ impl WindowRegistry {
         }
         self.laid_out = true;
 
-        // Two windows side by side along the top, one across the bottom: three
-        // gaps horizontally (edge, middle, edge) and three vertically.
-        let inner = workspace.size() - Vec2::splat(PAD * 3.0);
-        let top_h = inner.y * 0.55;
-        let left_w = inner.x * 0.56;
-        let origin = workspace.min + Vec2::splat(PAD);
+        let (w, h) = (workspace.width(), workspace.height());
+        // Fractions in, absolute positions out.
+        let at = |fx: f32, fy: f32| workspace.min + vec2(w * fx, h * fy);
+        let size = |fw: f32, fh: f32| vec2(w * fw, h * fh);
 
-        self.data_sources.default_rect = Rect::from_min_size(origin, vec2(left_w, top_h));
+        // Data Sources and Operations side by side, Data Visualization centred
+        // beneath the pair. Unused fractions become even margins.
+        let top_row_w = DATA_SOURCES_W + COL_GAP + OPERATIONS_W;
+        let x0 = (1.0 - top_row_w) / 2.0;
+        let y0 = (1.0 - (TOP_ROW_H + ROW_GAP + BOTTOM_ROW_H)) / 2.0;
+
+        self.data_sources.default_rect =
+            Rect::from_min_size(at(x0, y0), size(DATA_SOURCES_W, TOP_ROW_H));
         self.operations.default_rect = Rect::from_min_size(
-            origin + vec2(left_w + PAD, 0.0),
-            vec2(inner.x - left_w, top_h),
+            at(x0 + DATA_SOURCES_W + COL_GAP, y0),
+            size(OPERATIONS_W, TOP_ROW_H),
         );
         self.visualization.default_rect = Rect::from_min_size(
-            origin + vec2(0.0, top_h + PAD),
-            vec2(inner.x + PAD, inner.y - top_h),
+            at(
+                x0 + (top_row_w - VISUALIZATION_W) / 2.0,
+                y0 + TOP_ROW_H + ROW_GAP,
+            ),
+            size(VISUALIZATION_W, BOTTOM_ROW_H),
         );
     }
 
@@ -225,6 +246,63 @@ mod tests {
                         rects[j]
                     );
                 }
+            }
+        }
+    }
+
+    /// Clearance between two disjoint rects, along whichever axis separates
+    /// them. Negative when they overlap.
+    fn separation(a: Rect, b: Rect) -> f32 {
+        let dx = (b.min.x - a.max.x).max(a.min.x - b.max.x);
+        let dy = (b.min.y - a.max.y).max(a.min.y - b.max.y);
+        dx.max(dy)
+    }
+
+    #[test]
+    fn test_windows_leave_visible_space_between_them() {
+        for (w, h) in VIEWPORTS {
+            let (_, mut registry) = tiled(w, h);
+            let rects: Vec<Rect> = registry
+                .entries_mut()
+                .iter()
+                .map(|e| e.default_rect)
+                .collect();
+            // Free canvas is the point of the arrangement: windows that merely
+            // fail to overlap still read as panels butted together.
+            let min_gap = w.min(h) * 0.04;
+
+            for i in 0..rects.len() {
+                for j in (i + 1)..rects.len() {
+                    let gap = separation(rects[i], rects[j]);
+                    assert!(
+                        gap >= min_gap,
+                        "windows {} and {} sit {:.0}px apart at {}x{}, want >= {:.0}px",
+                        i,
+                        j,
+                        gap,
+                        w,
+                        h,
+                        min_gap
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_windows_leave_a_margin_around_the_workspace() {
+        for (w, h) in VIEWPORTS {
+            let (workspace, mut registry) = tiled(w, h);
+            let inset = workspace.shrink(w.min(h) * 0.04);
+            for entry in registry.entries_mut() {
+                assert!(
+                    inset.contains_rect(entry.default_rect),
+                    "{} reaches the workspace edge at {}x{}: {:?}",
+                    entry.title,
+                    w,
+                    h,
+                    entry.default_rect
+                );
             }
         }
     }
