@@ -115,6 +115,27 @@ iterating, not fine as evidence.
   left it, not to the cascade position — each window keeps its own geometry
   because each has its own id.
 
+### Persistence (#108)
+
+This is the one section that cannot be checked in a single sitting — every item
+needs a restart, and on web a reload of the same browser.
+
+- **Move and resize the windows, close one, change the theme and the fingerprint
+  radius. Restart.** All of it should come back: geometry, which windows were
+  open, the theme, the display options, radius, size and top-k.
+- **Load a file and compute fingerprints, then restart.** The dataset is *not*
+  restored, and neither are the fingerprints or results. That is deliberate — a
+  fingerprint cache restored under settings you can no longer see is worse than
+  none.
+- **Drag a window mostly off-screen, then View → Reset layout.** It comes back.
+  Without the reset this state would persist across restarts, which is what
+  makes the menu item necessary rather than a convenience.
+- **On web, check the same browser** — persistence is `localStorage`, so a
+  different browser or a private window starts fresh, correctly.
+- **Then check it survives a version change.** Not something to do by hand every
+  time, but worth knowing the shape: a saved file from an older build must be
+  ignored rather than crash, and the app should open on defaults.
+
 ### Settings (#121)
 
 - **Settings sits beside File and View**, plain text like they are, and lights

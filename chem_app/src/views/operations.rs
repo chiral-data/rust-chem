@@ -17,12 +17,12 @@ use web_time::{Duration, Instant};
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct OperationsView {
-    fp_params: FingerprintParams,
+    pub(crate) fp_params: FingerprintParams,
     query_smiles: String,
     /// When the query box was last edited, or `None` if the edit has already
     /// been acted on. Drives the debounce in [`OperationsView::tick`].
     query_dirty_since: Option<Instant>,
-    top_k: usize,
+    pub(crate) top_k: usize,
 }
 
 impl Default for OperationsView {

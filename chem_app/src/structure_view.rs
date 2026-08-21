@@ -13,7 +13,7 @@ use std::collections::HashSet;
 /// Chemical convention leaves carbons as implicit vertices — a benzene ring is
 /// six lines, not six "C" glyphs — so the useful question is which ones are
 /// exceptions. Mirrors smilesDrawer's `showCarbons`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShowCarbons {
     /// Never, even where nothing else marks the atom's position.
     None,
@@ -29,7 +29,7 @@ pub enum ShowCarbons {
 }
 
 /// How atoms are drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AtomVisualization {
     /// Element symbol as text.
     Default,
@@ -49,7 +49,8 @@ pub enum AtomVisualization {
 /// given, so the on-screen bond length varies and anything fixed in pixels
 /// would look wrong at one end of the range — oversized in a table thumbnail,
 /// hairline in a large detail view.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct StructureOptions {
     /// Pixels per coordinate unit. `0.0` means derive one instead — see
     /// [`StructureOptions::bond_length`]. smilesDrawer's `scale` defaults to
