@@ -90,6 +90,16 @@ impl WorkbenchApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
+                    // Set by chem_app/e2e.sh, absent from an ordinary build.
+                    // Without it there is no way to tell from the app which
+                    // commit you are looking at, which is how a stale bundle
+                    // went unnoticed for eleven minutes of commits during
+                    // v0.5.0.
+                    if let Some(build) = option_env!("CHEM_BUILD_ID") {
+                        ui.label(RichText::new(build).small().weak())
+                            .on_hover_text("Build under test");
+                        ui.separator();
+                    }
                     self.backend_chips(ui);
                 });
             });

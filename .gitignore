@@ -26,3 +26,4 @@ Cargo.lock
 
 # trunk (chem_app web build output)
 /chem_app/dist/
+dist-e2e/
