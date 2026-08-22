@@ -115,10 +115,14 @@ iterating, not fine as evidence.
   `intersection/union = x.xxx`, and it should equal the similarity printed in the
   row above — it comes from the same function that ranked the results, so a
   disagreement means a real bug.
-- **The two grids must be the same shape**, one directly above the other, with
-  bit *n* at the same x in both. They were 64 wide in one view and 32 in
-  another, so the same bits formed a landscape grid in one place and a portrait
-  one in the other, and two side by side overflowed the window.
+- **One grid, three colours.** Blue for bits in both fingerprints, amber for this
+  molecule only, violet for the query only. Count the blue against the "shared"
+  figure if you want to be sure the legend describes the grid.
+- **Search a molecule against itself** — the top hit at 1.000 should be entirely
+  blue, with no amber or violet at all. Any other colour on a perfect match means
+  the grid and the score disagree.
+- **Switch the theme with the panel open.** Unset cells follow it. They were a
+  hardcoded near-white, which only became wrong once the theme was a choice.
 - **Check phenol against itself** — both spellings are in the examples. Scoring
   1.000 with two visibly identical drawings side by side is the check that a
   fingerprinting bug would now be obvious rather than hidden behind text.

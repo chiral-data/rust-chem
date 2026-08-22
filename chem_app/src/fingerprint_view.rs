@@ -13,9 +13,24 @@ const GRID_WIDTH: usize = 64;
 /// Cell edge, in points, for a grid shown on its own.
 const CELL_SIZE: f32 = 8.0;
 
-/// Cell edge for grids compared against each other inside a result row, where
-/// two have to fit one above the other.
-const CELL_SIZE_COMPACT: f32 = 4.0;
+/// Cell edge for the comparison grid inside a result row.
+const CELL_SIZE_COMPACT: f32 = 5.0;
+
+/// A bit set in both fingerprints — the numerator of the score.
+const BOTH: Color32 = Color32::from_rgb(70, 130, 180);
+/// Set in the molecule but not the query.
+const MOLECULE_ONLY: Color32 = Color32::from_rgb(214, 148, 48);
+/// Set in the query but not the molecule.
+const QUERY_ONLY: Color32 = Color32::from_rgb(142, 110, 190);
+
+/// Background for a bit set in neither.
+///
+/// Taken from the theme rather than fixed: this was a hardcoded near-white,
+/// which was invisible against a light background and glaring against a dark
+/// one. It only became wrong when #121 made the theme a choice.
+fn unset_color(ui: &Ui) -> Color32 {
+    ui.visuals().faint_bg_color
+}
 
 pub struct FingerprintView<'a> {
     fingerprint: &'a BitVec,
@@ -71,6 +86,7 @@ impl<'a> Widget for FingerprintView<'a> {
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(total_width, total_height), Sense::hover());
 
+        let unset = unset_color(ui);
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
 
@@ -85,9 +101,9 @@ impl<'a> Widget for FingerprintView<'a> {
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_size, cell_size));
 
                 let color = if *self.fingerprint.get(i).unwrap() {
-                    Color32::from_rgb(70, 130, 180)
+                    BOTH
                 } else {
-                    Color32::from_rgb(240, 240, 240)
+                    unset
                 };
 
                 painter.rect_filled(cell_rect, 0.0, color);
@@ -98,12 +114,73 @@ impl<'a> Widget for FingerprintView<'a> {
     }
 }
 
-/// Two fingerprints, one above the other, and the arithmetic behind their score.
+/// Both fingerprints in one grid, each bit coloured by which of them has it set.
 ///
-/// Stacked rather than side by side: two grids are 64 cells wide, and a pair of
-/// them will not fit a window's width, so one was being cut off. Stacking also
-/// puts bit *n* at the same x in both, which is what makes a difference readable
-/// by running an eye down a column.
+/// This *is* the Tanimoto calculation drawn. Every bit is in one of four states,
+/// and three of them are the sum: set in both is the numerator, set in either
+/// alone joins it to make the denominator, set in neither is not counted. Two
+/// stacked grids made you do that intersection by eye across two rows; one grid
+/// has already done it.
+struct FingerprintDiffView<'a> {
+    molecule: &'a BitVec,
+    query: &'a BitVec,
+}
+
+impl Widget for FingerprintDiffView<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let total_bits = self.molecule.len().min(self.query.len());
+        let grid_height = total_bits.div_ceil(GRID_WIDTH);
+
+        let cell_size = CELL_SIZE_COMPACT;
+        let spacing = 1.0;
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(
+                (cell_size + spacing) * GRID_WIDTH as f32,
+                (cell_size + spacing) * grid_height as f32,
+            ),
+            Sense::hover(),
+        );
+
+        let unset = unset_color(ui);
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            for i in 0..total_bits {
+                let in_molecule = self.molecule[i];
+                let in_query = self.query[i];
+                let color = match (in_molecule, in_query) {
+                    (true, true) => BOTH,
+                    (true, false) => MOLECULE_ONLY,
+                    (false, true) => QUERY_ONLY,
+                    (false, false) => unset,
+                };
+
+                let x = rect.min.x + (i % GRID_WIDTH) as f32 * (cell_size + spacing);
+                let y = rect.min.y + (i / GRID_WIDTH) as f32 * (cell_size + spacing);
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::splat(cell_size)),
+                    0.0,
+                    color,
+                );
+            }
+        }
+
+        response
+    }
+}
+
+/// A colour swatch and its count, for the grid's legend.
+fn legend_entry(ui: &mut Ui, color: Color32, label: &str, count: usize) {
+    ui.label(egui::RichText::new("\u{25a0}").color(color));
+    ui.label(egui::RichText::new(format!("{label} {count}")).small());
+}
+
+/// Why a result scored what it did: the arithmetic, and both fingerprints in one
+/// colour-coded grid.
+///
+/// One grid rather than two. Side by side they did not fit a window's width, so
+/// one was cut off; stacked they fit but left the reader intersecting two rows by
+/// eye. Colouring a single grid by which fingerprint holds each bit does that
+/// intersection for them, and is the same three numbers the score is made of.
 pub fn fingerprint_comparison(ui: &mut Ui, molecule: &BitVec, query: Option<&BitVec>) {
     ui.group(|ui| {
         let Some(query) = query else {
@@ -145,23 +222,25 @@ pub fn fingerprint_comparison(ui: &mut Ui, molecule: &BitVec, query: Option<&Bit
         let union = (molecule.clone() | query.clone()).count_ones();
         let tanimoto = tanimoto_similarity(molecule, query).unwrap_or(0.0);
 
+        let molecule_only = (molecule.clone() & !query.clone()).count_ones();
+        let query_only = (query.clone() & !molecule.clone()).count_ones();
+
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Shared bits").strong());
-            ui.label(format!("{intersection}"));
+            legend_entry(ui, BOTH, "both", intersection);
             ui.separator();
-            ui.label(egui::RichText::new("Either").strong());
-            ui.label(format!("{union}"));
+            legend_entry(ui, MOLECULE_ONLY, "this only", molecule_only);
             ui.separator();
-            ui.label(
-                egui::RichText::new(format!("{intersection}/{union} = {tanimoto:.3}")).strong(),
-            );
+            legend_entry(ui, QUERY_ONLY, "query only", query_only);
         });
+        ui.label(
+            egui::RichText::new(format!(
+                "{intersection} shared / {union} in either = {tanimoto:.3}"
+            ))
+            .strong(),
+        );
 
         ui.add_space(2.0);
-        ui.label(egui::RichText::new("This molecule").small());
-        ui.add(FingerprintView::new(molecule).compact());
-        ui.label(egui::RichText::new("Query").small());
-        ui.add(FingerprintView::new(query).compact());
+        ui.add(FingerprintDiffView { molecule, query });
     });
 }
 
@@ -228,15 +307,31 @@ mod tests {
     }
 
     #[test]
-    fn test_a_grid_is_the_same_shape_whatever_its_cell_size() {
-        // The two views differed in grid width, so the same bits were a
-        // landscape grid in one place and a portrait one in another, with no bit
-        // in the same position in both. Only the cell size varies now.
-        let fp = fingerprint(&[1; 128]);
-        let full = FingerprintView::new(&fp);
-        let compact = FingerprintView::new(&fp).compact();
-
-        assert_eq!(full.stats().total_bits, compact.stats().total_bits);
+    fn test_every_grid_shares_one_width() {
+        // The views used to take grid width as an argument, so the same 2048
+        // bits were a landscape grid in one place and a portrait one in another,
+        // with no bit in the same position in both. There is one width now.
         assert_eq!(128_usize.div_ceil(GRID_WIDTH), 2);
+        assert_eq!(2048_usize.div_ceil(GRID_WIDTH), 32);
+    }
+
+    #[test]
+    fn test_the_four_bit_states_partition_the_grid() {
+        // The three coloured states are exactly the union, and the fourth is
+        // everything the score ignores. If that stopped holding, the legend
+        // would be counting something other than what the grid draws.
+        let a = fingerprint(&[1, 1, 0, 1, 0, 0, 1, 0]);
+        let b = fingerprint(&[1, 0, 0, 1, 1, 0, 1, 1]);
+
+        let both = (a.clone() & b.clone()).count_ones();
+        let a_only = (a.clone() & !b.clone()).count_ones();
+        let b_only = (b.clone() & !a.clone()).count_ones();
+        let neither = a.len() - (both + a_only + b_only);
+
+        assert_eq!(both, 3);
+        assert_eq!(a_only, 1);
+        assert_eq!(b_only, 2);
+        assert_eq!(both + a_only + b_only, (a.clone() | b.clone()).count_ones());
+        assert_eq!(both + a_only + b_only + neither, a.len());
     }
 }
