@@ -67,6 +67,8 @@ In the **Datasets** window, or from the **File** menu:
 
 The table below lists the active dataset's molecules and scrolls through all of them, however many there are — only the rows on screen are drawn. Click a name to open that molecule's detail window; click it again to close it. A row stays highlighted while its window is open.
 
+Each detail window has an **Export SVG** button, which saves that molecule's structure as a vector file — a file on the desktop build, a download in the browser. Exports always use the light palette, whatever theme the app is showing, since a structure bound for a printed page shouldn't carry a dark background's colours.
+
 Several detail windows can be open at once, so two molecules can be compared side by side rather than remembered. Eight is the limit: opening a ninth closes the oldest, since rows can be clicked much faster than windows can be closed. **View → Close all molecule windows** clears them.
 
 **Show structures in table** adds a structure column. A structure is drawn where the molecule has coordinates: SDF files bring their own, and for anything parsed from SMILES, run **2D Coordinates** in Operations to generate them. Rows without coordinates show a dash rather than a blank cell.
@@ -105,7 +107,7 @@ You need to do this at least once before you can search.
 
 The **Inspector** window has two sections.
 
-**Query** — the parsed query molecule drawn, its details, and its fingerprint as a bit grid. It is labelled with the SMILES it was parsed from, which is not necessarily what is currently in the box in Operations.
+**Query** — the parsed query molecule drawn, its details, and its fingerprint as a bit grid. **Export SVG** saves the structure as a vector file you can drop into a document or a slide. It is labelled with the SMILES it was parsed from, which is not necessarily what is currently in the box in Operations.
 
 **Results** — each hit drawn, with its rank, name, SMILES and similarity score. Seeing the molecule is the point: two structures can score 0.9 for reasons obvious in a drawing and invisible in a SMILES string.
 

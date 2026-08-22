@@ -5,6 +5,7 @@ mod molecule_view;
 mod search;
 mod state;
 mod structure_view;
+mod svg;
 mod task;
 mod views;
 mod windows;

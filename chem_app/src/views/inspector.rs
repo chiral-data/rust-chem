@@ -16,8 +16,9 @@ use crate::fingerprint_view::{fingerprint_comparison, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_molecule_info};
 use crate::state::AppState;
 use crate::structure_view::{
-    ShowCarbons, StructureOptions, StructureView, structure_panel_with_options,
+    ShowCarbons, StructureOptions, StructureTheme, StructureView, structure_panel_with_options,
 };
+use crate::svg::{save_svg, structure_to_svg, suggested_filename};
 use egui::{Color32, RichText, Vec2};
 
 #[derive(Default)]
@@ -208,6 +209,20 @@ fn query_section(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(RichText::new("Nothing parsed yet — enter a SMILES in Operations.").weak());
             return;
         };
+
+        if ui
+            .button("Export SVG")
+            .on_hover_text("Save the query structure as an SVG file")
+            .clicked()
+        {
+            let svg = structure_to_svg(
+                &mol,
+                egui::vec2(360.0, 300.0),
+                &state.display.structure,
+                &StructureTheme::light(),
+            );
+            save_svg(&suggested_filename(&state.query_source), &svg);
+        }
 
         structure_panel_with_options(ui, &mol, 200.0, state.display.structure);
         show_molecule_info(ui, &mol, &state.query_source, "Query");

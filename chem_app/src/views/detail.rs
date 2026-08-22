@@ -16,10 +16,18 @@
 
 use crate::molecule_view::{show_atom_list, show_bond_list, show_molecule_info};
 use crate::state::AppState;
-use crate::structure_view::structure_panel_with_options;
+use crate::structure_view::{StructureTheme, structure_panel_with_options};
+use crate::svg::{save_svg, structure_to_svg, suggested_filename};
 use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
 use std::collections::HashMap;
+
+/// Size of an exported SVG, in points.
+///
+/// Larger than the on-screen panel: an export is destined for a document or a
+/// slide rather than a 220px window, and the geometry is proportional so a
+/// bigger viewport simply gives the labels more room.
+const EXPORT_SIZE: (f32, f32) = (360.0, 300.0);
 
 /// Offset between successive windows, so the second one to open is visible
 /// rather than exactly beneath the first.
@@ -111,6 +119,28 @@ impl DetailView {
                 .max_height(max_height)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        // Beside the structure it exports, rather than in a menu
+                        // that would have to guess which of up to
+                        // MAX_OPEN_DETAILS molecules was meant.
+                        if ui
+                            .button("Export SVG")
+                            .on_hover_text("Save this structure as an SVG file")
+                            .clicked()
+                        {
+                            // The theme the file gets is decided here rather
+                            // than read from the live one: an SVG bound for a
+                            // light document should not carry a dark palette
+                            // because that is what the app happened to be
+                            // showing.
+                            let svg = structure_to_svg(
+                                &mol,
+                                egui::vec2(EXPORT_SIZE.0, EXPORT_SIZE.1),
+                                &options,
+                                &StructureTheme::light(),
+                            );
+                            save_svg(&suggested_filename(&name), &svg);
+                        }
+
                         structure_panel_with_options(ui, &mol, 220.0, options);
                         show_molecule_info(ui, &mol, &smiles, &name);
                         show_atom_list(ui, &mol);
