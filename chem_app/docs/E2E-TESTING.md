@@ -108,9 +108,17 @@ iterating, not fine as evidence.
   first: rows show a dash, not a blank or a broken box. Then run it and they
   fill in — the same convention as the dataset table.
 - **The expansion is fingerprints only now.** Click **▼ Why?** and you get the
-  molecule's bits beside the query's, which is what the score is computed from.
+  shared-bit count, the either-bit count, their division, and both grids stacked.
   The atom and bond lists moved out; they are in a detail window, opened from
   the Datasets table.
+- **Check the division matches the row's score.** The panel shows
+  `intersection/union = x.xxx`, and it should equal the similarity printed in the
+  row above — it comes from the same function that ranked the results, so a
+  disagreement means a real bug.
+- **The two grids must be the same shape**, one directly above the other, with
+  bit *n* at the same x in both. They were 64 wide in one view and 32 in
+  another, so the same bits formed a landscape grid in one place and a portrait
+  one in the other, and two side by side overflowed the window.
 - **Check phenol against itself** — both spellings are in the examples. Scoring
   1.000 with two visibly identical drawings side by side is the check that a
   fingerprinting bug would now be obvious rather than hidden behind text.

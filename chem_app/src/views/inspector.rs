@@ -12,7 +12,7 @@
 //! is the data itself. The per-molecule structures live in detail windows, one
 //! per molecule, rather than being duplicated here.
 
-use crate::fingerprint_view::{fingerprint_compact, fingerprint_full};
+use crate::fingerprint_view::{fingerprint_comparison, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_molecule_info};
 use crate::state::AppState;
 use crate::structure_view::{
@@ -159,13 +159,7 @@ impl InspectorView {
                 // better and is a click away in the Datasets table.
                 ui.indent(format!("result_{}", rank), |ui| {
                     if let Some(fingerprint) = state.dataset_fingerprints.get(idx) {
-                        ui.horizontal_top(|ui| {
-                            fingerprint_compact(ui, fingerprint, "Molecule Fingerprint");
-                            if let Some(query) = &state.query_fingerprint {
-                                ui.separator();
-                                fingerprint_compact(ui, query, "Query Fingerprint");
-                            }
-                        });
+                        fingerprint_comparison(ui, fingerprint, state.query_fingerprint.as_ref());
                     } else {
                         ui.label(
                             RichText::new("No fingerprint for this molecule.")

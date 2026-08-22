@@ -110,7 +110,7 @@ The **Inspector** window has two sections.
 
 A structure appears where the molecule has coordinates — run **2D Coordinates** in Operations for anything parsed from SMILES, or load an SDF, which brings its own. Rows without them show a dash.
 
-Click **▼ Why?** on a result to see the fingerprint it was scored on, beside your query's, since Tanimoto similarity is computed from exactly those bits and nothing else. For a molecule's atoms and bonds, click its name in the Datasets table to open a detail window.
+Click **▼ Why?** on a result to see how the score was arrived at: how many bits the two fingerprints share, how many are set in either, and the division of one by the other — which is what Tanimoto similarity is. Both fingerprints are drawn beneath, one above the other, so a bit is at the same position in both and a difference can be read down a column. For a molecule's atoms and bonds, click its name in the Datasets table to open a detail window.
 
 ### What is remembered
 
