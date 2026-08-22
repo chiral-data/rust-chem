@@ -99,6 +99,34 @@ iterating, not fine as evidence.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
 
+### Structures in result rows (#111)
+
+- **Run a search on a dataset with coordinates.** Every hit draws its molecule at
+  96x72, larger than the table's 64x48 because a result is being compared
+  against the query rather than scanned.
+- **Search a freshly parsed SMILES dataset** without running 2D Coordinates
+  first: rows show a dash, not a blank or a broken box. Then run it and they
+  fill in — the same convention as the dataset table.
+- **The expansion is fingerprints only now.** Click **▼ Why?** and you get the
+  shared-bit count, the either-bit count, their division, and both grids stacked.
+  The atom and bond lists moved out; they are in a detail window, opened from
+  the Datasets table.
+- **Check the division matches the row's score.** The panel shows
+  `intersection/union = x.xxx`, and it should equal the similarity printed in the
+  row above — it comes from the same function that ranked the results, so a
+  disagreement means a real bug.
+- **One grid, three colours.** Blue for bits in both fingerprints, amber for this
+  molecule only, violet for the query only. Count the blue against the "shared"
+  figure if you want to be sure the legend describes the grid.
+- **Search a molecule against itself** — the top hit at 1.000 should be entirely
+  blue, with no amber or violet at all. Any other colour on a perfect match means
+  the grid and the score disagree.
+- **Switch the theme with the panel open.** Unset cells follow it. They were a
+  hardcoded near-white, which only became wrong once the theme was a choice.
+- **Check phenol against itself** — both spellings are in the examples. Scoring
+  1.000 with two visibly identical drawings side by side is the check that a
+  fingerprinting bug would now be obvious rather than hidden behind text.
+
 ### Molecule detail windows (#107)
 
 - **Click three different molecule names.** Three windows, cascaded so each is
