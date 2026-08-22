@@ -63,6 +63,7 @@ In the **Datasets** window, or from the **File** menu:
   - SMILES format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
   - Each load adds a new entry to the **Files** list rather than replacing what's already there — click any entry to switch back to it. Each is shown with its format and molecule count, so two SMILES files are told apart without switching between them. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
+  - **✕** removes an entry you've finished with. The last one can't be removed, since the app always has a dataset. Removing the one you're looking at discards its fingerprints and search results and switches to a neighbour; removing any other leaves your work untouched.
 
 The table below lists the active dataset's molecules and scrolls through all of them, however many there are — only the rows on screen are drawn. Click a name to open that molecule's detail window; click it again to close it. A row stays highlighted while its window is open.
 

@@ -67,14 +67,33 @@ impl DatasetsView {
                     .map(|e| (e.name.clone(), e.format.label(), e.dataset.len()))
                     .collect();
 
+                let can_remove = state.loaded_files.can_remove();
                 let mut clicked = None;
+                let mut removed = None;
                 for (i, (name, format, len)) in described.iter().enumerate() {
-                    let label = format!("{}  ({}, {} molecules)", name, format, len);
-                    if ui.selectable_label(i == active, label).clicked() {
-                        clicked = Some(i);
-                    }
+                    ui.horizontal(|ui| {
+                        // Disabled at one entry rather than hidden, so the
+                        // control doesn't appear and vanish as files are loaded.
+                        // The hover text says why it's greyed.
+                        let remove = ui
+                            .add_enabled(can_remove, egui::Button::new("✕").small())
+                            .on_disabled_hover_text("The last dataset can't be removed");
+                        if remove.clicked() {
+                            removed = Some(i);
+                        }
+
+                        let label = format!("{}  ({}, {} molecules)", name, format, len);
+                        if ui.selectable_label(i == active, label).clicked() {
+                            clicked = Some(i);
+                        }
+                    });
                 }
-                if let Some(i) = clicked {
+
+                // Removal first: acting on a click into a list that has just
+                // changed length would activate the wrong entry.
+                if let Some(i) = removed {
+                    state.remove_loaded_file(i);
+                } else if let Some(i) = clicked {
                     state.activate_loaded_file(i);
                 }
             });

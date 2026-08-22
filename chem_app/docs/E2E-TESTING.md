@@ -90,6 +90,15 @@ iterating, not fine as evidence.
   shows as blank or repeated rows while scrolling fast.
 - **Each file in the list shows its format and molecule count.** Load a `.smi`
   and a `.sdf` and confirm both are labelled correctly.
+- **Load three files, then remove the *first* while looking at the third.** The
+  third must still be the active one, with its fingerprints and results intact.
+  This is the case the feature can get quietly wrong: every entry after the
+  removed one shifts down a slot, so an unadjusted index would leave you looking
+  at a different dataset with nothing invalidated.
+- **Now remove the one you're looking at.** A neighbour takes over, and its
+  fingerprints, results and open molecule windows are gone — they belonged to
+  the dataset that just went.
+- **Remove down to one.** The **✕** greys out, and hovering says why.
 - **Drag a column edge.** Columns are resizable now; SMILES is the one worth
   widening.
 - **Turn on "Show structures in table" with a SMILES dataset.** Cells show a dash,

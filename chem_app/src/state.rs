@@ -476,6 +476,36 @@ impl AppState {
         self.invalidate_active_dataset();
     }
 
+    /// Removes a loaded dataset, discarding what belonged to it if it was the
+    /// active one.
+    pub fn remove_loaded_file(&mut self, index: usize) {
+        let Some(name) = self
+            .loaded_files
+            .entries()
+            .get(index)
+            .map(|entry| entry.name.clone())
+        else {
+            return;
+        };
+
+        if self.loaded_files.remove(index) {
+            // A different dataset is active now, so everything derived from the
+            // old one goes — the same reset that switching files performs.
+            self.invalidate_active_dataset();
+            self.dataset_status = format!(
+                "Removed '{}' — now showing '{}' ({} molecules)",
+                name,
+                self.loaded_files
+                    .names()
+                    .nth(self.loaded_files.active_index())
+                    .unwrap_or_default(),
+                self.loaded_files.active_dataset().len()
+            );
+        } else {
+            self.dataset_status = format!("Removed '{}'", name);
+        }
+    }
+
     pub fn precompute_dataset_fingerprints(&mut self, params: FingerprintParams) {
         if self.loaded_files.active_dataset().is_empty() {
             self.fingerprints = OperationOutcome::failure("No dataset loaded");
@@ -896,6 +926,64 @@ mod tests {
         assert_eq!(state.loaded_files.names().count(), files_before);
         assert_eq!(state.dataset_epoch(), epoch);
         assert_eq!(state.open_details(), [0]);
+        assert!(!state.dataset_fingerprints.is_empty());
+    }
+
+    /// A second entry under a different name.
+    ///
+    /// `load_example_dataset` cannot be used for this: it always loads under the
+    /// name "Examples", and `add_and_activate` replaces a same-named entry in
+    /// place rather than appending, so the list would still hold one.
+    fn add_second_file(state: &mut AppState) {
+        state.apply_loaded_file_bytes("second.smi".to_string(), b"C\nCC\n".to_vec());
+        assert_eq!(state.loaded_files.entries().len(), 2, "need two entries");
+    }
+
+    #[test]
+    fn test_removing_the_active_file_discards_what_belonged_to_it() {
+        let mut state = AppState::cpu_only();
+        add_second_file(&mut state); // now active
+        with_derived_data(&mut state);
+        let epoch = state.dataset_epoch();
+
+        state.remove_loaded_file(state.loaded_files.active_index());
+
+        assert!(state.dataset_fingerprints.is_empty());
+        assert!(state.search_results.is_empty());
+        assert!(state.open_details().is_empty());
+        assert!(state.dataset_epoch() > epoch);
+        assert!(state.dataset_status.contains("Removed"));
+    }
+
+    #[test]
+    fn test_removing_another_file_leaves_the_active_one_alone() {
+        let mut state = AppState::cpu_only();
+        add_second_file(&mut state);
+        // The second entry stays active; the first is removed.
+        with_derived_data(&mut state);
+        let epoch = state.dataset_epoch();
+
+        state.remove_loaded_file(0);
+
+        // The dataset on screen didn't change, so its fingerprints, results and
+        // open windows are still about the right molecules. Discarding them here
+        // would be the easy over-correction.
+        assert!(!state.dataset_fingerprints.is_empty());
+        assert!(!state.search_results.is_empty());
+        assert_eq!(state.open_details(), [0]);
+        assert_eq!(state.dataset_epoch(), epoch);
+    }
+
+    #[test]
+    fn test_removing_the_only_file_does_nothing() {
+        let mut state = AppState::cpu_only();
+        with_derived_data(&mut state);
+        let epoch = state.dataset_epoch();
+
+        state.remove_loaded_file(0);
+
+        assert_eq!(state.loaded_files.entries().len(), 1);
+        assert_eq!(state.dataset_epoch(), epoch);
         assert!(!state.dataset_fingerprints.is_empty());
     }
 
