@@ -88,7 +88,7 @@ pub struct StructureOptions {
     /// effect there. smilesDrawer's `explicitHydrogens`.
     pub explicit_hydrogens: bool,
     /// How atoms are drawn (smilesDrawer's `atomVisualization`).
-    pub atom_inspector: AtomVisualization,
+    pub atom_visualization: AtomVisualization,
     /// Atom label height as a fraction of bond length.
     pub font_size_ratio: f32,
     /// Charge and isotope annotation height, as a fraction of the main label
@@ -113,7 +113,7 @@ impl Default for StructureOptions {
             short_bond_length: 0.8,
             show_carbons: ShowCarbons::Default,
             explicit_hydrogens: true,
-            atom_inspector: AtomVisualization::Default,
+            atom_visualization: AtomVisualization::Default,
             font_size_ratio: 0.42,
             font_size_small_ratio: 0.62,
             font_size_range: (7.0, 22.0),
@@ -568,7 +568,7 @@ impl Widget for StructureView<'_> {
         let label_margin = font_size * self.options.label_margin_ratio;
         let label_half_extents: Vec<Option<Vec2>> = (0..self.molecule.num_atoms())
             .map(|atom_idx| {
-                if self.options.atom_inspector != AtomVisualization::Default
+                if self.options.atom_visualization != AtomVisualization::Default
                     || !is_labeled(self.molecule, atom_idx, &self.options, &ring_atoms)
                 {
                     return None;
@@ -716,7 +716,7 @@ impl Widget for StructureView<'_> {
             let pos = transform.apply(p);
             let element_color = theme.element_color(self.molecule.atom(atom_idx).atomic_number());
 
-            match self.options.atom_inspector {
+            match self.options.atom_visualization {
                 AtomVisualization::None => continue,
                 AtomVisualization::Balls => {
                     // Sized off the bond length so dots stay proportionate at
@@ -833,11 +833,11 @@ pub fn structure_option_controls(ui: &mut Ui, options: &mut StructureOptions) {
 
         ui.separator();
         ui.label("Atoms:");
-        egui::ComboBox::from_id_salt("atom_inspector")
-            .selected_text(options.atom_inspector.label())
+        egui::ComboBox::from_id_salt("atom_visualization")
+            .selected_text(options.atom_visualization.label())
             .show_ui(ui, |ui| {
                 for mode in AtomVisualization::ALL {
-                    ui.selectable_value(&mut options.atom_inspector, mode, mode.label());
+                    ui.selectable_value(&mut options.atom_visualization, mode, mode.label());
                 }
             });
 
