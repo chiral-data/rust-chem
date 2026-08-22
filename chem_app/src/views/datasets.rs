@@ -74,9 +74,10 @@ impl DatasetsView {
                     ui.horizontal(|ui| {
                         // Disabled at one entry rather than hidden, so the
                         // control doesn't appear and vanish as files are loaded.
-                        // The hover text says why it's greyed.
                         let remove = ui
-                            .add_enabled(can_remove, egui::Button::new("✕").small())
+                            .add_enabled_ui(can_remove, remove_button)
+                            .inner
+                            .on_hover_text("Remove this dataset")
                             .on_disabled_hover_text("The last dataset can't be removed");
                         if remove.clicked() {
                             removed = Some(i);
@@ -223,4 +224,28 @@ impl DatasetsView {
             state.toggle_detail(i);
         }
     }
+}
+
+/// A close control, painted rather than lettered.
+///
+/// egui paints its own window close button from two line segments instead of
+/// using a character, and the reason shows up the moment you try: the
+/// multiplication-x glyphs aren't in the bundled font subset, so `✕` renders as
+/// a missing-glyph box. Painting it takes the stroke from the interaction
+/// visuals, so it also follows the theme and greys itself when disabled without
+/// being told to.
+fn remove_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::Vec2::splat(ui.spacing().icon_width);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let stroke = visuals.fg_stroke;
+        let cross = rect.shrink(rect.width() * 0.28);
+        let painter = ui.painter();
+        painter.line_segment([cross.left_top(), cross.right_bottom()], stroke);
+        painter.line_segment([cross.right_top(), cross.left_bottom()], stroke);
+    }
+
+    response
 }
