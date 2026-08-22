@@ -114,6 +114,26 @@ iterating, not fine as evidence.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
 
+### SVG export (#109)
+
+- **Export a molecule from its detail window**, then open the file. Bonds should
+  stop at the edge of atom labels, not strike through them — that inset is
+  computed from an estimate for the font the file declares, not from egui's
+  metrics, and getting it wrong is the specific failure this design avoids.
+- **Export the query from the Inspector** too; both surfaces have a button,
+  since with several detail windows open there is no single "current" structure.
+- **Export something aromatic** (benzene, phenol). The inner ring lines must be
+  dashed in the file, not solid — the dash survives as an attribute rather than
+  being cut into segments.
+- **Export while the app is in dark theme.** The file must still come out with
+  dark strokes on nothing, ready for a light document. It does not inherit the
+  live palette.
+- **Open the file in a browser and in an editor** if you can. It is valid XML —
+  verified with a real parser — but how a viewer substitutes fonts is exactly
+  what cannot be checked here.
+- **Try a molecule with an awkward name** — anything with slashes or spaces. The
+  suggested filename should be sanitised, and never start with a dot.
+
 ### Structures in result rows (#111)
 
 - **Run a search on a dataset with coordinates.** Every hit draws its molecule at
