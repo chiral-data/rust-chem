@@ -512,6 +512,348 @@ fn mean_bond_length(molecule: &Molecule, transform: &Transform) -> Option<f32> {
     }
 }
 
+/// One primitive of a drawn structure, independent of what draws it.
+///
+/// The renderer used to compute geometry and emit egui shapes in the same pass,
+/// so there was nothing an SVG writer could consume. These are that missing
+/// middle: enough to paint, and enough to serialise.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StructureShape {
+    Line {
+        from: Pos2,
+        to: Pos2,
+        width: f32,
+        color: Color32,
+    },
+    /// Kept as a dash length rather than pre-cut into segments, so each backend
+    /// expresses it natively — egui through `Shape::dashed_line`, SVG through
+    /// `stroke-dasharray`.
+    DashedLine {
+        from: Pos2,
+        to: Pos2,
+        width: f32,
+        color: Color32,
+        dash: f32,
+    },
+    Disc {
+        center: Pos2,
+        radius: f32,
+        color: Color32,
+    },
+    Text {
+        pos: Pos2,
+        align: Align2,
+        text: String,
+        size: f32,
+        color: Color32,
+    },
+}
+
+/// Measures a label at a font size, so bonds can be inset to its edge.
+///
+/// This is the only part of describing a structure that a backend has to supply,
+/// and the reason the description is worth having: egui measures with its own
+/// font, an SVG writer estimates for the font it declares, and each then gets
+/// insets that match the labels *it* will draw. Sharing one backend's metrics
+/// with the other is what makes bonds strike through text.
+pub type MeasureText<'a> = &'a dyn Fn(&str, f32) -> Vec2;
+
+/// Everything to draw for a molecule, in the given rectangle.
+pub fn describe_structure(
+    molecule: &Molecule,
+    rect: Rect,
+    options: &StructureOptions,
+    theme: &StructureTheme,
+    weak_color: Color32,
+    measure: MeasureText<'_>,
+) -> Vec<StructureShape> {
+    let mut shapes = Vec::new();
+
+    // Bonds are drawn in the foreground rather than per-element: colouring a
+    // bond by its atoms would need a gradient, and it's the atom labels that
+    // carry the identity anyway.
+    let color = theme.foreground;
+
+    let Some(coords) = molecule.coords() else {
+        // No layout to draw. Say so rather than leaving a blank panel that looks
+        // like a rendering failure.
+        shapes.push(StructureShape::Text {
+            pos: rect.center(),
+            align: Align2::CENTER_CENTER,
+            text: "No 2D coordinates".to_owned(),
+            size: 12.0,
+            color: weak_color,
+        });
+        return shapes;
+    };
+
+    let Some(bbox) = BoundingBox::from_points(coords) else {
+        // Coordinates present but no atoms — nothing to draw.
+        return shapes;
+    };
+
+    let transform = Transform::for_options(molecule, bbox, rect, options);
+
+    // Derive the proportional options from the bond length this molecule
+    // actually ended up with on screen. A single-atom molecule has no bonds to
+    // measure, so fall back to the scale itself.
+    let bond_len = mean_bond_length(molecule, &transform).unwrap_or(transform.scale);
+    let font_size = (bond_len * options.font_size_ratio)
+        .clamp(options.font_size_range.0, options.font_size_range.1);
+    let bond_spacing = bond_len * options.bond_spacing_ratio;
+
+    // Ring membership drives both which carbons get labelled and which way is
+    // "into the ring" for a multiple bond's second line.
+    let (ring_centers, ring_atoms) = ring_bond_centers(molecule, &transform);
+
+    // Lay out the labels first: their sizes determine how far to pull the bond
+    // endpoints back, which has to be known before any bond is drawn.
+    let label_margin = font_size * options.label_margin_ratio;
+    let label_sizes: Vec<Option<Vec2>> = (0..molecule.num_atoms())
+        .map(|atom_idx| {
+            if options.atom_visualization != AtomVisualization::Default
+                || !is_labeled(molecule, atom_idx, options, &ring_atoms)
+            {
+                return None;
+            }
+            Some(measure(&atom_label(molecule, atom_idx), font_size))
+        })
+        .collect();
+    let label_half_extents: Vec<Option<Vec2>> = label_sizes
+        .iter()
+        .map(|size| size.map(|s| s / 2.0 + Vec2::splat(label_margin)))
+        .collect();
+
+    // Bonds under labels, so the labels read cleanly on top.
+    for (bond_idx, bond) in molecule.bonds().iter().enumerate() {
+        let (a, b) = bond.atoms();
+        if is_hidden(molecule, a, options) || is_hidden(molecule, b, options) {
+            continue;
+        }
+        let (Some(pa), Some(pb)) = (molecule.coord(a), molecule.coord(b)) else {
+            continue;
+        };
+
+        let mut start = transform.apply(pa);
+        let mut end = transform.apply(pb);
+
+        let Some(dir) = (end - start).normalized_or_zero_check() else {
+            // Superimposed atoms have no bond direction to draw along. A 3D SDF
+            // flattened to 2D can produce these.
+            continue;
+        };
+
+        // Pull each end back to the edge of its label, if it has one, without
+        // letting the two insets cross past each other on a short bond with
+        // large labels.
+        let full_len = start.distance(end);
+        let inset_a = label_half_extents[a]
+            .map(|h| box_edge_distance(dir, h.x, h.y))
+            .unwrap_or(0.0);
+        let inset_b = label_half_extents[b]
+            .map(|h| box_edge_distance(dir, h.x, h.y))
+            .unwrap_or(0.0);
+        if inset_a + inset_b >= full_len {
+            continue;
+        }
+        start += dir * inset_a;
+        end -= dir * inset_b;
+
+        let mut offset = Vec2::new(-dir.y, dir.x) * bond_spacing;
+
+        // On a ring bond, flip the offset if it points out of the ring, so the
+        // secondary line always lands in the interior.
+        let in_ring = match ring_centers.get(bond_idx).copied().flatten() {
+            Some(center) => {
+                let midpoint = start + (end - start) * 0.5;
+                if offset.dot(center - midpoint) < 0.0 {
+                    offset = -offset;
+                }
+                true
+            }
+            None => false,
+        };
+
+        // Trim applied to a secondary line drawn inside a ring, so adjacent ring
+        // bonds don't run into each other at the vertices.
+        let trim = (1.0 - options.short_bond_length).clamp(0.0, 1.0) / 2.0;
+        let width = options.bond_thickness;
+        let mut line = |from: Pos2, to: Pos2| {
+            shapes.push(StructureShape::Line {
+                from,
+                to,
+                width,
+                color,
+            });
+        };
+
+        match bond.order() {
+            BondOrder::Single => line(start, end),
+            BondOrder::Double if in_ring => {
+                // Ring convention: one line on the ring perimeter, the second
+                // inside it and shortened.
+                line(start, end);
+                let inner_a = start + offset;
+                let inner_b = end + offset;
+                let shrink = (inner_b - inner_a) * trim;
+                line(inner_a + shrink, inner_b - shrink);
+            }
+            BondOrder::Double => {
+                // Off a ring there's no interior to favour, so both lines sit
+                // symmetrically about the bond axis.
+                line(start + offset * 0.5, end + offset * 0.5);
+                line(start - offset * 0.5, end - offset * 0.5);
+            }
+            BondOrder::Triple => {
+                line(start, end);
+                line(start + offset, end + offset);
+                line(start - offset, end - offset);
+            }
+            BondOrder::Aromatic => {
+                // Solid line on the ring perimeter, dashed one inside it. (The
+                // other common convention draws a single circle inside the ring
+                // instead; this keeps the per-bond form.)
+                let (solid_a, solid_b, inner_a, inner_b) = if in_ring {
+                    (start, end, start + offset, end + offset)
+                } else {
+                    // Aromatic bonds do occur outside a perceived ring (a lone
+                    // aromatic-flagged bond, a ring the SSSR basis didn't pick);
+                    // fall back to a symmetric pair.
+                    (
+                        start + offset * 0.5,
+                        end + offset * 0.5,
+                        start - offset * 0.5,
+                        end - offset * 0.5,
+                    )
+                };
+
+                line(solid_a, solid_b);
+
+                // Trimmed equally at both ends, so adjacent aromatic bonds don't
+                // collide at ring vertices.
+                let shrink = (inner_b - inner_a) * trim;
+                shapes.push(StructureShape::DashedLine {
+                    from: inner_a + shrink,
+                    to: inner_b - shrink,
+                    width,
+                    color,
+                    dash: (bond_spacing * 1.5).max(2.0),
+                });
+            }
+            BondOrder::Quadruple => {
+                line(start + offset, end + offset);
+                line(start, end);
+                line(start - offset, end - offset);
+                line(start + offset * 2.0, end + offset * 2.0);
+            }
+        }
+    }
+
+    let small_size = font_size * options.font_size_small_ratio;
+
+    for (atom_idx, label_size) in label_sizes.iter().enumerate() {
+        if is_hidden(molecule, atom_idx, options) {
+            continue;
+        }
+        let Some(p) = molecule.coord(atom_idx) else {
+            continue;
+        };
+        let pos = transform.apply(p);
+        let element_color = theme.element_color(molecule.atom(atom_idx).atomic_number());
+
+        match options.atom_visualization {
+            AtomVisualization::None => continue,
+            AtomVisualization::Balls => {
+                // Sized off the bond length so dots stay proportionate at any
+                // scale, same reasoning as the font size.
+                shapes.push(StructureShape::Disc {
+                    center: pos,
+                    radius: (bond_len * 0.16).max(1.5),
+                    color: element_color,
+                });
+                continue;
+            }
+            AtomVisualization::Default => {}
+        }
+
+        let Some(label_size) = *label_size else {
+            continue;
+        };
+
+        shapes.push(StructureShape::Text {
+            pos,
+            align: Align2::CENTER_CENTER,
+            text: atom_label(molecule, atom_idx),
+            size: font_size,
+            color: element_color,
+        });
+
+        // Charge and isotope go above-right of the symbol, smaller — the
+        // superscript position chemists expect, and it keeps `O` with a charge
+        // from reading as a two-character element symbol.
+        //
+        // Positioned from the measured label rather than from a rect a painter
+        // handed back, so it lands in the same place whoever is drawing.
+        if let Some(annotation) = atom_annotation(molecule, atom_idx) {
+            shapes.push(StructureShape::Text {
+                pos: pos + Vec2::new(label_size.x / 2.0, -label_size.y / 2.0),
+                align: Align2::LEFT_CENTER,
+                text: annotation,
+                size: small_size,
+                color: element_color,
+            });
+        }
+    }
+
+    shapes
+}
+
+/// Draws a description with egui.
+fn paint_structure(painter: &egui::Painter, shapes: &[StructureShape]) {
+    for shape in shapes {
+        match shape {
+            StructureShape::Line {
+                from,
+                to,
+                width,
+                color,
+            } => {
+                painter.line_segment([*from, *to], Stroke::new(*width, *color));
+            }
+            StructureShape::DashedLine {
+                from,
+                to,
+                width,
+                color,
+                dash,
+            } => {
+                painter.extend(Shape::dashed_line(
+                    &[*from, *to],
+                    Stroke::new(*width, *color),
+                    *dash,
+                    *dash,
+                ));
+            }
+            StructureShape::Disc {
+                center,
+                radius,
+                color,
+            } => {
+                painter.circle_filled(*center, *radius, *color);
+            }
+            StructureShape::Text {
+                pos,
+                align,
+                text,
+                size,
+                color,
+            } => {
+                painter.text(*pos, *align, text, FontId::proportional(*size), *color);
+            }
+        }
+    }
+}
+
 impl Widget for StructureView<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         let (rect, response) = ui.allocate_exact_size(self.desired_size, Sense::hover());
@@ -521,238 +863,30 @@ impl Widget for StructureView<'_> {
         }
 
         let theme = StructureTheme::from_visuals(ui.visuals());
-        // Bonds are drawn in the foreground rather than per-element: colouring
-        // a bond by its atoms would need a gradient, and it's the atom labels
-        // that carry the identity anyway.
-        let color = theme.foreground;
         let weak_color = ui.visuals().weak_text_color();
 
-        let Some(coords) = self.molecule.coords() else {
-            // No layout to draw. Say so rather than leaving a blank panel that
-            // looks like a rendering failure.
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "No 2D coordinates",
-                FontId::proportional(12.0),
+        // Scoped so the measuring borrow ends before the painting one begins.
+        let shapes = {
+            let measure = |text: &str, size: f32| {
+                ui.painter()
+                    .layout_no_wrap(
+                        text.to_owned(),
+                        FontId::proportional(size),
+                        Color32::PLACEHOLDER,
+                    )
+                    .size()
+            };
+            describe_structure(
+                self.molecule,
+                rect,
+                &self.options,
+                &theme,
                 weak_color,
-            );
-            return response;
+                &measure,
+            )
         };
 
-        let Some(bbox) = BoundingBox::from_points(coords) else {
-            // Coordinates present but no atoms — nothing to draw.
-            return response;
-        };
-
-        let transform = Transform::for_options(self.molecule, bbox, rect, &self.options);
-
-        // Derive the proportional options from the bond length this molecule
-        // actually ended up with on screen. A single-atom molecule has no bonds
-        // to measure, so fall back to the scale itself.
-        let bond_len = mean_bond_length(self.molecule, &transform).unwrap_or(transform.scale);
-        let font_size = (bond_len * self.options.font_size_ratio).clamp(
-            self.options.font_size_range.0,
-            self.options.font_size_range.1,
-        );
-        let bond_spacing = bond_len * self.options.bond_spacing_ratio;
-        let font_id = FontId::proportional(font_size);
-        let stroke = Stroke::new(self.options.bond_thickness, color);
-
-        // Ring membership drives both which carbons get labelled and which way
-        // is "into the ring" for a multiple bond's second line.
-        let (ring_centers, ring_atoms) = ring_bond_centers(self.molecule, &transform);
-
-        // Lay out the labels first: their sizes determine how far to pull the
-        // bond endpoints back, which has to be known before any bond is drawn.
-        let label_margin = font_size * self.options.label_margin_ratio;
-        let label_half_extents: Vec<Option<Vec2>> = (0..self.molecule.num_atoms())
-            .map(|atom_idx| {
-                if self.options.atom_visualization != AtomVisualization::Default
-                    || !is_labeled(self.molecule, atom_idx, &self.options, &ring_atoms)
-                {
-                    return None;
-                }
-                let galley = ui.painter().layout_no_wrap(
-                    atom_label(self.molecule, atom_idx),
-                    font_id.clone(),
-                    theme.element_color(self.molecule.atom(atom_idx).atomic_number()),
-                );
-                Some(galley.size() / 2.0 + Vec2::splat(label_margin))
-            })
-            .collect();
-
-        let painter = ui.painter();
-
-        // Bonds under labels, so the labels read cleanly on top.
-        for (bond_idx, bond) in self.molecule.bonds().iter().enumerate() {
-            let (a, b) = bond.atoms();
-            if is_hidden(self.molecule, a, &self.options)
-                || is_hidden(self.molecule, b, &self.options)
-            {
-                continue;
-            }
-            let (Some(pa), Some(pb)) = (self.molecule.coord(a), self.molecule.coord(b)) else {
-                continue;
-            };
-
-            let mut start = transform.apply(pa);
-            let mut end = transform.apply(pb);
-
-            let Some(dir) = (end - start).normalized_or_zero_check() else {
-                // Superimposed atoms have no bond direction to draw along.
-                // A 3D SDF flattened to 2D can produce these.
-                continue;
-            };
-
-            // Pull each end back to the edge of its label, if it has one,
-            // without letting the two insets cross past each other on a short
-            // bond with large labels.
-            let full_len = start.distance(end);
-            let inset_a = label_half_extents[a]
-                .map(|h| box_edge_distance(dir, h.x, h.y))
-                .unwrap_or(0.0);
-            let inset_b = label_half_extents[b]
-                .map(|h| box_edge_distance(dir, h.x, h.y))
-                .unwrap_or(0.0);
-            if inset_a + inset_b >= full_len {
-                continue;
-            }
-            start += dir * inset_a;
-            end -= dir * inset_b;
-
-            let mut offset = Vec2::new(-dir.y, dir.x) * bond_spacing;
-
-            // On a ring bond, flip the offset if it points out of the ring, so
-            // the secondary line always lands in the interior.
-            let in_ring = match ring_centers.get(bond_idx).copied().flatten() {
-                Some(center) => {
-                    let midpoint = start + (end - start) * 0.5;
-                    if offset.dot(center - midpoint) < 0.0 {
-                        offset = -offset;
-                    }
-                    true
-                }
-                None => false,
-            };
-
-            // Trim applied to a secondary line drawn inside a ring, so adjacent
-            // ring bonds don't run into each other at the vertices.
-            let trim = (1.0 - self.options.short_bond_length).clamp(0.0, 1.0) / 2.0;
-
-            match bond.order() {
-                BondOrder::Single => {
-                    painter.line_segment([start, end], stroke);
-                }
-                BondOrder::Double if in_ring => {
-                    // Ring convention: one line on the ring perimeter, the
-                    // second inside it and shortened.
-                    painter.line_segment([start, end], stroke);
-                    let inner_a = start + offset;
-                    let inner_b = end + offset;
-                    let shrink = (inner_b - inner_a) * trim;
-                    painter.line_segment([inner_a + shrink, inner_b - shrink], stroke);
-                }
-                BondOrder::Double => {
-                    // Off a ring there's no interior to favour, so both lines
-                    // sit symmetrically about the bond axis.
-                    painter.line_segment([start + offset * 0.5, end + offset * 0.5], stroke);
-                    painter.line_segment([start - offset * 0.5, end - offset * 0.5], stroke);
-                }
-                BondOrder::Triple => {
-                    painter.line_segment([start, end], stroke);
-                    painter.line_segment([start + offset, end + offset], stroke);
-                    painter.line_segment([start - offset, end - offset], stroke);
-                }
-                BondOrder::Aromatic => {
-                    // Solid line on the ring perimeter, dashed one inside it.
-                    // (The other common convention draws a single circle inside
-                    // the ring instead; this keeps the per-bond form.)
-                    let (solid_a, solid_b, inner_a, inner_b) = if in_ring {
-                        (start, end, start + offset, end + offset)
-                    } else {
-                        // Aromatic bonds do occur outside a perceived ring
-                        // (a lone aromatic-flagged bond, a ring the SSSR basis
-                        // didn't pick); fall back to a symmetric pair.
-                        (
-                            start + offset * 0.5,
-                            end + offset * 0.5,
-                            start - offset * 0.5,
-                            end - offset * 0.5,
-                        )
-                    };
-
-                    painter.line_segment([solid_a, solid_b], stroke);
-
-                    // Trimmed equally at both ends, so adjacent aromatic bonds
-                    // don't collide at ring vertices.
-                    let shrink = (inner_b - inner_a) * trim;
-                    let dash = (bond_spacing * 1.5).max(2.0);
-                    painter.extend(Shape::dashed_line(
-                        &[inner_a + shrink, inner_b - shrink],
-                        stroke,
-                        dash,
-                        dash,
-                    ));
-                }
-                BondOrder::Quadruple => {
-                    painter.line_segment([start + offset, end + offset], stroke);
-                    painter.line_segment([start, end], stroke);
-                    painter.line_segment([start - offset, end - offset], stroke);
-                    painter.line_segment([start + offset * 2.0, end + offset * 2.0], stroke);
-                }
-            }
-        }
-
-        let small_font = FontId::proportional(font_size * self.options.font_size_small_ratio);
-
-        for (atom_idx, half_extent) in label_half_extents.iter().enumerate() {
-            if is_hidden(self.molecule, atom_idx, &self.options) {
-                continue;
-            }
-            let Some(p) = self.molecule.coord(atom_idx) else {
-                continue;
-            };
-            let pos = transform.apply(p);
-            let element_color = theme.element_color(self.molecule.atom(atom_idx).atomic_number());
-
-            match self.options.atom_visualization {
-                AtomVisualization::None => continue,
-                AtomVisualization::Balls => {
-                    // Sized off the bond length so dots stay proportionate at
-                    // any scale, same reasoning as the font size.
-                    painter.circle_filled(pos, (bond_len * 0.16).max(1.5), element_color);
-                    continue;
-                }
-                AtomVisualization::Default => {}
-            }
-
-            if half_extent.is_none() {
-                continue;
-            }
-
-            let label_rect = painter.text(
-                pos,
-                Align2::CENTER_CENTER,
-                atom_label(self.molecule, atom_idx),
-                font_id.clone(),
-                element_color,
-            );
-
-            // Charge and isotope go above-right of the symbol, smaller — the
-            // superscript position chemists expect, and it keeps `O` with a
-            // charge from reading as a two-character element symbol.
-            if let Some(annotation) = atom_annotation(self.molecule, atom_idx) {
-                painter.text(
-                    label_rect.right_top(),
-                    Align2::LEFT_CENTER,
-                    annotation,
-                    small_font.clone(),
-                    element_color,
-                );
-            }
-        }
-
+        paint_structure(ui.painter(), &shapes);
         response
     }
 }
@@ -864,10 +998,185 @@ pub fn structure_panel_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chemcore::layout::layout;
+    use chemcore::prelude::*;
     use egui::pos2;
+
+    fn carbon_skeleton(n: usize, bonds: &[(usize, usize)]) -> Molecule {
+        let mut mol = Molecule::new();
+        for _ in 0..n {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        for &(a, b) in bonds {
+            mol.add_bond(Bond::new(a, b, BondOrder::Single)).unwrap();
+        }
+        mol
+    }
 
     fn rect(w: f32, h: f32) -> Rect {
         Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(w, h))
+    }
+
+    /// A stand-in for a real font: every glyph the same box, proportional to
+    /// the size. Enough for the geometry, and it means these tests describe a
+    /// structure without egui.
+    fn stub_measure(text: &str, size: f32) -> Vec2 {
+        Vec2::new(text.chars().count() as f32 * size * 0.6, size)
+    }
+
+    fn describe(molecule: &Molecule, options: &StructureOptions) -> Vec<StructureShape> {
+        describe_structure(
+            molecule,
+            rect(200.0, 200.0),
+            options,
+            &StructureTheme::light(),
+            Color32::GRAY,
+            &stub_measure,
+        )
+    }
+
+    fn count_lines(shapes: &[StructureShape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| matches!(s, StructureShape::Line { .. }))
+            .count()
+    }
+
+    fn texts(shapes: &[StructureShape]) -> Vec<&str> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                StructureShape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_a_molecule_without_coordinates_says_so() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        // Rather than a blank panel, which reads as a rendering failure.
+        assert_eq!(
+            texts(&describe(&mol, &StructureOptions::default())),
+            ["No 2D coordinates"]
+        );
+    }
+
+    #[test]
+    fn test_every_bond_of_a_ring_is_drawn() {
+        let mut mol = carbon_skeleton(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]);
+        layout(&mut mol);
+
+        // Six single bonds, one line each, and no carbon labelled — a plain
+        // hexagon is drawn as six strokes and nothing else.
+        let shapes = describe(&mol, &StructureOptions::default());
+        assert_eq!(count_lines(&shapes), 6);
+        assert!(texts(&shapes).is_empty());
+    }
+
+    #[test]
+    fn test_a_double_bond_in_a_ring_draws_two_lines() {
+        let mut mol = carbon_skeleton(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]);
+        mol.bond_mut(0).set_order(BondOrder::Double);
+        layout(&mut mol);
+
+        // Five single bonds plus a double: the perimeter line and the inner one.
+        assert_eq!(
+            count_lines(&describe(&mol, &StructureOptions::default())),
+            7
+        );
+    }
+
+    #[test]
+    fn test_an_aromatic_bond_is_dashed_inside_the_ring() {
+        let mut mol = carbon_skeleton(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]);
+        for i in 0..mol.num_bonds() {
+            mol.bond_mut(i).set_order(BondOrder::Aromatic);
+        }
+        layout(&mut mol);
+
+        let shapes = describe(&mol, &StructureOptions::default());
+        // One solid perimeter line and one dashed inner line per bond. The dash
+        // stays a length rather than being cut into segments, so each backend
+        // expresses it natively.
+        assert_eq!(count_lines(&shapes), 6);
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|s| matches!(s, StructureShape::DashedLine { .. }))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn test_heteroatoms_are_labelled_and_carbons_are_not() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        layout(&mut mol);
+
+        assert_eq!(texts(&describe(&mol, &StructureOptions::default())), ["O"]);
+    }
+
+    #[test]
+    fn test_labels_pull_the_bond_back_from_the_text() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        layout(&mut mol);
+
+        let shapes = describe(&mol, &StructureOptions::default());
+        let (from, to) = shapes
+            .iter()
+            .find_map(|s| match s {
+                StructureShape::Line { from, to, .. } => Some((*from, *to)),
+                _ => None,
+            })
+            .expect("expected a bond");
+        let labels: Vec<Pos2> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                StructureShape::Text { pos, .. } => Some(*pos),
+                _ => None,
+            })
+            .collect();
+
+        // The bond must stop short of both label centres, which is the whole
+        // point of measuring them first — and is what would break if one
+        // backend's metrics were used to inset another's labels.
+        assert_eq!(labels.len(), 2);
+        let span = labels[0].distance(labels[1]);
+        let drawn = from.distance(to);
+        assert!(
+            drawn < span,
+            "bond is {drawn:.2} long but the label centres are {span:.2} apart; \
+             it should stop short of both"
+        );
+    }
+
+    #[test]
+    fn test_balls_mode_draws_discs_and_no_text() {
+        let mut mol = carbon_skeleton(2, &[(0, 1)]);
+        layout(&mut mol);
+        let options = StructureOptions {
+            atom_visualization: AtomVisualization::Balls,
+            ..Default::default()
+        };
+
+        let shapes = describe(&mol, &options);
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|s| matches!(s, StructureShape::Disc { .. }))
+                .count(),
+            2
+        );
+        assert!(texts(&shapes).is_empty());
     }
 
     #[test]
