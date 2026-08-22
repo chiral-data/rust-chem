@@ -99,6 +99,22 @@ iterating, not fine as evidence.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
 
+### Structures in result rows (#111)
+
+- **Run a search on a dataset with coordinates.** Every hit draws its molecule at
+  96x72, larger than the table's 64x48 because a result is being compared
+  against the query rather than scanned.
+- **Search a freshly parsed SMILES dataset** without running 2D Coordinates
+  first: rows show a dash, not a blank or a broken box. Then run it and they
+  fill in — the same convention as the dataset table.
+- **The expansion is fingerprints only now.** Click **▼ Why?** and you get the
+  molecule's bits beside the query's, which is what the score is computed from.
+  The atom and bond lists moved out; they are in a detail window, opened from
+  the Datasets table.
+- **Check phenol against itself** — both spellings are in the examples. Scoring
+  1.000 with two visibly identical drawings side by side is the check that a
+  fingerprinting bug would now be obvious rather than hidden behind text.
+
 ### Molecule detail windows (#107)
 
 - **Click three different molecule names.** Three windows, cascaded so each is

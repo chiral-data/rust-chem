@@ -106,7 +106,11 @@ The **Inspector** window has two sections.
 
 **Query** — the parsed query molecule drawn, its details, and its fingerprint as a bit grid. It is labelled with the SMILES it was parsed from, which is not necessarily what is currently in the box in Operations.
 
-**Results** — each hit with its rank, summary and similarity score. Click **▼ Show** on any result to expand it in place: atom list, bond list, and a side-by-side fingerprint comparison against your query. Click **▲ Hide** to collapse it again.
+**Results** — each hit drawn, with its rank, name, SMILES and similarity score. Seeing the molecule is the point: two structures can score 0.9 for reasons obvious in a drawing and invisible in a SMILES string.
+
+A structure appears where the molecule has coordinates — run **2D Coordinates** in Operations for anything parsed from SMILES, or load an SDF, which brings its own. Rows without them show a dash.
+
+Click **▼ Why?** on a result to see the fingerprint it was scored on, beside your query's, since Tanimoto similarity is computed from exactly those bits and nothing else. For a molecule's atoms and bonds, click its name in the Datasets table to open a detail window.
 
 ### What is remembered
 
