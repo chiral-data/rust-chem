@@ -16,10 +16,12 @@
 
 use crate::molecule_view::{show_atom_list, show_bond_list, show_molecule_info};
 use crate::state::AppState;
-use crate::structure_view::{StructureTheme, structure_panel_with_options};
-use crate::svg::{save_svg, structure_to_svg, suggested_filename};
+use crate::structure_view::structure_panel_with_options;
+use crate::svg::save_svg;
 use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
+use chemdraw::structure::StructureTheme;
+use chemdraw::svg::{structure_to_svg, suggested_filename};
 use std::collections::HashMap;
 
 /// Size of an exported SVG, in points.
