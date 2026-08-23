@@ -3,8 +3,13 @@ name: Chiral Pipeline
 on:
   push:
     branches: [main]
+  # Milestone integration branches (v050, v060, ...) as well as main. Story
+  # PRs merge into those, and until now they merged unchecked: CI ran once per
+  # milestone, on its own PR into main, so a break could sit unattributed
+  # behind ten merged PRs. Deliberately not added to `push`: a merge into the
+  # branch would re-run the identical commit the PR just checked.
   pull_request:
-    branches: [main]
+    branches: [main, 'v[0-9]*']
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +21,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Anything aimed at main gets the full three-OS sweep. A story PR into
+        # a milestone branch gets Linux only: a milestone lands ten-odd small
+        # PRs, and paying for Windows and macOS on each of them is what the
+        # milestone's own PR into main is for.
+        #
+        # The cost is that a Windows- or macOS-only break surfaces at the end
+        # of the milestone rather than in the PR that caused it. chem_app has a
+        # Windows-only `winit` dependency, so that isn't hypothetical - but it
+        # still cannot reach main unnoticed.
+        os: >-
+          ${{ (github.base_ref == 'main' || github.ref_name == 'main')
+          && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]')
+          || fromJSON('["ubuntu-latest"]') }}
         rust: [stable]
 
     steps:
@@ -64,6 +81,11 @@ jobs:
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
+    # Only on the way to main. It uploads with `fail_ci_if_error: false`, so it
+    # can never fail a build, and it is the slowest job here - an instrumented
+    # rebuild plus a cargo-llvm-cov install. A coverage delta per story PR is
+    # noise; the one that matters is the milestone's.
+    if: github.base_ref == 'main' || github.ref_name == 'main'
 
     steps:
       - uses: actions/checkout@v4
