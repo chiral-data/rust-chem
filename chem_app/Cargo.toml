@@ -15,6 +15,7 @@ log = { workspace = true }
 web-time = "1.1.0"
 
 chemcore = { workspace = true }
+chemdraw = { workspace = true }
 chemfp = { workspace = true }
 chemgpu = { workspace = true }
 chemio = { workspace = true }

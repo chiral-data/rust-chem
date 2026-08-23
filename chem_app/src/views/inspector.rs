@@ -15,10 +15,10 @@
 use crate::fingerprint_view::{fingerprint_comparison, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_molecule_info};
 use crate::state::AppState;
-use crate::structure_view::{
-    ShowCarbons, StructureOptions, StructureTheme, StructureView, structure_panel_with_options,
-};
-use crate::svg::{save_svg, structure_to_svg, suggested_filename};
+use crate::structure_view::{StructureView, structure_panel_with_options};
+use crate::svg::save_svg;
+use chemdraw::structure::{ShowCarbons, StructureOptions, StructureTheme};
+use chemdraw::svg::{structure_to_svg, suggested_filename};
 use egui::{Color32, RichText, Vec2};
 
 #[derive(Default)]

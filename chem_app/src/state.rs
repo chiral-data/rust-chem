@@ -13,11 +13,11 @@
 
 use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
 use crate::search::{FingerprintSearch, SearchResult};
-use crate::structure_view::StructureOptions;
 use crate::task::Task;
 use bitvec::prelude::BitVec;
 use chemcore::layout::ensure_coords;
 use chemcore::molecule::Molecule;
+use chemdraw::structure::StructureOptions;
 use chemio::aromaticity::detect_aromaticity;
 use chemio::smiles::parse_smiles;
 
