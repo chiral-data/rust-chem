@@ -440,13 +440,51 @@ mod tests {
         pollster::block_on(future)
     }
 
+    /// One GPU-initialised search, built once and cloned per test.
+    ///
+    /// Every test that called `FingerprintSearch::new()` requested its own
+    /// adapter and device, and two of those racing against one physical GPU
+    /// hangs indefinitely on at least one driver — the deadlock #19 diagnosed
+    /// for `chemgpu` and #134 for here. `chemgpu` solved it by sharing a context
+    /// through a `OnceLock`; this is the same move one layer up.
+    ///
+    /// Clones rather than lending a reference because these tests mutate the
+    /// search — `set_target_dataset` fills its upload cache. Cloning is what
+    /// makes that safe *and* cheap: `wgpu`'s device, queue and pipelines are
+    /// refcounted handles, so a clone shares the device instead of asking for
+    /// another one, while getting a cache of its own.
+    ///
+    /// `None` means no usable GPU, which is not a failure — it is what every
+    /// CI runner reports.
+    ///
+    /// Native only, and there is nothing to share on wasm32 anyway:
+    /// `FingerprintSearch::new()` starts CPU-only there, since it cannot block
+    /// the browser's single thread to request a device, so a GPU-path test has
+    /// nothing to run against. A `static` would not compile either — wgpu's
+    /// WebGPU types hold a `RefCell` and raw pointers, the web being
+    /// single-threaded, so they are not `Sync`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shared_gpu_search() -> Option<FingerprintSearch> {
+        static SEARCH: std::sync::OnceLock<Option<FingerprintSearch>> = std::sync::OnceLock::new();
+        SEARCH
+            .get_or_init(|| {
+                let search = FingerprintSearch::new();
+                if search.is_using_gpu() {
+                    Some(search)
+                } else {
+                    println!("GPU not available; GPU-path tests will skip");
+                    None
+                }
+            })
+            .clone()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_gpu_search_rejects_mismatched_fingerprint_size() {
-        let mut search = FingerprintSearch::new();
-        if !search.is_using_gpu() {
-            println!("GPU not available, skipping GPU-path size-mismatch test");
+        let Some(mut search) = shared_gpu_search() else {
             return;
-        }
+        };
 
         // Two 1024-bit targets flatten to exactly the same word count as one
         // 2048-bit query (64 words), so a word-count-divisibility-only check
@@ -524,13 +562,12 @@ mod tests {
         assert_eq!(batch[0].len(), 2048);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_gpu_search_reflects_new_dataset_after_reupload() {
-        let mut search = FingerprintSearch::new();
-        if !search.is_using_gpu() {
-            println!("GPU not available, skipping GPU target-cache test");
+        let Some(mut search) = shared_gpu_search() else {
             return;
-        }
+        };
 
         // Same shape (1 target, 64 words) for both datasets, so a cache keyed
         // only on count/fp_words would wrongly keep serving dataset A's
