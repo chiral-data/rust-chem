@@ -15,9 +15,9 @@
 #   * refuses to start if something else already holds the port, naming it.
 #
 # Usage:
-#   chem_app/e2e.sh                          # 127.0.0.1:8080
-#   chem_app/e2e.sh --port 8081
-#   chem_app/e2e.sh --address 0.0.0.0        # reachable from other machines
+#   crates/chem_app/e2e.sh                   # 127.0.0.1:8080
+#   crates/chem_app/e2e.sh --port 8081
+#   crates/chem_app/e2e.sh --address 0.0.0.0 # reachable from other machines
 #
 # For the native build there is nothing to serve: `cargo run --release -p chem_app`.
 
@@ -35,8 +35,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_DIR="$REPO_ROOT/chem_app"
+# Derived from the script's own location rather than named, so moving the crate
+# again cannot leave these disagreeing.
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$APP_DIR/../.." && pwd)"
 DIST="$APP_DIR/dist-e2e"
 
 command -v trunk >/dev/null || { echo "trunk not installed: cargo install trunk" >&2; exit 1; }

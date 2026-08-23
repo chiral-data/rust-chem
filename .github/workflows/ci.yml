@@ -148,5 +148,5 @@ jobs:
         uses: taiki-e/install-action@trunk
 
       - name: Build web bundle
-        working-directory: chem_app
+        working-directory: crates/chem_app
         run: trunk build --release
