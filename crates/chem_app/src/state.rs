@@ -259,7 +259,7 @@ impl AppState {
     }
 
     fn with_engine(search_engine: FingerprintSearch) -> Self {
-        let dataset = MoleculeDataset::example_dataset().unwrap_or_default();
+        let dataset = MoleculeDataset::example_dataset();
         let dataset_status = format!("Loaded {} example molecules", dataset.len());
         let loaded_files = LoadedFiles::new("Examples".to_string(), dataset, DatasetFormat::Smiles);
 
@@ -421,45 +421,47 @@ impl AppState {
         };
 
         let format = DatasetFormat::from_filename(&name);
-        let result = match format {
-            DatasetFormat::Sdf => MoleculeDataset::load_from_sdf_str(&content),
-            DatasetFormat::Smiles => MoleculeDataset::load_from_smiles_str(&content),
-        };
+        let outcome = chemio::reader::read(&content, format);
+        let dataset = MoleculeDataset::from_outcome(&outcome);
 
-        match result {
-            Ok(dataset) => {
-                self.dataset_status = format!(
-                    "Loaded {} molecules from '{}' ({})",
-                    dataset.len(),
-                    name,
-                    format.label()
-                );
-                self.loaded_files.add_and_activate(name, dataset, format);
-                self.invalidate_active_dataset();
-                log::info!("Dataset loaded successfully");
-            }
-            Err(e) => {
-                self.dataset_status = format!("Failed to load file: {}", e);
-                log::error!("Dataset load failed: {}", e);
-            }
+        // Records that failed used to be logged and never surfaced, so a file
+        // that half-loaded looked like a file that fully loaded. Reading now
+        // reports them, so the status line can too.
+        self.dataset_status = if outcome.skipped.is_empty() {
+            format!(
+                "Loaded {} molecules from '{}' ({})",
+                dataset.len(),
+                name,
+                format.label()
+            )
+        } else {
+            format!(
+                "Loaded {} molecules from '{}' ({}) — {} skipped",
+                dataset.len(),
+                name,
+                format.label(),
+                outcome.skipped.len()
+            )
+        };
+        for skipped in &outcome.skipped {
+            log::warn!(
+                "Skipped record {} in '{}': {}",
+                skipped.position,
+                name,
+                skipped.error
+            );
         }
+
+        self.loaded_files.add_and_activate(name, dataset, format);
+        self.invalidate_active_dataset();
     }
 
     pub fn load_example_dataset(&mut self) {
-        match MoleculeDataset::example_dataset() {
-            Ok(dataset) => {
-                self.dataset_status = format!("Loaded {} example molecules", dataset.len());
-                self.loaded_files.add_and_activate(
-                    "Examples".to_string(),
-                    dataset,
-                    DatasetFormat::Smiles,
-                );
-                self.invalidate_active_dataset();
-            }
-            Err(e) => {
-                self.dataset_status = format!("Failed to load examples: {}", e);
-            }
-        }
+        let dataset = MoleculeDataset::example_dataset();
+        self.dataset_status = format!("Loaded {} example molecules", dataset.len());
+        self.loaded_files
+            .add_and_activate("Examples".to_string(), dataset, DatasetFormat::Smiles);
+        self.invalidate_active_dataset();
     }
 
     /// Switches the active dataset to an already-loaded entry, e.g. the user
