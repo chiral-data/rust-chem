@@ -41,6 +41,10 @@ The app is now called **Chem Workbench**. "ChemFP Demo — Molecular Fingerprint
 
 - `chem_app/e2e.sh` builds and serves the web build for hands-on testing, refusing to serve a bundle older than the run and stamping the commit into the page — CI cannot see what the app does, and a stale bundle once made a change look ineffective across eleven minutes of commits. `docs/E2E-TESTING.md` lists what to check per story (#117)
 
+### Testing
+
+- `cargo test --workspace` no longer deadlocks on a machine with a GPU. Several tests each requested their own adapter and device, and concurrent creation against one physical GPU hangs in the driver — test binaries stayed alive for half an hour holding GPU handles. Two crates were affected: `chemgpu`'s Morgan tests and `chem_app`'s search tests now take a lazily-initialised shared instance, the pattern [#19](https://github.com/chiral-data/rust-chem/issues/19) established for the rest of `chemgpu`. The suite goes from hanging indefinitely to 3.6 seconds (#135)
+
 ### CI
 
 - The pipeline runs on pull requests into milestone branches, not only `main`. It previously ran once per milestone, so a break could sit unattributed behind a dozen merged PRs. Linux only off the path to `main`, where the three-OS sweep belongs (#114)
