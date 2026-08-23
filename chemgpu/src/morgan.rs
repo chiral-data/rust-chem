@@ -922,6 +922,33 @@ mod tests {
     use chemcore::atom::{Atom, Element};
     use chemcore::bond::{Bond, BondOrder};
 
+    /// A single `GpuMorganFingerprint`, lazily built once from the crate's
+    /// shared test `GpuContext` and reused by every test below.
+    ///
+    /// `GpuMorganFingerprint::new()` builds its own `GpuContext`, so three tests
+    /// calling it raced to create three devices against one GPU — the hang #19
+    /// diagnosed and fixed for `context.rs`, `buffers.rs`, `pipeline.rs` and
+    /// `tanimoto.rs`, which left this file out. It is what still hung
+    /// `cargo test --workspace` after #134 fixed the same mistake in `chem_app`.
+    ///
+    /// Cloned per test rather than lent: `wgpu`'s device, queue and pipelines are
+    /// refcounted handles, so a clone shares the device instead of requesting
+    /// another.
+    fn shared_test_morgan() -> Option<GpuMorganFingerprint> {
+        static GPU: std::sync::OnceLock<Option<GpuMorganFingerprint>> = std::sync::OnceLock::new();
+        GPU.get_or_init(|| {
+            let ctx = crate::context::shared_test_context()?.clone();
+            match GpuMorganFingerprint::from_context(ctx) {
+                Ok(gpu) => Some(gpu),
+                Err(e) => {
+                    println!("GPU morgan pipeline unavailable, skipping: {}", e);
+                    None
+                }
+            }
+        })
+        .clone()
+    }
+
     fn chain_molecule(num_atoms: u32) -> Molecule {
         let mut mol = Molecule::new();
         let first = mol.add_atom(Atom::new(Element::carbon()));
@@ -953,8 +980,7 @@ mod tests {
     /// without needing millions of molecules.
     #[test]
     fn test_chunked_dispatch_matches_single_dispatch() {
-        let Ok(gpu) = GpuMorganFingerprint::new() else {
-            println!("GPU not available, skipping");
+        let Some(gpu) = shared_test_morgan() else {
             return;
         };
 
@@ -1004,8 +1030,7 @@ mod tests {
     /// `copy` dispatch `ceil(total_atoms / 256)` workgroups.
     #[test]
     fn test_chunking_triggered_by_atom_count() {
-        let Ok(gpu) = GpuMorganFingerprint::new() else {
-            println!("GPU not available, skipping");
+        let Some(gpu) = shared_test_morgan() else {
             return;
         };
 
@@ -1054,8 +1079,7 @@ mod tests {
     /// atom-count check.
     #[test]
     fn test_chunking_triggered_by_neighborhood_word_count() {
-        let Ok(gpu) = GpuMorganFingerprint::new() else {
-            println!("GPU not available, skipping");
+        let Some(gpu) = shared_test_morgan() else {
             return;
         };
 

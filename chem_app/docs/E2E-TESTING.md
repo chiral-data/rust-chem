@@ -280,7 +280,9 @@ inventing a checklist item.
   whenever any file changes, in debug unless it was started with `--release`.
   `e2e.sh` builds into `dist-e2e/` to stay out of its way. Check for one before
   concluding anything about which build you are seeing.
-- **`cargo test --workspace` twice at once will hang.** `chem_app/src/search.rs`
-  has two tests that call `FingerprintSearch::new()`, which initialises a real
-  GPU; two concurrent runs deadlock inside the driver, holding GPU handles until
-  killed. CI never sees it because runners have no GPU. Run one at a time.
+- **GPU tests share one device now.** `cargo test --workspace` used to hang on a
+  machine with a GPU — several tests each requested their own adapter and device,
+  and concurrent creation against one GPU deadlocks in the driver. Fixed in
+  #134 by sharing one instance per crate, the pattern #19 established. If a run
+  ever hangs again, look for a test calling a `*::new()` that builds its own
+  context instead of taking the shared one, and check `nvidia-smi -pm 1` is on.
