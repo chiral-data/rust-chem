@@ -12,7 +12,6 @@
 //! [`crate::views`], and are handed to these operations as arguments.
 
 use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
-use crate::search::{FingerprintSearch, SearchResult};
 use crate::task::Task;
 use bitvec::prelude::BitVec;
 use chemcore::layout::ensure_coords;
@@ -20,6 +19,7 @@ use chemcore::molecule::Molecule;
 use chemdraw::structure::StructureOptions;
 use chemio::aromaticity::detect_aromaticity;
 use chemio::smiles::parse_smiles;
+use chemsearch::{FingerprintSearch, SearchResult};
 
 #[cfg(target_arch = "wasm32")]
 use chemgpu::{GpuMorganFingerprint, GpuTanimoto};

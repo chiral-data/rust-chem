@@ -1,3 +1,33 @@
+//! Fingerprint generation and similarity search, across CPU and GPU backends.
+//!
+//! [`FingerprintSearch`] picks a backend and runs the work on it: Morgan
+//! fingerprints from `chemfp` or `chemgpu`, Tanimoto similarity from either,
+//! with the GPU used where one is usable and the CPU otherwise.
+//!
+//! # Why this is a crate rather than part of `chemfp`
+//!
+//! `chemfp`'s library is pure CPU and depends on nothing heavy. Putting the
+//! backend selection there would make `wgpu` a permanent dependency of anyone
+//! who only wants to fingerprint on a CPU — which is every wasm build and every
+//! machine without a usable device. Keeping the orchestration separate lets
+//! `chemfp` stay small and lets a consumer opt into the GPU by depending on
+//! this instead.
+//!
+//! # Why the API is async
+//!
+//! Not for the GUI's benefit. `wgpu` device creation and buffer readback are
+//! inherently async, and on the web they cannot block at all — the browser has
+//! no thread to park. A native caller that wants to block does so at its own
+//! edge with `pollster::block_on`, which is one line and keeps a single code
+//! path for both.
+//!
+//! # Where the GPU is *not* used
+//!
+//! Similarity is computed on the GPU only when a device initialised and the
+//! caller has not forced the CPU. Both paths must agree, which is what
+//! `chemfp`'s parity tests check; the CPU path is not a fallback of last
+//! resort but the reference the GPU one is measured against.
+
 use bitvec::prelude::BitVec;
 use chemcore::molecule::Molecule;
 use chemfp::morgan::MorganFingerprint;
@@ -214,10 +244,11 @@ impl FingerprintSearch {
         }
     }
 
-    /// Upload `target_fps` to the GPU once, so subsequent [`Self::search`]
-    /// calls reuse the same buffer instead of re-uploading the whole
-    /// dataset on every query. Call this whenever the dataset changes;
-    /// `search` will still lazily upload on its own if this was skipped.
+    /// Upload `target_fps` to the GPU once, so subsequent
+    /// [`Self::search_async`] calls reuse the same buffer instead of
+    /// re-uploading the whole dataset on every query. Call this whenever the
+    /// dataset changes; `search_async` will still lazily upload on its own if
+    /// this was skipped.
     pub fn set_target_dataset(&mut self, target_fps: &[BitVec]) -> anyhow::Result<()> {
         if !(self.use_gpu && self.gpu_tanimoto.is_some()) || target_fps.is_empty() {
             self.gpu_targets = None;
