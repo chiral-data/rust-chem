@@ -276,9 +276,288 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
     Ok(())
 }
 
+// ============================================================================
+// WRITING
+// ============================================================================
+
+/// Writes one molecule as a molfile V2000 record, terminated by `$$$$`.
+///
+/// This is the only format here that can carry coordinates, which is why it
+/// exists: 2D layout is computed by `chemcore::layout`, and SMILES has nowhere
+/// to put the result. Writing a laid-out molecule as SMILES silently discards
+/// the geometry.
+///
+/// # Fixed columns
+///
+/// The molfile spec fixes the column of every field. [`parse_sdf`] is
+/// deliberately lenient and splits on whitespace instead, so it would accept
+/// looser output than this produces — but other software will not, and a file
+/// only this crate can read is not an interchange format. So the widths here
+/// follow the spec (`%10.4f` coordinates, a left-justified 3-column symbol,
+/// `%3d` bond fields) rather than what the local parser happens to tolerate.
+///
+/// # What is not written
+///
+/// Charges, isotopes, chirality and bond stereo. The atom block emits the
+/// zero-valued fields the spec expects in their place, so the record is
+/// structurally complete and a reader that wants them finds defaults rather
+/// than absent columns. Aromatic bonds are written as type 4, which round-trips
+/// through [`parse_sdf`] but is a query bond type in strict molfile — a Kekulé
+/// form would be more portable and needs a Kekulisation pass that does not
+/// exist yet.
+///
+/// A molecule with no coordinates is written with zeros, and
+/// [`molecule_has_coords_for_sdf`] lets a caller check first rather than
+/// discovering it in the file.
+pub fn write_sdf(mol: &Molecule) -> String {
+    let mut out = String::with_capacity(128 + mol.num_atoms() * 70 + mol.num_bonds() * 22);
+
+    // Line 0: the name. Lines 1 and 2 are the program line and a comment; both
+    // may be blank, and blank is more honest than inventing content.
+    out.push_str(mol.name().unwrap_or(""));
+    out.push('\n');
+    out.push('\n');
+    out.push('\n');
+
+    // Line 3: counts. The trailing fields are the spec's defaults —
+    // `0999 V2000` is the version marker every V2000 file carries.
+    out.push_str(&format!(
+        "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000\n",
+        mol.num_atoms(),
+        mol.num_bonds()
+    ));
+
+    let coords = mol.coords();
+    for index in 0..mol.num_atoms() {
+        // z is always 0: coordinate storage is 2D. A molecule read from a 3D
+        // SDF already lost its z on the way in, so writing 0 is reporting what
+        // is held rather than flattening something.
+        let (x, y) = match coords {
+            Some(points) => (points[index].x, points[index].y),
+            None => (0.0, 0.0),
+        };
+        let symbol = ELEMENT_SYMBOLS
+            .get(mol.atom(index).atomic_number() as usize)
+            .copied()
+            .unwrap_or("*");
+        out.push_str(&format!(
+            "{x:>10.4}{y:>10.4}{:>10.4} {symbol:<3} 0  0  0  0  0  0  0  0  0  0  0  0\n",
+            0.0
+        ));
+    }
+
+    for index in 0..mol.num_bonds() {
+        let bond = mol.bond(index);
+        let order = match bond.order() {
+            BondOrder::Single => 1,
+            BondOrder::Double => 2,
+            BondOrder::Triple => 3,
+            BondOrder::Aromatic => 4,
+            // Quadruple has no molfile bond type. Writing 1 would silently
+            // change the chemistry; 8 is the spec's "any", which at least does
+            // not assert something false.
+            _ => 8,
+        };
+        // Molfile atom indices are 1-based.
+        out.push_str(&format!(
+            "{:>3}{:>3}{order:>3}  0  0  0  0\n",
+            bond.atom1() + 1,
+            bond.atom2() + 1
+        ));
+    }
+
+    out.push_str("M  END\n");
+    out.push_str(SDF_ENTRY_END);
+    out.push('\n');
+    out
+}
+
+/// Writes several molecules as one SDF file.
+pub fn write_sdf_all<'a>(molecules: impl IntoIterator<Item = &'a Molecule>) -> String {
+    let mut out = String::new();
+    for mol in molecules {
+        out.push_str(&write_sdf(mol));
+    }
+    out
+}
+
+/// Whether writing this molecule would record real coordinates.
+///
+/// Exposed so a caller can warn before writing rather than after: a file full
+/// of zeros is a plausible-looking result that is entirely useless, and the
+/// difference is invisible in the output.
+pub fn molecule_has_coords_for_sdf(mol: &Molecule) -> bool {
+    mol.has_coords()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- writing ----------------------------------------------------------
+    //
+    // Every test here goes through `parse_sdf`, because the writer's job is to
+    // produce something a reader accepts. Asserting on expected text instead
+    // would pass for a file nothing can read, and would need rewriting every
+    // time a column moved.
+
+    use crate::smiles::parse_smiles;
+    use chemcore::layout::ensure_coords;
+
+    fn laid_out(smiles: &str) -> Molecule {
+        let mut mol = parse_smiles(smiles).expect("valid SMILES");
+        assert!(ensure_coords(&mut mol), "layout should succeed");
+        mol
+    }
+
+    #[test]
+    fn test_a_molecule_survives_a_round_trip() {
+        let original = laid_out("CCO");
+        let back = parse_sdf(&write_sdf(&original)).expect("our own output should parse");
+
+        assert_eq!(back.num_atoms(), original.num_atoms());
+        assert_eq!(back.num_bonds(), original.num_bonds());
+        for i in 0..original.num_atoms() {
+            assert_eq!(
+                back.atom(i).atomic_number(),
+                original.atom(i).atomic_number(),
+                "atom {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coordinates_survive_a_round_trip() {
+        // The whole reason this writer exists. Tolerance is the four decimal
+        // places the format stores, not floating-point epsilon.
+        let original = laid_out("c1ccccc1O");
+        let back = parse_sdf(&write_sdf(&original)).expect("parse");
+
+        let before = original.coords().expect("laid out");
+        let after = back.coords().expect("coordinates should survive");
+        assert_eq!(before.len(), after.len());
+        for (i, (a, b)) in before.iter().zip(after).enumerate() {
+            assert!(
+                (a.x - b.x).abs() < 1e-4 && (a.y - b.y).abs() < 1e-4,
+                "atom {i}: ({}, {}) became ({}, {})",
+                a.x,
+                a.y,
+                b.x,
+                b.y
+            );
+        }
+    }
+
+    #[test]
+    fn test_bond_orders_survive_a_round_trip() {
+        // Single, double, triple and aromatic, in one molecule each, since a
+        // writer that mapped every order to 1 would still round-trip atoms
+        // and coordinates perfectly.
+        for smiles in ["CC", "C=C", "C#C", "c1ccccc1", "CC(=O)O"] {
+            let original = laid_out(smiles);
+            let back = parse_sdf(&write_sdf(&original)).expect(smiles);
+            let mut before: Vec<_> = (0..original.num_bonds())
+                .map(|i| original.bond(i).order())
+                .collect();
+            let mut after: Vec<_> = (0..back.num_bonds())
+                .map(|i| back.bond(i).order())
+                .collect();
+            before.sort_by_key(|o| format!("{o:?}"));
+            after.sort_by_key(|o| format!("{o:?}"));
+            assert_eq!(before, after, "{smiles}");
+        }
+    }
+
+    #[test]
+    fn test_bond_topology_survives_not_just_the_count() {
+        // Off-by-one on the 1-based index conversion would keep the bond count
+        // and rewire the molecule.
+        let original = laid_out("CC(C)C");
+        let back = parse_sdf(&write_sdf(&original)).expect("parse");
+
+        let pairs = |m: &Molecule| {
+            let mut v: Vec<(usize, usize)> = (0..m.num_bonds())
+                .map(|i| {
+                    let b = m.bond(i);
+                    let (x, y) = (b.atom1(), b.atom2());
+                    if x <= y { (x, y) } else { (y, x) }
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(pairs(&back), pairs(&original));
+    }
+
+    #[test]
+    fn test_the_name_survives() {
+        let mut mol = laid_out("CCO");
+        mol.set_name("ethanol".to_string());
+        let back = parse_sdf(&write_sdf(&mol)).expect("parse");
+        assert_eq!(back.name(), Some("ethanol"));
+    }
+
+    #[test]
+    fn test_a_molecule_with_no_layout_writes_zeros_and_says_so() {
+        // Not an error: a caller may legitimately want connectivity only. But
+        // a file of zeros looks like a real result, so the caller needs to be
+        // able to ask first.
+        let mol = parse_smiles("CCO").expect("valid SMILES");
+        assert!(!molecule_has_coords_for_sdf(&mol));
+        let text = write_sdf(&mol);
+        assert!(text.contains("0.0000    0.0000"));
+        assert_eq!(parse_sdf(&text).expect("still parses").num_atoms(), 3);
+    }
+
+    #[test]
+    fn test_a_single_atom_round_trips() {
+        let mol = laid_out("C");
+        let back = parse_sdf(&write_sdf(&mol)).expect("parse");
+        assert_eq!(back.num_atoms(), 1);
+        assert_eq!(back.num_bonds(), 0);
+    }
+
+    #[test]
+    fn test_writing_many_molecules_produces_records_the_reader_splits() {
+        // `write_sdf_all` has to agree with how `chemio::reader` splits records,
+        // or a multi-molecule file reads back as one molecule or none.
+        let molecules: Vec<Molecule> = ["CCO", "c1ccccc1", "CC(=O)O"]
+            .iter()
+            .map(|s| laid_out(s))
+            .collect();
+        let text = write_sdf_all(&molecules);
+        let outcome = crate::reader::read_sdf(&text);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert_eq!(outcome.len(), 3);
+        for (read, original) in outcome.records.iter().zip(&molecules) {
+            assert_eq!(read.molecule.num_atoms(), original.num_atoms());
+            assert!(read.molecule.has_coords());
+        }
+    }
+
+    #[test]
+    fn test_the_counts_line_matches_the_blocks() {
+        // The counts line is what the reader trusts to find the bond block, so
+        // a mismatch shifts everything after it.
+        let mol = laid_out("c1ccc2ccccc2c1");
+        let text = write_sdf(&mol);
+        let counts: Vec<usize> = text
+            .lines()
+            .nth(3)
+            .expect("counts line")
+            .split_whitespace()
+            .take(2)
+            .map(|f| f.parse().expect("numeric"))
+            .collect();
+        assert_eq!(counts, vec![mol.num_atoms(), mol.num_bonds()]);
+    }
+
+    #[test]
+    fn test_the_record_is_terminated() {
+        let text = write_sdf(&laid_out("CCO"));
+        assert!(text.contains("M  END"));
+        assert!(text.trim_end().ends_with("$$$$"));
+    }
 
     #[test]
     fn test_parse_simple_sdf() {
