@@ -206,3 +206,206 @@ ethanol
 M  END
 $$$$
 ";
+
+// ---- chem fp / chem search (#140) ------------------------------------------
+
+/// Every test below pins `--backend cpu`. A GPU is not present on every machine
+/// that runs these, and a test that quietly changes which code path it exercises
+/// depending on the host is a test that proves less than it appears to.
+/// CPU/GPU agreement is asserted once, separately, and skipped where there is
+/// no device.
+const CPU: &str = "--backend";
+
+#[test]
+fn test_fp_writes_a_self_describing_file() {
+    let path = fixture("fp-basic.smi", GOOD);
+    let r = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    // The header is what lets `chem search` refuse a mismatched query rather
+    // than silently comparing incomparable fingerprints.
+    assert_eq!(lines[0], "# chem-fingerprints 1");
+    assert!(lines.contains(&"# radius 2"));
+    assert!(lines.contains(&"# size 2048"));
+    assert_eq!(lines[3], "name\tfingerprint");
+    assert_eq!(lines.len(), 7, "3 header + 1 column row + 3 molecules");
+    assert!(r.stderr.contains("fingerprinted 3 molecules"));
+}
+
+#[test]
+fn test_fp_honours_the_requested_parameters() {
+    let path = fixture("fp-params.smi", GOOD);
+    let r = run(
+        &[
+            CPU,
+            "cpu",
+            "fp",
+            path.to_str().unwrap(),
+            "--radius",
+            "3",
+            "--size",
+            "512",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.contains("# radius 3"));
+    assert!(r.stdout.contains("# size 512"));
+    // 512 bits is 128 hex characters.
+    let row = r.stdout.lines().nth(4).expect("a molecule row");
+    let hex = row.split('\t').nth(1).expect("a fingerprint column");
+    assert_eq!(hex.len(), 128);
+}
+
+#[test]
+fn test_fp_and_search_compose_through_a_pipe() {
+    // The reason these are two commands rather than one. If either put its
+    // progress on stdout, this would feed garbage into the second process.
+    let path = fixture("pipe.smi", GOOD);
+    let fp = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+    assert_eq!(fp.code, 0);
+
+    let search = run(
+        &[CPU, "cpu", "search", "--query", "CCO", "--top", "1"],
+        Some(&fp.stdout),
+    );
+    assert_eq!(search.code, 0);
+    let rows: Vec<&str> = search.stdout.lines().collect();
+    assert_eq!(rows[0], "rank\tname\tsimilarity");
+    // Ethanol against itself.
+    assert!(rows[1].starts_with("1\tethanol\t1.000000"), "{:?}", rows[1]);
+}
+
+#[test]
+fn test_search_fingerprints_the_query_with_the_files_parameters() {
+    // Not with its own defaults. A query at radius 2 compared against targets
+    // at radius 3 produces plausible-looking similarities rather than an error,
+    // which is the failure the header exists to prevent.
+    let path = fixture("search-params.smi", GOOD);
+    let fp = run(
+        &[
+            CPU,
+            "cpu",
+            "fp",
+            path.to_str().unwrap(),
+            "--radius",
+            "3",
+            "--size",
+            "512",
+        ],
+        None,
+    );
+    let search = run(
+        &[CPU, "cpu", "search", "--query", "CCO", "--top", "1"],
+        Some(&fp.stdout),
+    );
+    assert_eq!(search.code, 0);
+    assert!(search.stderr.contains("radius 3"));
+    assert!(search.stderr.contains("512 bits"));
+    // An identical molecule must still score 1.0 — which only holds if the
+    // query used the same parameters.
+    assert!(search.stdout.contains("1.000000"), "{:?}", search.stdout);
+}
+
+#[test]
+fn test_search_ranks_by_descending_similarity() {
+    let path = fixture("rank.smi", "CCO ethanol\nCCCO propanol\nc1ccccc1 benzene\n");
+    let fp = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+    let search = run(
+        &[CPU, "cpu", "search", "--query", "CCO", "--top", "0"],
+        Some(&fp.stdout),
+    );
+
+    assert_eq!(search.code, 0);
+    let scores: Vec<f64> = search
+        .stdout
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').nth(2).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(scores.len(), 3, "--top 0 returns everything");
+    assert!(
+        scores.windows(2).all(|w| w[0] >= w[1]),
+        "not descending: {scores:?}"
+    );
+    assert_eq!(scores[0], 1.0, "the query itself ranks first");
+}
+
+#[test]
+fn test_ties_come_out_in_dataset_order() {
+    // Two identical molecules under different names score identically. The sort
+    // is stable, so they must come out in the order the file listed them —
+    // otherwise a diff of two runs is noisy for no reason. This is currently
+    // guaranteed only by `sort_by` being stable, which is exactly why it is
+    // worth pinning: switching to `sort_unstable_by` would break it silently.
+    let path = fixture("ties.smi", "CCO first\nCCO second\nCCO third\n");
+    let fp = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+    let search = run(
+        &[CPU, "cpu", "search", "--query", "CCO", "--top", "0"],
+        Some(&fp.stdout),
+    );
+
+    assert_eq!(search.code, 0);
+    let names: Vec<&str> = search
+        .stdout
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').nth(1).unwrap())
+        .collect();
+    assert_eq!(names, ["first", "second", "third"]);
+}
+
+#[test]
+fn test_search_refuses_a_file_that_is_not_a_fingerprint_file() {
+    // `chem search mols.smi` instead of `chem search fps.tsv` is the ordinary
+    // mistake, and the error should name it rather than describe a bad row.
+    let path = fixture("not-fps.smi", GOOD);
+    let r = run(
+        &[
+            CPU,
+            "cpu",
+            "search",
+            path.to_str().unwrap(),
+            "--query",
+            "CCO",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("not a chem fingerprint file"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_fp_on_an_unusable_file_exits_before_touching_a_backend() {
+    let path = fixture("fp-allbad.smi", ALL_BAD);
+    let r = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+    assert_eq!(r.code, 2);
+    assert!(r.stdout.is_empty());
+}
+
+#[test]
+fn test_fp_reports_timing_on_stderr_not_stdout() {
+    let path = fixture("fp-timing.smi", GOOD);
+    let r = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+    assert!(r.stderr.contains(" ms ("));
+    assert!(!r.stdout.contains(" ms "));
+}
+
+#[test]
+fn test_a_gpu_request_fails_loudly_when_there_is_no_gpu() {
+    // Either outcome is correct depending on the host; what must never happen
+    // is exit 0 having quietly used the CPU. A batch job pinned to the GPU that
+    // silently ran on the CPU reports success and takes the slowdown.
+    let path = fixture("gpu-req.smi", GOOD);
+    let r = run(&[CPU, "gpu", "fp", path.to_str().unwrap()], None);
+    if r.code == 0 {
+        assert!(r.stderr.contains("backend: gpu"), "{:?}", r.stderr);
+    } else {
+        assert!(r.stderr.contains("no GPU is usable") || r.stderr.contains("did not engage"));
+    }
+}

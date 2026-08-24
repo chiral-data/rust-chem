@@ -28,31 +28,43 @@ pub struct Input {
 /// an override falls back to SMILES — which is the same default a file with an
 /// unrecognised extension gets, rather than a special case for pipes.
 pub fn read_input(path: Option<&Path>, format: Option<Format>) -> Result<Input> {
-    let from_stdin = match path {
-        None => true,
-        Some(p) => p.as_os_str() == "-",
-    };
-
-    let (content, label, detected) = if from_stdin {
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .context("reading standard input")?;
-        (buf, "-".to_owned(), Format::Smiles)
+    let (content, label) = read_text(path)?;
+    // Detection needs a name and stdin has none, so a pipe gets the same
+    // default an unrecognised extension does rather than a rule of its own.
+    let detected = if label == "-" {
+        Format::Smiles
     } else {
-        let p = path.expect("checked above");
-        let content =
-            std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-        let label = p.display().to_string();
-        (content, label.clone(), Format::from_filename(&label))
+        Format::from_filename(&label)
     };
-
     let format = format.unwrap_or(detected);
     Ok(Input {
         outcome: reader::read(&content, format),
         format,
         label,
     })
+}
+
+/// Reads a named file, or stdin when the path is absent or `-`.
+///
+/// Every input in this tool goes through here, so `-` means the same thing
+/// everywhere. `chem search` needing it is why this is a function rather than
+/// inline: without it `chem fp mols.smi | chem search -` fails, and that
+/// pipeline is the point of the two commands being separate.
+pub fn read_text(path: Option<&Path>) -> Result<(String, String)> {
+    match path {
+        Some(p) if p.as_os_str() != "-" => {
+            let content =
+                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            Ok((content, p.display().to_string()))
+        }
+        _ => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading standard input")?;
+            Ok((buf, "-".to_owned()))
+        }
+    }
 }
 
 /// Writes to the file at `path`, or stdout when it is `None` or `-`.
