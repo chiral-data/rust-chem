@@ -1,36 +1,12 @@
 use chemcore::molecule::Molecule;
-use chemio::sdf::parse_sdf;
-use chemio::smiles::parse_smiles;
+use chemio::reader::{self, ReadOutcome};
 
-/// Which file format a loaded dataset came from. Doesn't affect anything
-/// downstream (fingerprinting/search work the same either way) — it's
-/// tracked per `LoadedFile` purely so the Data window can label entries and
-/// status messages accurately.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DatasetFormat {
-    Smiles,
-    Sdf,
-}
-
-impl DatasetFormat {
-    /// Picks a format from a filename's extension. Defaults to SMILES for
-    /// anything not recognized as SDF, matching the loader's prior behavior
-    /// (`.smi`/`.smiles`/`.txt`/no extension all went through the SMILES path).
-    pub fn from_filename(name: &str) -> Self {
-        if name.to_lowercase().ends_with(".sdf") {
-            DatasetFormat::Sdf
-        } else {
-            DatasetFormat::Smiles
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            DatasetFormat::Smiles => "SMILES",
-            DatasetFormat::Sdf => "SDF",
-        }
-    }
-}
+/// Which file format a loaded dataset came from.
+///
+/// An alias rather than a type of its own: the app used to keep a parallel enum
+/// beside `chemio`'s parsers, and two enums meaning the same thing is one more
+/// place for the app and the CLI to disagree about what `.txt` means.
+pub type DatasetFormat = reader::Format;
 
 #[derive(Clone)]
 pub struct MoleculeDataset {
@@ -48,104 +24,23 @@ impl MoleculeDataset {
         }
     }
 
-    /// Parses a SMILES dataset from already-loaded file content. Takes content
-    /// instead of a path so callers can supply bytes from any source (native
-    /// filesystem, browser file picker, etc.) without this function needing
-    /// to know how they were obtained.
-    pub fn load_from_smiles_str(content: &str) -> anyhow::Result<Self> {
+    /// Builds a dataset from what [`chemio::reader`] read.
+    ///
+    /// The parallel-vector shape is what the views consume; the skipped records
+    /// are the caller's to report, which is why they are not swallowed here.
+    pub fn from_outcome(outcome: &ReadOutcome) -> Self {
         let mut dataset = Self::new();
-
-        for (line_num, line) in content.lines().enumerate() {
-            let line = line.trim();
-
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-
-            let smiles_str = parts[0];
-            let name = if parts.len() > 1 {
-                parts[1..].join(" ")
-            } else {
-                format!("Molecule_{}", line_num + 1)
-            };
-
-            match parse_smiles(smiles_str) {
-                Ok(mol) => {
-                    dataset.molecules.push(mol);
-                    dataset.smiles.push(smiles_str.to_string());
-                    dataset.names.push(name);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to parse SMILES on line {}: {} - Error: {}",
-                        line_num + 1,
-                        smiles_str,
-                        e
-                    );
-                }
-            }
+        for record in &outcome.records {
+            dataset.molecules.push(record.molecule.clone());
+            // SDF carries coordinates and connectivity rather than a SMILES
+            // string. The placeholder is a display decision, so it is made
+            // here rather than in the library that read the file.
+            dataset
+                .smiles
+                .push(record.smiles.clone().unwrap_or_else(|| "(SDF)".to_owned()));
+            dataset.names.push(record.name.clone());
         }
-
-        log::info!(
-            "Loaded {} molecules from SMILES file",
-            dataset.molecules.len()
-        );
-        Ok(dataset)
-    }
-
-    /// Parses a multi-molecule SDF dataset from already-loaded file content.
-    /// `chemio::sdf::parse_sdf` only parses a single `$$$$`-terminated
-    /// record, so this splits the file into records first (real-world SDF
-    /// files are almost always a batch of these), mirroring how
-    /// `load_from_smiles_str` splits its input into one molecule per line.
-    pub fn load_from_sdf_str(content: &str) -> anyhow::Result<Self> {
-        let mut dataset = Self::new();
-        let mut record_lines: Vec<&str> = Vec::new();
-        let mut record_num = 0;
-
-        for line in content.lines() {
-            record_lines.push(line);
-            if line.trim() == "$$$$" {
-                record_num += 1;
-                dataset.push_sdf_record(&record_lines, record_num);
-                record_lines.clear();
-            }
-        }
-        // A trailing record with no `$$$$` terminator (e.g. a single-molecule
-        // file) still has real content sitting in `record_lines`.
-        if record_lines.iter().any(|line| !line.trim().is_empty()) {
-            record_num += 1;
-            dataset.push_sdf_record(&record_lines, record_num);
-        }
-
-        log::info!("Loaded {} molecules from SDF file", dataset.molecules.len());
-        Ok(dataset)
-    }
-
-    fn push_sdf_record(&mut self, lines: &[&str], record_num: usize) {
-        let record = lines.join("\n");
-        match parse_sdf(&record) {
-            Ok(mol) => {
-                let name = mol
-                    .name()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("Molecule_{}", record_num));
-                self.molecules.push(mol);
-                // SDF stores 2D/3D coordinates and connectivity, not a SMILES
-                // string, so there's nothing to put here — a placeholder
-                // makes that clear rather than showing a blank code snippet.
-                self.smiles.push("(SDF)".to_string());
-                self.names.push(name);
-            }
-            Err(e) => {
-                log::warn!("Failed to parse SDF record {}: {}", record_num, e);
-            }
-        }
+        dataset
     }
 
     pub fn len(&self) -> usize {
@@ -156,40 +51,38 @@ impl MoleculeDataset {
         self.molecules.is_empty()
     }
 
-    pub fn example_dataset() -> anyhow::Result<Self> {
-        let examples = vec![
-            ("C", "Methane"),
-            ("CC", "Ethane"),
-            ("CCC", "Propane"),
-            ("C=C", "Ethene"),
-            ("C#C", "Ethyne"),
-            ("c1ccccc1", "Benzene"),
-            ("CC(C)C", "Isobutane"),
-            ("CCO", "Ethanol"),
-            ("CC(=O)O", "Acetic_acid"),
-            ("c1ccccc1O", "Phenol"),
-            ("c1ccc(O)cc1", "Phenol_alt"),
-            ("c1ccccc1N", "Aniline"),
-            ("CC(=O)c1ccccc1", "Acetophenone"),
-            ("c1ccc2ccccc2c1", "Naphthalene"),
-            ("CC(C)(C)C", "Neopentane"),
-        ];
-
-        let mut dataset = Self::new();
-        for (smiles, name) in examples {
-            match parse_smiles(smiles) {
-                Ok(mol) => {
-                    dataset.molecules.push(mol);
-                    dataset.smiles.push(smiles.to_string());
-                    dataset.names.push(name.to_string());
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse example {}: {}", name, e);
-                }
-            }
+    /// The built-in sampler, as a SMILES file rather than a third parse loop.
+    ///
+    /// Written as the text a user could have supplied so it goes through
+    /// exactly the path a loaded file does — anything that breaks the examples
+    /// breaks real files too, and is therefore visible immediately.
+    pub fn example_dataset() -> Self {
+        const EXAMPLES: &str = "\
+C Methane
+CC Ethane
+CCC Propane
+C=C Ethene
+C#C Ethyne
+c1ccccc1 Benzene
+CC(C)C Isobutane
+CCO Ethanol
+CC(=O)O Acetic_acid
+c1ccccc1O Phenol
+c1ccc(O)cc1 Phenol_alt
+c1ccccc1N Aniline
+CC(=O)c1ccccc1 Acetophenone
+c1ccc2ccccc2c1 Naphthalene
+CC(C)(C)C Neopentane
+";
+        let outcome = reader::read_smiles(EXAMPLES);
+        for skipped in &outcome.skipped {
+            log::warn!(
+                "Built-in example on line {} failed to parse: {}",
+                skipped.position,
+                skipped.error
+            );
         }
-
-        Ok(dataset)
+        Self::from_outcome(&outcome)
     }
 }
 
@@ -332,7 +225,9 @@ mod tests {
 
     fn dataset_of(smiles: &[&str]) -> MoleculeDataset {
         let content = smiles.join("\n");
-        MoleculeDataset::load_from_smiles_str(&content).expect("valid SMILES")
+        let outcome = reader::read_smiles(&content);
+        assert!(outcome.skipped.is_empty(), "fixture should parse cleanly");
+        MoleculeDataset::from_outcome(&outcome)
     }
 
     #[test]
