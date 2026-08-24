@@ -15,13 +15,52 @@ use chemcore::{bond::BondOrder, molecule::Molecule, rings::find_sssr};
 /// - This uses a lightweight ring-search and aromaticity heuristic.
 /// - It is NOT a full, industry-grade aromaticity model.
 pub fn detect_aromaticity(mol: &mut Molecule) {
+    // Computed once: marking a ring changes bond *orders*, not topology, so the
+    // ring set stays valid across passes.
     let rings = find_sssr(mol);
 
-    for ring in rings {
-        if is_aromatic_ring(mol, ring.atoms()) {
-            mark_ring_aromatic(mol, ring.atoms());
+    // Repeated until nothing new is found, because marking one ring can enable
+    // another. `mark_ring_aromatic` sets its bonds to `BondOrder::Aromatic`,
+    // and `has_in_ring_pi_bond` accepts `Aromatic` — so a fused neighbour that
+    // failed earlier in a pass may succeed after its partner is marked.
+    //
+    // A single pass made detection depend on the order `find_sssr` happened to
+    // return rings, and therefore on how the input SMILES was written: Kekulé
+    // naphthalene needed two passes while anthracene succeeded in one. Two
+    // spellings of the same compound could disagree.
+    //
+    // Terminates because each pass either marks at least one previously
+    // unmarked ring or stops, so it runs at most `rings.len() + 1` times.
+    loop {
+        let mut marked_any = false;
+        for ring in &rings {
+            if ring_bonds_all_aromatic(mol, ring.atoms()) {
+                continue;
+            }
+            if is_aromatic_ring(mol, ring.atoms()) {
+                mark_ring_aromatic(mol, ring.atoms());
+                marked_any = true;
+            }
+        }
+        if !marked_any {
+            break;
         }
     }
+}
+
+/// Whether this ring has already been marked.
+///
+/// Tests the ring's own bonds rather than its atoms: in a fused system an atom
+/// can be aromatic by virtue of a neighbouring ring while this ring's bonds are
+/// untouched, and treating that as "already done" is what would stop the loop
+/// one ring short.
+fn ring_bonds_all_aromatic(mol: &Molecule, ring: &[usize]) -> bool {
+    (0..ring.len()).all(|i| {
+        let next = (i + 1) % ring.len();
+        mol.graph()
+            .get_bond(ring[i], ring[next])
+            .is_some_and(|idx| mol.bond(idx).order() == BondOrder::Aromatic)
+    })
 }
 
 /// Determines whether a given ring satisfies a simplified aromaticity model.
@@ -79,17 +118,38 @@ fn is_aromatic_ring(mol: &Molecule, ring: &[usize]) -> bool {
                 }
                 pi_electrons += 1;
             }
+            // The discriminator is an in-ring pi bond, not the degree.
+            //
+            // A pyridine-type nitrogen is part of a ring double bond and
+            // contributes one electron, exactly as a ring carbon does. A
+            // pyrrole-type nitrogen has no ring double bond and donates its
+            // lone pair, contributing two.
+            //
+            // This used to key off `degree == 2`, with the two cases labelled
+            // the wrong way round. Both types have heavy-atom degree 2, so
+            // degree cannot tell them apart: pyridine's five carbons plus a
+            // nitrogen credited 2 summed to 7 and failed Huckel, while pyrrole
+            // came out right by coincidence. Imidazole has one nitrogen of each
+            // type and needs them counted differently, which no degree-based
+            // rule can do.
             7 => {
-                // N: check if it has lone pair or is sp2
-                if mol.degree(atom_idx) == 2 {
-                    pi_electrons += 2; // Pyridine-like
+                if has_in_ring_pi_bond(mol, atom_idx, ring) {
+                    pi_electrons += 1;
                 } else {
-                    pi_electrons += 1; // Pyrrole-like
+                    pi_electrons += 2;
                 }
             }
-            // O, S with lone pair
-            8 | 16 if mol.degree(atom_idx) == 2 => {
-                pi_electrons += 2;
+            // Same rule for oxygen and sulfur, for the same reason. Furan and
+            // thiophene are unaffected — their heteroatom has no ring double
+            // bond and still contributes two — but a ring oxygen that does
+            // carry one (a pyrylium, say) now contributes one rather than being
+            // miscounted.
+            8 | 16 => {
+                if has_in_ring_pi_bond(mol, atom_idx, ring) {
+                    pi_electrons += 1;
+                } else {
+                    pi_electrons += 2;
+                }
             }
             _ => {}
         }
@@ -188,92 +248,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_complex_polycyclic_aromaticity() {
-        // Naphthalene: Two fused benzene rings
-        // Two aromatic 6-membered rings sharing edge 4-5
-        // Ring 1: [0, 1, 2, 3, 4, 5, 9, 8, 7, 6] (outer perimeter - NOT a simple ring)
-        // Ring 2: [0, 1, 2, 3, 4, 5] (right benzene)
-        // Ring 3: [5, 6, 7, 8, 9, 0] (left benzene) - shares edge with Ring 2
-
-        let mut mol = crate::smiles::parse_smiles("c1ccc2ccccc2c1").unwrap();
-
-        // Verify molecule structure
-        assert_eq!(mol.num_atoms(), 10, "Naphthalene should have 10 carbons");
-
-        // Detect aromaticity
+    /// Every case here starts from **Kekulé** SMILES — explicit alternating
+    /// double bonds, uppercase atoms — because that is the only input that
+    /// reaches this code. Lowercase aromatic SMILES is already flagged aromatic
+    /// by the parser, so a test written that way passes whatever
+    /// `detect_aromaticity` does.
+    ///
+    /// The test this replaces used `c1ccc2ccccc2c1` and said so in its own
+    /// comment: "All Atoms are already Aromatic because of `parse_smiles`". It
+    /// asserted a property the parser had already established, which is why
+    /// #160 survived having a polycyclic test at all.
+    fn aromatic_count(smiles: &str) -> usize {
+        let mut mol = crate::smiles::parse_smiles(smiles).expect(smiles);
+        assert_eq!(
+            mol.atoms().iter().filter(|a| a.is_aromatic()).count(),
+            0,
+            "{smiles} must start non-aromatic or this test proves nothing"
+        );
         detect_aromaticity(&mut mol);
+        mol.atoms().iter().filter(|a| a.is_aromatic()).count()
+    }
 
-        // After detection - ALL atoms should be aromatic
-        // INFO: All Atoms are alreay Aromatic because of `parse_smiles` fn.
-        for i in 0..10 {
-            assert!(
-                mol.atom(i).is_aromatic(),
-                "Atom {} in naphthalene should be aromatic (fused aromatic rings)",
-                i
-            );
-        }
+    #[test]
+    fn test_pyridine_type_nitrogen_is_aromatic() {
+        // The inverted electron count made all of these return zero: five ring
+        // carbons contributing 1 each plus a nitrogen credited 2 summed to 7,
+        // which fails Hückel.
+        assert_eq!(aromatic_count("C1=CC=NC=C1"), 6, "pyridine");
+        assert_eq!(aromatic_count("C1=CN=CN=C1"), 6, "pyrimidine");
+        assert_eq!(aromatic_count("C1=CN=CC=N1"), 6, "pyrazine");
+    }
 
-        // Verify bonds are marked aromatic
-        // Check some key bonds in the structure
-        let aromatic_bond_count = (0..mol.num_bonds())
-            .filter(|&bond_idx| mol.bond(bond_idx).is_aromatic())
-            .count();
+    #[test]
+    fn test_pyrrole_type_nitrogen_still_donates_two() {
+        // Right before the fix as well, but by coincidence — the old rule keyed
+        // off degree, and a pyrrole nitrogen also has heavy-atom degree 2. This
+        // pins it so the new rule is not credited for luck.
+        assert_eq!(aromatic_count("C1=CNC=C1"), 5, "pyrrole");
+    }
 
-        assert!(
-            aromatic_bond_count >= 10,
-            "Expected at least 10 aromatic bonds in naphthalene, found {}",
-            aromatic_bond_count
+    #[test]
+    fn test_a_ring_with_one_nitrogen_of_each_type() {
+        // Imidazole is the case no degree-based rule can get right: one
+        // pyridine-type nitrogen contributing 1, one pyrrole-type contributing
+        // 2, and three carbons — six in total.
+        assert_eq!(aromatic_count("C1=CN=CN1"), 5, "imidazole");
+    }
+
+    #[test]
+    fn test_oxygen_and_sulfur_heteroaromatics() {
+        assert_eq!(aromatic_count("C1=COC=C1"), 5, "furan");
+        assert_eq!(aromatic_count("C1=CSC=C1"), 5, "thiophene");
+    }
+
+    #[test]
+    fn test_fused_rings_are_all_found_regardless_of_ring_order() {
+        // A single pass marked naphthalene's rings one at a time, so it found
+        // 6 of 10 — while anthracene happened to come out complete. Whether
+        // detection worked depended on how the SMILES was written.
+        assert_eq!(aromatic_count("C1=CC2=CC=CC=C2C=C1"), 10, "naphthalene");
+        assert_eq!(aromatic_count("C1=CC2=CC=CC=C2N=C1"), 10, "quinoline");
+        assert_eq!(
+            aromatic_count("C1=CC=C2C=C3C=CC=CC3=CC2=C1"),
+            14,
+            "anthracene"
         );
+    }
 
-        // Verify bond orders are set to Aromatic
-        for bond_idx in 0..mol.num_bonds() {
-            if mol.bond(bond_idx).is_aromatic() {
-                assert_eq!(
-                    mol.bond(bond_idx).order(),
-                    BondOrder::Aromatic,
-                    "Aromatic bond {} should have BondOrder::Aromatic",
-                    bond_idx
-                );
-            }
+    #[test]
+    fn test_substituents_do_not_disturb_the_ring() {
+        assert_eq!(aromatic_count("CC1=CC=CC=C1"), 6, "toluene");
+        assert_eq!(aromatic_count("OC1=CC=CC=C1"), 6, "phenol");
+    }
+
+    #[test]
+    fn test_saturated_and_partly_saturated_rings_stay_non_aromatic() {
+        // The other direction, and the one a looser electron count breaks: #65
+        // was this function calling cyclohexane aromatic. Heteroatom rings are
+        // included because the new rule credits a lone-pair heteroatom 2
+        // electrons, and 2 plus nothing must not reach 6.
+        for smiles in [
+            "C1CCCCC1",   // cyclohexane
+            "C1=CCCCC1",  // cyclohexene
+            "C1CCCC1",    // cyclopentane
+            "O=C1CCCCC1", // cyclohexanone
+            "C1CCNCC1",   // piperidine
+            "C1CCOC1",    // tetrahydrofuran
+            "C1COCCO1",   // dioxane
+        ] {
+            assert_eq!(aromatic_count(smiles), 0, "{smiles} must not be aromatic");
         }
+    }
 
-        // Test ring detection specifically
-        let rings = find_sssr(&mol);
-
-        // Should find at least 2 rings (the two fused benzenes)
-        // Might find more depending on the algorithm (e.g., outer perimeter)
-        assert!(
-            rings.len() >= 2,
-            "Should detect at least 2 rings in naphthalene, found {}",
-            rings.len()
-        );
-
-        // Check that we found 6-membered rings
-        let six_membered_rings: Vec<_> = rings.iter().filter(|ring| ring.len() == 6).collect();
-
-        assert!(
-            six_membered_rings.len() >= 2,
-            "Should find at least 2 six-membered rings in naphthalene, found {}",
-            six_membered_rings.len()
-        );
-
-        // Verify each 6-membered ring is aromatic
-        for ring in six_membered_rings {
-            assert!(
-                is_aromatic_ring(&mol, ring.atoms()),
-                "Six-membered ring {:?} should be aromatic",
-                ring
-            );
-
-            // Verify all atoms in the ring are marked aromatic
-            for &atom_idx in ring.atoms() {
-                assert!(
-                    mol.atom(atom_idx).is_aromatic(),
-                    "Atom {} in aromatic ring should be marked aromatic",
-                    atom_idx
-                );
-            }
-        }
+    #[test]
+    fn test_detection_is_idempotent() {
+        // The fixed-point loop must settle rather than oscillate, and a second
+        // call must not widen the result.
+        let mut mol = crate::smiles::parse_smiles("C1=CC2=CC=CC=C2N=C1").expect("quinoline");
+        detect_aromaticity(&mut mol);
+        let first = mol.atoms().iter().filter(|a| a.is_aromatic()).count();
+        detect_aromaticity(&mut mol);
+        let second = mol.atoms().iter().filter(|a| a.is_aromatic()).count();
+        assert_eq!(first, 10);
+        assert_eq!(first, second);
     }
 }
