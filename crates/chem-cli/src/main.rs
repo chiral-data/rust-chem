@@ -19,6 +19,7 @@ mod backend;
 mod exit;
 mod fpfile;
 mod io;
+mod write;
 
 use anyhow::{Context, Result};
 use backend::Backend;
@@ -27,6 +28,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fpfile::FingerprintFile;
 use std::path::PathBuf;
 use std::time::Instant;
+use write::OutputFormat;
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +94,60 @@ enum Command {
         /// Fingerprint length in bits.
         #[arg(long, default_value_t = 2048)]
         size: u32,
+    },
+
+    /// Perceive aromatic rings and write the molecules back out.
+    ///
+    /// Aromaticity survives a SMILES round trip as lowercase atoms, so the
+    /// default output format follows the input.
+    Aromatic {
+        /// Input file. Reads standard input when absent or `-`.
+        input: Option<PathBuf>,
+
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
+
+        /// Write to a file instead of standard output.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Output format. Defaults to the output file's extension, or SMILES.
+        #[arg(long, value_enum)]
+        out_format: Option<OutputFormat>,
+
+        /// Allow writing over the input file.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Generate 2D coordinates and write the molecules back out.
+    ///
+    /// Defaults to SDF, because SMILES cannot store coordinates — writing
+    /// SMILES would discard the result.
+    Coords {
+        /// Input file. Reads standard input when absent or `-`.
+        input: Option<PathBuf>,
+
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
+
+        /// Write to a file instead of standard output.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Output format. Defaults to SDF, which is the only one that can hold
+        /// coordinates.
+        #[arg(long, value_enum)]
+        out_format: Option<OutputFormat>,
+
+        /// Recompute coordinates for molecules that already have them, such as
+        /// those read from an SDF.
+        #[arg(long)]
+        relayout: bool,
+
+        /// Allow writing over the input file.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Rank a file of fingerprints against a query molecule.
@@ -228,6 +284,100 @@ fn run(cli: &Cli) -> Result<i32> {
             Ok(exit::OK)
         }
 
+        Command::Aromatic {
+            input,
+            format,
+            output,
+            out_format,
+            force,
+        } => {
+            write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
+            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
+            io::report(&read);
+            if read.outcome.is_empty() {
+                eprintln!("nothing readable in {}", read.label);
+                return Ok(exit::NO_INPUT);
+            }
+            note_cpu_only(cli);
+
+            let mut changed = 0;
+            let mut records = Vec::with_capacity(read.outcome.records.len());
+            for record in &read.outcome.records {
+                let mut molecule = record.molecule.clone();
+                let before = aromatic_atoms(&molecule);
+                chemio::aromaticity::detect_aromaticity(&mut molecule);
+                if aromatic_atoms(&molecule) != before {
+                    changed += 1;
+                }
+                records.push((record.name.clone(), molecule));
+            }
+            // Reported because "it did nothing" and "nothing needed doing" look
+            // identical in the output file, and only one of them is a problem.
+            eprintln!(
+                "perceived aromaticity: {changed} of {} molecules changed",
+                records.len()
+            );
+
+            let format = OutputFormat::resolve(*out_format, false, output.as_deref());
+            eprintln!("writing {}", format.label());
+            io::write_output(output.as_ref(), &write::render(format, &records))?;
+
+            if cli.strict && !read.outcome.skipped.is_empty() {
+                return Ok(exit::PARTIAL);
+            }
+            Ok(exit::OK)
+        }
+
+        Command::Coords {
+            input,
+            format,
+            output,
+            out_format,
+            relayout,
+            force,
+        } => {
+            write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
+            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
+            io::report(&read);
+            if read.outcome.is_empty() {
+                eprintln!("nothing readable in {}", read.label);
+                return Ok(exit::NO_INPUT);
+            }
+            note_cpu_only(cli);
+
+            let mut laid_out = 0;
+            let mut kept = 0;
+            let mut failed = 0;
+            let mut records = Vec::with_capacity(read.outcome.records.len());
+            for record in &read.outcome.records {
+                let mut molecule = record.molecule.clone();
+                let had = molecule.has_coords();
+                let ok = if *relayout {
+                    chemcore::layout::layout(&mut molecule)
+                } else {
+                    chemcore::layout::ensure_coords(&mut molecule)
+                };
+                if !ok {
+                    failed += 1;
+                } else if had && !*relayout {
+                    kept += 1;
+                } else {
+                    laid_out += 1;
+                }
+                records.push((record.name.clone(), molecule));
+            }
+            eprintln!("laid out {laid_out}, kept {kept} existing, {failed} without coordinates");
+
+            let format = OutputFormat::resolve(*out_format, true, output.as_deref());
+            eprintln!("writing {}", format.label());
+            io::write_output(output.as_ref(), &write::render(format, &records))?;
+
+            if cli.strict && !read.outcome.skipped.is_empty() {
+                return Ok(exit::PARTIAL);
+            }
+            Ok(exit::OK)
+        }
+
         Command::Search {
             fingerprints,
             query,
@@ -306,6 +456,26 @@ fn run(cli: &Cli) -> Result<i32> {
             io::write_output(output.as_ref(), &out)?;
             Ok(exit::OK)
         }
+    }
+}
+
+fn aromatic_atoms(molecule: &chemcore::molecule::Molecule) -> usize {
+    (0..molecule.num_atoms())
+        .filter(|&i| molecule.atom(i).is_aromatic())
+        .count()
+}
+
+/// Says so rather than erroring when `--backend` is passed to a CPU-only
+/// command, since a script that pins the backend globally should not have to
+/// special-case which subcommands can use it.
+fn note_cpu_only(cli: &Cli) {
+    if cli.backend != Backend::Cpu {
+        eprintln!(
+            "backend: cpu (this operation has no GPU path; --backend {} ignored)",
+            cli.backend.label()
+        );
+    } else {
+        eprintln!("backend: cpu");
     }
 }
 
