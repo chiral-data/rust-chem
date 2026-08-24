@@ -315,26 +315,25 @@ $$$$
         assert_eq!(sdf.len(), 2);
         assert!(sdf.records.iter().all(|r| r.molecule.num_atoms() > 0));
 
-        // The same bytes read as SMILES are mostly rejected, and nothing that
-        // survives is a real molecule.
+        // The same bytes read as SMILES yield nothing at all. Before #151 the
+        // `$$$$` terminators survived as atomless molecules, so this reported
+        // "read 2 molecules" and exited successfully on a wrong-format file.
         let wrong = read(TWO_RECORDS, Format::Smiles);
+        assert!(wrong.is_empty(), "kept {} records", wrong.records.len());
         assert!(!wrong.skipped.is_empty());
-        assert!(
-            wrong.records.iter().all(|r| r.molecule.num_atoms() == 0),
-            "no SDF line should read as a molecule with atoms"
-        );
     }
 
     #[test]
-    fn test_a_dollar_line_reads_as_an_empty_molecule() {
-        // Documents a parser gap rather than endorsing it: `$` is not a SMILES
-        // character, but `parse_smiles` consumes it and returns an atomless
-        // molecule instead of an error. It matters here because `$$$$` is the
-        // SDF record terminator, so an SDF read as SMILES yields one of these
-        // per record rather than failing outright. Tracked separately; when it
-        // is fixed, this test should flip to expecting a skip.
+    fn test_a_dollar_line_is_skipped_rather_than_read_as_a_molecule() {
+        // The flip side of #151. `$` is a legal SMILES token — the
+        // quadruple-bond character — so `$$$$` tokenizes cleanly and used to
+        // build an atomless molecule that was returned as a success. It is
+        // also the SDF record terminator, so an SDF read as SMILES reported
+        // one molecule per record, and a caller asking "did anything parse?"
+        // was told yes.
         let out = read_smiles("$$$$\n");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out.records[0].molecule.num_atoms(), 0);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
     }
 }

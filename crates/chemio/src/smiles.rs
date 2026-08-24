@@ -395,6 +395,19 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
         return Err(SmilesError::MismatchedBranches);
     }
 
+    // Last, so the more specific failures above keep their better messages.
+    //
+    // Bond characters (`-`, `=`, `#`, `:`, `$`) and `(` are all legal tokens
+    // in isolation, so a string of nothing but those tokenized cleanly and
+    // built an empty molecule, which was then returned as a success. `$` is
+    // the one that bites: it is the quadruple-bond token *and* the character
+    // SDF uses for its `$$$$` record terminator, so an SDF file read as SMILES
+    // reported one atomless molecule per record rather than failing. A caller
+    // checking "did anything parse?" was told yes.
+    if mol.num_atoms() == 0 {
+        return Err(SmilesError::NoAtoms);
+    }
+
     mol.calculate_implicit_hydrogens();
     Ok(mol)
 }
@@ -875,6 +888,54 @@ mod tests {
             result.is_err(),
             "must not panic, and must not succeed either"
         );
+    }
+
+    /// Bond and branch characters are legal tokens on their own, so a string
+    /// of nothing but those used to tokenize cleanly and build a molecule with
+    /// no atoms — returned as success. #151.
+    #[test]
+    fn test_a_string_with_no_atoms_is_an_error() {
+        for input in ["$", "$$$$", "=", "#", "-", ":", "====", "(", ""] {
+            let result = parse_smiles(input);
+            assert!(
+                matches!(result, Err(SmilesError::NoAtoms)),
+                "{input:?} should be NoAtoms, got {:?}",
+                result.map(|m| m.num_atoms())
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_sdf_terminator_is_the_case_that_mattered() {
+        // `$$$$` ends every SDF record, so reading an SDF as SMILES used to
+        // report one atomless molecule per record. That defeated the "did
+        // anything parse?" check a caller relies on to notice a wrong format.
+        assert!(parse_smiles("$$$$").is_err());
+    }
+
+    #[test]
+    fn test_the_more_specific_errors_still_win() {
+        // The atom-count check is last on purpose: a molecule that also has an
+        // unclosed ring or an unbalanced branch should say so, since that is
+        // the more useful diagnosis.
+        assert!(matches!(
+            parse_smiles("1"),
+            Err(SmilesError::InvalidRing(1))
+        ));
+        assert!(matches!(
+            parse_smiles("()"),
+            Err(SmilesError::MismatchedBranches)
+        ));
+    }
+
+    #[test]
+    fn test_real_molecules_are_unaffected() {
+        // The narrowest possible molecule, to make sure the check is "no
+        // atoms" and not "too few atoms".
+        for input in ["C", "O", "[H]", "CCO", "c1ccccc1"] {
+            let mol = parse_smiles(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert!(mol.num_atoms() > 0, "{input}");
+        }
     }
 
     #[test]
