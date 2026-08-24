@@ -4,8 +4,8 @@ use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::tag,
-    character::complete::{char, digit1},
-    combinator::{map, opt},
+    character::complete::{char, digit1, one_of},
+    combinator::{map, map_res, opt},
     multi::many0,
     sequence::{delimited, preceded},
 };
@@ -270,10 +270,32 @@ fn parse_bond(input: &str) -> IResult<&str, BondToken> {
     .parse(input)
 }
 
+/// Parses a ring-closure label.
+///
+/// Two forms, and the distinction between them is load-bearing: **a bare label
+/// is exactly one digit.** `%NN` exists precisely so a label of 10 or more can
+/// be written next to another digit without ambiguity.
+///
+/// Consuming more than one bare digit is what #69 was: `c12` means *close ring
+/// 1, then close ring 2*, and reading it as a single ring 12 leaves both open.
+/// An atom closing two labels is not exotic — it is the shared atom of any
+/// fused ring system, so `c1ccnc2ccccc12` (quinoline) and
+/// `c1ccc2c(c1)ccc1ccccc12` (anthracene) both failed while the same ring
+/// systems spelled to avoid adjacency parsed fine.
 fn parse_ring_number(input: &str) -> IResult<&str, u32> {
     alt((
-        map(preceded(char('%'), digit1), |s: &str| s.parse().unwrap()),
-        map(digit1, |s: &str| s.parse().unwrap()),
+        // `map_res` rather than `map` + `unwrap`: a long enough digit run
+        // overflows u32, and a library that panics on a malformed line turns
+        // one bad record into a dead process. `%` still takes any number of
+        // digits, which is looser than the spec's exactly-two — deliberately
+        // left alone, since no real molecule has 100 open rings and tightening
+        // it is not what #69 is about.
+        map_res(preceded(char('%'), digit1), |s: &str| s.parse()),
+        // Exactly one digit. `one_of` cannot match a non-digit, so the
+        // conversion is infallible.
+        map(one_of("0123456789"), |c: char| {
+            c.to_digit(10).expect("one_of matched a digit")
+        }),
     ))
     .parse(input)
 }
@@ -757,12 +779,16 @@ mod tests {
         assert_eq!(remaining, "");
         assert_eq!(ring, 15);
 
-        // Test 7: Multiple digits without % (only takes first digit)
+        // Test 7: a bare label is one digit, so "123" is three labels and this
+        // parser takes only the first. The assertions here used to say `123`
+        // and `""` while the comment above them said "only takes first digit"
+        // — the test was written to match the bug rather than the spec it
+        // describes, which is why #69 survived having a test at all.
         let result = parse_ring_number("123");
         assert!(result.is_ok());
         let (remaining, ring) = result.unwrap();
-        assert_eq!(remaining, ""); // Only consumes "1"
-        assert_eq!(ring, 123);
+        assert_eq!(remaining, "23");
+        assert_eq!(ring, 1);
 
         // Test 8: Ring number followed by parenthesis
         let result = parse_ring_number("2(C)");
@@ -792,6 +818,63 @@ mod tests {
         // Test 12: Should fail - empty input
         let result = parse_ring_number("");
         assert!(result.is_err());
+    }
+
+    /// A bare ring label is one digit, so an atom can close two rings by
+    /// naming them back to back. That is not an exotic spelling — it is the
+    /// shared atom of any fused ring system, which is why #69 cost real
+    /// molecules.
+    #[test]
+    fn test_an_atom_can_close_two_rings_at_once() {
+        // The minimal case: two fused six-rings sharing an edge, no aromatics
+        // involved. 10 atoms, 11 bonds — one more bond than atoms is what
+        // makes it two rings rather than one.
+        let mol = parse_smiles("C12CCCCC1CCCC2").expect("bicyclic should parse");
+        assert_eq!(mol.num_atoms(), 10);
+        assert_eq!(mol.num_bonds(), 11);
+    }
+
+    #[test]
+    fn test_the_molecules_69_lost_now_parse() {
+        // Each pair is the same ring system spelled two ways. Before the fix
+        // the first of each pair failed and the second worked, purely because
+        // of where the closure digits happened to land.
+        for (adjacent, spaced, atoms, bonds) in [
+            ("c1ccnc2ccccc12", "c1ccc2ncccc2c1", 10, 11),
+            ("c1ccc2c(c1)ccc1ccccc12", "c1ccc2c(c1)ccc1c2cccc1", 14, 16),
+        ] {
+            let a = parse_smiles(adjacent).unwrap_or_else(|e| panic!("{adjacent}: {e}"));
+            let b = parse_smiles(spaced).unwrap_or_else(|e| panic!("{spaced}: {e}"));
+            assert_eq!((a.num_atoms(), a.num_bonds()), (atoms, bonds), "{adjacent}");
+            // The point of the pairing: two spellings of one ring system must
+            // agree, not merely both succeed.
+            assert_eq!(
+                (a.num_atoms(), a.num_bonds()),
+                (b.num_atoms(), b.num_bonds()),
+                "{adjacent} and {spaced} describe the same ring system"
+            );
+        }
+    }
+
+    #[test]
+    fn test_percent_still_reads_a_multi_digit_label() {
+        // The bare branch got narrower; `%NN` must not have.
+        let mol = parse_smiles("C%10CCCC%10").expect("%10 should still close");
+        assert_eq!(mol.num_atoms(), 5);
+        assert_eq!(mol.num_bonds(), 5);
+    }
+
+    #[test]
+    fn test_an_oversized_label_errors_instead_of_panicking() {
+        // Found while fixing #69, and worse than a wrong answer: `unwrap()` on
+        // a u32 overflow aborted the process. Once a file reader exists, one
+        // malformed line killing the whole run is the difference between a
+        // skipped record and no output at all.
+        let result = parse_smiles("C%99999999999999999999CC");
+        assert!(
+            result.is_err(),
+            "must not panic, and must not succeed either"
+        );
     }
 
     #[test]
