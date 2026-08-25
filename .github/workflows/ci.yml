@@ -78,6 +78,39 @@ jobs:
       - name: Run doctests
         run: cargo t --doc --all-features
 
+  minimal:
+    name: Default features only
+    runs-on: ubuntu-latest
+    # `chem`'s default build must stay free of wgpu and clap. Nothing else
+    # checks this: `--all-features` covers one of four configurations, and a
+    # workspace build unifies chem-app's `gpu` into every member's view of
+    # `chem`, so the lean configuration is only observable through `-p chem`.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy (no default features)
+        run: cargo clippy -p chem --no-default-features --all-targets -- -D warnings
+
+      - name: Test (no default features)
+        run: cargo test -p chem --no-default-features
+
+      - name: The lean build pulls neither wgpu nor clap
+        run: |
+          if cargo tree -p chem --no-default-features -e normal | grep -qE 'wgpu|clap'; then
+            echo "::error::the default build should not depend on wgpu or clap"
+            cargo tree -p chem --no-default-features -e normal | grep -E 'wgpu|clap'
+            exit 1
+          fi
+
+      - name: Packaging is publishable
+        run: cargo publish -p chem --dry-run --locked --all-features
+
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest

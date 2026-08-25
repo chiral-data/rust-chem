@@ -11,6 +11,13 @@ categories = ["science", "parser-implementations", "visualization"]
 documentation = "https://docs.rs/chem"
 readme = "README.md"
 
+# docs.rs builds with every feature so `chem::gpu` is documented; `docsrs`
+# enables the per-item feature banners, so a reader can see what needs
+# enabling without cross-referencing the manifest.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 # core / io
 nom = { workspace = true }

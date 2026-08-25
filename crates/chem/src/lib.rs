@@ -33,6 +33,8 @@
 //! through `std` — and the collision is a compile error rather than a silent
 //! misresolution, so it announces itself.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod core;
 pub mod draw;
 pub mod fp;
@@ -40,6 +42,7 @@ pub mod io;
 pub mod search;
 
 #[cfg(feature = "gpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gpu")))]
 pub mod gpu;
 
 pub mod prelude {
