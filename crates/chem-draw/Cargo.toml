@@ -1,0 +1,18 @@
+[package]
+name = "chem-draw"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "2D molecule depiction: geometry, styling and an SVG writer, with no GUI"
+
+keywords = ["chemistry", "cheminformatics", "svg", "depiction", "molecule"]
+categories = ["science", "visualization"]
+documentation = "https://docs.rs/chem-draw"
+readme = "../../README.md"
+
+[dependencies]
+chem-core = { workspace = true }
+ecolor = { workspace = true }
+emath = { workspace = true }
+serde = { workspace = true }

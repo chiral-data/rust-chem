@@ -1,0 +1,25 @@
+[package]
+name = "chem-gpu"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "GPU-accelerated Morgan fingerprint and Tanimoto similarity kernels via wgpu"
+
+keywords = ["chemistry", "cheminformatics", "gpu", "wgpu", "fingerprint"]
+categories = ["science"]
+documentation = "https://docs.rs/chem-gpu"
+readme = "../../README.md"
+
+[dependencies]
+log = { workspace = true }
+wgpu = { workspace = true }
+futures = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+thiserror = { workspace = true }
+env_logger = { workspace = true }
+
+# chem-fp = { workspace = true }
+chem-core = { workspace = true }
+

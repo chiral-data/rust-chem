@@ -1,0 +1,17 @@
+[package]
+name = "chem-io"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "SMILES/SDF parsing and aromaticity perception for cheminformatics"
+
+keywords = ["chemistry", "cheminformatics", "smiles", "sdf", "parser"]
+categories = ["science", "parser-implementations"]
+documentation = "https://docs.rs/chem-io"
+readme = "../../README.md"
+
+[dependencies]
+nom = { workspace = true }
+thiserror = { workspace = true }
+chem-core = { workspace = true }

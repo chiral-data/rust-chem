@@ -1,0 +1,19 @@
+[package]
+name = "chem-core"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Core molecule/atom/bond data structures for cheminformatics"
+
+keywords = ["chemistry", "cheminformatics", "molecule", "graph"]
+categories = ["science"]
+documentation = "https://docs.rs/chem-core"
+readme = "README.md"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+

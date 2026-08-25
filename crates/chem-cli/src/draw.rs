@@ -1,11 +1,11 @@
 //! Rendering structures to SVG files.
 //!
-//! The depiction itself is `chemdraw`; what lives here is the part a directory
+//! The depiction itself is `chem-draw`; what lives here is the part a directory
 //! of files needs and a single export does not — turning molecule names into
 //! filenames that cannot collide, escape, or overwrite each other.
 
 use anyhow::{Context, Result};
-use chemdraw::svg::suggested_filename;
+use chem_draw::svg::suggested_filename;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

@@ -27,7 +27,7 @@ jobs:
         # milestone's own PR into main is for.
         #
         # The cost is that a Windows- or macOS-only break surfaces at the end
-        # of the milestone rather than in the PR that caused it. chem_app has a
+        # of the milestone rather than in the PR that caused it. chem-app has a
         # Windows-only `winit` dependency, so that isn't hypothetical - but it
         # still cannot reach main unnoticed.
         os: >-
@@ -142,11 +142,11 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-wasm-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clippy (wasm32)
-        run: cargo clippy -p chem_app --target wasm32-unknown-unknown --all-targets -- -D warnings
+        run: cargo clippy -p chem-app --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       - name: Install trunk
         uses: taiki-e/install-action@trunk
 
       - name: Build web bundle
-        working-directory: crates/chem_app
+        working-directory: crates/chem-app
         run: trunk build --release

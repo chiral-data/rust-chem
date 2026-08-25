@@ -1,0 +1,29 @@
+[package]
+name = "chem-fp"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Molecular fingerprinting and similarity search for cheminformatics"
+
+keywords = ["chemistry", "cheminformatics", "fingerprint", "morgan", "tanimoto"]
+categories = ["science"]
+documentation = "https://docs.rs/chem-fp"
+readme = "README.md"
+
+[dependencies]
+bitvec = "1.0.1"
+fxhash = "0.2.1"
+rayon = { workspace = true }
+thiserror = { workspace = true }
+
+chem-io = { workspace = true }
+chem-core = { workspace = true }
+
+[dev-dependencies]
+# Tests only. The library itself never touches the GPU — chem-fp is the CPU
+# implementation, and chem-gpu's kernels are validated against it in
+# tests/gpu_cpu_parity.rs. A dev-dependency keeps that check while leaving
+# wgpu out of every consumer's tree, which is what lets #144 put `gpu` behind
+# a feature without chem-fp dragging it back in.
+chem-gpu = { workspace = true }

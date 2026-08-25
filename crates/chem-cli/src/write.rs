@@ -5,9 +5,9 @@
 //! what format, and does that format survive the operation.
 
 use anyhow::{Result, bail};
-use chemcore::molecule::Molecule;
-use chemio::sdf::write_sdf_all;
-use chemio::smiles_writer::write_smiles_for_molecule;
+use chem_core::molecule::Molecule;
+use chem_io::sdf::write_sdf_all;
+use chem_io::smiles_writer::write_smiles_for_molecule;
 use clap::ValueEnum;
 use std::path::Path;
 

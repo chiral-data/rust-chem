@@ -10,7 +10,7 @@
 //! keeps the tool composable.
 
 use anyhow::{Context, Result};
-use chemio::reader::{self, Format, ReadOutcome};
+use chem_io::reader::{self, Format, ReadOutcome};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 

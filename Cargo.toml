@@ -16,8 +16,8 @@ rfd = "0.16"
 wgpu = "27.0.1"
 egui = { version = "0.33.3", features = ["persistence"] }
 # egui's own geometry and colour crates, published separately. Depending on
-# them directly is what lets `chemdraw` describe a depiction without a GUI;
-# egui re-exports these very types, so `chem_app` needs no conversions.
+# them directly is what lets `chem-draw` describe a depiction without a GUI;
+# egui re-exports these very types, so `chem-app` needs no conversions.
 emath = "0.33.3"
 ecolor = "0.33.3"
 rayon = "1.11.0"
@@ -31,11 +31,15 @@ serde = { version = "1.0", features = ["derive"] }
 env_logger = "0.11.8"
 egui_extras = "0.33.3"
 
-chemio = { path = "./crates/chemio" }
-chemfp = { path = "./crates/chemfp" }
-chemgpu = { path = "./crates/chemgpu" }
-chemcore = { path = "./crates/chemcore" }
-chemdraw = { path = "./crates/chemdraw" }
-chemsearch = { path = "./crates/chemsearch" }
-chem-cli = { path = "./crates/chem-cli" }
+# `version` alongside `path` is what makes these publishable: cargo refuses to
+# publish a crate whose dependencies carry no version requirement, and strips
+# the `path` on the way to crates.io so consumers resolve from the registry.
+# Locally the path still wins, so a workspace build never touches the network.
+chem-io = { path = "./crates/chem-io", version = "0.5.0" }
+chem-fp = { path = "./crates/chem-fp", version = "0.5.0" }
+chem-gpu = { path = "./crates/chem-gpu", version = "0.5.0" }
+chem-core = { path = "./crates/chem-core", version = "0.5.0" }
+chem-draw = { path = "./crates/chem-draw", version = "0.5.0" }
+chem-search = { path = "./crates/chem-search", version = "0.5.0" }
+chem-cli = { path = "./crates/chem-cli", version = "0.5.0" }
 

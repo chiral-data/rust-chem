@@ -15,6 +15,11 @@ description = "Command-line cheminformatics: fingerprints, similarity search, ar
 name = "chem"
 path = "src/main.rs"
 
+keywords = ["chemistry", "cheminformatics", "cli", "smiles", "fingerprint"]
+categories = ["science", "command-line-utilities"]
+documentation = "https://docs.rs/chem-cli"
+readme = "../../README.md"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
@@ -22,8 +27,8 @@ clap = { version = "4.5", features = ["derive"] }
 bitvec = "1.0.1"
 pollster = { workspace = true }
 
-chemcore = { workspace = true }
-chemio = { workspace = true }
-chemdraw = { workspace = true }
+chem-core = { workspace = true }
+chem-io = { workspace = true }
+chem-draw = { workspace = true }
 emath = { workspace = true }
-chemsearch = { workspace = true }
+chem-search = { workspace = true }

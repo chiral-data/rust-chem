@@ -1,0 +1,26 @@
+[package]
+name = "chem-search"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Fingerprint generation and similarity search across CPU and GPU backends"
+
+keywords = ["chemistry", "cheminformatics", "similarity", "search", "gpu"]
+categories = ["science"]
+documentation = "https://docs.rs/chem-search"
+readme = "../../README.md"
+
+[dependencies]
+anyhow = { workspace = true }
+bitvec = "1.0.1"
+log = { workspace = true }
+
+chem-core = { workspace = true }
+chem-fp = { workspace = true }
+chem-gpu = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+# Only the tests build molecules from SMILES; the library takes them as given.
+chem-io = { workspace = true }
