@@ -5,8 +5,8 @@
 //! the app's own font, following the app's light/dark setting, and the option
 //! controls.
 
-use chemcore::molecule::Molecule;
-use chemdraw::structure::{
+use chem::core::molecule::Molecule;
+use chem::draw::structure::{
     AtomVisualization, ShowCarbons, StructureOptions, StructureShape, StructureTheme,
     describe_structure,
 };

@@ -1,5 +1,5 @@
-use chemcore::molecule::Molecule;
-use chemio::reader::{self, ReadOutcome};
+use chem::core::molecule::Molecule;
+use chem::io::reader::{self, ReadOutcome};
 
 /// Which file format a loaded dataset came from.
 ///
@@ -24,7 +24,7 @@ impl MoleculeDataset {
         }
     }
 
-    /// Builds a dataset from what [`chemio::reader`] read.
+    /// Builds a dataset from what [`chem::io::reader`] read.
     ///
     /// The parallel-vector shape is what the views consume; the skipped records
     /// are the caller's to report, which is why they are not swallowed here.

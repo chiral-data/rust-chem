@@ -1,0 +1,15 @@
+[package]
+name = "chem"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Cheminformatics in Rust: molecules, SMILES/SDF, fingerprints, similarity search, 2D depiction"
+
+[dependencies]
+chemcore = { workspace = true }
+chemdraw = { workspace = true }
+chemfp = { workspace = true }
+chemgpu = { workspace = true }
+chemio = { workspace = true }
+chemsearch = { workspace = true }

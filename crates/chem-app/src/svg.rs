@@ -1,6 +1,6 @@
 //! Handing an SVG to the user.
 //!
-//! Producing the document is [`chemdraw::svg::structure_to_svg`]; what stays
+//! Producing the document is [`chem::draw::svg::structure_to_svg`]; what stays
 //! here is the part that cannot leave the application — a native file dialog on
 //! one platform, a browser download on the other.
 

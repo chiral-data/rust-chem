@@ -7,6 +7,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+chem = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
@@ -17,12 +18,6 @@ serde = { workspace = true }
 log = { workspace = true }
 web-time = "1.1.0"
 
-chemcore = { workspace = true }
-chemdraw = { workspace = true }
-chemsearch = { workspace = true }
-chemfp = { workspace = true }
-chemgpu = { workspace = true }
-chemio = { workspace = true }
 
 [dependencies.bitvec]
 version = "1.0"

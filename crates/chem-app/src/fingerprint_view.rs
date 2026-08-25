@@ -1,5 +1,5 @@
 use bitvec::prelude::BitVec;
-use chemfp::tanimoto::tanimoto_similarity;
+use chem::fp::tanimoto::tanimoto_similarity;
 use egui::{Color32, Pos2, Rect, Response, Sense, Ui, Vec2, Widget};
 
 /// Bits per row, everywhere a fingerprint is drawn.

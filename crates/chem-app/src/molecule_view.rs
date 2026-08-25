@@ -1,4 +1,4 @@
-use chemcore::molecule::Molecule;
+use chem::core::molecule::Molecule;
 use egui::Ui;
 
 pub fn show_molecule_info(ui: &mut Ui, mol: &Molecule, smiles: &str, name: &str) {

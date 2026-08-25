@@ -5,7 +5,7 @@
 //! filenames that cannot collide, escape, or overwrite each other.
 
 use anyhow::{Context, Result};
-use chemdraw::svg::suggested_filename;
+use chem::draw::svg::suggested_filename;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

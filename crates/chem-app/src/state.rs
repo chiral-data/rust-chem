@@ -14,15 +14,15 @@
 use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
 use crate::task::Task;
 use bitvec::prelude::BitVec;
-use chemcore::layout::ensure_coords;
-use chemcore::molecule::Molecule;
-use chemdraw::structure::StructureOptions;
-use chemio::aromaticity::detect_aromaticity;
-use chemio::smiles::parse_smiles;
-use chemsearch::{FingerprintSearch, SearchResult};
+use chem::core::layout::ensure_coords;
+use chem::core::molecule::Molecule;
+use chem::draw::structure::StructureOptions;
+use chem::io::aromaticity::detect_aromaticity;
+use chem::io::smiles::parse_smiles;
+use chem::search::{FingerprintSearch, SearchResult};
 
 #[cfg(target_arch = "wasm32")]
-use chemgpu::{GpuMorganFingerprint, GpuTanimoto};
+use chem::gpu::{GpuMorganFingerprint, GpuTanimoto};
 #[cfg(target_arch = "wasm32")]
 use std::{cell::RefCell, rc::Rc};
 
@@ -421,7 +421,7 @@ impl AppState {
         };
 
         let format = DatasetFormat::from_filename(&name);
-        let outcome = chemio::reader::read(&content, format);
+        let outcome = chem::io::reader::read(&content, format);
         let dataset = MoleculeDataset::from_outcome(&outcome);
 
         // Records that failed used to be logged and never surfaced, so a file

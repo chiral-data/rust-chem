@@ -24,9 +24,9 @@ mod write;
 
 use anyhow::{Context, Result, bail};
 use backend::Backend;
-use chemdraw::structure::{StructureOptions, StructureTheme};
-use chemdraw::svg::structure_to_svg;
-use chemio::reader::Format;
+use chem::draw::structure::{StructureOptions, StructureTheme};
+use chem::draw::svg::structure_to_svg;
+use chem::io::reader::Format;
 use clap::{Parser, Subcommand, ValueEnum};
 use emath::Vec2;
 use fpfile::FingerprintFile;
@@ -222,7 +222,7 @@ impl Theme {
     }
 }
 
-/// `chemio::reader::Format` is not ours to derive `ValueEnum` on, so this is the
+/// `chem::io::reader::Format` is not ours to derive `ValueEnum` on, so this is the
 /// clap-facing mirror. Kept adjacent to its conversion so the two cannot drift.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FormatArg {
@@ -357,7 +357,7 @@ fn run(cli: &Cli) -> Result<i32> {
             for record in &read.outcome.records {
                 let mut molecule = record.molecule.clone();
                 let before = aromatic_atoms(&molecule);
-                chemio::aromaticity::detect_aromaticity(&mut molecule);
+                chem::io::aromaticity::detect_aromaticity(&mut molecule);
                 if aromatic_atoms(&molecule) != before {
                     changed += 1;
                 }
@@ -405,9 +405,9 @@ fn run(cli: &Cli) -> Result<i32> {
                 let mut molecule = record.molecule.clone();
                 let had = molecule.has_coords();
                 let ok = if *relayout {
-                    chemcore::layout::layout(&mut molecule)
+                    chem::core::layout::layout(&mut molecule)
                 } else {
-                    chemcore::layout::ensure_coords(&mut molecule)
+                    chem::core::layout::ensure_coords(&mut molecule)
                 };
                 if !ok {
                     failed += 1;
@@ -466,7 +466,7 @@ fn run(cli: &Cli) -> Result<i32> {
             for record in &read.outcome.records {
                 let mut molecule = record.molecule.clone();
                 if !molecule.has_coords() {
-                    chemcore::layout::layout(&mut molecule);
+                    chem::core::layout::layout(&mut molecule);
                     generated += 1;
                 }
                 rendered.push(structure_to_svg(&molecule, size, &options, &palette));
@@ -490,7 +490,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     let renamed = filenames
                         .iter()
                         .zip(&names)
-                        .filter(|(f, n)| *f != &chemdraw::svg::suggested_filename(n))
+                        .filter(|(f, n)| *f != &chem::draw::svg::suggested_filename(n))
                         .count();
                     let files: Vec<(String, String)> =
                         filenames.into_iter().zip(rendered).collect();
@@ -534,7 +534,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 return Ok(exit::NO_INPUT);
             }
 
-            let molecule = chemio::smiles::parse_smiles(query)
+            let molecule = chem::io::smiles::parse_smiles(query)
                 .with_context(|| format!("parsing the query {query:?}"))?;
 
             let mut search = cli.backend.open()?;
@@ -594,7 +594,7 @@ fn run(cli: &Cli) -> Result<i32> {
     }
 }
 
-fn aromatic_atoms(molecule: &chemcore::molecule::Molecule) -> usize {
+fn aromatic_atoms(molecule: &chem::core::molecule::Molecule) -> usize {
     (0..molecule.num_atoms())
         .filter(|&i| molecule.atom(i).is_aromatic())
         .count()

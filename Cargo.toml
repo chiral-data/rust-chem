@@ -37,5 +37,6 @@ chemgpu = { path = "./crates/chemgpu" }
 chemcore = { path = "./crates/chemcore" }
 chemdraw = { path = "./crates/chemdraw" }
 chemsearch = { path = "./crates/chemsearch" }
+chem = { path = "./crates/chem" }
 chem-cli = { path = "./crates/chem-cli" }
 

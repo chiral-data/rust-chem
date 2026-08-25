@@ -10,7 +10,7 @@
 
 use crate::state::AppState;
 use crate::structure_view::StructureView;
-use chemdraw::structure::{ShowCarbons, StructureOptions};
+use chem::draw::structure::{ShowCarbons, StructureOptions};
 use egui::{RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
 

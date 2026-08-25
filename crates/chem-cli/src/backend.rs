@@ -9,7 +9,7 @@
 //! read or describe never call it.
 
 use anyhow::{Result, bail};
-use chemsearch::FingerprintSearch;
+use chem::search::FingerprintSearch;
 use clap::ValueEnum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]

@@ -16,14 +16,11 @@ name = "chem"
 path = "src/main.rs"
 
 [dependencies]
+chem = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 
 bitvec = "1.0.1"
 pollster = { workspace = true }
 
-chemcore = { workspace = true }
-chemio = { workspace = true }
-chemdraw = { workspace = true }
 emath = { workspace = true }
-chemsearch = { workspace = true }
