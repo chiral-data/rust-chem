@@ -6,10 +6,32 @@ license.workspace = true
 repository.workspace = true
 description = "Cheminformatics in Rust: molecules, SMILES/SDF, fingerprints, similarity search, 2D depiction"
 
+keywords = ["chemistry", "cheminformatics", "smiles", "fingerprint", "gpu"]
+categories = ["science", "parser-implementations", "visualization"]
+documentation = "https://docs.rs/chem"
+readme = "README.md"
+
 [dependencies]
-chemcore = { workspace = true }
-chemdraw = { workspace = true }
-chemfp = { workspace = true }
-chemgpu = { workspace = true }
-chemio = { workspace = true }
-chemsearch = { workspace = true }
+# core / io
+nom = { workspace = true }
+thiserror = { workspace = true }
+# fp
+bitvec = "1.0.1"
+fxhash = "0.2.1"
+# gpu
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+futures = { workspace = true }
+pollster = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+# draw
+ecolor = { workspace = true }
+emath = { workspace = true }
+serde = { workspace = true }
+# search
+anyhow = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+pollster = { workspace = true }
