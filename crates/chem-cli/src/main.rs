@@ -16,15 +16,19 @@
 //! handling and exit codes a tool actually needs.
 
 mod backend;
+mod draw;
 mod exit;
 mod fpfile;
 mod io;
 mod write;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use backend::Backend;
+use chemdraw::structure::{StructureOptions, StructureTheme};
+use chemdraw::svg::structure_to_svg;
 use chemio::reader::Format;
 use clap::{Parser, Subcommand, ValueEnum};
+use emath::Vec2;
 use fpfile::FingerprintFile;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -150,6 +154,39 @@ enum Command {
         force: bool,
     },
 
+    /// Draw each molecule as an SVG.
+    ///
+    /// Coordinates are a prerequisite and SMILES carries none, so any molecule
+    /// without a layout gets one — reported on stderr, since it is work the
+    /// command did that was not asked for. `chem coords` is the explicit form.
+    Draw {
+        /// Input file. Reads standard input when absent or `-`.
+        input: Option<PathBuf>,
+
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
+
+        /// Write one SVG per molecule into this directory, named after each
+        /// molecule. Without it, a single structure goes to standard output.
+        #[arg(long)]
+        outdir: Option<PathBuf>,
+
+        /// Write the single structure to a file instead of standard output.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        #[arg(long, default_value_t = 360.0)]
+        width: f32,
+
+        #[arg(long, default_value_t = 300.0)]
+        height: f32,
+
+        /// Palette. Light by default: an SVG is bound for a document or a
+        /// slide, and should not carry a dark background's colours there.
+        #[arg(long, value_enum, default_value_t = Theme::Light)]
+        theme: Theme,
+    },
+
     /// Rank a file of fingerprints against a query molecule.
     Search {
         /// A file written by `chem fp`. Reads standard input when absent or `-`,
@@ -168,6 +205,21 @@ enum Command {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn palette(self) -> StructureTheme {
+        match self {
+            Theme::Light => StructureTheme::light(),
+            Theme::Dark => StructureTheme::dark(),
+        }
+    }
 }
 
 /// `chemio::reader::Format` is not ours to derive `ValueEnum` on, so this is the
@@ -371,6 +423,89 @@ fn run(cli: &Cli) -> Result<i32> {
             let format = OutputFormat::resolve(*out_format, true, output.as_deref());
             eprintln!("writing {}", format.label());
             io::write_output(output.as_ref(), &write::render(format, &records))?;
+
+            if cli.strict && !read.outcome.skipped.is_empty() {
+                return Ok(exit::PARTIAL);
+            }
+            Ok(exit::OK)
+        }
+
+        Command::Draw {
+            input,
+            format,
+            outdir,
+            output,
+            width,
+            height,
+            theme,
+        } => {
+            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
+            io::report(&read);
+            if read.outcome.is_empty() {
+                eprintln!("nothing readable in {}", read.label);
+                return Ok(exit::NO_INPUT);
+            }
+            note_cpu_only(cli);
+
+            // Concatenated SVG documents are not a valid SVG, so a single
+            // stream can only ever hold one structure. Saying which flag fixes
+            // it beats letting someone discover it from a broken file.
+            if outdir.is_none() && read.outcome.len() > 1 {
+                bail!(
+                    "{} molecules but no --outdir: an SVG stream holds one structure, so pass --outdir to write a file each",
+                    read.outcome.len()
+                );
+            }
+
+            let options = StructureOptions::default();
+            let palette = theme.palette();
+            let size = Vec2::new(*width, *height);
+
+            let mut generated = 0;
+            let mut rendered = Vec::with_capacity(read.outcome.len());
+            for record in &read.outcome.records {
+                let mut molecule = record.molecule.clone();
+                if !molecule.has_coords() {
+                    chemcore::layout::layout(&mut molecule);
+                    generated += 1;
+                }
+                rendered.push(structure_to_svg(&molecule, size, &options, &palette));
+            }
+            if generated > 0 {
+                eprintln!(
+                    "generated coordinates for {generated} of {} molecules (use `chem coords` to do this explicitly)",
+                    rendered.len()
+                );
+            }
+
+            match outdir {
+                Some(dir) => {
+                    let names: Vec<String> = read
+                        .outcome
+                        .records
+                        .iter()
+                        .map(|r| r.name.clone())
+                        .collect();
+                    let filenames = draw::unique_filenames(&names);
+                    let renamed = filenames
+                        .iter()
+                        .zip(&names)
+                        .filter(|(f, n)| *f != &chemdraw::svg::suggested_filename(n))
+                        .count();
+                    let files: Vec<(String, String)> =
+                        filenames.into_iter().zip(rendered).collect();
+                    draw::write_directory(dir, &files)?;
+                    eprintln!("wrote {} files to {}", files.len(), dir.display());
+                    if renamed > 0 {
+                        // Silence here would mean the caller believes the
+                        // filenames match the molecule names, and acts on it.
+                        eprintln!("{renamed} had duplicate names and were suffixed");
+                    }
+                }
+                None => {
+                    io::write_output(output.as_ref(), &rendered[0])?;
+                }
+            }
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);

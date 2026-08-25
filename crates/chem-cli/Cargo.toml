@@ -24,4 +24,6 @@ pollster = { workspace = true }
 
 chemcore = { workspace = true }
 chemio = { workspace = true }
+chemdraw = { workspace = true }
+emath = { workspace = true }
 chemsearch = { workspace = true }
