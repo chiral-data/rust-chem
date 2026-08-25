@@ -616,3 +616,180 @@ fn test_aromaticity_changes_the_fingerprint() {
         "aromatic perception must reach the fingerprint"
     );
 }
+
+// ---- chem draw (#142) ------------------------------------------------------
+
+/// Parses far enough to tell a real SVG from a string that merely starts with
+/// `<svg`. Counts the drawable elements, since a document with none is a blank
+/// page that still passes a "does it contain `<svg`" check.
+fn svg_marks(text: &str) -> usize {
+    text.matches("<line").count() + text.matches("<text").count() + text.matches("<circle").count()
+}
+
+#[test]
+fn test_a_single_molecule_goes_to_stdout_as_one_document() {
+    let r = run(&["draw"], Some("c1ccccc1O phenol\n"));
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.starts_with("<svg"));
+    assert!(r.stdout.trim_end().ends_with("</svg>"));
+    assert_eq!(r.stdout.matches("<svg").count(), 1);
+    assert!(
+        svg_marks(&r.stdout) > 6,
+        "phenol should draw more than 6 marks"
+    );
+}
+
+#[test]
+fn test_many_molecules_without_outdir_is_refused_with_the_fix_named() {
+    // Concatenated SVG documents are not a valid SVG, so this cannot be done
+    // silently. The error has to name the flag, or the user is left guessing.
+    let path = fixture("draw-many.smi", GOOD);
+    let r = run(&["draw", path.to_str().unwrap()], None);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("--outdir"), "{:?}", r.stderr);
+    assert!(r.stdout.is_empty(), "no partial document may escape");
+}
+
+#[test]
+fn test_outdir_writes_one_file_per_molecule() {
+    let path = fixture("draw-dir.smi", GOOD);
+    let dir = std::env::temp_dir().join("chem-cli-test-drawdir");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let r = run(
+        &[
+            "draw",
+            path.to_str().unwrap(),
+            "--outdir",
+            dir.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0);
+
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("directory created")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["acetic.svg", "benzene.svg", "ethanol.svg"]);
+
+    for name in &names {
+        let text = std::fs::read_to_string(dir.join(name)).expect(name);
+        assert!(text.starts_with("<svg"), "{name}");
+        assert!(svg_marks(&text) > 0, "{name} drew nothing");
+    }
+}
+
+#[test]
+fn test_duplicate_molecule_names_do_not_overwrite_each_other() {
+    // Molecule names come from a file's own records and are not unique. Without
+    // suffixing, this reports three files and leaves one — silently short.
+    let path = fixture("draw-dup.smi", "CCO Phenol\nc1ccccc1O Phenol\nCC Phenol!\n");
+    let dir = std::env::temp_dir().join("chem-cli-test-drawdup");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let r = run(
+        &[
+            "draw",
+            path.to_str().unwrap(),
+            "--outdir",
+            dir.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 3);
+    // And it says so, since otherwise the caller believes the filenames match
+    // the molecule names.
+    assert!(r.stderr.contains("duplicate names"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_coordinates_are_generated_and_the_command_says_so() {
+    // SMILES carries no coordinates, so drawing one means doing work that was
+    // not asked for. Doing it silently would make `chem coords` look redundant.
+    let r = run(&["draw"], Some("CCO ethanol\n"));
+    assert_eq!(r.code, 0);
+    assert!(r.stderr.contains("generated coordinates"), "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("chem coords"),
+        "should point at the explicit form"
+    );
+}
+
+#[test]
+fn test_an_sdf_with_coordinates_is_drawn_without_relaying_out() {
+    let smi = fixture("draw-sdf-src.smi", "CCO ethanol\n");
+    let sdf = run(&["coords", smi.to_str().unwrap()], None).stdout;
+
+    let r = run(&["draw", "--format", "sdf"], Some(&sdf));
+    assert_eq!(r.code, 0);
+    assert!(
+        !r.stderr.contains("generated coordinates"),
+        "existing coordinates must be used as-is: {:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_the_theme_flag_changes_the_palette_and_defaults_to_light() {
+    // An SVG is bound for a document or a slide, so light is the honest
+    // default — a CLI has no ambient theme to follow.
+    let light = run(&["draw", "--theme", "light"], Some("c1ccccc1O x\n"));
+    let dark = run(&["draw", "--theme", "dark"], Some("c1ccccc1O x\n"));
+    let default = run(&["draw"], Some("c1ccccc1O x\n"));
+
+    assert!(light.stdout.contains("#222222"), "light foreground");
+    assert!(dark.stdout.contains("#ffffff"), "dark foreground");
+    assert_eq!(default.stdout, light.stdout, "default must be light");
+    // The heteroatom hues are shared between the palettes, so a test that only
+    // compared those would pass whatever the flag did.
+    assert!(light.stdout.contains("#e74c3c") && dark.stdout.contains("#e74c3c"));
+}
+
+#[test]
+fn test_the_size_flags_reach_the_document() {
+    let r = run(
+        &["draw", "--width", "800", "--height", "600"],
+        Some("CCO x\n"),
+    );
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.contains("width=\"800\""), "{:?}", &r.stdout[..80]);
+    assert!(r.stdout.contains("height=\"600\""));
+    assert!(r.stdout.contains("viewBox=\"0 0 800 600\""));
+}
+
+#[test]
+fn test_output_flag_writes_the_single_structure_to_a_file() {
+    let dest = std::env::temp_dir().join("chem-cli-test-draw-out.svg");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(&["draw", "-o", dest.to_str().unwrap()], Some("CCO x\n"));
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.is_empty());
+    assert!(
+        std::fs::read_to_string(&dest)
+            .expect("written")
+            .starts_with("<svg")
+    );
+}
+
+#[test]
+fn test_drawing_an_unusable_file_exits_before_writing_anything() {
+    let path = fixture("draw-allbad.smi", ALL_BAD);
+    let dir = std::env::temp_dir().join("chem-cli-test-drawbad");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let r = run(
+        &[
+            "draw",
+            path.to_str().unwrap(),
+            "--outdir",
+            dir.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 2);
+    assert!(!dir.exists(), "no directory should be created for nothing");
+}
