@@ -409,3 +409,210 @@ fn test_a_gpu_request_fails_loudly_when_there_is_no_gpu() {
         assert!(r.stderr.contains("no GPU is usable") || r.stderr.contains("did not engage"));
     }
 }
+
+// ---- chem aromatic / chem coords (#141) ------------------------------------
+
+/// Kekulé SMILES — explicit alternating bonds, uppercase atoms. Lowercase
+/// aromatic input is already flagged by the parser, so a test written that way
+/// would pass whether or not `chem aromatic` did anything.
+const KEKULE: &str = "C1=CC=NC=C1 pyridine\nC1=CC=CC=C1 benzene\nCCO ethanol\n";
+
+#[test]
+fn test_aromatic_perceives_rings_and_writes_them_lowercase() {
+    let path = fixture("arom.smi", KEKULE);
+    let r = run(&["aromatic", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines[0], "c1ccncc1 pyridine", "pyridine must be perceived");
+    assert_eq!(lines[1], "c1ccccc1 benzene");
+    // Not everything is aromatic, and the command must not claim otherwise.
+    assert_eq!(lines[2], "CCO ethanol");
+}
+
+#[test]
+fn test_aromatic_reports_how_many_molecules_it_changed() {
+    // "it did nothing" and "nothing needed doing" produce identical output
+    // files, and only one of them is a problem.
+    let path = fixture("arom-count.smi", KEKULE);
+    let r = run(&["aromatic", path.to_str().unwrap()], None);
+    assert!(
+        r.stderr.contains("2 of 3 molecules changed"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_aromatic_output_round_trips_back_to_aromatic() {
+    // The point of defaulting to SMILES here: the perception survives, because
+    // lowercase atoms carry it. If the writer emitted uppercase, this command
+    // would compute a result and then throw it away.
+    let path = fixture("arom-rt.smi", KEKULE);
+    let first = run(&["aromatic", path.to_str().unwrap()], None);
+    let second = run(&["aromatic"], Some(&first.stdout));
+
+    assert_eq!(second.code, 0);
+    assert_eq!(
+        first.stdout, second.stdout,
+        "already-aromatic input is stable"
+    );
+    assert!(second.stderr.contains("0 of 3 molecules changed"));
+}
+
+#[test]
+fn test_coords_defaults_to_sdf_because_smiles_cannot_hold_coordinates() {
+    let path = fixture("coords.smi", KEKULE);
+    let r = run(&["coords", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    assert!(r.stderr.contains("writing SDF"));
+    assert!(r.stdout.contains("V2000"));
+    assert!(r.stdout.trim_end().ends_with("$$$$"));
+}
+
+#[test]
+fn test_coords_output_actually_carries_the_coordinates() {
+    // The whole reason the default is SDF. Reading it back and finding `yes` in
+    // the coords column is what proves the result was not discarded — these
+    // molecules came from SMILES, which has nowhere to put geometry.
+    let path = fixture("coords-carry.smi", KEKULE);
+    let coords = run(&["coords", path.to_str().unwrap()], None);
+    let info = run(&["info", "--format", "sdf"], Some(&coords.stdout));
+
+    assert_eq!(info.code, 0);
+    let rows: Vec<&str> = info.stdout.lines().skip(1).collect();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert!(row.ends_with("\tyes"), "no coordinates in {row:?}");
+    }
+}
+
+#[test]
+fn test_coords_warns_rather_than_silently_discarding_the_result() {
+    let path = fixture("coords-warn.smi", KEKULE);
+
+    // Explicitly asking for SMILES is allowed — connectivity only is a real
+    // want — but it must say what it is costing.
+    let r = run(
+        &["coords", path.to_str().unwrap(), "--out-format", "smiles"],
+        None,
+    );
+    assert_eq!(r.code, 0);
+    assert!(r.stderr.contains("warning:"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("cannot store them"));
+
+    // And an output name that is not .sdf is the same mistake made implicitly.
+    // Named `-dest` rather than reusing the fixture stem: the first draft of
+    // this test picked the same path as its own input, and the clobber guard
+    // refused it — correctly, but that is a different assertion.
+    let dest = std::env::temp_dir().join("chem-cli-test-coords-warn-dest.smi");
+    let r = run(
+        &[
+            "coords",
+            path.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(r.stderr.contains("will be discarded"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_an_sdf_name_is_honoured_without_the_flag() {
+    let path = fixture("coords-ext.smi", KEKULE);
+    let dest = std::env::temp_dir().join("chem-cli-test-coords-ext.sdf");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(
+        &[
+            "coords",
+            path.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0);
+    assert!(!r.stderr.contains("warning:"), "{:?}", r.stderr);
+    assert!(
+        std::fs::read_to_string(&dest)
+            .expect("written")
+            .contains("V2000")
+    );
+}
+
+#[test]
+fn test_writing_over_the_input_is_refused_unless_forced() {
+    // It would happen to work today, because the input is read fully before the
+    // write begins — which is worse than failing, since it would keep working
+    // until the day reading became streamed.
+    let path = fixture("clobber.smi", KEKULE);
+    let arg = path.to_str().unwrap();
+
+    let r = run(&["coords", arg, "-o", arg], None);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("is the input file"), "{:?}", r.stderr);
+    // And the file is untouched.
+    assert_eq!(std::fs::read_to_string(&path).expect("intact"), KEKULE);
+
+    let r = run(&["aromatic", arg, "-o", arg, "--force"], None);
+    assert_eq!(r.code, 0);
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("rewritten")
+            .contains("c1ccncc1")
+    );
+}
+
+#[test]
+fn test_relayout_distinguishes_kept_from_recomputed() {
+    let smi = fixture("relayout.smi", KEKULE);
+    let sdf = run(&["coords", smi.to_str().unwrap()], None).stdout;
+
+    let kept = run(&["coords", "--format", "sdf"], Some(&sdf));
+    assert!(
+        kept.stderr.contains("laid out 0, kept 3"),
+        "{:?}",
+        kept.stderr
+    );
+
+    let redone = run(&["coords", "--format", "sdf", "--relayout"], Some(&sdf));
+    assert!(
+        redone.stderr.contains("laid out 3, kept 0"),
+        "{:?}",
+        redone.stderr
+    );
+}
+
+#[test]
+fn test_a_cpu_only_command_notes_the_backend_flag_instead_of_failing() {
+    // A script pinning --backend globally should not have to special-case which
+    // subcommands can use it.
+    let path = fixture("cpu-note.smi", KEKULE);
+    let r = run(
+        &["--backend", "gpu", "aromatic", path.to_str().unwrap()],
+        None,
+    );
+    assert_eq!(r.code, 0, "must not fail: {:?}", r.stderr);
+    assert!(r.stderr.contains("no GPU path"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_aromaticity_changes_the_fingerprint() {
+    // Not a formatting detail: perceiving aromaticity changes the bonds, so it
+    // changes the Morgan environments. This is why `chem aromatic` is worth
+    // having in a pipeline rather than being cosmetic.
+    let path = fixture("arom-fp.smi", KEKULE);
+    let plain = run(&[CPU, "cpu", "fp", path.to_str().unwrap()], None);
+    let perceived = run(&["aromatic", path.to_str().unwrap()], None);
+    let after = run(&[CPU, "cpu", "fp"], Some(&perceived.stdout));
+
+    assert_eq!(plain.code, 0);
+    assert_eq!(after.code, 0);
+    assert_ne!(
+        plain.stdout, after.stdout,
+        "aromatic perception must reach the fingerprint"
+    );
+}
