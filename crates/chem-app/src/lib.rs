@@ -12,5 +12,5 @@ mod windows;
 pub use app::WorkbenchApp;
 
 /// Id of the `<canvas>` element eframe renders into on web builds (see
-/// chem_app/index.html).
+/// crates/chem-app/index.html).
 pub const CANVAS_ID: &str = "the_canvas_id";

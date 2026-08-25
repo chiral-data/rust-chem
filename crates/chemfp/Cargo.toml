@@ -6,18 +6,6 @@ license.workspace = true
 repository.workspace = true
 description = "Molecular fingerprinting and similarity search for cheminformatics"
 
-[[bin]]
-name = "cli"
-path = "src/bin/cli.rs"
-
-[[bin]]
-name = "hash_test"
-path = "src/bin/hash_test.rs"
-
-[[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-
 [dependencies]
 bitvec = "1.0.1"
 fxhash = "0.2.1"
@@ -25,5 +13,10 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 
 chemio = { workspace = true }
-chemgpu = { workspace = true }
 chemcore = { workspace = true }
+
+[dev-dependencies]
+# Tests only. The library is the CPU implementation; chemgpu's kernels are
+# validated against it in tests/gpu_cpu_parity.rs. Keeping this out of
+# [dependencies] is what stops wgpu reaching every consumer.
+chemgpu = { workspace = true }

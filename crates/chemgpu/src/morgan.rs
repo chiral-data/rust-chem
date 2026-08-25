@@ -929,7 +929,7 @@ mod tests {
     /// calling it raced to create three devices against one GPU — the hang #19
     /// diagnosed and fixed for `context.rs`, `buffers.rs`, `pipeline.rs` and
     /// `tanimoto.rs`, which left this file out. It is what still hung
-    /// `cargo test --workspace` after #134 fixed the same mistake in `chem_app`.
+    /// `cargo test --workspace` after #134 fixed the same mistake in `chem-app`.
     ///
     /// Cloned per test rather than lent: `wgpu`'s device, queue and pipelines are
     /// refcounted handles, so a clone shares the device instead of requesting

@@ -1,4 +1,4 @@
-# Testing chem_app by hand
+# Testing chem-app by hand
 
 CI proves the code compiles on both targets, that the tests pass, that clippy is
 quiet at `-D warnings`, that rustdoc has no broken links, and that the web bundle
@@ -13,15 +13,15 @@ v0.5.0 and only found by looking.
 ## Running it
 
 ```bash
-crates/chem_app/e2e.sh                 # builds, then serves on 127.0.0.1:8080
-crates/chem_app/e2e.sh --port 8081
-crates/chem_app/e2e.sh --address 0.0.0.0  # reachable from another machine
+crates/chem-app/e2e.sh                 # builds, then serves on 127.0.0.1:8080
+crates/chem-app/e2e.sh --port 8081
+crates/chem-app/e2e.sh --address 0.0.0.0  # reachable from another machine
 ```
 
 Native, where there is a display:
 
 ```bash
-cargo run --release -p chem_app
+cargo run --release -p chem-app
 ```
 
 Use `--release` for anything involving timings or the FPS readout. A debug wasm
@@ -276,7 +276,7 @@ inventing a checklist item.
   content-hashed, so those can't be served stale — but a cached `index.html`
   points at a hash that no longer exists, which shows as a stuck loading
   overlay. Hard-refresh.
-- **A long-lived `trunk serve` on another port** rebuilds into `crates/chem_app/dist/`
+- **A long-lived `trunk serve` on another port** rebuilds into `crates/chem-app/dist/`
   whenever any file changes, in debug unless it was started with `--release`.
   `e2e.sh` builds into `dist-e2e/` to stay out of its way. Check for one before
   concluding anything about which build you are seeing.

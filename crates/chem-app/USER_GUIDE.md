@@ -1,6 +1,6 @@
 # Chem Workbench — User Guide
 
-`chem_app` is a cheminformatics workbench built on `chemcore`, `chemio`, `chemfp`, and `chemgpu`: it loads SMILES and SDF datasets, draws structures, computes Morgan fingerprints, detects aromaticity, and searches by Tanimoto similarity. It runs both as a native desktop app and as a browser (WASM) build.
+`chem-app` is a cheminformatics workbench built on `chemcore`, `chemio`, `chemfp`, and `chemgpu`: it loads SMILES and SDF datasets, draws structures, computes Morgan fingerprints, detects aromaticity, and searches by Tanimoto similarity. It runs both as a native desktop app and as a browser (WASM) build.
 
 ## Running it
 
@@ -9,7 +9,7 @@
 From the repo root:
 
 ```bash
-cargo run --release -p chem_app
+cargo run --release -p chem-app
 ```
 
 ### Web (browser)
@@ -21,7 +21,7 @@ rustup target add wasm32-unknown-unknown
 cargo install trunk
 ```
 
-Then, from `crates/chem_app/`:
+Then, from `crates/chem-app/`:
 
 ```bash
 trunk serve --address 0.0.0.0 --port 8080

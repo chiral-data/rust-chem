@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Builds chem_app's web bundle and serves it for hands-on testing.
+# Builds chem-app's web bundle and serves it for hands-on testing.
 #
 # The point of this script rather than `trunk build` plus a web server by hand:
 # it is very easy to end up serving a bundle that isn't the code you think you
@@ -15,11 +15,11 @@
 #   * refuses to start if something else already holds the port, naming it.
 #
 # Usage:
-#   crates/chem_app/e2e.sh                   # 127.0.0.1:8080
-#   crates/chem_app/e2e.sh --port 8081
-#   crates/chem_app/e2e.sh --address 0.0.0.0 # reachable from other machines
+#   crates/chem-app/e2e.sh                   # 127.0.0.1:8080
+#   crates/chem-app/e2e.sh --port 8081
+#   crates/chem-app/e2e.sh --address 0.0.0.0 # reachable from other machines
 #
-# For the native build there is nothing to serve: `cargo run --release -p chem_app`.
+# For the native build there is nothing to serve: `cargo run --release -p chem-app`.
 
 set -euo pipefail
 

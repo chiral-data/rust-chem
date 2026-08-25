@@ -17,7 +17,7 @@ wgpu = "27.0.1"
 egui = { version = "0.33.3", features = ["persistence"] }
 # egui's own geometry and colour crates, published separately. Depending on
 # them directly is what lets `chemdraw` describe a depiction without a GUI;
-# egui re-exports these very types, so `chem_app` needs no conversions.
+# egui re-exports these very types, so `chem-app` needs no conversions.
 emath = "0.33.3"
 ecolor = "0.33.3"
 rayon = "1.11.0"

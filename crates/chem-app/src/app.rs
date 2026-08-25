@@ -189,7 +189,7 @@ impl WorkbenchApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("FPS: {:.0}", self.fps_counter));
                     ui.separator();
-                    // Set by chem_app/e2e.sh, absent from an ordinary build.
+                    // Set by crates/chem-app/e2e.sh, absent from an ordinary build.
                     // Without it there is no way to tell from the app which
                     // commit you are looking at, which is how a stale bundle
                     // went unnoticed for eleven minutes of commits during

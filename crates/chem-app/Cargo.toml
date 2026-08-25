@@ -1,7 +1,10 @@
 [package]
-name = "chem_app"
+name = "chem-app"
 version.workspace = true
 edition = "2024"
+# A GUI binary, not a library. Excluded from the registry explicitly rather
+# than by omission from a publish command.
+publish = false
 
 [dependencies]
 eframe = { workspace = true }
