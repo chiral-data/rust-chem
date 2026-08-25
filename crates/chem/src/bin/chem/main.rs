@@ -16,10 +16,10 @@
 //! handling and exit codes a tool actually needs.
 
 mod backend;
-mod draw;
 mod exit;
+mod export;
 mod fpfile;
-mod io;
+mod stream;
 mod write;
 
 use anyhow::{Context, Result, bail};
@@ -262,8 +262,8 @@ fn run(cli: &Cli) -> Result<i32> {
             format,
             output,
         } => {
-            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
-            io::report(&read);
+            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            stream::report(&read);
             // Echoed rather than resolved: `info` computes nothing, and
             // probing for a device costs a device creation. A mistyped flag is
             // still visible here rather than three commands later.
@@ -274,7 +274,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 return Ok(exit::NO_INPUT);
             }
 
-            io::write_output(output.as_ref(), &describe(&read))?;
+            stream::write_output(output.as_ref(), &describe(&read))?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -289,8 +289,8 @@ fn run(cli: &Cli) -> Result<i32> {
             radius,
             size,
         } => {
-            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
-            io::report(&read);
+            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
                 return Ok(exit::NO_INPUT);
@@ -328,7 +328,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     .collect(),
                 fingerprints,
             };
-            io::write_output(output.as_ref(), &file.to_text())?;
+            stream::write_output(output.as_ref(), &file.to_text())?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -344,8 +344,8 @@ fn run(cli: &Cli) -> Result<i32> {
             force,
         } => {
             write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
-            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
-            io::report(&read);
+            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
                 return Ok(exit::NO_INPUT);
@@ -372,7 +372,7 @@ fn run(cli: &Cli) -> Result<i32> {
 
             let format = OutputFormat::resolve(*out_format, false, output.as_deref());
             eprintln!("writing {}", format.label());
-            io::write_output(output.as_ref(), &write::render(format, &records))?;
+            stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -389,8 +389,8 @@ fn run(cli: &Cli) -> Result<i32> {
             force,
         } => {
             write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
-            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
-            io::report(&read);
+            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
                 return Ok(exit::NO_INPUT);
@@ -422,7 +422,7 @@ fn run(cli: &Cli) -> Result<i32> {
 
             let format = OutputFormat::resolve(*out_format, true, output.as_deref());
             eprintln!("writing {}", format.label());
-            io::write_output(output.as_ref(), &write::render(format, &records))?;
+            stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -439,8 +439,8 @@ fn run(cli: &Cli) -> Result<i32> {
             height,
             theme,
         } => {
-            let read = io::read_input(input.as_deref(), format.map(Into::into))?;
-            io::report(&read);
+            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
                 return Ok(exit::NO_INPUT);
@@ -486,7 +486,7 @@ fn run(cli: &Cli) -> Result<i32> {
                         .iter()
                         .map(|r| r.name.clone())
                         .collect();
-                    let filenames = draw::unique_filenames(&names);
+                    let filenames = export::unique_filenames(&names);
                     let renamed = filenames
                         .iter()
                         .zip(&names)
@@ -494,7 +494,7 @@ fn run(cli: &Cli) -> Result<i32> {
                         .count();
                     let files: Vec<(String, String)> =
                         filenames.into_iter().zip(rendered).collect();
-                    draw::write_directory(dir, &files)?;
+                    export::write_directory(dir, &files)?;
                     eprintln!("wrote {} files to {}", files.len(), dir.display());
                     if renamed > 0 {
                         // Silence here would mean the caller believes the
@@ -503,7 +503,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     }
                 }
                 None => {
-                    io::write_output(output.as_ref(), &rendered[0])?;
+                    stream::write_output(output.as_ref(), &rendered[0])?;
                 }
             }
 
@@ -519,7 +519,7 @@ fn run(cli: &Cli) -> Result<i32> {
             top,
             output,
         } => {
-            let (text, label) = io::read_text(fingerprints.as_deref())?;
+            let (text, label) = stream::read_text(fingerprints.as_deref())?;
             let targets =
                 FingerprintFile::parse(&text).with_context(|| format!("reading {label}"))?;
             eprintln!(
@@ -588,7 +588,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     result.similarity
                 ));
             }
-            io::write_output(output.as_ref(), &out)?;
+            stream::write_output(output.as_ref(), &out)?;
             Ok(exit::OK)
         }
     }
@@ -616,7 +616,7 @@ fn note_cpu_only(cli: &Cli) {
 
 /// A tab-separated row per molecule: parseable by `cut` and `awk`, which is the
 /// point of stdout being data.
-fn describe(read: &io::Input) -> String {
+fn describe(read: &stream::Input) -> String {
     let mut out = String::from("name\tatoms\tbonds\tcoords\n");
     for record in &read.outcome.records {
         let molecule = &record.molecule;

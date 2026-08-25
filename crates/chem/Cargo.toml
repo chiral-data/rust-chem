@@ -30,6 +30,8 @@ emath = { workspace = true }
 serde = { workspace = true }
 # search
 anyhow = { workspace = true }
+# cli
+clap = { version = "4.5", features = ["derive"], optional = true }
 
 [features]
 default = []
@@ -39,6 +41,21 @@ default = []
 # direction: adding a feature to `default` later is non-breaking, removing one
 # is not.
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:futures", "dep:pollster"]
+# Implies `gpu`: the CLI's `--backend gpu` calls into the GPU paths, and
+# headless GPU access is one of the reasons the tool exists.
+cli = ["dep:clap", "dep:pollster", "gpu"]
+
+# The binary is `chem`; the package is too. `required-features` keeps clap out
+# of every library consumer's tree — Cargo has no bin-only dependency section,
+# so a feature is the only way to express "this dependency is for the binary".
+[[bin]]
+name = "chem"
+path = "src/bin/chem/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
 
 [[test]]
 name = "gpu_cpu_parity"

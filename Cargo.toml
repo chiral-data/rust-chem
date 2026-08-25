@@ -32,5 +32,4 @@ env_logger = "0.11.8"
 egui_extras = "0.33.3"
 
 chem = { path = "./crates/chem" }
-chem-cli = { path = "./crates/chem-cli" }
 
