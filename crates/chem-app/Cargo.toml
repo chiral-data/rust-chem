@@ -7,7 +7,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-chem = { workspace = true }
+chem = { workspace = true, features = ["gpu"] }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }

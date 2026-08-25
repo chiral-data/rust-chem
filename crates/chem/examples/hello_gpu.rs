@@ -1,7 +1,10 @@
-use chem::gpu::{BufferManager, ComputePipeline, GpuContext, init_logging};
+use chem::gpu::{BufferManager, ComputePipeline, GpuContext};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging();
+    // Installing a logger is the application's job, not the library's.
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 
     println!("=== GPU Hello World ===\n");
 

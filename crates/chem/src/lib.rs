@@ -39,6 +39,7 @@ pub mod fp;
 pub mod io;
 pub mod search;
 
+#[cfg(feature = "gpu")]
 pub mod gpu;
 
 pub mod prelude {

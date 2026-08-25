@@ -31,8 +31,12 @@
 use crate::core::molecule::Molecule;
 use crate::fp::morgan::MorganFingerprint;
 use crate::fp::tanimoto::tanimoto_similarity;
-use crate::gpu::{GpuMorganFingerprint, GpuTanimoto, GpuTargetSet};
+#[cfg(feature = "gpu")]
+use crate::gpu::{GpuMorganFingerprint, GpuTanimoto};
+
+mod gpu_state;
 use bitvec::prelude::BitVec;
+use gpu_state::GpuState;
 
 #[derive(Clone, Debug)]
 pub struct SearchResult {
@@ -48,13 +52,10 @@ pub struct SearchResult {
 /// than reusing the cache #16 added — an accepted, wasm32-only tradeoff.
 #[derive(Clone)]
 pub struct FingerprintSearch {
-    gpu_morgan: Option<GpuMorganFingerprint>,
-    gpu_tanimoto: Option<GpuTanimoto>,
+    /// Every GPU handle, in one field so the struct has the same shape with
+    /// and without the `gpu` feature. See [`gpu_state`].
+    gpu: GpuState,
     use_gpu: bool,
-    /// Target dataset already uploaded to the GPU, reused across searches
-    /// so only the (small) query fingerprint round-trips per search instead
-    /// of re-uploading the whole dataset every time.
-    gpu_targets: Option<GpuTargetSet>,
     /// Set when a GPU init attempt (initial or retried) fails, so callers
     /// can distinguish "on CPU because GPU was never available/failed" from
     /// "on CPU by choice" (see [`Self::force_cpu`]) — e.g. to show a
@@ -71,19 +72,39 @@ impl FingerprintSearch {
     // CPU-only and upgrade to GPU shortly after via `try_init_gpu_async` +
     // `install_gpu`, which `chem_app::app` drives with `spawn_local` and
     // polls once per frame (mirroring the file-load pattern from #37).
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn new() -> Self {
+        let mut search = Self::new_cpu_only();
+        if let Err(e) = search.retry_gpu_init() {
+            log::warn!("GPU initialization failed, using CPU fallback: {e}");
+        }
+        search
+    }
+
+    /// wasm32 cannot block the browser's only thread, so it starts CPU-only and
+    /// upgrades through [`Self::try_init_gpu_async`]. A build without the `gpu`
+    /// feature has nothing to upgrade to, and records that as the reason —
+    /// otherwise the downgrade is invisible and someone benchmarks this crate
+    /// concluding the GPU work does not exist.
+    /// wasm32 cannot block the browser's only thread, so it starts CPU-only and
+    /// upgrades through [`Self::try_init_gpu_async`].
+    #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
     pub fn new() -> Self {
         log::info!("Web build: starting CPU-only, upgrading to GPU asynchronously if available");
         Self::new_cpu_only()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Built without the `gpu` feature, so there is no device to find. The
+    /// reason is recorded rather than left implicit: otherwise the downgrade is
+    /// invisible, and someone benchmarks this crate concluding the GPU work
+    /// does not exist. [`Self::gpu_init_error`] reports it, and the CLI prints
+    /// it.
+    #[cfg(not(feature = "gpu"))]
     pub fn new() -> Self {
-        let mut search = Self::new_cpu_only();
-        if let Err(e) = search.retry_gpu_init() {
-            log::warn!("GPU initialization failed, using CPU fallback: {}", e);
+        Self {
+            gpu_init_error: Some("built without the `gpu` feature".to_string()),
+            ..Self::new_cpu_only()
         }
-        search
     }
 
     /// Bypasses GPU init entirely and always uses the CPU fingerprinting/
@@ -94,15 +115,13 @@ impl FingerprintSearch {
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn new_cpu_only() -> Self {
         Self {
-            gpu_morgan: None,
-            gpu_tanimoto: None,
+            gpu: GpuState::new(),
             use_gpu: false,
-            gpu_targets: None,
             gpu_init_error: None,
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     fn init_gpu() -> anyhow::Result<(GpuMorganFingerprint, GpuTanimoto)> {
         let morgan = GpuMorganFingerprint::new()?;
         let tanimoto = GpuTanimoto::new()?;
@@ -113,7 +132,7 @@ impl FingerprintSearch {
     /// action. Installs and switches to it on success; on failure, records
     /// the reason (see [`Self::gpu_init_error`]) and leaves the instance on
     /// whatever it was using before (CPU, unless a GPU was already active).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     pub fn retry_gpu_init(&mut self) -> Result<(), String> {
         match Self::init_gpu() {
             Ok((m, t)) => {
@@ -136,6 +155,7 @@ impl FingerprintSearch {
     /// callers install the result themselves via [`Self::install_gpu`] on
     /// success, or [`Self::record_gpu_init_failure`] on failure.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(feature = "gpu")]
     pub async fn try_init_gpu_async() -> Result<(GpuMorganFingerprint, GpuTanimoto), String> {
         let morgan = GpuMorganFingerprint::new_async().await.map_err(|e| {
             let msg = format!("Morgan: {}", e);
@@ -157,11 +177,12 @@ impl FingerprintSearch {
     /// keeps the invariant explicit rather than assuming it — and clears
     /// [`Self::gpu_init_error`].
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(feature = "gpu")]
     pub fn install_gpu(&mut self, gpu_morgan: GpuMorganFingerprint, gpu_tanimoto: GpuTanimoto) {
-        self.gpu_morgan = Some(gpu_morgan);
-        self.gpu_tanimoto = Some(gpu_tanimoto);
+        self.gpu.morgan = Some(gpu_morgan);
+        self.gpu.tanimoto = Some(gpu_tanimoto);
         self.use_gpu = true;
-        self.gpu_targets = None;
+        self.gpu.clear_targets();
         self.gpu_init_error = None;
     }
 
@@ -183,7 +204,7 @@ impl FingerprintSearch {
     /// whether or not it's the one currently in use (see [`Self::force_cpu`]/
     /// [`Self::force_gpu`]).
     pub fn has_gpu_available(&self) -> bool {
-        self.gpu_morgan.is_some() && self.gpu_tanimoto.is_some()
+        self.gpu.is_available()
     }
 
     /// Switches to the CPU fingerprinting/search path without discarding an
@@ -221,12 +242,13 @@ impl FingerprintSearch {
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<BitVec> {
-        if self.use_gpu && self.gpu_morgan.is_some() {
-            self.generate_fingerprint_gpu_async(mol, radius, fp_size)
-                .await
-        } else {
-            self.generate_fingerprint_cpu(mol, radius, fp_size)
+        #[cfg(feature = "gpu")]
+        if self.use_gpu && self.gpu.has_morgan() {
+            return self
+                .generate_fingerprint_gpu_async(mol, radius, fp_size)
+                .await;
         }
+        self.generate_fingerprint_cpu(mol, radius, fp_size)
     }
 
     /// Batch form of [`Self::generate_fingerprint_async`].
@@ -236,12 +258,13 @@ impl FingerprintSearch {
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<Vec<BitVec>> {
-        if self.use_gpu && self.gpu_morgan.is_some() {
-            self.generate_fingerprints_gpu_batch_async(molecules, radius, fp_size)
-                .await
-        } else {
-            self.generate_fingerprints_cpu_batch(molecules, radius, fp_size)
+        #[cfg(feature = "gpu")]
+        if self.use_gpu && self.gpu.has_morgan() {
+            return self
+                .generate_fingerprints_gpu_batch_async(molecules, radius, fp_size)
+                .await;
         }
+        self.generate_fingerprints_cpu_batch(molecules, radius, fp_size)
     }
 
     /// Upload `target_fps` to the GPU once, so subsequent
@@ -250,22 +273,23 @@ impl FingerprintSearch {
     /// dataset changes; `search_async` will still lazily upload on its own if
     /// this was skipped.
     pub fn set_target_dataset(&mut self, target_fps: &[BitVec]) -> anyhow::Result<()> {
-        if !(self.use_gpu && self.gpu_tanimoto.is_some()) || target_fps.is_empty() {
-            self.gpu_targets = None;
+        #[cfg(feature = "gpu")]
+        if self.use_gpu && self.gpu.has_tanimoto() && !target_fps.is_empty() {
+            let gpu = self.gpu.tanimoto.as_ref().unwrap();
+            let fp_words = Self::bitvec_to_words(&target_fps[0]).len();
+            let flattened: Vec<u32> = target_fps.iter().flat_map(Self::bitvec_to_words).collect();
+            self.gpu.targets = Some(gpu.upload_targets(&flattened, fp_words)?);
             return Ok(());
         }
-
-        let gpu = self.gpu_tanimoto.as_ref().unwrap();
-        let fp_words = Self::bitvec_to_words(&target_fps[0]).len();
-        let flattened: Vec<u32> = target_fps.iter().flat_map(Self::bitvec_to_words).collect();
-
-        self.gpu_targets = Some(gpu.upload_targets(&flattened, fp_words)?);
+        // Named so the argument is used in every configuration.
+        let _ = target_fps;
+        self.gpu.clear_targets();
         Ok(())
     }
 
     /// Drop the cached GPU target upload, e.g. when the dataset is cleared.
     pub fn invalidate_target_dataset(&mut self) {
-        self.gpu_targets = None;
+        self.gpu.clear_targets();
     }
 
     /// Ranks `target_fps` against `query_fp`, on the GPU where one is
@@ -277,12 +301,15 @@ impl FingerprintSearch {
         target_fps: &[BitVec],
         top_k: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let similarities = if self.use_gpu && self.gpu_tanimoto.is_some() {
+        #[cfg(feature = "gpu")]
+        let similarities = if self.use_gpu && self.gpu.has_tanimoto() {
             self.compute_similarities_gpu_async(query_fp, target_fps)
                 .await?
         } else {
             self.compute_similarities_cpu(query_fp, target_fps)?
         };
+        #[cfg(not(feature = "gpu"))]
+        let similarities = self.compute_similarities_cpu(query_fp, target_fps)?;
 
         let mut results: Vec<SearchResult> = similarities
             .into_iter()
@@ -296,13 +323,14 @@ impl FingerprintSearch {
         Ok(results)
     }
 
+    #[cfg(feature = "gpu")]
     async fn generate_fingerprint_gpu_async(
         &self,
         mol: &Molecule,
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<BitVec> {
-        let gpu = self.gpu_morgan.as_ref().unwrap();
+        let gpu = self.gpu.morgan.as_ref().unwrap();
         let fp_words = gpu
             .generate_fingerprints_batch_async(
                 std::slice::from_ref(mol),
@@ -317,13 +345,14 @@ impl FingerprintSearch {
         Ok(Self::words_to_bitvec(&fp_words[0], fp_size as usize))
     }
 
+    #[cfg(feature = "gpu")]
     async fn generate_fingerprints_gpu_batch_async(
         &self,
         molecules: &[Molecule],
         radius: u32,
         fp_size: u32,
     ) -> anyhow::Result<Vec<BitVec>> {
-        let gpu = self.gpu_morgan.as_ref().unwrap();
+        let gpu = self.gpu.morgan.as_ref().unwrap();
         let fp_words_batch = gpu
             .generate_fingerprints_batch_async(molecules, radius, fp_size, false, true, false)
             .await?;
@@ -334,6 +363,7 @@ impl FingerprintSearch {
             .collect())
     }
 
+    #[cfg(feature = "gpu")]
     async fn compute_similarities_gpu_async(
         &mut self,
         query_fp: &BitVec,
@@ -363,17 +393,18 @@ impl FingerprintSearch {
         // Reuse the cached upload when it already matches this target set's
         // shape; only re-upload (the whole point of #16) when the caller
         // never called `set_target_dataset` or the dataset actually changed.
-        let cache_valid = self
-            .gpu_targets
-            .as_ref()
-            .is_some_and(|t| t.count() == target_fps.len() && t.fp_words() == query_words.len());
+        let cache_valid =
+            self.gpu.targets.as_ref().is_some_and(|t| {
+                t.count() == target_fps.len() && t.fp_words() == query_words.len()
+            });
         if !cache_valid {
             self.set_target_dataset(target_fps)?;
         }
 
-        let gpu = self.gpu_tanimoto.as_ref().unwrap();
+        let gpu = self.gpu.tanimoto.as_ref().unwrap();
         let targets = self
-            .gpu_targets
+            .gpu
+            .targets
             .as_ref()
             .expect("set_target_dataset populates gpu_targets for a non-empty dataset");
         let similarities_f32 = gpu
@@ -420,6 +451,7 @@ impl FingerprintSearch {
             .collect()
     }
 
+    #[cfg(feature = "gpu")]
     fn words_to_bitvec(words: &[u32], fp_size: usize) -> BitVec {
         let mut bv = BitVec::repeat(false, fp_size);
         for (word_idx, &word) in words.iter().enumerate() {
@@ -435,6 +467,7 @@ impl FingerprintSearch {
         bv
     }
 
+    #[cfg(feature = "gpu")]
     fn bitvec_to_words(bv: &BitVec) -> Vec<u32> {
         let num_words = bv.len().div_ceil(32);
         let mut words = vec![0u32; num_words];
