@@ -1,16 +1,16 @@
 //! Fingerprint generation and similarity search, across CPU and GPU backends.
 //!
 //! [`FingerprintSearch`] picks a backend and runs the work on it: Morgan
-//! fingerprints from `chemfp` or `chemgpu`, Tanimoto similarity from either,
+//! fingerprints from `chem::fp` or `chem::gpu`, Tanimoto similarity from either,
 //! with the GPU used where one is usable and the CPU otherwise.
 //!
-//! # Why this is a crate rather than part of `chemfp`
+//! # Why this is a crate rather than part of `chem::fp`
 //!
-//! `chemfp`'s library is pure CPU and depends on nothing heavy. Putting the
+//! `chem::fp`'s library is pure CPU and depends on nothing heavy. Putting the
 //! backend selection there would make `wgpu` a permanent dependency of anyone
 //! who only wants to fingerprint on a CPU — which is every wasm build and every
 //! machine without a usable device. Keeping the orchestration separate lets
-//! `chemfp` stay small and lets a consumer opt into the GPU by depending on
+//! `chem::fp` stay small and lets a consumer opt into the GPU by depending on
 //! this instead.
 //!
 //! # Why the API is async
@@ -25,7 +25,7 @@
 //!
 //! Similarity is computed on the GPU only when a device initialised and the
 //! caller has not forced the CPU. Both paths must agree, which is what
-//! `chemfp`'s parity tests check; the CPU path is not a fallback of last
+//! `chem::fp`'s parity tests check; the CPU path is not a fallback of last
 //! resort but the reference the GPU one is measured against.
 
 use crate::core::molecule::Molecule;
@@ -45,7 +45,7 @@ pub struct SearchResult {
 }
 
 /// Cheaply `Clone` (see [`GpuMorganFingerprint`]/[`GpuTanimoto`]) — the
-/// wasm32 async call sites in `chem_app::app` clone a snapshot to move into
+/// wasm32 async call sites in `chem-app`'s app module clone a snapshot to move into
 /// `spawn_local` rather than sharing `&mut` access across the await
 /// boundary. Cloned snapshots don't propagate their `gpu_targets` cache
 /// back, so those call sites re-upload the target dataset per search rather
@@ -70,7 +70,7 @@ impl FingerprintSearch {
     // runs inside eframe's synchronous app-construction callback, so it
     // can't block OR run the async adapter/device request itself; start
     // CPU-only and upgrade to GPU shortly after via `try_init_gpu_async` +
-    // `install_gpu`, which `chem_app::app` drives with `spawn_local` and
+    // `install_gpu`, which `chem-app`'s app module drives with `spawn_local` and
     // polls once per frame (mirroring the file-load pattern from #37).
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     pub fn new() -> Self {
@@ -187,7 +187,7 @@ impl FingerprintSearch {
     }
 
     /// Records that a GPU init attempt (e.g. the wasm32 async one kicked off
-    /// by `chem_app::app`) failed, for [`Self::gpu_init_error`] to report.
+    /// by `chem-app`'s app module) failed, for [`Self::gpu_init_error`] to report.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn record_gpu_init_failure(&mut self, error: String) {
         self.gpu_init_error = Some(error);
@@ -509,7 +509,7 @@ mod tests {
     /// Every test that called `FingerprintSearch::new()` requested its own
     /// adapter and device, and two of those racing against one physical GPU
     /// hangs indefinitely on at least one driver — the deadlock #19 diagnosed
-    /// for `chemgpu` and #134 for here. `chemgpu` solved it by sharing a context
+    /// for `chem::gpu` and #134 for here. `chem::gpu` solved it by sharing a context
     /// through a `OnceLock`; this is the same move one layer up.
     ///
     /// Clones rather than lending a reference because these tests mutate the

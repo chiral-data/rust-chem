@@ -4,7 +4,7 @@ use chem::io::reader::{self, ReadOutcome};
 /// Which file format a loaded dataset came from.
 ///
 /// An alias rather than a type of its own: the app used to keep a parallel enum
-/// beside `chemio`'s parsers, and two enums meaning the same thing is one more
+/// beside `chem::io`'s parsers, and two enums meaning the same thing is one more
 /// place for the app and the CLI to disagree about what `.txt` means.
 pub type DatasetFormat = reader::Format;
 

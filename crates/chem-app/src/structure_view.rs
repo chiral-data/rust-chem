@@ -1,6 +1,6 @@
 //! The egui side of 2D structure depiction.
 //!
-//! Describing a structure is [`chemdraw`]; this is the backend that paints the
+//! Describing a structure is [`chem::draw`]; this is the backend that paints the
 //! description, plus the pieces that need egui itself — measuring labels with
 //! the app's own font, following the app's light/dark setting, and the option
 //! controls.
@@ -46,7 +46,7 @@ impl<'a> StructureView<'a> {
 /// the app's theme rather than needing a setting of their own.
 ///
 /// A free function rather than `StructureTheme::from_visuals`: the type is
-/// `chemdraw`'s now, and an inherent method would have to live with it — which
+/// `chem::draw`'s now, and an inherent method would have to live with it — which
 /// would put `egui` back in the crate the extraction took it out of.
 pub fn theme_from_visuals(visuals: &egui::Visuals) -> StructureTheme {
     if visuals.dark_mode {
