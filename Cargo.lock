@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "chem"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "chem-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bitvec",
