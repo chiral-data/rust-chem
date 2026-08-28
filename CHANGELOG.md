@@ -27,6 +27,9 @@ Four in the SMILES parser, all found by pointing a batch tool at whole files rat
 - **Back-to-back ring-closure digits were read as one number.** A bare ring label is exactly one digit, so `c12` closes rings 1 and 2 — but `digit1` consumed both, leaving them open. Anthracene and quinoline failed to parse at all while their isomers succeeded, purely because of where the digits landed (#69)
 - **A string of bond characters parsed as a molecule.** Every bond character is legal in isolation, so `$$$$` — the SDF record terminator — built an atomless molecule reported as success. Reading an SDF as SMILES exited 0 claiming to have read molecules (#151)
 
+- **A bond with nothing on one side was dropped silently**, so `=CC` and `CC=` both parsed as ethane — a real molecule, quietly different from the one written (#155)
+- **`UnclosedRing` named an arbitrary ring**, so the same input reported a different number between runs, and a molecule with two open rings had one of them named at random (#153)
+
 ### Corrections to v0.5.0 and earlier
 
 - `chemfp` shipped three binaries from a library crate, a dead 79-line `BitVec` nothing imported, a commented-out copy of its own module list, and a `rayon` dependency used only in a doc comment
@@ -40,6 +43,10 @@ Four in the SMILES parser, all found by pointing a batch tool at whole files rat
 - Two tests were written to match the behaviour rather than the specification. `test_parse_ring_number` had a comment reading "only takes first digit" above an assertion expecting `123`; the polycyclic aromaticity test used lowercase SMILES and admitted in its own comment that the parser had already set every flag before detection ran — it would have passed with the function deleted
 - `build_molecule` produced four separate bugs this milestone, so the aromatic-bond test asserts the *invariant* — no aromatic bond may have a non-aromatic endpoint — rather than a fifth list of cases
 - Asserting on fingerprints from inside the SMILES parser's own tests only became possible once the crates merged
+
+### API notes
+
+The five public error enums are `#[non_exhaustive]`, so future releases can add error variants without a breaking change. Match them with a catch-all arm. Data enums — `BondOrder`, `StructureShape`, `ShowCarbons` — are deliberately exhaustive: if a bond order is ever added, a consumer's match should fail loudly rather than fall silently into `_`.
 
 ### Known limitations
 
