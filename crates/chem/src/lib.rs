@@ -12,6 +12,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! # Examples
+//!
+//! Six runnable examples ship with the crate, one idea each — building a
+//! molecule by hand, reading and converting a file, ranking by similarity,
+//! SMILES to SVG, and two for the GPU. `cargo run --example build_a_molecule`.
+//!
 //! # Features
 //!
 //! | feature | brings in |
