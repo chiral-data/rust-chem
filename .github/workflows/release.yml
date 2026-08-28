@@ -36,7 +36,7 @@ jobs:
             --notes-file RELEASE_NOTES.md
 
   build-binaries:
-    name: Build chem_app (${{ matrix.os }})
+    name: Build chem-app (${{ matrix.os }})
     needs: changelog
     runs-on: ${{ matrix.os }}
     strategy:
@@ -44,11 +44,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset_name: chem_app-linux-x86_64.tar.gz
+            asset_name: chem-app-linux-x86_64.tar.gz
           - os: macos-latest
-            asset_name: chem_app-macos-x86_64.tar.gz
+            asset_name: chem-app-macos-x86_64.tar.gz
           - os: windows-latest
-            asset_name: chem_app-windows-x86_64.zip
+            asset_name: chem-app-windows-x86_64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -62,16 +62,16 @@ jobs:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build chem_app (release)
-        run: cargo build --release -p chem_app
+      - name: Build chem-app (release)
+        run: cargo build --release -p chem-app
 
       - name: Package (unix)
         if: runner.os != 'Windows'
-        run: tar -czf ${{ matrix.asset_name }} -C target/release chem_app
+        run: tar -czf ${{ matrix.asset_name }} -C target/release chem-app
 
       - name: Package (windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/release/chem_app.exe -DestinationPath ${{ matrix.asset_name }}
+        run: Compress-Archive -Path target/release/chem-app.exe -DestinationPath ${{ matrix.asset_name }}
 
       - name: Upload release asset
         env:
@@ -87,13 +87,16 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # Publish order follows the internal dependency graph: chemcore has no
-      # internal deps; chemgpu/chemio depend only on chemcore; chemfp depends
-      # on all three. chem_app is a GUI binary, not published as a library.
+      # One crate, so there is no ordering problem and no inter-crate version
+      # sync. `--locked` publishes exactly what CI verified.
+      #
+      # chem-app is a GUI binary carrying `publish = false`; it ships as a
+      # release asset above. `--all-features` so the published package is
+      # verified with `gpu` and `cli` compiled, not just the default surface.
       #
       # `secrets` isn't a valid context for a job-level `if`, so the
       # not-configured-yet skip has to happen inside the step instead.
-      - name: Publish crates (skips if CARGO_REGISTRY_TOKEN isn't set)
+      - name: Publish chem (skips if CARGO_REGISTRY_TOKEN isn't set)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -101,9 +104,4 @@ jobs:
             echo "::notice::CARGO_REGISTRY_TOKEN not set - skipping crates.io publish (add the secret to enable)"
             exit 0
           fi
-          cargo publish -p chemcore
-          sleep 20
-          cargo publish -p chemgpu
-          cargo publish -p chemio
-          sleep 20
-          cargo publish -p chemfp
+          cargo publish -p chem --locked --all-features

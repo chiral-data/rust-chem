@@ -1,9 +1,11 @@
 [workspace]
-members = ["chem_app","chemcore", "chemfp", "chemgpu", "chemio"]
+# A glob rather than a list: this milestone adds two more crates, and a
+# members list is one more place to forget.
+members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 license = "MIT"
 repository = "https://github.com/chiral-data/rust-chem"
 
@@ -13,6 +15,11 @@ nom  = "8.0.0" # Build safe Parsers
 rfd = "0.16"
 wgpu = "27.0.1"
 egui = { version = "0.33.3", features = ["persistence"] }
+# egui's own geometry and colour crates, published separately. Depending on
+# them directly is what lets `chem::draw` describe a depiction without a GUI;
+# egui re-exports these very types, so `chem-app` needs no conversions.
+emath = "0.33.3"
+ecolor = "0.33.3"
 rayon = "1.11.0"
 eframe = { version = "0.33.3", features = ["persistence"] }
 anyhow = "1.0"
@@ -24,8 +31,5 @@ serde = { version = "1.0", features = ["derive"] }
 env_logger = "0.11.8"
 egui_extras = "0.33.3"
 
-chemio = { path = "./chemio" }
-chemfp = { path = "./chemfp" }
-chemgpu = { path = "./chemgpu" }
-chemcore = { path = "./chemcore" }
+chem = { path = "./crates/chem" }
 

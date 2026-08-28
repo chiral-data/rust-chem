@@ -1,0 +1,87 @@
+[package]
+name = "chem"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Cheminformatics in Rust: molecules, SMILES/SDF, fingerprints, similarity search, 2D depiction"
+
+keywords = ["chemistry", "cheminformatics", "smiles", "fingerprint", "gpu"]
+categories = ["science", "parser-implementations", "visualization"]
+documentation = "https://docs.rs/chem"
+readme = "README.md"
+
+# docs.rs builds with every feature so `chem::gpu` is documented; `docsrs`
+# enables the per-item feature banners, so a reader can see what needs
+# enabling without cross-referencing the manifest.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# core / io
+nom = { workspace = true }
+thiserror = { workspace = true }
+# fp
+bitvec = "1.0.1"
+fxhash = "0.2.1"
+# gpu — optional; see [features]
+wgpu = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+log = { workspace = true }
+# draw
+ecolor = { workspace = true }
+emath = { workspace = true }
+serde = { workspace = true }
+# search
+anyhow = { workspace = true }
+# cli
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+[features]
+default = []
+# `wgpu` is a large tree and irrelevant to anyone parsing SMILES or
+# fingerprinting on a CPU — which is what every GPU-less machine and every
+# WebAssembly build already do. Off by default is also the reversible
+# direction: adding a feature to `default` later is non-breaking, removing one
+# is not.
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:futures", "dep:pollster"]
+# Implies `gpu`: the CLI's `--backend gpu` calls into the GPU paths, and
+# headless GPU access is one of the reasons the tool exists.
+cli = ["dep:clap", "dep:pollster", "gpu"]
+
+# The binary is `chem`; the package is too. `required-features` keeps clap out
+# of every library consumer's tree — Cargo has no bin-only dependency section,
+# so a feature is the only way to express "this dependency is for the binary".
+[[bin]]
+name = "chem"
+path = "src/bin/chem/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
+[[test]]
+name = "gpu_cpu_parity"
+required-features = ["gpu"]
+
+[[test]]
+name = "large_batch_dispatch_cap"
+required-features = ["gpu"]
+
+[[example]]
+name = "hello_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "search_cpu_vs_gpu"
+required-features = ["gpu"]
+
+[dev-dependencies]
+# Examples install their own logger; the library never does.
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }
