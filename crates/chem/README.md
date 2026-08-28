@@ -33,6 +33,20 @@ let fp = MorganFingerprint::get_fingerprint_as_bitvec(
 Longer notes: [core data structures](docs/core.md), [the Morgan
 algorithm](docs/morgan.md).
 
+## Examples
+
+Runnable, one idea each. `cargo run --example <name>`, and docs.rs renders them
+on the crate page.
+
+| example | shows |
+| --- | --- |
+| `build_a_molecule` | atoms and bonds by hand, implicit hydrogens, computing 2D coordinates |
+| `read_and_convert` | reading a `.smi` or `.sdf`, what happens to records that fail, perceiving aromaticity, writing SDF back |
+| `rank_by_similarity` | fingerprinting a small library and ranking it by Tanimoto |
+| `smiles_to_svg` | parse, lay out, draw — takes a SMILES and an output path |
+| `hello_gpu` | the GPU context and a compute pipeline (needs `--features gpu`) |
+| `search_cpu_vs_gpu` | where the GPU starts paying for itself (needs `--features gpu`) |
+
 ## Features
 
 `gpu` is **off by default**. `wgpu` is a large dependency tree and irrelevant to
