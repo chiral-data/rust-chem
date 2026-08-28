@@ -2,6 +2,51 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] - 2026-08-28
+
+**`chem` is on crates.io.** Everything the workbench could do is now available as a library and a command-line tool: `chem = "0.6"` for the library, `cargo install chem --features cli` for the tool.
+
+The libraries were seven crates. They are one. crates.io has a flat namespace, so seven crates meant claiming seven names permanently for one project — and nothing had been published yet, so the choice was still free. One crate is the reversible direction: splitting later is easy, un-publishing seven abandoned names is not. `chem::core`, `chem::io`, `chem::fp`, `chem::gpu`, `chem::draw`, `chem::search`.
+
+### Features
+
+- **A `chem` command-line tool** with six subcommands over the same operations the workbench runs: `info`, `fp`, `search`, `aromatic`, `coords`, `draw`. It reads a named file or standard input, writes to `-o` or standard output, and puts progress and warnings on standard error — so `chem aromatic x.smi | chem fp` composes. Exit codes distinguish an unusable file from an empty result (#139, #140, #141, #142)
+- **Depiction became a library.** `describe_structure`, the shape types and the SVG writer left the GUI crate, so anything can draw a molecule without linking a window and a GPU surface (#138)
+- **File-level reading became a library.** Splitting a `.smi` by line and an `.sdf` on `$$$$` lived in the app; now both front ends agree, by construction, on what a file contains. Records that fail come back to the caller rather than into a log, which is what lets a batch tool count them and exit on them (#139)
+- **An SDF writer.** There was none, so 2D coordinates had nowhere to go — SMILES cannot carry them, and `chem coords` would have discarded the thing it just computed (#161)
+- **Backend selection became a library**, so the CLI reaches the GPU kernels with no window server (#140)
+- The GPU is behind an off-by-default `gpu` feature: **32 dependencies without it, 177 with**. `wgpu` is irrelevant to anyone parsing SMILES or fingerprinting on a CPU, which is what every GPU-less machine and every WebAssembly build already do (#144)
+- Six runnable examples, rendered by docs.rs (#145)
+
+### Bug Fixes
+
+Four in the SMILES parser, all found by pointing a batch tool at whole files rather than one molecule at a time.
+
+- **An unspecified bond to an aromatic atom parsed as aromatic even when the other atom was not.** The default consulted only the atom being added, so the answer depended on which end the author wrote first: `Oc1ccccc1` got an aromatic C–O bond and `c1ccccc1O` did not, and the two spellings of phenol scored 0.467 against each other. **32 of the 122 molecules in `test.smi` were affected** — every toluene, cresol, xylene and aniline in the file had a wrong fingerprint (#167)
+- **Aromaticity detection missed pyridine-type nitrogen entirely**, returning zero aromatic atoms for pyridine, pyrimidine, pyrazine and imidazole, and 6 of 10 for quinoline. The π-electron count was inverted and keyed off atom degree, which cannot distinguish the two nitrogen types. A single pass also under-detected fused rings order-dependently — naphthalene needed two passes while anthracene needed one, so detection depended on how the SMILES was written (#160)
+- **Back-to-back ring-closure digits were read as one number.** A bare ring label is exactly one digit, so `c12` closes rings 1 and 2 — but `digit1` consumed both, leaving them open. Anthracene and quinoline failed to parse at all while their isomers succeeded, purely because of where the digits landed (#69)
+- **A string of bond characters parsed as a molecule.** Every bond character is legal in isolation, so `$$$$` — the SDF record terminator — built an atomless molecule reported as success. Reading an SDF as SMILES exited 0 claiming to have read molecules (#151)
+
+### Corrections to v0.5.0 and earlier
+
+- `chemfp` shipped three binaries from a library crate, a dead 79-line `BitVec` nothing imported, a commented-out copy of its own module list, and a `rayon` dependency used only in a doc comment
+- `gpu::init_logging()` called `env_logger::builder().init()`, which panics if a logger already exists — a landmine in a library, since the caller cannot know whether something got there first
+- `crates/chem-app/README` and the root README described the repository around v0.1.0 and cited paths that had moved twice
+
+### Testing
+
+278 tests at the start of this milestone, **353** at the end. Three findings worth recording:
+
+- Two tests were written to match the behaviour rather than the specification. `test_parse_ring_number` had a comment reading "only takes first digit" above an assertion expecting `123`; the polycyclic aromaticity test used lowercase SMILES and admitted in its own comment that the parser had already set every flag before detection ran — it would have passed with the function deleted
+- `build_molecule` produced four separate bugs this milestone, so the aromatic-bond test asserts the *invariant* — no aromatic bond may have a non-aromatic endpoint — rather than a fifth list of cases
+- Asserting on fingerprints from inside the SMILES parser's own tests only became possible once the crates merged
+
+### Known limitations
+
+- Aromaticity perception is a Hückel heuristic over the SSSR. Exotic systems and charged aromatics are untested
+- SDF output writes atoms, bonds and 2D coordinates; charges, isotopes, chirality and bond stereo are not yet written, and aromatic bonds are written as type 4, a query bond type in strict molfile
+- The GPU path panics on a batch large enough to outgrow `max_storage_buffer_binding_size` (#158), and `--backend auto` prefers the GPU even for a one-shot search where it is slower (#159)
+
 ## [0.5.0] - 2026-08-22
 
 Floating-window workbench UI — `chem_app` moves from four fixed panels to a menu bar over a free canvas, with **Datasets**, **Operations**, **Inspector** and **Settings** as windows whose arrangement survives a restart. Plus the visualization work deferred from v0.4.0: SVG export, layout refinement for bridged systems, and structures in search results.
