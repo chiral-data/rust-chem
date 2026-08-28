@@ -309,6 +309,7 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
     let mut stack: Vec<usize> = Vec::new();
     let mut current_atom: Option<usize> = None;
     let mut next_bond: Option<BondToken> = None;
+    let mut dangling_bond = false;
     let mut rings: HashMap<u32, (usize, Option<BondToken>)> = HashMap::new();
 
     for token in tokens {
@@ -352,6 +353,15 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
             }
 
             Token::Bond(bond_token) => {
+                if current_atom.is_none() {
+                    // `=CC` — a bond before any atom. Recorded rather than
+                    // returned here, so that a string of nothing but bond
+                    // characters still reports NoAtoms below. `$` is the
+                    // quadruple-bond token, so `$$$$` reaches this arm four
+                    // times, and "No atoms in SMILES" names that mistake far
+                    // better than "a bond has no atom to attach to" would.
+                    dangling_bond = true;
+                }
                 next_bond = Some(*bond_token);
             }
 
@@ -402,7 +412,11 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
     }
 
     if !rings.is_empty() {
-        return Err(SmilesError::UnclosedRing(*rings.keys().next().unwrap()));
+        // Sorted: `rings` is a HashMap, so taking an arbitrary key made the same
+        // input report a different ring between runs (#153).
+        let mut open: Vec<u32> = rings.keys().copied().collect();
+        open.sort_unstable();
+        return Err(SmilesError::UnclosedRings(open));
     }
 
     if !stack.is_empty() {
@@ -420,6 +434,12 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
     // checking "did anything parse?" was told yes.
     if mol.num_atoms() == 0 {
         return Err(SmilesError::NoAtoms);
+    }
+
+    // After the atom-count check, so an atomless string keeps the better
+    // message. `next_bond` still set means a trailing bond: `CC=` (#155).
+    if dangling_bond || next_bond.is_some() {
+        return Err(SmilesError::DanglingBond);
     }
 
     mol.calculate_implicit_hydrogens();
@@ -925,6 +945,59 @@ mod tests {
         // report one atomless molecule per record. That defeated the "did
         // anything parse?" check a caller relies on to notice a wrong format.
         assert!(parse_smiles("$$$$").is_err());
+    }
+
+    #[test]
+    fn test_every_unclosed_ring_is_reported_and_sorted() {
+        // It used to name one arbitrary HashMap key, so the same input reported
+        // a different ring between runs (#153). Both are genuinely open, and
+        // naming one tells the reader least.
+        let Err(SmilesError::UnclosedRings(open)) = parse_smiles("C1CC2") else {
+            panic!("expected UnclosedRings");
+        };
+        assert_eq!(open, vec![1, 2]);
+
+        // The message is what a user actually sees, and sorting is only
+        // observable through it — an unsorted Vec would still contain both.
+        let message = parse_smiles("C1CC2").unwrap_err().to_string();
+        assert_eq!(message, "Unclosed rings: 1, 2");
+    }
+
+    #[test]
+    fn test_a_bond_with_nothing_to_attach_to_is_rejected() {
+        // Both used to parse as ethane — a real molecule, quietly different
+        // from the one written, which is worse than a rejection (#155).
+        for input in ["=CC", "CC=", "#CC", "CCO="] {
+            assert!(
+                matches!(parse_smiles(input), Err(SmilesError::DanglingBond)),
+                "{input:?} should be DanglingBond, got {:?}",
+                parse_smiles(input).map(|m| (m.num_atoms(), m.num_bonds()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_real_bonds_are_untouched() {
+        // The other direction: a check this aggressive could reject valid
+        // input, and every one of these has a bond symbol in it.
+        for input in ["C=C", "C#N", "CC(=O)O", "c1ccccc1-c1ccccc1", "C=1CCCCC1"] {
+            assert!(parse_smiles(input).is_ok(), "{input:?} should parse");
+        }
+    }
+
+    #[test]
+    fn test_an_atomless_string_still_reports_no_atoms() {
+        // Ordering, asserted rather than left to `test_a_string_with_no_atoms_
+        // is_an_error` to notice. `$` is the quadruple-bond token, so `$$$$` —
+        // the SDF record terminator — is four dangling bonds and no atoms.
+        // Both complaints are true; "No atoms in SMILES" names the mistake
+        // someone actually made, which is reading an SDF as SMILES.
+        for input in ["$$$$", "=", "===="] {
+            assert!(
+                matches!(parse_smiles(input), Err(SmilesError::NoAtoms)),
+                "{input:?} should prefer NoAtoms over DanglingBond"
+            );
+        }
     }
 
     #[test]
