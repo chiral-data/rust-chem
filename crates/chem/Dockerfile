@@ -21,7 +21,7 @@ COPY . .
 # To make the image self-contained, we can pre-build the binary.
 # The script is smart enough not to rebuild if it's already there.
 # This ensures all dependencies are fetched when the image is built.
-RUN cargo build --bin cli
+RUN cargo build --release -p chem --features cli
 
 # Set the default command to run the Python validation script
-CMD ["python3", "chemfp/compare.py"]
+CMD ["python3", "crates/chem/compare.py"]

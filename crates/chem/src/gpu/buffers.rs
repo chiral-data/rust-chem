@@ -62,7 +62,7 @@ impl<'a> BufferManager<'a> {
 
     /// Write data to a buffer at a given byte offset — for populating one
     /// region of a larger buffer shared by several logically distinct
-    /// arrays (see chemgpu/src/shaders/morgan.wgsl's combined `scratch`
+    /// arrays (see crates/chem/src/gpu/shaders/morgan.wgsl's combined `scratch`
     /// binding).
     pub fn write_buffer_at<T: bytemuck::Pod>(
         &self,

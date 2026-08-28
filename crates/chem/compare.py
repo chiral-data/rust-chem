@@ -15,12 +15,12 @@ except ImportError:
 class Validator:
     def __init__(self):
         self.project_root = Path(__file__).parent.parent
-        self.binary_path = self.project_root / "target" / "release" / "cli"
+        self.binary_path = self.project_root / "target" / "release" / "chem"
 
     def build(self):
         print("Building Rust binary...")
         result = subprocess.run(
-            ["cargo", "build", "--release", "--bin", "cli"],
+            ["cargo", "build", "--release", "-p", "chem", "--features", "cli"],
             cwd=self.project_root,
             capture_output=True,
             text=True,
@@ -80,18 +80,40 @@ class Validator:
         }
 
     def get_rust_fp(self, smiles, radius=2, nbits=2048):
-        """Get Rust fingerprint bits."""
+        """Get Rust fingerprint bits, via `chem fp`.
+
+        `chem fp` reads molecules on stdin and writes a self-describing file:
+        `#` metadata, a column header, then `name<TAB>hex` per molecule. The hex
+        is least-significant-bit-first within each nibble, so bit *n* lives in
+        character *n // 4* at position *n % 4*.
+        """
         result = subprocess.run(
-            [str(self.binary_path), smiles, str(radius), str(nbits)],
+            [
+                str(self.binary_path), "fp", "-",
+                "--radius", str(radius), "--size", str(nbits),
+            ],
+            input=f"{smiles} query\n",
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             return None
-        output = result.stdout.strip()
-        if not output:
+
+        rows = [
+            line for line in result.stdout.splitlines()
+            if line and not line.startswith("#") and not line.startswith("name\t")
+        ]
+        if not rows:
             return []
-        return sorted(map(int, output.split(",")))
+        hex_digits = rows[0].split("\t")[1].strip()
+
+        bits = []
+        for index, char in enumerate(hex_digits):
+            nibble = int(char, 16)
+            for offset in range(4):
+                if nibble & (1 << offset):
+                    bits.append(index * 4 + offset)
+        return sorted(b for b in bits if b < nbits)
 
     def compare(self, smiles, name, radius=2, nbits=2048):
         """Compare side-by-side."""

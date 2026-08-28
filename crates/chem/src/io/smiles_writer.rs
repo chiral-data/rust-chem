@@ -419,14 +419,13 @@ mod tests {
     fn test_round_trip_smiles() {
         let test_data: Vec<&str> = vec![
             "Oc1ccccc1",
-            // "Oc1cccc2ccccc12" is omitted: chemio's parser mis-tokenizes
-            // back-to-back bare ring-closure digits ("12") as one ring
-            // number 12 rather than two separate closures (1, then 2) --
-            // a pre-existing parser limitation unrelated to this writer.
+            // Re-enabled by #154: the parser used to mis-tokenize back-to-back
+            // bare ring-closure digits ("12") as one ring number 12 rather than
+            // two closures. Both this and the fused-ring case below round-trip
+            // exactly now, writer output included.
+            "Oc1cccc2ccccc12",
             "CC(C)(CCCOc1cc(Cl)c(OCCCC(C)(C)C(=O)O)cc1Cl)C(=O)O", // 4631
-            // "OCCCCCNCc1c2ccccc2c(CNCCCCCO)c2ccccc12" is omitted for the
-            // same back-to-back-ring-closure-digit reason as above (ends
-            // in "c12").
+            "OCCCCCNCc1c2ccccc2c(CNCCCCCO)c2ccccc12",
             "CC1(C)c2ccc([nH]2)C2(C)CCCCNC(=O)c3cccc(n3)C(=O)NCCCCC(C)(c3ccc1[nH]3)c1ccc([nH]1)C(C)(C)c1ccc2[nH]1", // 4971
             // "C1CC1N1CN2c3nonc3N3CN(C4CC4)CN4c5nonc5N(C1)C2C34" is omitted
             // for the same reason (ends in "C34").

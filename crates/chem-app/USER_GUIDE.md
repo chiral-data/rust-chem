@@ -1,6 +1,6 @@
 # Chem Workbench — User Guide
 
-`chem-app` is a cheminformatics workbench built on `chemcore`, `chemio`, `chemfp`, and `chemgpu`: it loads SMILES and SDF datasets, draws structures, computes Morgan fingerprints, detects aromaticity, and searches by Tanimoto similarity. It runs both as a native desktop app and as a browser (WASM) build.
+`chem-app` is a cheminformatics workbench built on `chem::core`, `chem::io`, `chem::fp`, and `chem::gpu`: it loads SMILES and SDF datasets, draws structures, computes Morgan fingerprints, detects aromaticity, and searches by Tanimoto similarity. It runs both as a native desktop app and as a browser (WASM) build.
 
 ## Running it
 
