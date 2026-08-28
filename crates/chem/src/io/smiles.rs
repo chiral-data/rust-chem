@@ -317,13 +317,27 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                 let atom_idx = add_atom_from_token(&mut mol, atom_token)?;
 
                 if let Some(prev_atom) = current_atom {
-                    let bond_order = next_bond // This is the previous pending_bond that will be applied NOW.
+                    // With no explicit bond symbol, a bond is aromatic only when
+                    // **both** atoms are. Consulting only the atom being added
+                    // makes the result depend on which end the author wrote
+                    // first: `c1ccccc1O` gave the C-O bond Single and
+                    // `Oc1ccccc1` gave it Aromatic, for the same molecule. That
+                    // is #167, and it put a wrong fingerprint on 32 of the 122
+                    // molecules in test.smi — every substituted aromatic written
+                    // substituent-first.
+                    //
+                    // The ring-closure branch below has always had this right;
+                    // its comment claims this path "already infers this", which
+                    // is what kept the bug hidden.
+                    let implicit_order = if atom_token.aromatic && mol.atom(prev_atom).is_aromatic()
+                    {
+                        BondOrder::Aromatic
+                    } else {
+                        BondOrder::Single
+                    };
+                    let bond_order = next_bond // the pending_bond, applied NOW
                         .map(|b| b.to_bond_order())
-                        .unwrap_or(if atom_token.aromatic {
-                            BondOrder::Aromatic
-                        } else {
-                            BondOrder::Single
-                        });
+                        .unwrap_or(implicit_order);
 
                     let mut bond = Bond::new(prev_atom, atom_idx, bond_order);
                     if bond_order == BondOrder::Aromatic {
@@ -356,11 +370,11 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                 let current = current_atom.ok_or(SmilesError::InvalidRing(*ring_num))?;
 
                 if let Some((ring_start, ring_bond)) = rings.remove(ring_num) {
-                    // With no explicit bond symbol, a bond between two aromatic
-                    // atoms is aromatic. The atom-to-atom path below already
-                    // infers this; ring-closure bonds used to default to Single
+                    // Same rule as the atom-to-atom path above: with no
+                    // explicit bond symbol, a bond is aromatic only when both
+                    // atoms are. Ring-closure bonds used to default to Single
                     // regardless, so `c1ccccc1` came out with five aromatic
-                    // bonds and one single one.
+                    // bonds and one single one (#94).
                     let implicit_order =
                         if mol.atom(ring_start).is_aromatic() && mol.atom(current).is_aromatic() {
                             BondOrder::Aromatic
@@ -936,6 +950,106 @@ mod tests {
             let mol = parse_smiles(input).unwrap_or_else(|e| panic!("{input}: {e}"));
             assert!(mol.num_atoms() > 0, "{input}");
         }
+    }
+
+    /// An unspecified bond is aromatic only when **both** atoms are. Checking
+    /// only the atom being added made the answer depend on which end the author
+    /// wrote first, which is #167.
+    #[test]
+    fn test_a_substituent_bond_is_single_whichever_end_is_written_first() {
+        for (smiles, aromatic_bonds) in [
+            ("c1ccccc1O", 6),
+            ("Oc1ccccc1", 6),
+            ("c1ccc(O)cc1", 6),
+            ("Cc1ccccc1", 6),
+            ("c1ccccc1C", 6),
+            ("CCc1ccccc1", 6),
+        ] {
+            let mol = parse_smiles(smiles).expect(smiles);
+            let found = (0..mol.num_bonds())
+                .filter(|&i| mol.bond(i).is_aromatic())
+                .count();
+            assert_eq!(found, aromatic_bonds, "{smiles}");
+        }
+    }
+
+    #[test]
+    fn test_no_aromatic_bond_has_a_non_aromatic_atom() {
+        // The invariant, rather than a list of cases. It is what would have
+        // caught both this and #94, and it keeps catching whatever comes next.
+        for smiles in [
+            "c1ccccc1O",
+            "Oc1ccccc1",
+            "Cc1ccccc1O",
+            "CC(C)c1ccc(O)cc1",
+            "c1ccc2ccccc2c1",
+            "Cn1cnc2c1c(=O)n(C)c(=O)n2C",
+            "CC(=O)Oc1ccccc1C(=O)O",
+        ] {
+            let mol = parse_smiles(smiles).expect(smiles);
+            for i in 0..mol.num_bonds() {
+                let bond = mol.bond(i);
+                if bond.is_aromatic() {
+                    assert!(
+                        mol.atom(bond.atom1()).is_aromatic()
+                            && mol.atom(bond.atom2()).is_aromatic(),
+                        "{smiles}: bond {i} is aromatic but an endpoint is not"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_two_spellings_of_one_molecule_fingerprint_identically() {
+        // The symptom that made #167 visible, asserted where it actually
+        // matters. Equal bond counts would pass on a molecule whose bonds were
+        // the wrong *kind*; equal fingerprints would not.
+        use crate::fp::morgan::MorganFingerprint;
+
+        let fp = |smiles: &str| {
+            let mol = parse_smiles(smiles).expect(smiles);
+            MorganFingerprint::get_fingerprint_as_bitvec(
+                &mol, 2, 2048, None, None, false, true, false,
+            )
+            .expect("fingerprint")
+        };
+
+        let reference = fp("c1ccccc1O");
+        for other in ["Oc1ccccc1", "c1ccc(O)cc1"] {
+            assert_eq!(fp(other), reference, "{other} should match c1ccccc1O");
+        }
+
+        let toluene = fp("Cc1ccccc1");
+        assert_eq!(fp("c1ccccc1C"), toluene);
+        // ...and a different molecule must still differ, or the test above
+        // would pass on a fingerprint function that returned a constant.
+        assert_ne!(toluene, reference);
+    }
+
+    #[test]
+    fn test_a_biaryl_bond_needs_its_explicit_single() {
+        // Where the rule could look like it over-fires, and does not. Two
+        // aromatic rings joined by a single bond must say so: SMILES treats an
+        // unspecified bond between aromatic atoms as aromatic, which is exactly
+        // why biphenyl is written with the dash.
+        let explicit = parse_smiles("c1ccccc1-c1ccccc1").expect("biphenyl");
+        assert_eq!(
+            (0..explicit.num_bonds())
+                .filter(|&i| explicit.bond(i).is_aromatic())
+                .count(),
+            12,
+            "the linking bond must stay single"
+        );
+
+        let implicit = parse_smiles("c1ccccc1c1ccccc1").expect("dash-less");
+        assert_eq!(
+            (0..implicit.num_bonds())
+                .filter(|&i| implicit.bond(i).is_aromatic())
+                .count(),
+            13,
+            "without the dash the linking bond is aromatic, per the spec"
+        );
     }
 
     #[test]
