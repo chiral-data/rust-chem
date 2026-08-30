@@ -10,6 +10,7 @@ ChemCore provides the fundamental building blocks for representing molecules:
 - **Bonds**: Connections with order and stereochemistry
 - **Molecules**: Complete molecular structures
 - **Graph**: Efficient connectivity queries
+- **Side tables**: Per-atom data a file supplied — 2D layout, 3D conformer, atom sites
 
 ## Quick Start
 
@@ -302,6 +303,16 @@ Graph (star):
 - Aromaticity flag
 - Implicit hydrogens (calculated or set)
 
+Note what is **not** here: no coordinates, no partial charge, no occupancy, no
+temperature factor, no atom name. Those live on the molecule as side tables, for
+two reasons.
+
+The mechanical one is that `Atom` derives `Eq`, and every one of them is a float.
+The honest one is that they are a different kind of fact. An element is a
+property of a species; a B-factor is a property of one *observation* of it. Two
+files describing the same molecule will agree on the first and disagree on the
+second.
+
 ### 2. Bonds Store Connectivity
 
 - Two atom indices
@@ -314,6 +325,34 @@ Graph (star):
 - Collection of bonds
 - Graph for fast queries
 - Properties (metadata)
+- Up to three per-atom side tables, each independently present or absent
+
+### 3a. The Side Tables
+
+Each is `Option<Vec<T>>`, indexed in parallel with `atoms`, and all-or-nothing —
+there is no meaningful state where only some atoms have a position.
+
+| Table | Type | Comes from | Accessors |
+|---|---|---|---|
+| 2D layout | `Point2` | a layout pass, or a flat SDF | `coords`, `coord`, `set_coords`, … |
+| 3D conformer | `Point3` | a file that states geometry: XYZ, PDB, Mol2, a 3D SDF | `coords3`, `coord3`, `set_coords3`, … |
+| Atom sites | `AtomSite` | file columns: name, alt-loc, partial charge, occupancy, B-factor, radius | `sites`, `site`, `set_sites`, … |
+
+**The layout and the conformer are different artefacts, and neither is derivable
+from the other.** A layout is computed for drawing; a conformer is physical. A
+molecule read from a 3D file and then laid out for display legitimately has both,
+and depiction wants the first while a conversion to XYZ wants the second.
+Projecting a conformer to get a layout superimposes atoms that differ only in
+depth, which is why `Point3::to_2d` is explicit rather than a `From` impl.
+
+`set_*` rejects a length that is not exactly one per atom, because the tables are
+positional: a mismatch would silently attribute a charge or a B-factor to the
+wrong atom.
+
+**`add_atom` drops all three.** It is the only method that can change the atom
+count — there is no `remove_atom`, and `atoms_mut()` returns a slice, so the
+length cannot change through it. That single choke point is what makes the
+parallel-array model safe.
 
 ### 4. Graph Enables Queries
 

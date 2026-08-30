@@ -3,6 +3,7 @@ use crate::core::bond::Bond;
 use crate::core::elements::ATOMIC_MASSES;
 use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
+use crate::core::site::AtomSite;
 
 use std::{collections::HashMap, fmt};
 
@@ -33,6 +34,9 @@ pub enum MoleculeError {
 
     #[error("Expected {expected} coordinates (one per atom), got {got}")]
     CoordinateCountMismatch { expected: usize, got: usize },
+
+    #[error("Expected {expected} atom sites (one per atom), got {got}")]
+    SiteCountMismatch { expected: usize, got: usize },
 }
 
 /// Represents a complete molecule with atoms, bonds, and connectivity.
@@ -65,6 +69,18 @@ pub struct Molecule {
     /// both, and depiction wants the first while a conversion to XYZ wants the
     /// second.
     coords3: Option<Vec<Point3>>,
+    /// Per-atom file data — names, partial charges, occupancies, temperature
+    /// factors — one per atom, indexed in parallel with `atoms`. `None` for
+    /// every molecule that did not come from a format carrying such columns,
+    /// which is most of them.
+    ///
+    /// A third side table rather than fields on [`Atom`] for the reason the
+    /// coordinates give: `Atom` derives `Eq`, and these are floats. It is also
+    /// the honest shape — an element is a fact about a species, while a
+    /// B-factor is a fact about one observation of it, and two files of the
+    /// same molecule will disagree about the second while agreeing on the
+    /// first.
+    sites: Option<Vec<AtomSite>>,
 }
 
 impl Molecule {
@@ -77,6 +93,7 @@ impl Molecule {
             properties: HashMap::new(),
             coords: None,
             coords3: None,
+            sites: None,
         }
     }
 
@@ -89,6 +106,7 @@ impl Molecule {
             properties: HashMap::new(),
             coords: None,
             coords3: None,
+            sites: None,
         }
     }
 
@@ -109,8 +127,12 @@ impl Molecule {
         // rather than leave the two out of sync — the layout has to be redone
         // to place the new atom anyway. The conformer goes for the same
         // reason, and there is no way to invent a position for the new atom.
+        // The site table is dropped on the same grounds: it is indexed in
+        // parallel with `atoms` too, and a file supplied it for a set of atoms
+        // this is no longer.
         self.coords = None;
         self.coords3 = None;
+        self.sites = None;
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -265,6 +287,56 @@ impl Molecule {
     /// [`Self::set_coords3`] to establish one first.
     pub fn coords3_mut(&mut self) -> Option<&mut [Point3]> {
         self.coords3.as_deref_mut()
+    }
+
+    /// This molecule's per-atom file data, one entry per atom, or `None` if it
+    /// carries none. Independent of both coordinate sets.
+    pub fn sites(&self) -> Option<&[AtomSite]> {
+        self.sites.as_deref()
+    }
+
+    /// The site record for a single atom, or `None` if this molecule has no
+    /// site data or `atom_idx` is out of range.
+    ///
+    /// Returns a reference rather than a copy, unlike [`Self::coord3`]:
+    /// `AtomSite` holds a `String` and is not `Copy`.
+    pub fn site(&self, atom_idx: usize) -> Option<&AtomSite> {
+        self.sites.as_ref()?.get(atom_idx)
+    }
+
+    pub fn has_sites(&self) -> bool {
+        self.sites.is_some()
+    }
+
+    /// Sets this molecule's per-atom file data.
+    ///
+    /// # Errors
+    /// [`MoleculeError::SiteCountMismatch`] if `sites.len()` isn't exactly one
+    /// per atom — the same all-or-nothing rule [`Self::set_coords`] enforces,
+    /// and for the same reason: the table is indexed in parallel with `atoms`,
+    /// so a mismatched length would silently misattribute a charge or a
+    /// B-factor to the wrong atom.
+    pub fn set_sites(&mut self, sites: Vec<AtomSite>) -> Result<(), MoleculeError> {
+        if sites.len() != self.atoms.len() {
+            return Err(MoleculeError::SiteCountMismatch {
+                expected: self.atoms.len(),
+                got: sites.len(),
+            });
+        }
+        self.sites = Some(sites);
+        Ok(())
+    }
+
+    /// Discards any per-atom file data, leaving both coordinate sets untouched.
+    pub fn clear_sites(&mut self) {
+        self.sites = None;
+    }
+
+    /// Mutable access to the site table, for a pass filling in a column the
+    /// reader could not. `None` if this molecule has no site data yet — use
+    /// [`Self::set_sites`] to establish it first.
+    pub fn sites_mut(&mut self) -> Option<&mut [AtomSite]> {
+        self.sites.as_deref_mut()
     }
 
     pub fn set_name(&mut self, name: String) {
@@ -560,18 +632,131 @@ mod tests {
     }
 
     #[test]
-    fn test_adding_an_atom_drops_both_coordinate_sets() {
+    fn test_sites_are_independent_of_both_coordinate_sets() {
+        // The state a PDB reader produces: geometry from the file, site data
+        // from the same file, and a layout computed later for drawing. All
+        // three are indexed in parallel with `atoms` and none may disturb the
+        // others.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert!(!mol.has_sites());
+        assert!(mol.sites().is_none());
+        assert!(mol.site(0).is_none());
+
+        mol.set_coords3(vec![
+            Point3::new(0.0, 0.0, -1.0),
+            Point3::new(1.0, 0.0, 1.0),
+        ])
+        .unwrap();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+        mol.set_sites(vec![
+            AtomSite {
+                name: Some("CA".to_string()),
+                occupancy: Some(1.0),
+                b_factor: Some(23.45),
+                ..AtomSite::default()
+            },
+            AtomSite {
+                name: Some("OD1".to_string()),
+                partial_charge: Some(-0.4157),
+                ..AtomSite::default()
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(mol.site(0).unwrap().name.as_deref(), Some("CA"));
+        assert_eq!(mol.site(1).unwrap().partial_charge, Some(-0.4157));
+        assert_eq!(mol.coord3(1), Some(Point3::new(1.0, 0.0, 1.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
+
+        // Clearing one leaves the other two standing.
+        mol.clear_sites();
+        assert!(!mol.has_sites());
+        assert!(mol.has_coords());
+        assert!(mol.has_coords3());
+    }
+
+    #[test]
+    fn test_a_b_factor_survives_untouched() {
+        // Pinned deliberately. OpenBabel zeroes this column on every PDB write,
+        // and a predicted structure reuses it for per-atom confidence — so the
+        // value has to come back exactly, and being different from that
+        // behaviour is the point rather than an accident.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.set_sites(vec![AtomSite {
+            b_factor: Some(87.31),
+            ..AtomSite::default()
+        }])
+        .unwrap();
+
+        let cloned = mol.clone();
+        assert_eq!(cloned.site(0).unwrap().b_factor, Some(87.31));
+
+        if let Some(sites) = mol.sites_mut() {
+            sites[0].occupancy = Some(0.5);
+        }
+        assert_eq!(mol.site(0).unwrap().b_factor, Some(87.31));
+        assert_eq!(mol.site(0).unwrap().occupancy, Some(0.5));
+    }
+
+    #[test]
+    fn test_set_sites_rejects_wrong_count() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        let too_few = mol.set_sites(vec![AtomSite::empty()]);
+        assert!(matches!(
+            too_few,
+            Err(MoleculeError::SiteCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert!(!mol.has_sites());
+
+        let too_many = mol.set_sites(vec![
+            AtomSite::empty(),
+            AtomSite::empty(),
+            AtomSite::empty(),
+        ]);
+        assert!(matches!(
+            too_many,
+            Err(MoleculeError::SiteCountMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+        assert!(!mol.has_sites());
+    }
+
+    #[test]
+    fn test_adding_an_atom_drops_every_per_atom_table() {
         // The conformer goes for the same reason the layout does: it would be
-        // one short, and there is no position to invent for the new atom.
+        // one short, and there is no position to invent for the new atom. The
+        // site table goes with them — `add_atom` is the only method that can
+        // change the atom count, so it is the only place this invariant has to
+        // be maintained, and missing one table here is how a charge silently
+        // ends up on the wrong atom.
         let mut mol = Molecule::new();
         mol.add_atom(Atom::new(Element::carbon()));
         mol.set_coords3(vec![Point3::ORIGIN]).unwrap();
         mol.set_coords(vec![Point2::ORIGIN]).unwrap();
+        mol.set_sites(vec![AtomSite {
+            b_factor: Some(12.0),
+            ..AtomSite::default()
+        }])
+        .unwrap();
 
         mol.add_atom(Atom::new(Element::oxygen()));
 
         assert!(!mol.has_coords3());
         assert!(!mol.has_coords());
+        assert!(!mol.has_sites());
     }
 
     #[test]
