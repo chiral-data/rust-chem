@@ -400,6 +400,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut laid_out = 0;
             let mut kept = 0;
             let mut failed = 0;
+            let mut flattened = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
                 let mut molecule = record.molecule.clone();
@@ -416,9 +417,26 @@ fn run(cli: &Cli) -> Result<i32> {
                 } else {
                     laid_out += 1;
                 }
+
+                // This command produces a depiction, and an SDF atom block
+                // holds one set of positions. A conformer outranks a layout on
+                // write — it is the more valuable data — so leaving it in place
+                // would emit the input unchanged after reporting that a layout
+                // was computed. Drop it, and say so rather than let someone
+                // find a 3D file where they asked for a drawing.
+                if ok && molecule.has_coords3() {
+                    molecule.clear_coords3();
+                    flattened += 1;
+                }
+
                 records.push((record.name.clone(), molecule));
             }
             eprintln!("laid out {laid_out}, kept {kept} existing, {failed} without coordinates");
+            if flattened > 0 {
+                eprintln!(
+                    "discarded the 3D conformer of {flattened} molecules: this writes a 2D depiction, and one atom block cannot carry both"
+                );
+            }
 
             let format = OutputFormat::resolve(*out_format, true, output.as_deref());
             eprintln!("writing {}", format.label());
