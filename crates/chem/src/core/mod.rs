@@ -5,6 +5,7 @@ pub mod graph;
 pub mod layout;
 pub mod molecule;
 pub mod rings;
+pub mod site;
 
 pub mod elements;
 
@@ -17,6 +18,7 @@ pub mod prelude {
     pub use crate::core::layout::{ensure_coords, layout};
     pub use crate::core::molecule::{Molecule, MoleculeError};
     pub use crate::core::rings::{Ring, find_sssr, perceive_rings, ring_count};
+    pub use crate::core::site::AtomSite;
 }
 
 #[cfg(test)]
