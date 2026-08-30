@@ -11,6 +11,7 @@ ChemCore provides the fundamental building blocks for representing molecules:
 - **Molecules**: Complete molecular structures
 - **Graph**: Efficient connectivity queries
 - **Side tables**: Per-atom data a file supplied — 2D layout, 3D conformer, atom sites
+- **Topology**: Chains and residues, for the formats organised by them
 
 ## Quick Start
 
@@ -326,6 +327,7 @@ second.
 - Graph for fast queries
 - Properties (metadata)
 - Up to three per-atom side tables, each independently present or absent
+- Chain and residue topology, for structural formats
 
 ### 3a. The Side Tables
 
@@ -349,10 +351,46 @@ depth, which is why `Point3::to_2d` is explicit rather than a `From` impl.
 positional: a mismatch would silently attribute a charge or a B-factor to the
 wrong atom.
 
-**`add_atom` drops all three.** It is the only method that can change the atom
-count — there is no `remove_atom`, and `atoms_mut()` returns a slice, so the
-length cannot change through it. That single choke point is what makes the
-parallel-array model safe.
+### 3b. Residue and Chain Topology
+
+Separate from the side tables, because chains and residues are not indexed in
+parallel with the atoms — they are collections that *own* ranges of them.
+
+```
+Molecule
+ ├── chains:   Vec<Chain>     — each owns a Range into residues
+ └── residues: Vec<Residue>   — each owns a Range into atoms
+```
+
+Empty means absent; there is no `Option` wrapper, unlike the side tables above.
+
+**Ranges, not a residue index on every atom.** PDB and mmCIF already order their
+records this way and it costs nothing per atom. The price is real and enforced:
+a residue's atoms must be *contiguous*, and the ranges must *ascend* — the
+latter because `residue_of` binary-searches them. `set_topology` validates both,
+plus that ranges stay in bounds and that a residue's `chain_ix` agrees with the
+chain claiming it. An interleaved file is rejected rather than represented.
+
+Ranges need not cover every atom. A ligand appended with no residue information
+is a legal molecule, and `residue_of` answers `None` for it.
+
+**Every residue is numbered twice.** `sequence` is the depositor's number
+(`auth_seq_id`) — what PDB files carry and what papers cite — and `label_seq` is
+mmCIF's canonical one, which is `None` for waters and ligands. They frequently
+disagree and neither is derivable from the other, so reading one and writing the
+other silently renumbers a structure. Chains carry the same pair as `id` and
+`label_id`.
+
+Residue identity is the **(chain, sequence, insertion code)** triple, never the
+number alone: `58`, `58A` and `58B` are three residues, and two chains may each
+have their own `58`.
+
+**`add_atom` drops all three tables and the topology.** It is the only method
+that can change the atom count — there is no `remove_atom`, and `atoms_mut()`
+returns a slice, so the length cannot change through it. That single choke point
+is what makes the parallel-array model safe. Appending does not strictly
+invalidate a residue range, but it leaves an atom belonging to no residue that a
+PDB write would silently drop, so one rule covers everything.
 
 ### 4. Graph Enables Queries
 
