@@ -484,8 +484,71 @@ fn test_coords_output_actually_carries_the_coordinates() {
     let rows: Vec<&str> = info.stdout.lines().skip(1).collect();
     assert_eq!(rows.len(), 3);
     for row in rows {
-        assert!(row.ends_with("\tyes"), "no coordinates in {row:?}");
+        // The 2D column specifically: `chem coords` computes a depiction, and
+        // a layout written to SDF comes back a layout rather than a conformer.
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(fields[3], "yes", "no layout in {row:?}");
+        assert_eq!(fields[4], "no", "a layout must not become a conformer");
     }
+}
+
+#[test]
+fn test_coords_on_a_3d_file_writes_the_depiction_it_computed() {
+    // A conformer outranks a layout in the SDF writer, so without an explicit
+    // drop `chem coords` would report "laid out 1" and then emit the input
+    // untouched — doing the work and discarding it. The depiction has to win
+    // here, because producing one is the entire command.
+    let sdf = "\
+Acetone
+APtclcactv06051922463D 0   0.00000     0.00000
+
+  4  3  0  0  0  0  0  0  0  0999 V2000
+    1.3051    0.6772    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000   -0.0763    0.8900 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.3051    0.6772   -0.8900 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -0.0000   -1.2839    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+  2  3  1  0  0  0  0
+  2  4  2  0  0  0  0
+M  END
+$$$$
+";
+    let path = fixture("coords-3d.sdf", sdf);
+    let r = run(&["coords", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    assert!(
+        r.stderr
+            .contains("discarded the 3D conformer of 1 molecules"),
+        "dropping geometry has to be announced: {:?}",
+        r.stderr
+    );
+
+    // Every z is zero now, and the header says 2D rather than 3D.
+    let z: Vec<&str> = r
+        .stdout
+        .lines()
+        .skip(4)
+        .take(4)
+        .map(|line| line.split_whitespace().nth(2).unwrap())
+        .collect();
+    assert_eq!(
+        z,
+        vec!["0.0000", "0.0000", "0.0000", "0.0000"],
+        "{:?}",
+        r.stdout
+    );
+    assert!(r.stdout.lines().nth(1).unwrap().contains("2D"));
+
+    // And reading it back finds a layout, not a conformer.
+    let info = run(&["info", "--format", "sdf"], Some(&r.stdout));
+    let row = info.stdout.lines().nth(1).unwrap();
+    let fields: Vec<&str> = row.split('\t').collect();
+    assert_eq!(fields[3], "yes", "no layout in {row:?}");
+    assert_eq!(
+        fields[4], "no",
+        "conformer should have been dropped: {row:?}"
+    );
 }
 
 #[test]

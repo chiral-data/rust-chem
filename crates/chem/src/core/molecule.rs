@@ -1,7 +1,7 @@
 use crate::core::atom::Atom;
 use crate::core::bond::Bond;
 use crate::core::elements::ATOMIC_MASSES;
-use crate::core::geometry::Point2;
+use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
 
 use std::{collections::HashMap, fmt};
@@ -53,6 +53,18 @@ pub struct Molecule {
     /// all-or-nothing in practice — there's no meaningful state where only
     /// some atoms have positions.
     coords: Option<Vec<Point2>>,
+    /// 3D coordinates — a conformer, one per atom, indexed in parallel with
+    /// `atoms`. `None` when the molecule has no geometry, which is the common
+    /// case: SMILES carries none, and a flat SDF carries a drawing rather than
+    /// a conformer.
+    ///
+    /// Kept alongside `coords` rather than replacing it because the two are
+    /// different artefacts and neither is derivable from the other. A layout
+    /// is computed for drawing; a conformer is physical. A molecule read from
+    /// a 3D file and then laid out for the structure view legitimately has
+    /// both, and depiction wants the first while a conversion to XYZ wants the
+    /// second.
+    coords3: Option<Vec<Point3>>,
 }
 
 impl Molecule {
@@ -64,6 +76,7 @@ impl Molecule {
             name: None,
             properties: HashMap::new(),
             coords: None,
+            coords3: None,
         }
     }
 
@@ -75,6 +88,7 @@ impl Molecule {
             name: None,
             properties: HashMap::new(),
             coords: None,
+            coords3: None,
         }
     }
 
@@ -93,8 +107,10 @@ impl Molecule {
         // The new atom has no position, so any existing coordinate set is now
         // one short and no longer indexable in parallel with `atoms`. Drop it
         // rather than leave the two out of sync — the layout has to be redone
-        // to place the new atom anyway.
+        // to place the new atom anyway. The conformer goes for the same
+        // reason, and there is no way to invent a position for the new atom.
         self.coords = None;
+        self.coords3 = None;
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -203,6 +219,52 @@ impl Molecule {
     /// [`Self::set_coords`] to establish one first.
     pub fn coords_mut(&mut self) -> Option<&mut [Point2]> {
         self.coords.as_deref_mut()
+    }
+
+    /// This molecule's 3D coordinates, one per atom, or `None` if it carries
+    /// no conformer. Independent of [`Self::coords`]: a molecule may have
+    /// either, both or neither.
+    pub fn coords3(&self) -> Option<&[Point3]> {
+        self.coords3.as_deref()
+    }
+
+    /// The 3D coordinate of a single atom, or `None` if this molecule has no
+    /// conformer or `atom_idx` is out of range.
+    pub fn coord3(&self, atom_idx: usize) -> Option<Point3> {
+        self.coords3.as_ref()?.get(atom_idx).copied()
+    }
+
+    pub fn has_coords3(&self) -> bool {
+        self.coords3.is_some()
+    }
+
+    /// Sets this molecule's 3D coordinates.
+    ///
+    /// # Errors
+    /// [`MoleculeError::CoordinateCountMismatch`] if `coords.len()` isn't
+    /// exactly one per atom — the same all-or-nothing rule
+    /// [`Self::set_coords`] enforces, and for the same reason.
+    pub fn set_coords3(&mut self, coords: Vec<Point3>) -> Result<(), MoleculeError> {
+        if coords.len() != self.atoms.len() {
+            return Err(MoleculeError::CoordinateCountMismatch {
+                expected: self.atoms.len(),
+                got: coords.len(),
+            });
+        }
+        self.coords3 = Some(coords);
+        Ok(())
+    }
+
+    /// Discards any conformer, leaving a 2D layout untouched.
+    pub fn clear_coords3(&mut self) {
+        self.coords3 = None;
+    }
+
+    /// Mutable access to the conformer, for a pass refining positions in
+    /// place. `None` if this molecule has no conformer yet — use
+    /// [`Self::set_coords3`] to establish one first.
+    pub fn coords3_mut(&mut self) -> Option<&mut [Point3]> {
+        self.coords3.as_deref_mut()
     }
 
     pub fn set_name(&mut self, name: String) {
@@ -449,6 +511,67 @@ mod tests {
         assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
         // Out of range, even though the molecule does have a layout.
         assert!(mol.coord(2).is_none());
+    }
+
+    #[test]
+    fn test_conformer_is_independent_of_the_layout() {
+        // Both, at once, holding different values. A molecule read from a 3D
+        // file and then laid out for drawing is exactly this state, and
+        // neither set may overwrite the other.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        assert!(!mol.has_coords3());
+        assert!(mol.coords3().is_none());
+
+        mol.set_coords3(vec![
+            Point3::new(0.0, 0.0, -1.0),
+            Point3::new(1.0, 0.0, 1.0),
+        ])
+        .unwrap();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+
+        assert_eq!(mol.coord3(1), Some(Point3::new(1.0, 0.0, 1.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
+
+        // Clearing one leaves the other standing.
+        mol.clear_coords3();
+        assert!(!mol.has_coords3());
+        assert!(mol.has_coords());
+    }
+
+    #[test]
+    fn test_set_coords3_rejects_wrong_count() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        let too_few = mol.set_coords3(vec![Point3::ORIGIN]);
+        assert!(matches!(
+            too_few,
+            Err(MoleculeError::CoordinateCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert!(!mol.has_coords3());
+    }
+
+    #[test]
+    fn test_adding_an_atom_drops_both_coordinate_sets() {
+        // The conformer goes for the same reason the layout does: it would be
+        // one short, and there is no position to invent for the new atom.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.set_coords3(vec![Point3::ORIGIN]).unwrap();
+        mol.set_coords(vec![Point2::ORIGIN]).unwrap();
+
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert!(!mol.has_coords3());
+        assert!(!mol.has_coords());
     }
 
     #[test]

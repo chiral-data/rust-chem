@@ -18,10 +18,12 @@ const SDF_PROPERTY_PREFIX_LEN: usize = 3;
 ///
 /// This parser handles real-world SDF files with flexible formatting.
 ///
-/// Atom coordinates are preserved: SDF carries per-atom x/y/z, and the x/y are
-/// stored on the molecule for depiction. Coordinates are set only if every atom
-/// supplied a parseable pair — otherwise the molecule parses normally but
-/// without a layout.
+/// Atom coordinates are preserved. SDF carries per-atom x/y/z, and what that
+/// means depends on z: an all-zero z is a flat drawing and is stored as the
+/// molecule's 2D layout, while any non-zero z is a conformer and is stored as
+/// its 3D coordinates. Coordinates are set only if every atom supplied a
+/// parseable triple — otherwise the molecule parses normally but carries
+/// neither.
 pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     let lines: Vec<&str> = sdf.lines().collect();
 
@@ -44,7 +46,7 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     let (num_atoms, num_bonds) = parse_counts_line(counts_line)?;
 
     // Parse atom block (starts at line 4)
-    let mut coords: Vec<Point2> = Vec::with_capacity(num_atoms);
+    let mut coords: Vec<Point3> = Vec::with_capacity(num_atoms);
     let mut all_coords_parsed = true;
     for i in 0..num_atoms {
         let line_idx = SDF_ATOM_BLOCK_START + i;
@@ -55,7 +57,7 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
             Some(point) => coords.push(point),
             // An unparseable coordinate isn't fatal — the atom itself is
             // still valid, so the molecule parses as it always did, just
-            // without a layout.
+            // without geometry.
             None => all_coords_parsed = false,
         }
     }
@@ -65,8 +67,23 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     // to come after every atom is added. Only set them if every atom supplied
     // one, matching Molecule's all-or-nothing coordinate model.
     if all_coords_parsed && coords.len() == num_atoms {
-        mol.set_coords(coords)
-            .map_err(|e| SdfError::ParseError(e.to_string()))?;
+        // A molfile's atom block is x/y/z whether the record is a drawing or a
+        // conformer, and z is what distinguishes them. All-zero z is a 2D
+        // depiction and belongs in the layout; any non-zero z is geometry and
+        // belongs in the conformer.
+        //
+        // Filling both would claim a conformer for every flat drawing, and
+        // storing a 3D record's x/y as a layout is the projection that
+        // superimposes atoms differing only in depth — which is what this
+        // parser did until now, silently.
+        if coords.iter().all(|point| point.z == 0.0) {
+            let flat: Vec<Point2> = coords.iter().map(|point| point.to_2d()).collect();
+            mol.set_coords(flat)
+                .map_err(|e| SdfError::ParseError(e.to_string()))?;
+        } else {
+            mol.set_coords3(coords)
+                .map_err(|e| SdfError::ParseError(e.to_string()))?;
+        }
     }
 
     // Parse bond block (follows atom block)
@@ -133,7 +150,7 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 ///     ^^^^^^    ^^^^^^    ^^^^^^ ^
 ///        x         y         z   element
 /// ```
-fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point2>, SdfError> {
+fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, SdfError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
 
     // Real-world SDF files typically have at least 4 fields: x, y, z, symbol
@@ -162,13 +179,16 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point2>, Sdf
     let atom = Atom::new(element);
     mol.add_atom(atom);
 
-    // Fields 0-2 are x, y, z. Only x/y are kept — coordinate storage is 2D,
-    // and for a 3D SDF this is a straight projection down the z axis, which is
-    // a serviceable starting depiction but can superimpose atoms that are only
-    // separated in z. A non-numeric coordinate yields None (no layout) rather
-    // than an error, so files that parsed before this change still parse.
-    let point = match (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-        (Ok(x), Ok(y)) => Some(Point2::new(x, y)),
+    // Fields 0-2 are x, y, z, all three kept. The caller decides from z
+    // whether they are a layout or a conformer. A non-numeric coordinate
+    // yields None (no geometry) rather than an error, so files that parsed
+    // before this change still parse.
+    let point = match (
+        parts[0].parse::<f64>(),
+        parts[1].parse::<f64>(),
+        parts[2].parse::<f64>(),
+    ) {
+        (Ok(x), Ok(y), Ok(z)) => Some(Point3::new(x, y, z)),
         _ => None,
     };
 
@@ -306,9 +326,11 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
 /// form would be more portable and needs a Kekulisation pass that does not
 /// exist yet.
 ///
-/// A molecule with no coordinates is written with zeros, and
-/// [`molecule_has_coords_for_sdf`] lets a caller check first rather than
-/// discovering it in the file.
+/// Geometry is written from whichever coordinate set the molecule carries: a
+/// conformer goes out as x/y/z with the header's dimensional code set to `3D`,
+/// a layout goes out as x/y with a zero z and `2D`. A molecule with neither is
+/// written with zeros, and [`molecule_has_coords_for_sdf`] lets a caller check
+/// first rather than discovering it in the file.
 pub fn write_sdf(mol: &Molecule) -> String {
     let mut out = String::with_capacity(128 + mol.num_atoms() * 70 + mol.num_bonds() * 22);
 
@@ -316,7 +338,20 @@ pub fn write_sdf(mol: &Molecule) -> String {
     // may be blank, and blank is more honest than inventing content.
     out.push_str(mol.name().unwrap_or(""));
     out.push('\n');
-    out.push('\n');
+
+    // Line 1 is the program line, whose columns 21-22 carry the dimensional
+    // code. A reader that trusts the header rather than sniffing z needs it to
+    // say 3D, and that is the difference between a conformer surviving a trip
+    // through another toolkit and being treated as a drawing. Blank when there
+    // is nothing to declare — claiming 2D for a molecule with no coordinates
+    // at all would be inventing content.
+    out.push_str(match (mol.has_coords3(), mol.has_coords()) {
+        (true, _) => "                    3D\n",
+        (false, true) => "                    2D\n",
+        (false, false) => "\n",
+    });
+
+    // Line 2 is a free-text comment; blank is more honest than inventing one.
     out.push('\n');
 
     // Line 3: counts. The trailing fields are the spec's defaults —
@@ -327,22 +362,24 @@ pub fn write_sdf(mol: &Molecule) -> String {
         mol.num_bonds()
     ));
 
+    let coords3 = mol.coords3();
     let coords = mol.coords();
     for index in 0..mol.num_atoms() {
-        // z is always 0: coordinate storage is 2D. A molecule read from a 3D
-        // SDF already lost its z on the way in, so writing 0 is reporting what
-        // is held rather than flattening something.
-        let (x, y) = match coords {
-            Some(points) => (points[index].x, points[index].y),
-            None => (0.0, 0.0),
+        // The conformer wins when there is one: it is the physical geometry,
+        // and a layout alongside it is a drawing of the same molecule rather
+        // than a competing set of positions. A zero z on the layout path is
+        // reporting what is held, not flattening something.
+        let (x, y, z) = match (coords3, coords) {
+            (Some(points), _) => (points[index].x, points[index].y, points[index].z),
+            (None, Some(points)) => (points[index].x, points[index].y, 0.0),
+            (None, None) => (0.0, 0.0, 0.0),
         };
         let symbol = ELEMENT_SYMBOLS
             .get(mol.atom(index).atomic_number() as usize)
             .copied()
             .unwrap_or("*");
         out.push_str(&format!(
-            "{x:>10.4}{y:>10.4}{:>10.4} {symbol:<3} 0  0  0  0  0  0  0  0  0  0  0  0\n",
-            0.0
+            "{x:>10.4}{y:>10.4}{z:>10.4} {symbol:<3} 0  0  0  0  0  0  0  0  0  0  0  0\n"
         ));
     }
 
@@ -381,13 +418,14 @@ pub fn write_sdf_all<'a>(molecules: impl IntoIterator<Item = &'a Molecule>) -> S
     out
 }
 
-/// Whether writing this molecule would record real coordinates.
+/// Whether writing this molecule would record real coordinates, of either
+/// kind.
 ///
 /// Exposed so a caller can warn before writing rather than after: a file full
 /// of zeros is a plausible-looking result that is entirely useless, and the
 /// difference is invisible in the output.
 pub fn molecule_has_coords_for_sdf(mol: &Molecule) -> bool {
-    mol.has_coords()
+    mol.has_coords() || mol.has_coords3()
 }
 
 #[cfg(test)]
@@ -703,10 +741,101 @@ M  END
 $$$$";
 
         let mol = parse_sdf(sdf).unwrap();
-        assert_eq!(mol.coords().expect("coordinates").len(), mol.num_atoms());
-        // A 3D file: z differs between atoms 6 and 7, but only x/y is stored,
-        // so they project onto the same 2D point.
-        assert_eq!(mol.coord(5), mol.coord(6));
+
+        // A 3D file, so the coordinates are a conformer and not a layout.
+        // Until #174 this stored x/y as a 2D layout, which projected atoms 6
+        // and 7 — identical but for z — onto the same point. The molecule is
+        // left with no layout deliberately: `ensure_coords` can compute a
+        // readable one, and a flattened conformer is not that.
+        assert!(!mol.has_coords(), "a conformer is not a depiction");
+        let conformer = mol.coords3().expect("conformer");
+        assert_eq!(conformer.len(), mol.num_atoms());
+
+        assert_ne!(mol.coord3(5), mol.coord3(6));
+        assert_eq!(mol.coord3(5).unwrap().z, 0.8900);
+        assert_eq!(mol.coord3(6).unwrap().z, -0.8900);
+    }
+
+    #[test]
+    fn test_flat_sdf_is_a_layout_not_a_conformer() {
+        // Every z is zero, so this is a drawing. Storing it as a conformer
+        // would claim geometry the file does not assert, and would put a
+        // planar "structure" into any 3D format written from it.
+        let sdf = "\
+Flat
+
+
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    1.5000    0.5000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+M  END
+$$$$";
+
+        let mol = parse_sdf(sdf).unwrap();
+        assert!(mol.has_coords());
+        assert!(!mol.has_coords3());
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.5)));
+    }
+
+    #[test]
+    fn test_conformer_survives_a_write_read_round_trip() {
+        // The point of the whole change: z has to come back. Before #174 the
+        // writer emitted a hardcoded 0.0 in the z column, so this molecule
+        // came back flat.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        mol.set_coords3(vec![
+            Point3::new(0.1234, -0.5678, 1.2345),
+            Point3::new(1.5000, 0.5000, -0.7500),
+        ])
+        .unwrap();
+
+        let text = write_sdf(&mol);
+        let back = parse_sdf(&text).unwrap();
+
+        let conformer = back.coords3().expect("conformer should survive");
+        assert_eq!(conformer[0], Point3::new(0.1234, -0.5678, 1.2345));
+        assert_eq!(conformer[1], Point3::new(1.5, 0.5, -0.75));
+        assert!(!back.has_coords(), "a conformer must not become a layout");
+    }
+
+    #[test]
+    fn test_writer_declares_the_dimensional_code() {
+        // Columns 21-22 of the program line. A reader that trusts the header
+        // instead of sniffing z gets the right answer only if we write it.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        mol.set_coords3(vec![Point3::new(0.0, 0.0, 1.0)]).unwrap();
+        assert_eq!(
+            write_sdf(&mol).lines().nth(1).unwrap().trim_end(),
+            "                    3D"
+        );
+
+        let mut flat = Molecule::new();
+        flat.add_atom(Atom::new(Element::carbon()));
+        flat.set_coords(vec![Point2::new(0.0, 0.0)]).unwrap();
+        assert_eq!(
+            write_sdf(&flat).lines().nth(1).unwrap().trim_end(),
+            "                    2D"
+        );
+
+        let mut bare = Molecule::new();
+        bare.add_atom(Atom::new(Element::carbon()));
+        assert_eq!(write_sdf(&bare).lines().nth(1).unwrap(), "");
+    }
+
+    #[test]
+    fn test_has_coords_for_sdf_accepts_either_kind() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        assert!(!molecule_has_coords_for_sdf(&mol));
+
+        mol.set_coords3(vec![Point3::new(0.0, 0.0, 1.0)]).unwrap();
+        assert!(molecule_has_coords_for_sdf(&mol));
     }
 
     #[test]

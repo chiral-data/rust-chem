@@ -12,7 +12,7 @@ pub mod prelude {
     pub use crate::core::atom::{Atom, Chirality, Element, Hybridization};
     pub use crate::core::bond::{Bond, BondOrder, BondStereo, BondType};
     pub use crate::core::elements::{ATOMIC_MASSES, ELEMENT_NAMES, ELEMENT_SYMBOLS};
-    pub use crate::core::geometry::{BoundingBox, Point2};
+    pub use crate::core::geometry::{BoundingBox, Point2, Point3};
     pub use crate::core::graph::{MoleculeGraph, Neighbor};
     pub use crate::core::layout::{ensure_coords, layout};
     pub use crate::core::molecule::{Molecule, MoleculeError};

@@ -400,6 +400,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut laid_out = 0;
             let mut kept = 0;
             let mut failed = 0;
+            let mut flattened = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
                 let mut molecule = record.molecule.clone();
@@ -416,9 +417,26 @@ fn run(cli: &Cli) -> Result<i32> {
                 } else {
                     laid_out += 1;
                 }
+
+                // This command produces a depiction, and an SDF atom block
+                // holds one set of positions. A conformer outranks a layout on
+                // write — it is the more valuable data — so leaving it in place
+                // would emit the input unchanged after reporting that a layout
+                // was computed. Drop it, and say so rather than let someone
+                // find a 3D file where they asked for a drawing.
+                if ok && molecule.has_coords3() {
+                    molecule.clear_coords3();
+                    flattened += 1;
+                }
+
                 records.push((record.name.clone(), molecule));
             }
             eprintln!("laid out {laid_out}, kept {kept} existing, {failed} without coordinates");
+            if flattened > 0 {
+                eprintln!(
+                    "discarded the 3D conformer of {flattened} molecules: this writes a 2D depiction, and one atom block cannot carry both"
+                );
+            }
 
             let format = OutputFormat::resolve(*out_format, true, output.as_deref());
             eprintln!("writing {}", format.label());
@@ -617,15 +635,21 @@ fn note_cpu_only(cli: &Cli) {
 /// A tab-separated row per molecule: parseable by `cut` and `awk`, which is the
 /// point of stdout being data.
 fn describe(read: &stream::Input) -> String {
-    let mut out = String::from("name\tatoms\tbonds\tcoords\n");
+    // Two coordinate columns rather than one, because a layout and a conformer
+    // are different things and a file can carry either. Folding them into a
+    // single `coords` column would report "no" for a 3D structure that has
+    // geometry but no depiction, which is the wrong answer to the question
+    // anyone is actually asking.
+    let mut out = String::from("name\tatoms\tbonds\tcoords2d\tcoords3d\n");
     for record in &read.outcome.records {
         let molecule = &record.molecule;
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             record.name,
             molecule.num_atoms(),
             molecule.num_bonds(),
             if molecule.has_coords() { "yes" } else { "no" },
+            if molecule.has_coords3() { "yes" } else { "no" },
         ));
     }
     out
