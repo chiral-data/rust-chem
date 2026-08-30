@@ -1,5 +1,6 @@
 use crate::core::atom::Atom;
 use crate::core::bond::Bond;
+use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ATOMIC_MASSES;
 use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
@@ -45,6 +46,11 @@ pub enum MoleculeError {
     /// index and the rule it broke.
     #[error("Invalid residue topology: {0}")]
     InvalidTopology(String),
+
+    /// Stringly-typed for the same reason as [`Self::InvalidTopology`]: a cell
+    /// has several unrelated ways to be wrong and the message names which.
+    #[error("Invalid unit cell: {0}")]
+    InvalidCell(String),
 }
 
 /// Represents a complete molecule with atoms, bonds, and connectivity.
@@ -105,6 +111,18 @@ pub struct Molecule {
     /// search correct, so both are enforced by [`Molecule::set_topology`]
     /// rather than trusted.
     residues: Vec<Residue>,
+    /// The lattice, for a periodic structure. `None` for every molecule that
+    /// is not a crystal, which is most of them.
+    ///
+    /// **Unlike every other optional field on this type, the cell survives
+    /// [`Molecule::add_atom`].** The coordinate tables, the site table and the
+    /// topology are all indexed by or into the atoms, so appending invalidates
+    /// them. A lattice references nothing atom-indexed — adding an atom to a
+    /// crystal does not change its unit cell.
+    cell: Option<UnitCell>,
+    /// The space group, as the source stated it. Survives `add_atom` for the
+    /// same reason the cell does.
+    space_group: Option<SpaceGroup>,
 }
 
 impl Molecule {
@@ -120,6 +138,8 @@ impl Molecule {
             sites: None,
             chains: Vec::new(),
             residues: Vec::new(),
+            cell: None,
+            space_group: None,
         }
     }
 
@@ -135,6 +155,8 @@ impl Molecule {
             sites: None,
             chains: Vec::new(),
             residues: Vec::new(),
+            cell: None,
+            space_group: None,
         }
     }
 
@@ -170,6 +192,11 @@ impl Molecule {
         // when that is no longer the set.
         self.chains.clear();
         self.residues.clear();
+
+        // The cell and space group deliberately do NOT go. They index nothing
+        // and reference no atom, so adding one leaves them exactly as true as
+        // they were. This is the one exception to the rule above, and it is
+        // easier to find here than in a field comment.
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -500,6 +527,48 @@ impl Molecule {
     pub fn clear_topology(&mut self) {
         self.chains.clear();
         self.residues.clear();
+    }
+
+    /// This molecule's unit cell, if it is a periodic structure.
+    ///
+    /// Returned by value — [`UnitCell`] is six `f64`s and `Copy`.
+    pub fn cell(&self) -> Option<UnitCell> {
+        self.cell
+    }
+
+    pub fn has_cell(&self) -> bool {
+        self.cell.is_some()
+    }
+
+    /// Sets the unit cell.
+    ///
+    /// # Errors
+    /// [`MoleculeError::InvalidCell`] for a cell that describes no real
+    /// lattice — see [`UnitCell::validate`]. Rejecting here rather than
+    /// storing a degenerate cell keeps `NaN` out of every coordinate a later
+    /// conversion would produce.
+    pub fn set_cell(&mut self, cell: UnitCell) -> Result<(), MoleculeError> {
+        cell.validate().map_err(MoleculeError::InvalidCell)?;
+        self.cell = Some(cell);
+        Ok(())
+    }
+
+    pub fn clear_cell(&mut self) {
+        self.cell = None;
+    }
+
+    /// The space group, as the source file stated it. Never validated against
+    /// the cell or against itself — see [`SpaceGroup`].
+    pub fn space_group(&self) -> Option<&SpaceGroup> {
+        self.space_group.as_ref()
+    }
+
+    pub fn set_space_group(&mut self, group: SpaceGroup) {
+        self.space_group = Some(group);
+    }
+
+    pub fn clear_space_group(&mut self) {
+        self.space_group = None;
     }
 
     /// The residue owning `atom_idx`, or `None` if this molecule has no
@@ -1246,6 +1315,78 @@ mod tests {
         assert!(!mol.has_topology());
         assert!(mol.residues().is_empty() && mol.chains().is_empty());
         assert!(mol.has_coords());
+    }
+
+    // ---- unit cell -----------------------------------------------------
+
+    #[test]
+    fn test_the_cell_survives_adding_an_atom() {
+        // The one exception to the rule the test below asserts. Every other
+        // optional field is indexed by or into the atoms, so appending
+        // invalidates it. A lattice is not: adding an atom to a crystal leaves
+        // its unit cell exactly as true as it was, and clearing it here would
+        // throw away data for no reason.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        let cell = UnitCell::new(9.42, 10.15, 11.32, 88.7, 79.4, 64.2);
+        mol.set_cell(cell).unwrap();
+        mol.set_space_group(SpaceGroup::from_number(2));
+        mol.set_coords(vec![Point2::ORIGIN]).unwrap();
+
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert!(!mol.has_coords(), "the layout still goes");
+        assert_eq!(mol.cell(), Some(cell), "the cell must not");
+        assert_eq!(mol.space_group().unwrap().number, Some(2));
+    }
+
+    #[test]
+    fn test_set_cell_rejects_a_cell_that_describes_no_lattice() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        // Legal angles individually, impossible together.
+        let err = mol
+            .set_cell(UnitCell::new(5.0, 5.0, 5.0, 170.0, 170.0, 170.0))
+            .unwrap_err();
+        assert!(format!("{err}").contains("describe no real cell"), "{err}");
+        assert!(!mol.has_cell());
+
+        let err = mol
+            .set_cell(UnitCell::new(0.0, 5.0, 5.0, 90.0, 90.0, 90.0))
+            .unwrap_err();
+        assert!(format!("{err}").contains("edge a"), "{err}");
+        assert!(!mol.has_cell());
+
+        // And a good one still lands.
+        assert!(mol.set_cell(UnitCell::cubic(4.0)).is_ok());
+        assert!(mol.has_cell());
+        mol.clear_cell();
+        assert!(!mol.has_cell());
+    }
+
+    #[test]
+    fn test_the_cell_converts_this_molecules_coordinates() {
+        // The reason the cell lives on the molecule rather than beside it: a
+        // conformer read as fractional coordinates becomes Cartesian through
+        // the structure's own lattice, and back again for writing.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.set_cell(UnitCell::new(9.42, 10.15, 11.32, 88.7, 79.4, 64.2))
+            .unwrap();
+
+        let fractional = [Point3::new(0.25, 0.5, 0.75), Point3::new(0.9, 0.1, 0.3)];
+        let cell = mol.cell().unwrap();
+        mol.set_coords3(fractional.iter().map(|f| cell.to_cartesian(*f)).collect())
+            .unwrap();
+
+        for (ix, original) in fractional.iter().enumerate() {
+            let back = cell.to_fractional(mol.coord3(ix).unwrap());
+            assert!((back.x - original.x).abs() < 1e-12);
+            assert!((back.y - original.y).abs() < 1e-12);
+            assert!((back.z - original.z).abs() < 1e-12);
+        }
     }
 
     #[test]

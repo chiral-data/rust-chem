@@ -12,6 +12,7 @@ ChemCore provides the fundamental building blocks for representing molecules:
 - **Graph**: Efficient connectivity queries
 - **Side tables**: Per-atom data a file supplied — 2D layout, 3D conformer, atom sites
 - **Topology**: Chains and residues, for the formats organised by them
+- **Unit cell**: Lattice and space group, for periodic structures
 
 ## Quick Start
 
@@ -328,6 +329,7 @@ second.
 - Properties (metadata)
 - Up to three per-atom side tables, each independently present or absent
 - Chain and residue topology, for structural formats
+- A unit cell and space group, for periodic structures
 
 ### 3a. The Side Tables
 
@@ -391,6 +393,47 @@ returns a slice, so the length cannot change through it. That single choke point
 is what makes the parallel-array model safe. Appending does not strictly
 invalidate a residue range, but it leaves an atom belonging to no residue that a
 PDB write would silently drop, so one rule covers everything.
+
+### 3c. The Unit Cell
+
+For a periodic structure — CIF, ShelX, VASP, CASTEP — the lattice is not
+metadata attached to the coordinates. Without it the coordinates do not mean
+anything.
+
+```
+Molecule
+ ├── cell:        Option<UnitCell>    — a, b, c (Ångström) and α, β, γ (degrees)
+ └── space_group: Option<SpaceGroup>  — number and symbol, as the file wrote them
+```
+
+**The orientation is a convention, and getting it wrong is silent.** A lattice
+can be placed in Cartesian space in more than one way, and the choices differ by
+a rotation. This uses the near-universal setting — **a along x, b in the xy
+plane, c taking up the rest** — the one PDB, CIF and every toolkit assume. Pick
+differently and bond lengths are still right, the volume is still right, nothing
+throws, and every coordinate sits in a rotated frame.
+
+That is why the tests assert the convention directly (`to_cartesian(1,0,0)` must
+be `(a, 0, 0)`) and recover the six cell parameters back out of the basis
+vectors, rather than only round-tripping. A round trip passes under a wrong
+convention — the matrix is still invertible.
+
+**Fractional coordinates are not a third coordinate set.** They convert to
+Cartesian on read and back on write; `Molecule` always holds Cartesian.
+Storing fractional directly would give the conformer two meanings depending on
+a flag somewhere else.
+
+**Space groups are stored exactly as given and never validated.** Real files
+pair a number with a symbol that contradicts it. Round-tripping what was
+supplied is most of what correctness means, and a converter that refuses a
+self-inconsistent file is less useful than one that reads it faithfully.
+Symmetry *operations* — expanding an asymmetric unit into a full cell — are out
+of scope here; this records which group, not the operator list.
+
+**The cell survives `add_atom`**, alone among the optional fields. Everything in
+3a and 3b is indexed by or into the atoms, so appending invalidates it. A
+lattice references nothing atom-indexed: adding an atom to a crystal does not
+change its unit cell.
 
 ### 4. Graph Enables Queries
 

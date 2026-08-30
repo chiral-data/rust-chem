@@ -166,6 +166,29 @@ impl Point3 {
         (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
     }
 
+    /// Dot product, treating both points as vectors from the origin.
+    ///
+    /// `a.dot(b) / (a.length() * b.length())` is the cosine of the angle
+    /// between them, which is how a unit cell's angles are recovered from its
+    /// basis vectors.
+    pub fn dot(&self, other: Point3) -> f64 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    /// Cross product, perpendicular to both and with magnitude equal to the
+    /// area of the parallelogram they span.
+    ///
+    /// With [`Self::dot`] this gives the scalar triple product, and so a cell
+    /// volume computed from the basis vectors rather than from the angle
+    /// formula — two independent routes to the same number.
+    pub fn cross(&self, other: Point3) -> Point3 {
+        Point3::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+    }
+
     /// This point projected onto the xy plane, discarding z.
     ///
     /// Explicit, and deliberately not a `From` impl. Dropping z is lossy, and
@@ -272,6 +295,27 @@ mod tests {
         let d = Point3::new(1.0, 2.0, 1.0);
         assert_eq!(c.distance(d), 1.0);
         assert_eq!(c.to_2d(), d.to_2d());
+    }
+
+    #[test]
+    fn test_point3_dot_and_cross() {
+        let x = Point3::new(1.0, 0.0, 0.0);
+        let y = Point3::new(0.0, 1.0, 0.0);
+        let z = Point3::new(0.0, 0.0, 1.0);
+
+        assert_eq!(x.dot(y), 0.0);
+        assert_eq!(x.dot(x), 1.0);
+        assert_eq!(x.cross(y), z);
+        assert_eq!(y.cross(x), z * -1.0);
+
+        // The scalar triple product of the axes is the unit volume.
+        assert_eq!(x.dot(y.cross(z)), 1.0);
+
+        // Recovering an angle, which is what the unit cell tests rely on.
+        let a = Point3::new(2.0, 0.0, 0.0);
+        let b = Point3::new(0.0, 3.0, 0.0);
+        let cos = a.dot(b) / (a.length() * b.length());
+        assert!((cos.acos().to_degrees() - 90.0).abs() < 1e-12);
     }
 
     #[test]
