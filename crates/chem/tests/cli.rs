@@ -484,7 +484,11 @@ fn test_coords_output_actually_carries_the_coordinates() {
     let rows: Vec<&str> = info.stdout.lines().skip(1).collect();
     assert_eq!(rows.len(), 3);
     for row in rows {
-        assert!(row.ends_with("\tyes"), "no coordinates in {row:?}");
+        // The 2D column specifically: `chem coords` computes a depiction, and
+        // a layout written to SDF comes back a layout rather than a conformer.
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(fields[3], "yes", "no layout in {row:?}");
+        assert_eq!(fields[4], "no", "a layout must not become a conformer");
     }
 }
 

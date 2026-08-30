@@ -617,15 +617,21 @@ fn note_cpu_only(cli: &Cli) {
 /// A tab-separated row per molecule: parseable by `cut` and `awk`, which is the
 /// point of stdout being data.
 fn describe(read: &stream::Input) -> String {
-    let mut out = String::from("name\tatoms\tbonds\tcoords\n");
+    // Two coordinate columns rather than one, because a layout and a conformer
+    // are different things and a file can carry either. Folding them into a
+    // single `coords` column would report "no" for a 3D structure that has
+    // geometry but no depiction, which is the wrong answer to the question
+    // anyone is actually asking.
+    let mut out = String::from("name\tatoms\tbonds\tcoords2d\tcoords3d\n");
     for record in &read.outcome.records {
         let molecule = &record.molecule;
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             record.name,
             molecule.num_atoms(),
             molecule.num_bonds(),
             if molecule.has_coords() { "yes" } else { "no" },
+            if molecule.has_coords3() { "yes" } else { "no" },
         ));
     }
     out
