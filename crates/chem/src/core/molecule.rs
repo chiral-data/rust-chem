@@ -1125,6 +1125,116 @@ mod tests {
         assert!(!mol.has_topology());
     }
 
+    /// Many residues, arranged to include every awkward shape: a gap before
+    /// the first, single-atom residues, gaps between residues, several chains,
+    /// and a tail of atoms past the last residue.
+    fn gappy_structure() -> Molecule {
+        const RESIDUES: usize = 200;
+        const CHAINS: usize = 5;
+        const PER_CHAIN: usize = RESIDUES / CHAINS;
+
+        let mut residues = Vec::with_capacity(RESIDUES);
+        let mut cursor = 2; // leading gap: atoms 0 and 1 belong to nothing
+        for ix in 0..RESIDUES {
+            // Alternating sizes, so single-atom residues are covered.
+            let size = if ix % 2 == 0 { 1 } else { 3 };
+            residues.push(residue(
+                "RES",
+                ix as i32,
+                ix / PER_CHAIN,
+                cursor..cursor + size,
+            ));
+            cursor += size;
+            // A gap after every fifth residue.
+            if ix % 5 == 4 {
+                cursor += 2;
+            }
+        }
+        let chains: Vec<Chain> = (0..CHAINS)
+            .map(|c| {
+                chain(
+                    "ABCDE".get(c..c + 1).unwrap(),
+                    c * PER_CHAIN..(c + 1) * PER_CHAIN,
+                )
+            })
+            .collect();
+
+        let mut mol = Molecule::new();
+        for _ in 0..cursor + 3 {
+            // trailing atoms past the last residue
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        mol.set_topology(chains, residues).unwrap();
+        mol
+    }
+
+    #[test]
+    fn test_residue_of_agrees_with_a_linear_scan_at_every_atom() {
+        // `residue_of` is a binary search over the ascending ranges, and a
+        // wrong predicate is an off-by-one that shows only at a boundary.
+        // Rather than guess which boundaries matter, check every atom against
+        // the obvious slow answer over a deliberately awkward layout. Size is
+        // not the point here — coverage of the boundaries is.
+        let mol = gappy_structure();
+        assert_eq!(mol.residues().len(), 200);
+        assert_eq!(mol.chains().len(), 5);
+
+        let mut hits = 0;
+        let mut misses = 0;
+        for atom in 0..mol.num_atoms() {
+            let expected = mol.residues().iter().find(|r| r.atoms.contains(&atom));
+            assert_eq!(mol.residue_of(atom), expected, "residue_of({atom})");
+
+            match expected {
+                Some(res) => {
+                    hits += 1;
+                    assert_eq!(
+                        mol.chain_of(atom),
+                        mol.chains().get(res.chain_ix),
+                        "chain_of({atom})"
+                    );
+                }
+                None => {
+                    misses += 1;
+                    assert!(mol.chain_of(atom).is_none(), "chain_of({atom})");
+                }
+            }
+        }
+
+        // The fixture has to actually contain both kinds of atom, or this
+        // whole test could pass vacuously.
+        assert!(
+            hits > 0 && misses > 0,
+            "{hits} in residues, {misses} in gaps"
+        );
+        assert!(mol.residue_of(mol.num_atoms()).is_none());
+        assert!(mol.residue_of(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_an_atom_in_a_gap_answers_none_rather_than_its_neighbour() {
+        // The `filter` after the binary search is what guarantees this: if the
+        // search lands on the wrong residue, membership rejects it and the
+        // answer is a miss rather than a confidently wrong residue. Anyone
+        // optimising that filter away would turn misses into wrong answers,
+        // so the property is pinned rather than left implicit.
+        let mut mol = Molecule::new();
+        for _ in 0..6 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        // Atoms 2 and 3 are in neither residue.
+        mol.set_topology(
+            vec![chain("A", 0..2)],
+            vec![residue("LYS", 1, 0, 0..2), residue("GLY", 2, 0, 4..6)],
+        )
+        .unwrap();
+
+        assert_eq!(mol.residue_of(1).unwrap().name, "LYS");
+        assert!(mol.residue_of(2).is_none());
+        assert!(mol.residue_of(3).is_none());
+        assert_eq!(mol.residue_of(4).unwrap().name, "GLY");
+    }
+
     #[test]
     fn test_clear_topology_leaves_the_per_atom_tables_alone() {
         let mut mol = two_chain_molecule();
