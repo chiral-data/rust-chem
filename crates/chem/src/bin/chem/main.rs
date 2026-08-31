@@ -222,8 +222,14 @@ impl Theme {
     }
 }
 
-/// `chem::io::reader::Format` is not ours to derive `ValueEnum` on, so this is the
-/// clap-facing mirror. Kept adjacent to its conversion so the two cannot drift.
+/// `chem::io::reader::Format` is a registry handle and not ours to derive
+/// `ValueEnum` on, so this is the clap-facing mirror. Kept adjacent to its
+/// conversion so the two cannot drift.
+///
+/// The mirror stays hand-written on purpose while the CLI exposes exactly two
+/// input formats. Generating the value list from the registry is what the
+/// `-L formats` story does, and doing it here first would mean two half-built
+/// mechanisms.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FormatArg {
     Smiles,
@@ -233,8 +239,8 @@ enum FormatArg {
 impl From<FormatArg> for Format {
     fn from(value: FormatArg) -> Self {
         match value {
-            FormatArg::Smiles => Format::Smiles,
-            FormatArg::Sdf => Format::Sdf,
+            FormatArg::Smiles => Format::SMILES,
+            FormatArg::Sdf => Format::SDF,
         }
     }
 }

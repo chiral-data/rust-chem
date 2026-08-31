@@ -29,14 +29,11 @@ pub struct Input {
 /// unrecognised extension gets, rather than a special case for pipes.
 pub fn read_input(path: Option<&Path>, format: Option<Format>) -> Result<Input> {
     let (content, label) = read_text(path)?;
-    // Detection needs a name and stdin has none, so a pipe gets the same
-    // default an unrecognised extension does rather than a rule of its own.
-    let detected = if label == "-" {
-        Format::Smiles
-    } else {
-        Format::from_filename(&label)
-    };
-    let format = format.unwrap_or(detected);
+    // No special case for stdin any more. `-` has no extension, and
+    // `from_filename` already answers SMILES for a name nothing claims — the
+    // branch that used to be here was restating the fallback, in a second
+    // place where it could drift from it.
+    let format = format.unwrap_or_else(|| Format::from_filename(&label));
     Ok(Input {
         outcome: reader::read(&content, format),
         format,
