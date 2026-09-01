@@ -6,8 +6,7 @@
 
 use anyhow::{Result, bail};
 use chem::core::molecule::Molecule;
-use chem::io::sdf::write_sdf_all;
-use chem::io::smiles_writer::write_smiles_for_molecule;
+use chem::io::reader::Format;
 use clap::ValueEnum;
 use std::path::Path;
 
@@ -18,10 +17,23 @@ use std::path::Path;
 /// carry coordinates** — writing SMILES would silently discard the entire
 /// result. So the format follows what the data needs, and the reason is
 /// reported rather than left for the user to notice from an unexpected file.
+/// `chem::io::reader::Format` is a registry handle and not ours to derive
+/// `ValueEnum` on, so this is the clap-facing mirror — the same arrangement
+/// `FormatArg` uses for input. Kept adjacent to its conversion so the two
+/// cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Smiles,
     Sdf,
+}
+
+impl From<OutputFormat> for Format {
+    fn from(value: OutputFormat) -> Self {
+        match value {
+            OutputFormat::Smiles => Format::SMILES,
+            OutputFormat::Sdf => Format::SDF,
+        }
+    }
 }
 
 impl OutputFormat {
@@ -46,7 +58,9 @@ impl OutputFormat {
         // A named file's extension is a clear request, so honour it — with the
         // same warning if it throws the result away.
         if let Some(p) = path.filter(|p| p.as_os_str() != "-") {
-            let from_name = if p.to_string_lossy().to_lowercase().ends_with(".sdf") {
+            // Through the registry rather than a second copy of the
+            // `.sdf`-or-else rule, which is what this used to be.
+            let from_name = if Format::from_filename(&p.to_string_lossy()) == Format::SDF {
                 OutputFormat::Sdf
             } else {
                 OutputFormat::Smiles
@@ -69,39 +83,21 @@ impl OutputFormat {
     }
 
     pub fn label(&self) -> &'static str {
-        match self {
-            OutputFormat::Smiles => "SMILES",
-            OutputFormat::Sdf => "SDF",
-        }
+        Format::from(*self).label()
     }
 }
 
 /// Serialises molecules, carrying their names.
+///
+/// The serialisation itself lives on the format descriptor now, so this is a
+/// lookup rather than a `match` that grows a arm per format. Every registered
+/// format writes today; `expect` documents that rather than hiding a `None`
+/// the caller cannot act on.
 pub fn render(format: OutputFormat, records: &[(String, Molecule)]) -> String {
-    match format {
-        OutputFormat::Sdf => {
-            let mut molecules = Vec::with_capacity(records.len());
-            for (name, molecule) in records {
-                let mut copy = molecule.clone();
-                copy.set_name(name.clone());
-                molecules.push(copy);
-            }
-            write_sdf_all(&molecules)
-        }
-        OutputFormat::Smiles => {
-            let mut out = String::new();
-            for (name, molecule) in records {
-                // `name<TAB>` is not the convention: the reader splits on
-                // whitespace and takes everything after the first token as the
-                // name, so a space matches what `chem fp` and the app read.
-                out.push_str(&write_smiles_for_molecule(molecule));
-                out.push(' ');
-                out.push_str(name);
-                out.push('\n');
-            }
-            out
-        }
-    }
+    let format = Format::from(format);
+    format
+        .write(records)
+        .unwrap_or_else(|| panic!("{} has no writer", format.name()))
 }
 
 /// Refuses to write over the file being read.

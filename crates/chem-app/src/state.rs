@@ -273,7 +273,7 @@ impl AppState {
     fn with_engine(ctx: &egui::Context, search_engine: FingerprintSearch) -> Self {
         let dataset = MoleculeDataset::example_dataset();
         let dataset_status = format!("Loaded {} example molecules", dataset.len());
-        let loaded_files = LoadedFiles::new("Examples".to_string(), dataset, DatasetFormat::Smiles);
+        let loaded_files = LoadedFiles::new("Examples".to_string(), dataset, DatasetFormat::SMILES);
 
         #[cfg(target_arch = "wasm32")]
         let pending_gpu_init = Rc::new(RefCell::new(None));
@@ -481,7 +481,7 @@ impl AppState {
         let dataset = MoleculeDataset::example_dataset();
         self.dataset_status = format!("Loaded {} example molecules", dataset.len());
         self.loaded_files
-            .add_and_activate("Examples".to_string(), dataset, DatasetFormat::Smiles);
+            .add_and_activate("Examples".to_string(), dataset, DatasetFormat::SMILES);
         self.invalidate_active_dataset();
     }
 

@@ -24,35 +24,13 @@ use crate::core::molecule::Molecule;
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
-/// Which format a file is in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Smiles,
-    Sdf,
-}
-
-impl Format {
-    /// Picks a format from a filename.
-    ///
-    /// Only `.sdf` is SDF. `.smi`, `.smiles`, `.txt` and no extension at all
-    /// take the SMILES path, which is deliberate rather than a gap: SMILES is
-    /// the universal default and SDF is the opt-in. Anything stricter would
-    /// reject the extensionless files people actually have.
-    pub fn from_filename(name: &str) -> Self {
-        if name.to_lowercase().ends_with(".sdf") {
-            Format::Sdf
-        } else {
-            Format::Smiles
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Format::Smiles => "SMILES",
-            Format::Sdf => "SDF",
-        }
-    }
-}
+/// Re-exported so `chem::io::reader::Format` keeps resolving.
+///
+/// The type moved to [`crate::io::format`] when it stopped being a
+/// two-variant enum and became a handle into the registry. Keeping the old
+/// path working means every `Format`-typed signature in the CLI and the
+/// workbench stayed as written.
+pub use crate::io::format::Format;
 
 /// One molecule read from a file.
 #[derive(Debug, Clone)]
@@ -103,10 +81,26 @@ impl ReadOutcome {
 }
 
 /// Reads a file's contents in the given format.
+///
+/// Dispatch goes through the registry rather than a `match`, so adding a
+/// format is adding a table entry rather than editing every call site.
+///
+/// A format with no reader — none today, but the descriptor allows it, and
+/// several planned formats are write-only — yields an outcome carrying one
+/// skipped record saying so. That keeps the "reading a file cannot fail as a
+/// whole" contract [`ReadOutcome`] documents, rather than introducing a
+/// `Result` for a case the caller can already see in `skipped`.
 pub fn read(content: &str, format: Format) -> ReadOutcome {
-    match format {
-        Format::Smiles => read_smiles(content),
-        Format::Sdf => read_sdf(content),
+    match format.reader() {
+        Some(reader) => reader(content),
+        None => ReadOutcome {
+            records: Vec::new(),
+            skipped: vec![Skipped {
+                position: 1,
+                input: String::new(),
+                error: format!("{} cannot be read, only written", format.name()),
+            }],
+        },
     }
 }
 
@@ -204,16 +198,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_only_sdf_extension_means_sdf() {
-        assert_eq!(Format::from_filename("a.sdf"), Format::Sdf);
-        assert_eq!(Format::from_filename("A.SDF"), Format::Sdf);
-        // Everything else takes the SMILES path, extensionless files included.
-        for name in ["a.smi", "a.smiles", "a.txt", "a", "a.sdf.gz"] {
-            assert_eq!(Format::from_filename(name), Format::Smiles, "{name}");
-        }
-    }
-
-    #[test]
     fn test_blank_lines_and_comments_are_not_failures() {
         let out = read_smiles("# header\n\nCCO\n\n# trailing\n");
         assert_eq!(out.len(), 1);
@@ -303,7 +287,7 @@ $$$$
     #[test]
     fn test_reading_an_empty_file_yields_nothing_rather_than_failing() {
         for content in ["", "\n\n", "# only a comment\n"] {
-            let out = read(content, Format::Smiles);
+            let out = read(content, Format::SMILES);
             assert!(out.is_empty());
             assert!(out.skipped.is_empty());
         }
@@ -311,14 +295,14 @@ $$$$
 
     #[test]
     fn test_read_dispatches_on_format() {
-        let sdf = read(TWO_RECORDS, Format::Sdf);
+        let sdf = read(TWO_RECORDS, Format::SDF);
         assert_eq!(sdf.len(), 2);
         assert!(sdf.records.iter().all(|r| r.molecule.num_atoms() > 0));
 
         // The same bytes read as SMILES yield nothing at all. Before #151 the
         // `$$$$` terminators survived as atomless molecules, so this reported
         // "read 2 molecules" and exited successfully on a wrong-format file.
-        let wrong = read(TWO_RECORDS, Format::Smiles);
+        let wrong = read(TWO_RECORDS, Format::SMILES);
         assert!(wrong.is_empty(), "kept {} records", wrong.records.len());
         assert!(!wrong.skipped.is_empty());
     }
