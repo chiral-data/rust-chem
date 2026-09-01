@@ -241,11 +241,20 @@ pub struct AppState {
     // succeed.
     #[cfg(target_arch = "wasm32")]
     pending_gpu_init: PendingGpuInit,
+
+    /// The frame loop, so work that finishes off-frame can wake it.
+    ///
+    /// Everything above that lands in a slot is collected by
+    /// `poll_pending_work`, which only runs inside `update()` — and eframe is
+    /// reactive, so it only calls `update()` when it paints. Without a repaint
+    /// request the result waits for the user to move the mouse (#186). Cloning
+    /// is cheap: `egui::Context` is a handle, not the state itself.
+    repaint: egui::Context,
 }
 
 impl AppState {
-    pub fn new() -> Self {
-        Self::with_engine(FingerprintSearch::new())
+    pub fn new(ctx: &egui::Context) -> Self {
+        Self::with_engine(ctx, FingerprintSearch::new())
     }
 
     /// A CPU-only instance, for tests that exercise state transitions and have
@@ -253,12 +262,15 @@ impl AppState {
     /// or on GPU init running at all, which does not take kindly to being
     /// driven from parallel tests (#19). Mirrors
     /// [`FingerprintSearch::new_cpu_only`], which exists for the same reason.
+    ///
+    /// Its context is detached from any window, which is what a test wants: a
+    /// repaint request can be observed but never has to be serviced.
     #[cfg(test)]
     fn cpu_only() -> Self {
-        Self::with_engine(FingerprintSearch::new_cpu_only())
+        Self::with_engine(&egui::Context::default(), FingerprintSearch::new_cpu_only())
     }
 
-    fn with_engine(search_engine: FingerprintSearch) -> Self {
+    fn with_engine(ctx: &egui::Context, search_engine: FingerprintSearch) -> Self {
         let dataset = MoleculeDataset::example_dataset();
         let dataset_status = format!("Loaded {} example molecules", dataset.len());
         let loaded_files = LoadedFiles::new("Examples".to_string(), dataset, DatasetFormat::Smiles);
@@ -268,9 +280,12 @@ impl AppState {
         #[cfg(target_arch = "wasm32")]
         {
             let slot = pending_gpu_init.clone();
+            // `self` does not exist yet, so this one takes the parameter.
+            let ctx = ctx.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let result = FingerprintSearch::try_init_gpu_async().await;
                 *slot.borrow_mut() = Some(result);
+                ctx.request_repaint();
             });
         }
 
@@ -300,6 +315,7 @@ impl AppState {
             pending_file_load: Rc::new(RefCell::new(None)),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
+            repaint: ctx.clone(),
         }
     }
 
@@ -396,6 +412,7 @@ impl AppState {
     #[cfg(target_arch = "wasm32")]
     pub fn load_dataset_from_file(&mut self) {
         let slot = self.pending_file_load.clone();
+        let ctx = self.repaint.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let file = rfd::AsyncFileDialog::new()
                 .add_filter("SMILES", &["smi", "smiles", "txt"])
@@ -406,6 +423,10 @@ impl AppState {
                 let name = file.file_name();
                 let bytes = file.read().await;
                 *slot.borrow_mut() = Some((name, bytes));
+                // Closing the picker is not itself an input event the canvas
+                // sees, so without this the file stays unloaded until the user
+                // moves the mouse (#186).
+                ctx.request_repaint();
             }
         });
     }
@@ -522,11 +543,12 @@ impl AppState {
         let engine = self.search_engine.clone();
         let molecules = self.loaded_files.active_dataset().molecules.clone();
 
-        self.dataset_fingerprint_task.start(async move {
-            engine
-                .generate_fingerprints_batch_async(&molecules, params.radius, params.size)
-                .await
-        });
+        self.dataset_fingerprint_task
+            .start(&self.repaint, async move {
+                engine
+                    .generate_fingerprints_batch_async(&molecules, params.radius, params.size)
+                    .await
+            });
     }
 
     // CPU-only, no GPU implementation exists or is needed for this — it's a
@@ -616,11 +638,12 @@ impl AppState {
     fn generate_query_fingerprint(&mut self, mol: Molecule, params: FingerprintParams) {
         let engine = self.search_engine.clone();
 
-        self.query_fingerprint_task.start(async move {
-            engine
-                .generate_fingerprint_async(&mol, params.radius, params.size)
-                .await
-        });
+        self.query_fingerprint_task
+            .start(&self.repaint, async move {
+                engine
+                    .generate_fingerprint_async(&mol, params.radius, params.size)
+                    .await
+            });
     }
 
     pub fn run_search(&mut self, top_k: usize) {
@@ -636,8 +659,9 @@ impl AppState {
         let mut engine = self.search_engine.clone();
         let target_fps = self.dataset_fingerprints.clone();
 
-        self.search_task
-            .start(async move { engine.search_async(&query_fp, &target_fps, top_k).await });
+        self.search_task.start(&self.repaint, async move {
+            engine.search_async(&query_fp, &target_fps, top_k).await
+        });
     }
 
     /// True once a search has everything it needs: a query fingerprint to look
@@ -664,9 +688,11 @@ impl AppState {
     #[cfg(target_arch = "wasm32")]
     pub fn retry_gpu(&mut self) {
         let slot = self.pending_gpu_init.clone();
+        let ctx = self.repaint.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let result = FingerprintSearch::try_init_gpu_async().await;
             *slot.borrow_mut() = Some(result);
+            ctx.request_repaint();
         });
     }
 
@@ -764,12 +790,6 @@ impl AppState {
         // Either way the old results are gone, so a view holding an index into
         // them has to let go of it.
         self.results_epoch += 1;
-    }
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
