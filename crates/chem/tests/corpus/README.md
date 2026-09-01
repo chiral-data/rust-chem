@@ -30,16 +30,15 @@ they double as ordinary input. `#` comments carry the reasoning.
 ## Pinned gaps
 
 An entry **named** `known-gap-*` records a place `chem` does not behave as the
-corpus otherwise promises. They run in both directions:
-
-- in `invalid.smi`, input that should be rejected and is not — #190, where a run
-  of bond symbols is silently collapsed so `C##C` parses as ethyne
-- in the themed files, valid input the parser cannot read yet — #191: chirality
-  markers, directional bonds and dot disconnection are all rejected outright
+corpus otherwise promises. They run in both directions: input that should be
+rejected and is not, and valid input the parser cannot read yet.
 
 Pinned rather than deleted, so the corpus describes the parser as it behaves.
 Closing a gap fails the test that pins it, which is the prompt to rename the
-entry and drop its comment.
+entry and drop its comment — that is how #191's nine entries left this file.
+
+The current ones are in `invalid.smi`: #190, where a run of bond symbols is
+silently collapsed so `C##C` parses as ethyne.
 
 The marker is the entry's *name*, not a nearby comment. The first version
 scanned for a `KNOWN GAP` comment, armed itself on the phrase appearing in a

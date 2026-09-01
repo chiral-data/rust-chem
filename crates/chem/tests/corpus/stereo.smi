@@ -1,12 +1,18 @@
-# Stereochemistry. Every line here is a KNOWN GAP #191: the parser rejects
-# chirality markers and directional bonds outright, so none of these load at
-# all yet — never mind whether the writer could emit them again.
+# Stereochemistry: tetrahedral centres and double-bond geometry.
 #
-# Kept as fixtures rather than deleted because they are exactly what the
-# oracles will be asked to adjudicate the moment #191 lands.
+# Every line here was a pinned gap until #191 — the parser rejected chirality
+# markers and directional bonds outright, so none of them loaded at all. They
+# now parse and round-trip.
+#
+# The reversed spellings are the ones worth keeping: `C(/F)=C/F` carries the
+# same two `/` as `F/C=C/F` and means the opposite, because the first marker
+# is written pointing away from the double bond. A writer and a parser that
+# disagree about that sign flip cis and trans between them.
 
-N[C@@H](C)C(=O)O known-gap-l-alanine
-N[C@H](C)C(=O)O known-gap-d-alanine
-F/C=C/F known-gap-trans
-F/C=C\F known-gap-cis
-O[C@H]1CC[C@@H](O)CC1 known-gap-trans-cyclohexanediol
+N[C@@H](C)C(=O)O l-alanine
+N[C@H](C)C(=O)O d-alanine
+F/C=C/F trans
+F/C=C\F cis
+C(/F)=C/F trans-reversed-spelling
+C(\F)=C/F cis-reversed-spelling
+O[C@H]1CC[C@@H](O)CC1 trans-cyclohexanediol

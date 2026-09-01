@@ -45,6 +45,14 @@ pub enum SmilesError {
     /// record instead of failing.
     #[error("No atoms in SMILES")]
     NoAtoms,
+
+    /// A `.` with no component on one side of it — `CC.` or `.CC`.
+    ///
+    /// Named rather than folded into [`SmilesError::DanglingBond`]: a dot is
+    /// not a bond, and "a bond has no atom to attach to" sends the reader
+    /// hunting for a `=` that was never there.
+    #[error("A dot has no component on one side of it")]
+    DanglingDot,
 }
 
 #[derive(Error, Debug)]
