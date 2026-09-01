@@ -1,0 +1,12 @@
+# Stereochemistry. Every line here is a KNOWN GAP #191: the parser rejects
+# chirality markers and directional bonds outright, so none of these load at
+# all yet — never mind whether the writer could emit them again.
+#
+# Kept as fixtures rather than deleted because they are exactly what the
+# oracles will be asked to adjudicate the moment #191 lands.
+
+N[C@@H](C)C(=O)O known-gap-l-alanine
+N[C@H](C)C(=O)O known-gap-d-alanine
+F/C=C/F known-gap-trans
+F/C=C\F known-gap-cis
+O[C@H]1CC[C@@H](O)CC1 known-gap-trans-cyclohexanediol
