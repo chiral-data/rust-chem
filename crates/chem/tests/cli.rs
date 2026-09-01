@@ -556,14 +556,16 @@ fn test_coords_warns_rather_than_silently_discarding_the_result() {
     let path = fixture("coords-warn.smi", KEKULE);
 
     // Explicitly asking for SMILES is allowed — connectivity only is a real
-    // want — but it must say what it is costing.
+    // want — but it must say what it is costing. The wording comes from the
+    // format registry now rather than a hand-written string, so this asserts
+    // on the attribute that was lost rather than on a sentence.
     let r = run(
         &["coords", path.to_str().unwrap(), "--out-format", "smiles"],
         None,
     );
     assert_eq!(r.code, 0);
-    assert!(r.stderr.contains("warning:"), "{:?}", r.stderr);
-    assert!(r.stderr.contains("cannot store them"));
+    assert!(r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("coords_2d"), "{:?}", r.stderr);
 
     // And an output name that is not .sdf is the same mistake made implicitly.
     // Named `-dest` rather than reusing the fixture stem: the first draft of
@@ -579,7 +581,88 @@ fn test_coords_warns_rather_than_silently_discarding_the_result() {
         ],
         None,
     );
-    assert!(r.stderr.contains("will be discarded"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("coords_2d"), "{:?}", r.stderr);
+}
+
+/// Two nitro compounds, whose charges an SDF write drops.
+///
+/// The registry says `Format::SDF` does not carry `formal_charge`, because
+/// `write_sdf` documents that it does not write the field. Real files in
+/// `test.smi` hit this, so it is not a contrived case.
+const CHARGED: &str = "c1ccccc1[N+](=O)[O-] nitrobenzene\nCc1ccccc1[N+](=O)[O-] o-nitrotoluene\n";
+
+#[test]
+fn test_a_write_that_loses_nothing_says_nothing() {
+    // The regression a general mechanism most easily introduces: noise on the
+    // path that was previously quiet. SMILES in, SMILES out drops nothing.
+    let path = fixture("drops-none.smi", GOOD);
+    let r = run(&["aromatic", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    assert!(
+        !r.stderr.contains("cannot carry"),
+        "a lossless write reported a loss: {:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_the_summary_names_each_lost_attribute_once() {
+    // Two molecules lose the same attribute, and the default report is one
+    // line with a count rather than one line per molecule — the whole reason
+    // the per-molecule form is behind a flag.
+    let path = fixture("drops-charge.smi", CHARGED);
+    let dest = std::env::temp_dir().join("chem-cli-test-drops-charge.sdf");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(
+        &[
+            "aromatic",
+            path.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    );
+
+    assert_eq!(r.code, 0);
+    assert!(r.stderr.contains("formal_charge (2)"), "{:?}", r.stderr);
+    // The molecules are not named without the flag.
+    assert!(!r.stderr.contains("nitrobenzene"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("--explain-drops"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_explain_drops_names_the_molecules() {
+    let path = fixture("drops-explain.smi", CHARGED);
+    let dest = std::env::temp_dir().join("chem-cli-test-drops-explain.sdf");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(
+        &[
+            "aromatic",
+            path.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+            "--explain-drops",
+        ],
+        None,
+    );
+
+    assert_eq!(r.code, 0);
+    assert!(
+        r.stderr.contains("nitrobenzene: formal_charge"),
+        "{:?}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("o-nitrotoluene: formal_charge"),
+        "{:?}",
+        r.stderr
+    );
+    // The pointer to the flag is pointless once the flag is on.
+    assert!(!r.stderr.contains("--explain-drops"), "{:?}", r.stderr);
 }
 
 #[test]

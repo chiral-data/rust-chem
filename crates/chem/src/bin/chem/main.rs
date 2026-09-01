@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use backend::Backend;
 use chem::draw::structure::{StructureOptions, StructureTheme};
 use chem::draw::svg::structure_to_svg;
+use chem::io::format::Carries;
 use chem::io::reader::Format;
 use clap::{Parser, Subcommand, ValueEnum};
 use emath::Vec2;
@@ -55,6 +56,14 @@ struct Cli {
     /// away the other 999. On for a job that must not half-succeed.
     #[arg(long, global = true)]
     strict: bool,
+
+    /// List the molecules behind a "cannot carry" summary, one line each.
+    ///
+    /// Off by default because the summary is what a hundred-thousand-molecule
+    /// file needs; on when a conversion surprised you and the question is
+    /// which records it touched.
+    #[arg(long, global = true)]
+    explain_drops: bool,
 }
 
 #[derive(Subcommand)]
@@ -376,7 +385,10 @@ fn run(cli: &Cli) -> Result<i32> {
                 records.len()
             );
 
-            let format = OutputFormat::resolve(*out_format, false, output.as_deref());
+            // Perceiving aromaticity adds nothing a format has to make room
+            // for, so no format is required and the default stands.
+            let format = OutputFormat::resolve(*out_format, Carries::empty(), output.as_deref());
+            write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
             stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
@@ -430,6 +442,15 @@ fn run(cli: &Cli) -> Result<i32> {
                 // would emit the input unchanged after reporting that a layout
                 // was computed. Drop it, and say so rather than let someone
                 // find a 3D file where they asked for a drawing.
+                //
+                // Reported here rather than by `write::report_drops`, and not
+                // for want of trying: `Carries` is a set of per-attribute
+                // capabilities, and SDF genuinely carries both COORDS_2D and
+                // COORDS_3D. What it cannot do is carry them *at the same
+                // time*, which a flat mask has no way to say. This loss is
+                // also this command's own decision rather than the format's
+                // limit, so deriving it from the mask would report a true
+                // thing for a false reason.
                 if ok && molecule.has_coords3() {
                     molecule.clear_coords3();
                     flattened += 1;
@@ -444,7 +465,11 @@ fn run(cli: &Cli) -> Result<i32> {
                 );
             }
 
-            let format = OutputFormat::resolve(*out_format, true, output.as_deref());
+            // A layout is the thing this command produced, so the default
+            // format is whichever registered one can hold it — SDF — rather
+            // than SDF by name.
+            let format = OutputFormat::resolve(*out_format, Carries::COORDS_2D, output.as_deref());
+            write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
             stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
