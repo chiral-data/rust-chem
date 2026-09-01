@@ -1,0 +1,24 @@
+# The cases named in the issue's own table. Every one is somewhere a parser or
+# a writer can be quietly wrong, and quietly is the operative word: each of
+# these round-trips to *something*, just not always the same molecule.
+
+# Sixty aromatic carbons, twelve five-membered rings, thirty-two ring closures
+# live at once. Breaks ring-closure bookkeeping that assumes a small digit pool.
+c12c3c4c5c1c6c7c8c2c9c1c3c2c4c3c5c4c6c5c7c6c7c8c9c8c1c2c3c1c4c5c2c6c7c8c12 buckyball
+# Tetrahedral stereo. Dropping @@ yields a valid molecule that is the wrong one.
+# KNOWN GAP #191: the parser rejects the chirality marker outright, though
+# `Chirality` exists in the data model.
+N[C@@H](C)C(=O)O known-gap-alanine-chirality
+# Double-bond geometry, and the pair that must not collapse into each other.
+# KNOWN GAP #191: directional bonds are unsupported, though `BondStereo` exists.
+F/C=C/F known-gap-trans-difluoroethene
+F/C=C\F known-gap-cis-difluoroethene
+# Two fragments, one record. A parser that returns the first component is wrong
+# without ever failing.
+# KNOWN GAP #191: dot disconnection is unsupported, so every salt is a skip.
+[Na+].[Cl-] known-gap-sodium-chloride
+# Aromatic nitrogen carrying the ring's hydrogen. The [nH] is load-bearing:
+# without it the ring has no valid Kekule form.
+c1cc[nH]c1 pyrrole
+# Isotope. Same connectivity, same charge, different molecule.
+[13CH4] carbon-13-methane

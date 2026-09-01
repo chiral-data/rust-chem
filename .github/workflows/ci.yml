@@ -183,3 +183,22 @@ jobs:
       - name: Build web bundle
         working-directory: crates/chem-app
         run: trunk build --release
+
+  oracle:
+    name: Differential oracles
+    runs-on: ubuntu-latest
+
+    # Its own job, parallel to the Rust ones, because it needs Docker and will
+    # be the slowest thing in this file. A `cargo fmt` fix must not wait on
+    # RDKit and OpenBabel installing.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the oracle image
+        run: docker build -t chem-oracle -f tools/oracle/Dockerfile .
+
+      # Fails on `chem` disagreeing with an oracle. Oracle-vs-oracle
+      # disagreements and pinned known gaps are reported and do not fail —
+      # see the module docstring in tools/oracle/run.py.
+      - name: Run the corpus against RDKit and OpenBabel
+        run: docker run --rm chem-oracle

@@ -1,0 +1,18 @@
+# Ring-closure bookkeeping. The digit is a *label*, not an identity: it is
+# freed the moment its pair closes and may be reused immediately, which is the
+# rule naive implementations get wrong.
+
+C1CCCCC1 cyclohexane
+# Two independent rings reusing digit 1 — legal, and a parser that treats
+# digits as globally unique mis-bonds it.
+C1CCCCC1C1CCCCC1 bicyclohexyl
+# Fused, sharing an edge.
+c1ccc2ccccc2c1 naphthalene
+# Bridged: three closures open before any of them shut.
+C1CC2CCC1C2 norbornane
+# Past nine, where the two-digit %NN form becomes mandatory.
+C%10CCCCC%10 cyclohexane-high-label
+# A closure carrying an explicit bond order. Cyclopentadiene rather than
+# benzene so this does not duplicate aromatics.smi, where the Kekule/aromatic
+# pair is the point rather than an accident.
+C1=CC=CC1 kekule-cyclopentadiene

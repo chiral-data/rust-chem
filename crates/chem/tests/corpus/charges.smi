@@ -1,0 +1,11 @@
+# Formal charge, which SDF's atom block cannot hold in the form our writer
+# emits — the loss #183's mask reports and this file makes an oracle confirm.
+
+[NH4+] ammonium
+[OH-] hydroxide
+c1ccccc1[N+](=O)[O-] nitrobenzene
+[Mg+2] magnesium-ion
+C[N+](C)(C)C tetramethylammonium
+# Net neutral, two charges. A writer that drops charges silently produces a
+# molecule that is not merely uncharged but chemically impossible.
+[O-]C(=O)C[NH3+] glycine-zwitterion

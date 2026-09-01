@@ -1,0 +1,5 @@
+# Pinned, because an oracle that resolves differently next month makes every
+# finding it reported unreproducible. Bump deliberately, in its own commit,
+# and re-read the corpus report when you do.
+rdkit==2025.3.3
+openbabel-wheel==3.1.1.21
