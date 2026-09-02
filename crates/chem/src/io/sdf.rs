@@ -126,6 +126,13 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     // still claimed it. Perceiving on read is what every toolkit does and what
     // makes the claim true again.
     crate::io::aromaticity::detect_aromaticity(&mut mol);
+
+    // Double-bond geometry, for the same reason and from the same place: a
+    // molfile states where the atoms are, not which isomer they make, so a
+    // reader that takes it literally returns a molecule that is drawn cis and
+    // claims nothing. Left alone where the drawing does not say — a substituent
+    // on one end only has no configuration to read (#198).
+    crate::core::stereo::perceive_bond_stereo(&mut mol);
     Ok(mol)
 }
 
@@ -334,8 +341,23 @@ fn parse_bond_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
         }
     };
 
+    // The field after the type is bond stereo. Value 3 on a double bond means
+    // "cis or trans, either" — the file declining to say, which is different
+    // from the file not mentioning it. Recorded as `Unspecified` so
+    // `perceive_bond_stereo` knows to leave the bond alone rather than read a
+    // configuration out of coordinates the writer never intended as a claim.
+    let declines_to_say = bond_order == BondOrder::Double
+        && parts.get(3).and_then(|f| f.parse::<u8>().ok()) == Some(3);
+
+    let bond = Bond::new(atom1, atom2, bond_order);
+    let bond = if declines_to_say {
+        bond.with_stereo(BondStereo::Unspecified)
+    } else {
+        bond
+    };
+
     // Add bond to molecule (validates atom indices internally)
-    mol.add_bond(Bond::new(atom1, atom2, bond_order))
+    mol.add_bond(bond)
         .map_err(|e| SdfError::ParseError(format!("Failed to add bond: {}", e)))?;
 
     Ok(())
@@ -417,6 +439,27 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
 /// written with zeros, and [`molecule_has_coords_for_sdf`] lets a caller check
 /// first rather than discovering it in the file.
 pub fn write_sdf(mol: &Molecule) -> String {
+    // A molecule that states double-bond geometry but carries no drawing is
+    // laid out first, because geometry is the *only* channel V2000 has for it:
+    // there is no field to write, so a record with no coordinates cannot
+    // express cis at all.
+    //
+    // Without this the attribute would survive for a molecule that happens to
+    // have been laid out and vanish for one that has not, and `Carries` is a
+    // per-format claim with no way to say "sometimes". Generating the layout
+    // makes the claim true for every molecule rather than most of them.
+    //
+    // Narrow on purpose: only when there is a configuration to lose and no
+    // drawing to hold it. An ordinary molecule with no coordinates is still
+    // written with zeros, as the caller expects.
+    let laid_out;
+    let mol = if mol.coords().is_none() && needs_geometry_for_stereo(mol) {
+        laid_out = crate::core::layout::with_coords(mol);
+        &laid_out
+    } else {
+        mol
+    };
+
     let mut out = String::with_capacity(128 + mol.num_atoms() * 70 + mol.num_bonds() * 22);
 
     // Line 0: the name. Lines 1 and 2 are the program line and a comment; both
@@ -503,6 +546,24 @@ pub fn write_sdf(mol: &Molecule) -> String {
         // narrow end on the nitrogen, and RDKit read it as a claim about the
         // nitrogen — parsed the record happily, and reported no stereocentre at
         // all.
+        // A double bond that states no configuration, but whose ends both
+        // carry a substituent, needs saying so explicitly. Any 2D drawing puts
+        // those substituents on *some* side, so a reader perceiving geometry
+        // from coordinates — ours included — would read a configuration the
+        // molecule never claimed. Field 3 is "either", which is a statement of
+        // ignorance rather than of geometry, and is what RDKit writes here.
+        if bond.order() == BondOrder::Double
+            && bond.stereo() == BondStereo::None
+            && geometry_is_inferrable(mol, bond.atom1(), bond.atom2())
+        {
+            out.push_str(&format!(
+                "{:>3}{:>3}{order:>3}  3  0  0  0\n",
+                bond.atom1() + 1,
+                bond.atom2() + 1
+            ));
+            continue;
+        }
+
         let (stereo, (first, second)) = match wedge.get(&index) {
             Some(&(centre, direction)) if centre == bond.atom2() => {
                 (direction, (bond.atom2(), bond.atom1()))
@@ -523,6 +584,23 @@ pub fn write_sdf(mol: &Molecule) -> String {
     out.push_str(SDF_ENTRY_END);
     out.push('\n');
     out
+}
+
+/// Whether a reader would derive a configuration for this double bond from a
+/// drawing of it — that is, whether both ends carry something to be on a side.
+fn geometry_is_inferrable(mol: &Molecule, left: usize, right: usize) -> bool {
+    let has_other =
+        |atom: usize, partner: usize| mol.neighbors(atom).iter().any(|n| n.atom_idx != partner);
+    has_other(left, right) && has_other(right, left)
+}
+
+/// Whether this molecule states a double-bond configuration that only a
+/// drawing can carry.
+fn needs_geometry_for_stereo(mol: &Molecule) -> bool {
+    (0..mol.num_bonds()).any(|i| {
+        let bond = mol.bond(i);
+        bond.order() == BondOrder::Double && matches!(bond.stereo(), BondStereo::E | BondStereo::Z)
+    })
 }
 
 /// `M  CHG` and `M  ISO` lines, between the bond block and `M  END`.

@@ -24,6 +24,7 @@
 //! where bond lengths are actually bad, and only kept if it improves them
 //! without introducing an overlap.
 
+use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::geometry::Point2;
 use crate::core::molecule::Molecule;
 use crate::core::rings::{Ring, find_sssr};
@@ -95,6 +96,17 @@ pub fn layout(molecule: &mut Molecule) -> bool {
     true
 }
 
+/// A copy of the molecule with generated coordinates.
+///
+/// For callers holding a `&Molecule` that need a drawing without taking
+/// ownership — [`crate::io::sdf::write_sdf`] does, because V2000 can only
+/// express double-bond geometry as positions.
+pub fn with_coords(molecule: &Molecule) -> Molecule {
+    let mut copy = molecule.clone();
+    layout(&mut copy);
+    copy
+}
+
 /// Generates coordinates only if the molecule doesn't already have some, so a
 /// file-supplied layout isn't discarded in favour of a generated one.
 ///
@@ -154,6 +166,115 @@ impl<'a> Layout<'a> {
         for component in &components {
             self.refine_component(component);
         }
+
+        // Last, and deliberately after refinement: the constructive pass above
+        // gets the turn right, but it depends on the traversal reaching a
+        // double bond's two ends in order, and both `resolve_overlaps` and
+        // `refine_component` then move atoms knowing nothing about
+        // stereochemistry. This checks the drawing that actually came out.
+        self.enforce_double_bond_stereo();
+    }
+
+    /// Whether the bond between two atoms is a cis double bond.
+    fn is_cis_bond(&self, a: usize, b: usize) -> bool {
+        self.molecule
+            .graph()
+            .get_bond(a, b)
+            .map(|idx| self.molecule.bond(idx))
+            .is_some_and(|bond| bond.order() == BondOrder::Double && bond.stereo() == BondStereo::Z)
+    }
+
+    /// Reflects a substituent group where the drawing contradicts the bond.
+    ///
+    /// Measures rather than assumes: for each double bond that states a
+    /// configuration, read the geometry back out of the finished layout with
+    /// the same test the reader uses, and if it disagrees, mirror one side
+    /// across the bond axis.
+    ///
+    /// Only acyclic double bonds. A double bond inside a ring has its geometry
+    /// forced by the ring — it cannot be reflected without tearing the ring
+    /// open, and it does not need to be, because the ring already determines
+    /// the answer.
+    ///
+    /// The smaller side moves, so the reflection disturbs as little of the
+    /// drawing as possible. It can still crowd a cis system: a correct drawing
+    /// of the wrong isomer is worse than a tight drawing of the right one.
+    fn enforce_double_bond_stereo(&mut self) {
+        let points: Vec<Point2> = match self.coords.iter().copied().collect::<Option<Vec<_>>>() {
+            Some(points) => points,
+            None => return, // an incomplete layout has nothing to check
+        };
+
+        for bond_idx in 0..self.molecule.num_bonds() {
+            let bond = self.molecule.bond(bond_idx);
+            let wanted = bond.stereo();
+            if bond.order() != BondOrder::Double
+                || (wanted != BondStereo::E && wanted != BondStereo::Z)
+            {
+                continue;
+            }
+            if self.rings.iter().any(|ring| ring.contains_bond(bond_idx)) {
+                continue;
+            }
+
+            let (left, right) = (bond.atom1(), bond.atom2());
+            let drawn = crate::core::stereo::geometry_of(self.molecule, &points, left, right);
+            if drawn == Some(wanted) {
+                continue;
+            }
+
+            self.reflect_across(left, right);
+        }
+    }
+
+    /// Mirrors the smaller side of a bond across that bond's axis.
+    fn reflect_across(&mut self, left: usize, right: usize) {
+        let Some(side) = self.side_of_bond(left, right) else {
+            return; // a ring would put both ends in the same piece
+        };
+        let (Some(origin), Some(far)) = (self.coords[left], self.coords[right]) else {
+            return;
+        };
+
+        let Some(axis) = (far - origin).normalized() else {
+            return;
+        };
+        for atom in side {
+            let Some(p) = self.coords[atom] else { continue };
+            let rel = p - origin;
+            // Reflection in the line through `origin` along `axis`.
+            let along = rel.x * axis.x + rel.y * axis.y;
+            let projected = axis * along;
+            self.coords[atom] = Some(origin + projected * 2.0 - rel);
+        }
+    }
+
+    /// The atoms hanging off `right`, once the bond to `left` is cut.
+    ///
+    /// `None` when cutting the bond does not separate them, which means they
+    /// are joined by some other path and reflecting would tear it.
+    fn side_of_bond(&self, left: usize, right: usize) -> Option<Vec<usize>> {
+        let mut seen = vec![false; self.molecule.num_atoms()];
+        seen[left] = true;
+        seen[right] = true;
+        let mut stack = vec![right];
+        let mut side = vec![right];
+
+        while let Some(atom) = stack.pop() {
+            for neighbour in self.molecule.neighbors(atom) {
+                let next = neighbour.atom_idx;
+                if next == left {
+                    // Reached the far end by another route: a ring.
+                    return None;
+                }
+                if !seen[next] {
+                    seen[next] = true;
+                    side.push(next);
+                    stack.push(next);
+                }
+            }
+        }
+        Some(side)
     }
 
     fn component_width(&self, component: &[usize]) -> f64 {
@@ -376,7 +497,16 @@ impl<'a> Layout<'a> {
             let directions = self.substituent_directions(current, unplaced.len());
             for (&atom, dir) in unplaced.iter().zip(directions) {
                 self.coords[atom] = Some(self.coords[current].expect("placed") + dir * BOND_LENGTH);
-                self.flip[atom] = !self.flip[current];
+                // Alternating the turn is what draws a chain trans, so a cis
+                // double bond is drawn by *not* alternating across it: the
+                // chain doubles back and the two substituents land on the same
+                // side. Constructive rather than corrective, so the common case
+                // comes out right first time and looks like a chemist drew it.
+                self.flip[atom] = if self.is_cis_bond(current, atom) {
+                    self.flip[current]
+                } else {
+                    !self.flip[current]
+                };
                 queue.push_back(atom);
             }
         }

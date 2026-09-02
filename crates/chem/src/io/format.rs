@@ -371,6 +371,11 @@ static FORMATS: &[FormatDescriptor] = &[
             .or(Carries::FORMAL_CHARGE)
             .or(Carries::ISOTOPE)
             .or(Carries::STEREO_ATOM)
+            // Earned in #198. Nothing is written for it — V2000 has no field
+            // for double-bond geometry — so it survives only because the layout
+            // now draws cis and trans differently and `perceive_bond_stereo`
+            // reads the difference back.
+            .or(Carries::STEREO_BOND)
             .or(Carries::PROPERTIES),
         reader: Some(crate::io::reader::read_sdf),
         writer: Some(write_sdf_records),

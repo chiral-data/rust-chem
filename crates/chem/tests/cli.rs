@@ -590,14 +590,17 @@ fn test_coords_warns_rather_than_silently_discarding_the_result() {
 /// The registry says `Format::SDF` does not carry `formal_charge`, because
 /// `write_sdf` documents that it does not write the field. Real files in
 /// `test.smi` hit this, so it is not a contrived case.
-/// Two molecules that lose the *same* attribute on the way to SDF.
+/// Two molecules that lose the *same* attribute when written.
 ///
-/// Double-bond geometry, not charge. Charge used to be the example, until #197
-/// taught the V2000 writer `M  CHG` and the loss stopped happening — these
-/// tests then failed by reporting nothing, which is the drop report being
-/// honest rather than broken. Bond stereo has no V2000 representation without a
-/// drawing, so it is the loss that remains.
-const CHARGED: &str = "F/C=C/F trans-difluoroethene\nF/C=C\\F cis-difluoroethene\n";
+/// **Coordinates on the way to SMILES**, which is a structural limit rather
+/// than a gap: a SMILES string has nowhere to put a position and never will.
+///
+/// The earlier choices both stopped being losses as the writers improved —
+/// formal charge until #197 taught V2000 `M  CHG`, then double-bond geometry
+/// until #198 taught the layout to draw it — and each time these tests failed
+/// by reporting *nothing*, which was the drop report being honest rather than
+/// broken. Picking a loss that cannot be fixed stops that recurring.
+const LAID_OUT: &str = "F/C=C/F trans-difluoroethene\nF/C=C\\F cis-difluoroethene\n";
 
 #[test]
 fn test_a_write_that_loses_nothing_says_nothing() {
@@ -619,13 +622,14 @@ fn test_the_summary_names_each_lost_attribute_once() {
     // Two molecules lose the same attribute, and the default report is one
     // line with a count rather than one line per molecule — the whole reason
     // the per-molecule form is behind a flag.
-    let path = fixture("drops-charge.smi", CHARGED);
-    let dest = std::env::temp_dir().join("chem-cli-test-drops-charge.sdf");
+    let path = fixture("drops-charge.smi", LAID_OUT);
+    let dest = std::env::temp_dir().join("chem-cli-test-drops-charge-out.smi");
     let _ = std::fs::remove_file(&dest);
 
+    // `coords` computes a layout, and SMILES has nowhere to keep it.
     let r = run(
         &[
-            "aromatic",
+            "coords",
             path.to_str().unwrap(),
             "-o",
             dest.to_str().unwrap(),
@@ -634,7 +638,7 @@ fn test_the_summary_names_each_lost_attribute_once() {
     );
 
     assert_eq!(r.code, 0);
-    assert!(r.stderr.contains("stereo_bond (2)"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("coords_2d (2)"), "{:?}", r.stderr);
     // The molecules are not named without the flag.
     assert!(!r.stderr.contains("difluoroethene"), "{:?}", r.stderr);
     assert!(r.stderr.contains("--explain-drops"), "{:?}", r.stderr);
@@ -642,13 +646,13 @@ fn test_the_summary_names_each_lost_attribute_once() {
 
 #[test]
 fn test_explain_drops_names_the_molecules() {
-    let path = fixture("drops-explain.smi", CHARGED);
-    let dest = std::env::temp_dir().join("chem-cli-test-drops-explain.sdf");
+    let path = fixture("drops-explain.smi", LAID_OUT);
+    let dest = std::env::temp_dir().join("chem-cli-test-drops-explain-out.smi");
     let _ = std::fs::remove_file(&dest);
 
     let r = run(
         &[
-            "aromatic",
+            "coords",
             path.to_str().unwrap(),
             "-o",
             dest.to_str().unwrap(),
@@ -659,12 +663,12 @@ fn test_explain_drops_names_the_molecules() {
 
     assert_eq!(r.code, 0);
     assert!(
-        r.stderr.contains("trans-difluoroethene: stereo_bond"),
+        r.stderr.contains("trans-difluoroethene: coords_2d"),
         "{:?}",
         r.stderr
     );
     assert!(
-        r.stderr.contains("cis-difluoroethene: stereo_bond"),
+        r.stderr.contains("cis-difluoroethene: coords_2d"),
         "{:?}",
         r.stderr
     );

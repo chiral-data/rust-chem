@@ -8,6 +8,7 @@ pub mod molecule;
 pub mod residue;
 pub mod rings;
 pub mod site;
+pub mod stereo;
 
 pub mod elements;
 
@@ -23,6 +24,7 @@ pub mod prelude {
     pub use crate::core::residue::{Chain, Residue};
     pub use crate::core::rings::{Ring, find_sssr, perceive_rings, ring_count};
     pub use crate::core::site::AtomSite;
+    pub use crate::core::stereo::perceive_bond_stereo;
 }
 
 #[cfg(test)]
