@@ -590,7 +590,14 @@ fn test_coords_warns_rather_than_silently_discarding_the_result() {
 /// The registry says `Format::SDF` does not carry `formal_charge`, because
 /// `write_sdf` documents that it does not write the field. Real files in
 /// `test.smi` hit this, so it is not a contrived case.
-const CHARGED: &str = "c1ccccc1[N+](=O)[O-] nitrobenzene\nCc1ccccc1[N+](=O)[O-] o-nitrotoluene\n";
+/// Two molecules that lose the *same* attribute on the way to SDF.
+///
+/// Double-bond geometry, not charge. Charge used to be the example, until #197
+/// taught the V2000 writer `M  CHG` and the loss stopped happening — these
+/// tests then failed by reporting nothing, which is the drop report being
+/// honest rather than broken. Bond stereo has no V2000 representation without a
+/// drawing, so it is the loss that remains.
+const CHARGED: &str = "F/C=C/F trans-difluoroethene\nF/C=C\\F cis-difluoroethene\n";
 
 #[test]
 fn test_a_write_that_loses_nothing_says_nothing() {
@@ -627,9 +634,9 @@ fn test_the_summary_names_each_lost_attribute_once() {
     );
 
     assert_eq!(r.code, 0);
-    assert!(r.stderr.contains("formal_charge (2)"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("stereo_bond (2)"), "{:?}", r.stderr);
     // The molecules are not named without the flag.
-    assert!(!r.stderr.contains("nitrobenzene"), "{:?}", r.stderr);
+    assert!(!r.stderr.contains("difluoroethene"), "{:?}", r.stderr);
     assert!(r.stderr.contains("--explain-drops"), "{:?}", r.stderr);
 }
 
@@ -652,12 +659,12 @@ fn test_explain_drops_names_the_molecules() {
 
     assert_eq!(r.code, 0);
     assert!(
-        r.stderr.contains("nitrobenzene: formal_charge"),
+        r.stderr.contains("trans-difluoroethene: stereo_bond"),
         "{:?}",
         r.stderr
     );
     assert!(
-        r.stderr.contains("o-nitrotoluene: formal_charge"),
+        r.stderr.contains("cis-difluoroethene: stereo_bond"),
         "{:?}",
         r.stderr
     );

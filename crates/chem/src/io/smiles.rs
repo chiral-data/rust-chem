@@ -371,6 +371,12 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
     // A dot with nothing before it, or nothing after it by the time we finish.
     let mut dangling_dot = false;
     let mut after_dot = false;
+    // Each atom's neighbours in the order the *string* introduced them, which
+    // is the order a chirality marker is defined against and which the finished
+    // graph cannot recover. `IMPLICIT_H` stands in for the hydrogen inside a
+    // bracket; a ring-closure slot is filled in when the label closes.
+    let mut written: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut pending_closures: HashMap<u32, (usize, usize)> = HashMap::new();
 
     for token in tokens {
         match token {
@@ -414,6 +420,19 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                     if let Some(lean) = next_bond.and_then(BondToken::direction) {
                         directional.push((prev_atom, atom_idx, lean));
                     }
+                }
+
+                // Written order for this atom: the atom it hangs off comes
+                // first, then the bracket's hydrogen, then whatever follows.
+                let slots = written.entry(atom_idx).or_default();
+                if let Some(prev) = current_atom {
+                    slots.push(prev);
+                }
+                if atom_token.h_count.is_some_and(|h| h > 0) {
+                    slots.push(IMPLICIT_H);
+                }
+                if let Some(prev) = current_atom {
+                    written.entry(prev).or_default().push(atom_idx);
                 }
 
                 current_atom = Some(atom_idx);
@@ -467,6 +486,11 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
             Token::Ring(ring_num) => {
                 let current = current_atom.ok_or(SmilesError::InvalidRing(*ring_num))?;
 
+                if let Some((opener, slot)) = pending_closures.remove(ring_num) {
+                    written.entry(opener).or_default()[slot] = current;
+                    written.entry(current).or_default().push(opener);
+                }
+
                 if let Some((ring_start, ring_bond)) = rings.remove(ring_num) {
                     // Same rule as the atom-to-atom path above: with no
                     // explicit bond symbol, a bond is aromatic only when both
@@ -492,6 +516,12 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                         .map_err(|e| SmilesError::ParseError(e.to_string()))?;
                     next_bond = None;
                 } else {
+                    // Reserve the slot now: the digit's position in the
+                    // string is what a chirality marker refers to, even though
+                    // the bond is not built until the label closes.
+                    let slots = written.entry(current).or_default();
+                    slots.push(usize::MAX - 1);
+                    pending_closures.insert(*ring_num, (current, slots.len() - 1));
                     rings.insert(*ring_num, (current, next_bond));
                     next_bond = None;
                 }
@@ -535,6 +565,7 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
         return Err(SmilesError::DanglingDot);
     }
 
+    normalise_chirality(&mut mol, &written);
     resolve_directional_bonds(&mut mol, &directional);
 
     mol.calculate_implicit_hydrogens();
@@ -575,6 +606,78 @@ fn add_atom_from_token(mol: &mut Molecule, token: &AtomToken) -> Result<usize, S
     }
 
     Ok(idx)
+}
+
+/// The implicit hydrogen of a bracket atom, as a neighbour slot.
+///
+/// `usize::MAX` so it sorts last: every convention that orders a stereocentre's
+/// neighbours by index — SMILES canonical order, molfile parity — puts an
+/// implicit hydrogen at the end.
+const IMPLICIT_H: usize = usize::MAX;
+
+/// Rewrites each stereocentre's [`Chirality`] to mean the same thing relative
+/// to **sorted** neighbour order rather than written order.
+///
+/// # Why this has to happen at parse time
+///
+/// `@` means "looking from the first neighbour *as written*, the rest appear
+/// anticlockwise". That definition is anchored to the string, and the string is
+/// gone by the time anyone reads the molecule. Two spellings of one molecule —
+/// `N[C@@H](C)C(=O)O` and `[C@@H](N)(C)C(=O)O` — carry different markers for
+/// the same configuration, and a consumer holding only the graph cannot tell
+/// which it has.
+///
+/// Storing the raw marker worked for as long as the only consumer was the
+/// SMILES writer, which emitted it back unchanged and round-tripped perfectly
+/// while meaning nothing. It failed the moment the SDF writer needed to state
+/// the same configuration in molfile's numbering-based parity: correct for
+/// `N[C@@H](C)...`, wrong for a centre written first, and wrong for a centre
+/// carrying a ring-closure digit — because a closure bond joins the graph when
+/// the ring closes, long after the digit was written.
+///
+/// So the marker is normalised here, while the written order is still known.
+/// Afterwards [`Chirality`] means: looking from the lowest-indexed neighbour,
+/// the rest in increasing index order run clockwise or anticlockwise, with an
+/// implicit hydrogen counted last. That is a property of the molecule, so every
+/// writer can convert into its own convention, and the SMILES writer converts
+/// back.
+fn normalise_chirality(mol: &mut Molecule, written: &HashMap<usize, Vec<usize>>) {
+    for atom_idx in 0..mol.num_atoms() {
+        let chirality = mol.atom(atom_idx).chirality();
+        if chirality != Chirality::Clockwise && chirality != Chirality::CounterClockwise {
+            continue;
+        }
+        let Some(order) = written.get(&atom_idx) else {
+            continue;
+        };
+
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        if permutation_is_odd(order, &sorted) {
+            let flipped = match chirality {
+                Chirality::Clockwise => Chirality::CounterClockwise,
+                _ => Chirality::Clockwise,
+            };
+            *mol.atom_mut(atom_idx) = mol.atom(atom_idx).clone().with_chirality(flipped);
+        }
+    }
+}
+
+/// Whether reordering `from` into `to` takes an odd number of swaps.
+pub(crate) fn permutation_is_odd(from: &[usize], to: &[usize]) -> bool {
+    let mut current: Vec<usize> = from.to_vec();
+    let mut swaps = 0;
+    for target in 0..to.len().min(current.len()) {
+        if current[target] == to[target] {
+            continue;
+        }
+        let Some(found) = (target + 1..current.len()).find(|&i| current[i] == to[target]) else {
+            return false;
+        };
+        current.swap(target, found);
+        swaps += 1;
+    }
+    swaps % 2 == 1
 }
 
 /// Turns `/` and `\` markers into [`BondStereo`] on the double bonds they
