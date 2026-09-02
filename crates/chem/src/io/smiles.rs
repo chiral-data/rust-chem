@@ -20,6 +20,10 @@ enum Token {
     Branch,
     BranchEnd,
     Ring(u32),
+    /// `.` — the next atom starts a new component rather than bonding to the
+    /// previous one. Salts and co-crystals are ordinary catalogue entries, so
+    /// this is not an exotic corner (#191).
+    Dot,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +33,7 @@ struct AtomToken {
     charge: i8,
     isotope: Option<u16>,
     h_count: Option<u8>,
+    chirality: Chirality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +43,14 @@ enum BondToken {
     Triple,
     Quadruble,
     Aromatic,
+    /// `/` and `\` — single bonds that also say which way they lean.
+    ///
+    /// The direction is not a property of this bond at all: it describes the
+    /// configuration of the *double* bond next to it. Carried through
+    /// tokenisation and resolved once the whole molecule is built, in
+    /// [`resolve_directional_bonds`].
+    Up,
+    Down,
 }
 
 impl BondToken {
@@ -48,6 +61,18 @@ impl BondToken {
             BondToken::Triple => BondOrder::Triple,
             BondToken::Quadruble => BondOrder::Quadruple,
             BondToken::Aromatic => BondOrder::Aromatic,
+            // A directional bond is a single bond. The slash carries stereo,
+            // not order.
+            BondToken::Up | BondToken::Down => BondOrder::Single,
+        }
+    }
+
+    /// Which way the marker leans, as written: `/` up, `\` down.
+    fn direction(self) -> Option<i8> {
+        match self {
+            BondToken::Up => Some(1),
+            BondToken::Down => Some(-1),
+            _ => None,
         }
     }
 }
@@ -84,6 +109,7 @@ fn parse_smiles_tokens(input: &str) -> IResult<&str, Vec<Token>> {
         map(char('('), |_| Token::Branch),
         map(char(')'), |_| Token::BranchEnd),
         map(parse_ring_number, Token::Ring),
+        map(char('.'), |_| Token::Dot),
     )))
     .parse(input)
 }
@@ -107,6 +133,10 @@ fn parse_bracket_atom(input: &str) -> IResult<&str, AtomToken> {
                 symbol.to_string()
             };
 
+            // Order inside brackets is fixed by the spec: isotope, symbol,
+            // chirality, hydrogen count, charge. Parsing chirality after the
+            // H count would reject `[C@H]`, which is the common spelling.
+            let (input, chirality) = opt(parse_chirality).parse(input)?;
             let (input, h_count) = opt(parse_h_count).parse(input)?;
             let (input, charge) = opt(parse_charge).parse(input)?;
 
@@ -118,6 +148,7 @@ fn parse_bracket_atom(input: &str) -> IResult<&str, AtomToken> {
                     charge: charge.unwrap_or(0),
                     isotope,
                     h_count,
+                    chirality: chirality.unwrap_or(Chirality::None),
                 },
             ))
         },
@@ -147,6 +178,9 @@ fn parse_element_atom(input: &str) -> IResult<&str, AtomToken> {
             charge: 0,
             isotope: None,
             h_count: None,
+            // The organic-subset shorthand has nowhere to write a chirality
+            // marker; `[C@H]` is the only spelling.
+            chirality: Chirality::None,
         },
     ))
 }
@@ -235,6 +269,23 @@ fn parse_one_char_element(input: &str) -> IResult<&str, String> {
     }
 }
 
+/// Tetrahedral chirality: `@` or `@@`.
+///
+/// Bracket atoms only — the organic-subset shorthand has nowhere to put it.
+/// `@@` must be tried first or `alt` matches the single `@` and leaves the
+/// second one to fail the closing bracket.
+///
+/// Only the tetrahedral case. `@AL1`, `@TB1` and `@OH1` describe allene,
+/// trigonal-bipyramidal and octahedral centres, which the data model has no
+/// room for and no format in this milestone needs.
+fn parse_chirality(input: &str) -> IResult<&str, Chirality> {
+    alt((
+        map(tag("@@"), |_| Chirality::Clockwise),
+        map(char('@'), |_| Chirality::CounterClockwise),
+    ))
+    .parse(input)
+}
+
 fn parse_h_count(input: &str) -> IResult<&str, u8> {
     preceded(
         char('H'),
@@ -266,6 +317,8 @@ fn parse_bond(input: &str) -> IResult<&str, BondToken> {
         map(char('#'), |_| BondToken::Triple),
         map(char(':'), |_| BondToken::Aromatic),
         map(char('$'), |_| BondToken::Quadruble),
+        map(char('/'), |_| BondToken::Up),
+        map(char('\\'), |_| BondToken::Down),
     ))
     .parse(input)
 }
@@ -311,6 +364,13 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
     let mut next_bond: Option<BondToken> = None;
     let mut dangling_bond = false;
     let mut rings: HashMap<u32, (usize, Option<BondToken>)> = HashMap::new();
+    // Every `/` or `\` as written: (first atom, second atom, lean). Written
+    // order matters and cannot be recovered from the finished graph, which is
+    // why this is collected here rather than derived later.
+    let mut directional: Vec<(usize, usize, i8)> = Vec::new();
+    // A dot with nothing before it, or nothing after it by the time we finish.
+    let mut dangling_dot = false;
+    let mut after_dot = false;
 
     for token in tokens {
         match token {
@@ -346,9 +406,18 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                     }
                     mol.add_bond(bond)
                         .map_err(|e| SmilesError::ParseError(e.to_string()))?;
+
+                    // Kept in written order — `prev_atom` came first in the
+                    // string. `resolve_directional_bonds` needs that, because
+                    // the same two symbols mean opposite things depending on
+                    // which side of the double bond they were written.
+                    if let Some(lean) = next_bond.and_then(BondToken::direction) {
+                        directional.push((prev_atom, atom_idx, lean));
+                    }
                 }
 
                 current_atom = Some(atom_idx);
+                after_dot = false;
                 next_bond = None; // pending_bond: i.e. it will be applied once next atom arrives
             }
 
@@ -374,6 +443,25 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
             Token::BranchEnd => {
                 current_atom = Some(stack.pop().ok_or(SmilesError::MismatchedBranches)?);
                 next_bond = None;
+            }
+
+            Token::Dot => {
+                // Breaks the chain: the next atom starts a component rather
+                // than bonding to this one.
+                //
+                // Ring labels deliberately survive. `C1.C1` is legal and bonds
+                // the two components together — the dot ends the *chain*, not
+                // the molecule, so `rings` is left alone.
+                if current_atom.is_none() {
+                    dangling_dot = true;
+                }
+                if next_bond.is_some() {
+                    // `C=.C` — a bond symbol with a dot where its second atom
+                    // should be.
+                    return Err(SmilesError::DanglingBond);
+                }
+                current_atom = None;
+                after_dot = true;
             }
 
             Token::Ring(ring_num) => {
@@ -442,6 +530,13 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
         return Err(SmilesError::DanglingBond);
     }
 
+    // `after_dot` still set means the string ended on one: `CC.`
+    if dangling_dot || after_dot {
+        return Err(SmilesError::DanglingDot);
+    }
+
+    resolve_directional_bonds(&mut mol, &directional);
+
     mol.calculate_implicit_hydrogens();
     Ok(mol)
 }
@@ -469,6 +564,10 @@ fn add_atom_from_token(mol: &mut Molecule, token: &AtomToken) -> Result<usize, S
         atom = atom.with_isotope(isotope);
     }
 
+    if token.chirality != Chirality::None {
+        atom = atom.with_chirality(token.chirality);
+    }
+
     let idx = mol.add_atom(atom);
 
     if let Some(h_count) = token.h_count {
@@ -478,9 +577,189 @@ fn add_atom_from_token(mol: &mut Molecule, token: &AtomToken) -> Result<usize, S
     Ok(idx)
 }
 
+/// Turns `/` and `\` markers into [`BondStereo`] on the double bonds they
+/// describe.
+///
+/// A directional marker says nothing about its own bond: it says which side of
+/// an adjacent double bond a substituent sits on. So the markers are collected
+/// during the token walk and resolved here, once every atom index is final.
+///
+/// # Written order is the whole difficulty
+///
+/// `F/C=C/F` is trans and `F/C=C\F` is cis — same symbols in the first
+/// position, opposite meaning. But `C(/F)=C/F` is *cis* despite also carrying
+/// two `/`, because the first marker is written pointing away from the double
+/// bond rather than towards it.
+///
+/// The question a marker answers is *which side of the double-bond axis the
+/// substituent sits on*, and that flips with the writing direction. In `F/C`
+/// the slash rises from F into C, so F sits **below** the axis. In `C(/F)` it
+/// rises from C out to F, so F sits **above** it — the same character, the
+/// opposite side.
+///
+/// So: the substituent's side is the lean when the double-bond atom is written
+/// first, and the negated lean when it is written second. Two substituents on
+/// the same side is Z; opposite sides is E.
+///
+/// Anything the markers do not describe is left alone. A double bond with a
+/// marker on only one end is under-specified, not wrong, and stays
+/// [`BondStereo::None`] rather than being guessed at.
+fn resolve_directional_bonds(mol: &mut Molecule, directional: &[(usize, usize, i8)]) {
+    if directional.is_empty() {
+        return;
+    }
+
+    /// Which side of the axis the substituent sits on, seen from `anchor` —
+    /// one end of the double bond.
+    fn side_at(anchor: usize, &(first, second, lean): &(usize, usize, i8)) -> Option<i8> {
+        if first == anchor {
+            // `C(/F)=...` — the slash rises away from the anchor, so the
+            // substituent is above.
+            Some(lean)
+        } else if second == anchor {
+            // `F/C=...` — the slash rises into the anchor, so the substituent
+            // it came from is below.
+            Some(-lean)
+        } else {
+            None
+        }
+    }
+
+    let doubles: Vec<(usize, usize, usize)> = mol
+        .bonds()
+        .iter()
+        .enumerate()
+        .filter(|(_, bond)| bond.order() == BondOrder::Double)
+        .map(|(idx, bond)| (idx, bond.atom1(), bond.atom2()))
+        .collect();
+
+    for (bond_idx, left, right) in doubles {
+        let left_side = directional.iter().find_map(|marker| side_at(left, marker));
+        let right_side = directional.iter().find_map(|marker| side_at(right, marker));
+
+        let (Some(left_side), Some(right_side)) = (left_side, right_side) else {
+            continue;
+        };
+
+        let stereo = if left_side == right_side {
+            BondStereo::Z
+        } else {
+            BondStereo::E
+        };
+        let existing = mol.bond(bond_idx);
+        let replacement = Bond::new(existing.atom1(), existing.atom2(), existing.order())
+            .with_aromatic(existing.is_aromatic())
+            .with_stereo(stereo);
+        *mol.bond_mut(bond_idx) = replacement;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stereo_of_double(smiles: &str) -> BondStereo {
+        let mol = parse_smiles(smiles).expect(smiles);
+        mol.bonds()
+            .iter()
+            .find(|b| b.order() == BondOrder::Double)
+            .expect("a double bond")
+            .stereo()
+    }
+
+    #[test]
+    fn test_dot_starts_a_new_component() {
+        // Every salt and co-crystal in a catalogue was a skipped record before
+        // this (#191).
+        let mol = parse_smiles("[Na+].[Cl-]").expect("valid SMILES");
+        assert_eq!(mol.num_atoms(), 2);
+        assert_eq!(mol.num_bonds(), 0);
+        assert_eq!(mol.graph().connected_components().len(), 2);
+        assert_eq!(mol.atom(0).formal_charge(), 1);
+        assert_eq!(mol.atom(1).formal_charge(), -1);
+    }
+
+    #[test]
+    fn test_a_ring_label_survives_a_dot() {
+        // The dot ends the chain, not the molecule. `C1.C1` closes ring 1
+        // across the break, so the two "components" are one bonded pair — a
+        // parser that cleared its ring table on `.` would report an unclosed
+        // ring instead.
+        let mol = parse_smiles("C1.C1").expect("valid SMILES");
+        assert_eq!(mol.num_atoms(), 2);
+        assert_eq!(mol.num_bonds(), 1);
+        assert_eq!(mol.graph().connected_components().len(), 1);
+    }
+
+    #[test]
+    fn test_a_dot_needs_something_on_both_sides() {
+        for bad in [".CC", "CC."] {
+            assert!(
+                matches!(parse_smiles(bad), Err(SmilesError::DanglingDot)),
+                "{bad} should be a dangling dot, got {:?}",
+                parse_smiles(bad)
+            );
+        }
+        // Not a DanglingDot: the bond symbol is the thing left unattached.
+        assert!(matches!(
+            parse_smiles("C=.C"),
+            Err(SmilesError::DanglingBond)
+        ));
+    }
+
+    #[test]
+    fn test_chirality_is_read_and_the_two_markers_differ() {
+        let anticlockwise = parse_smiles("N[C@H](C)C(=O)O").expect("valid SMILES");
+        let clockwise = parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+
+        assert_eq!(
+            anticlockwise.atom(1).chirality(),
+            Chirality::CounterClockwise
+        );
+        assert_eq!(clockwise.atom(1).chirality(), Chirality::Clockwise);
+        // The whole point: the two spellings are different molecules. Dropping
+        // the marker yields a valid molecule that is the wrong one. Compared
+        // by the field rather than by the molecule — `Molecule` has no
+        // `PartialEq`, and giving it one means deciding whether two graphs
+        // with different atom orders are equal, which is a canonicalisation
+        // question and not this story's.
+        assert_ne!(
+            anticlockwise.atom(1).chirality(),
+            clockwise.atom(1).chirality()
+        );
+    }
+
+    #[test]
+    fn test_an_unmarked_atom_has_no_chirality() {
+        let mol = parse_smiles("N[CH](C)C(=O)O").expect("valid SMILES");
+        assert_eq!(mol.atom(1).chirality(), Chirality::None);
+    }
+
+    #[test]
+    fn test_directional_bonds_resolve_to_e_and_z() {
+        // The textbook pair.
+        assert_eq!(stereo_of_double("F/C=C/F"), BondStereo::E, "trans");
+        assert_eq!(stereo_of_double("F/C=C\\F"), BondStereo::Z, "cis");
+    }
+
+    #[test]
+    fn test_the_same_markers_mean_the_opposite_when_written_reversed() {
+        // The case that makes this more than a lookup, and the one a naive
+        // implementation gets wrong: `C(/F)=C/F` carries two `/` just like
+        // `F/C=C/F`, but the first marker is written pointing away from the
+        // double bond rather than into it, so the substituents end up on the
+        // same side. Same characters, opposite answer.
+        assert_eq!(stereo_of_double("C(/F)=C/F"), BondStereo::Z);
+        assert_eq!(stereo_of_double("C(\\F)=C/F"), BondStereo::E);
+    }
+
+    #[test]
+    fn test_a_half_marked_double_bond_is_left_alone() {
+        // Under-specified rather than wrong. Guessing a configuration from one
+        // marker would invent stereochemistry the author did not write.
+        assert_eq!(stereo_of_double("F/C=CF"), BondStereo::None);
+        assert_eq!(stereo_of_double("FC=CF"), BondStereo::None);
+    }
 
     #[test]
     fn test_methane() {

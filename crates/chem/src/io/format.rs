@@ -331,13 +331,17 @@ static FORMATS: &[FormatDescriptor] = &[
         codes: &["smi", "smiles"],
         extensions: &["smi", "smiles", "txt"],
         category: Category::CommonCheminformatics,
-        // Bracket atoms carry charge and isotope, and lowercase carries
-        // aromaticity. Stereo is absent because the writer's traversal does
-        // not emit `@`/`/` markers yet, not because SMILES cannot hold them.
+        // Bracket atoms carry charge, isotope and the chirality marker;
+        // lowercase carries aromaticity; `/` and `\` carry double-bond
+        // geometry. Stereo arrived with #191 — this mask claimed no stereo
+        // until then, and `test_declared_masks_match_what_actually_survives`
+        // is what refused to let it stay that way.
         carries: Carries::TOPOLOGY
             .or(Carries::AROMATICITY)
             .or(Carries::FORMAL_CHARGE)
-            .or(Carries::ISOTOPE),
+            .or(Carries::ISOTOPE)
+            .or(Carries::STEREO_ATOM)
+            .or(Carries::STEREO_BOND),
         reader: Some(crate::io::reader::read_smiles),
         writer: Some(write_smiles_records),
     },
@@ -560,8 +564,6 @@ mod tests {
     /// carry both at once. Isolating them makes a failure name the attribute
     /// whose claim is wrong.
     fn one_per_attribute() -> Vec<(Carries, Molecule)> {
-        use crate::core::atom::{Atom, Element};
-        use crate::core::bond::Bond;
         use crate::core::cell::UnitCell;
         use crate::core::geometry::{Point2, Point3};
         use crate::core::residue::{Chain, Residue};
@@ -621,16 +623,14 @@ mod tests {
             .expect("valid topology");
             m
         };
-        let with_stereo_atom = {
-            let mut m = ethane();
-            *m.atom_mut(0) = Atom::new(Element::carbon()).with_chirality(Chirality::Clockwise);
-            m
-        };
-        let with_stereo_bond = {
-            let mut m = ethane();
-            *m.bond_mut(0) = Bond::new(0, 1, m.bond(0).order()).with_stereo(BondStereo::E);
-            m
-        };
+        // Parsed rather than hand-built, since #191. The hand-built versions
+        // were quietly nonsense: the bond fixture put `BondStereo::E` on
+        // ethane's single C-C bond, which no format can express because the
+        // configuration of a single bond means nothing. It passed only while
+        // no writer emitted stereo at all, and the moment one did it reported
+        // SMILES as losing something that was never expressible.
+        let with_stereo_atom = parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+        let with_stereo_bond = parse_smiles("F/C=C/F").expect("valid SMILES");
 
         vec![
             (Carries::TOPOLOGY, ethane()),

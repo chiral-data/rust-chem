@@ -27,7 +27,8 @@
 //! assert_eq!(write_smiles(atom_symbols, atom_neighbours, atom_rankings, bond_symbols), "c1ccccc1=O".to_string());
 //! ```
 
-use crate::core::bond::BondOrder;
+use crate::core::atom::Chirality;
+use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
 
 /// Manager of ring digit
@@ -153,8 +154,10 @@ fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
         symbol.to_string()
     };
 
-    let needs_brackets =
-        atom.formal_charge() != 0 || atom.isotope().is_some() || atom.explicit_hydrogens() > 0;
+    let needs_brackets = atom.formal_charge() != 0
+        || atom.isotope().is_some()
+        || atom.explicit_hydrogens() > 0
+        || atom.chirality() != Chirality::None;
     if !needs_brackets {
         return symbol;
     }
@@ -164,6 +167,20 @@ fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
         bracket += &isotope.to_string();
     }
     bracket += &symbol;
+    // Between the symbol and the hydrogen count, which is the order the spec
+    // fixes and the order `parse_bracket_atom` reads. Kept adjacent in both
+    // files for that reason.
+    //
+    // This re-emits the marker as it was read. It does *not* recompute parity
+    // for a traversal that visits this atom's neighbours in a different order
+    // than the input wrote them, so a round trip preserves the marker rather
+    // than provably the configuration. Fixing that needs a canonical
+    // neighbour order, which belongs to the canonical-writer story.
+    bracket += match atom.chirality() {
+        Chirality::CounterClockwise => "@",
+        Chirality::Clockwise => "@@",
+        Chirality::None | Chirality::Unspecified => "",
+    };
     match atom.explicit_hydrogens() {
         0 => {}
         1 => bracket += "H",
@@ -180,6 +197,84 @@ fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
     bracket
 }
 
+/// The reference substituent whose bond carries the marker for `anchor`.
+///
+/// One per end of the double bond, chosen deterministically so both ends agree
+/// without passing state between them: the lowest-indexed neighbour that is not
+/// the double-bond partner.
+fn reference_substituent(mol: &Molecule, anchor: usize, partner: usize) -> Option<usize> {
+    mol.neighbors(anchor)
+        .iter()
+        .map(|n| n.atom_idx)
+        .filter(|&n| n != partner)
+        .min()
+}
+
+/// `/` or `\` for a single bond written `first` → `second`, if it is the bond
+/// carrying a neighbouring double bond's configuration.
+///
+/// The inverse of `resolve_directional_bonds` in the parser, and it has to
+/// agree with it exactly or a round trip flips cis and trans. Both use the same
+/// rule: a substituent's *side* of the double-bond axis is the marker's lean
+/// when the double-bond atom is written first, and the negated lean when it is
+/// written second. Same sides is Z, opposite sides is E.
+///
+/// Here the sides are chosen and the leans derived. The first end's substituent
+/// is arbitrarily placed below the axis; the second end's follows from the
+/// configuration. Then each lean is whatever writes that side, given which way
+/// this particular traversal happens to be emitting the bond.
+///
+/// Returns `None` when the configuration cannot be written on this bond, which
+/// is not an error: a molecule whose reference substituent is reached by a ring
+/// closure rather than by this edge simply loses the marker. That degrades the
+/// output, unlike a dropped component, which would corrupt it.
+fn directional_marker(mol: &Molecule, first: usize, second: usize) -> Option<char> {
+    for bond in mol.bonds() {
+        if bond.order() != BondOrder::Double {
+            continue;
+        }
+        let stereo = bond.stereo();
+        if stereo != BondStereo::E && stereo != BondStereo::Z {
+            continue;
+        }
+        let (left, right) = (bond.atom1(), bond.atom2());
+
+        // Which end of the double bond does this single bond hang off, and
+        // which atom is the substituent?
+        let (anchor, substituent, partner, is_second_end) = if first == left || second == left {
+            let substituent = if first == left { second } else { first };
+            (left, substituent, right, false)
+        } else if first == right || second == right {
+            let substituent = if first == right { second } else { first };
+            (right, substituent, left, true)
+        } else {
+            continue;
+        };
+
+        // The substituent must not be the other end of the double bond itself.
+        if substituent == partner {
+            continue;
+        }
+        if reference_substituent(mol, anchor, partner) != Some(substituent) {
+            continue;
+        }
+
+        // The first end's substituent is placed below the axis by fiat — the
+        // choice is arbitrary, only the relationship matters. The second end's
+        // is then above for E (opposite sides) and below for Z (same side).
+        let side: i8 = if is_second_end && stereo == BondStereo::E {
+            1
+        } else {
+            -1
+        };
+
+        // Convert the side back into a lean, using this traversal's direction.
+        let lean = if anchor == first { side } else { -side };
+        return Some(if lean > 0 { '/' } else { '\\' });
+    }
+    None
+}
+
 impl TraitMoleculeForSMILES for Molecule {
     fn get_neighbours_of_atom(&self, atom: &usize) -> Vec<usize> {
         self.neighbors(*atom).iter().map(|n| n.atom_idx).collect()
@@ -187,7 +282,19 @@ impl TraitMoleculeForSMILES for Molecule {
 
     fn get_bond_symbol(&self, atom_1: &usize, atom_2: &usize) -> String {
         match self.graph().get_bond(*atom_1, *atom_2) {
-            Some(bond_idx) => bond_order_symbol(self.bond(bond_idx).order()).to_string(),
+            Some(bond_idx) => {
+                let bond = self.bond(bond_idx);
+                // A single bond next to a stereo double bond carries the
+                // configuration, so it is asked about first: `/` and `\` take
+                // the slot a `-` would have, and `bond_order_symbol` writes
+                // nothing for a single bond anyway.
+                if bond.order() == BondOrder::Single
+                    && let Some(marker) = directional_marker(self, *atom_1, *atom_2)
+                {
+                    return marker.to_string();
+                }
+                bond_order_symbol(bond.order()).to_string()
+            }
             None => panic!("No such bond"),
         }
     }
@@ -324,17 +431,48 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
 }
 
 /// SMILES writer with trait Molecule
+///
+/// Traverses once per connected component and joins them with `.`. A single
+/// traversal from the lowest-ranked atom was enough while nothing could parse a
+/// dot, but it meant a two-component molecule wrote back as its first component
+/// alone — `[Na+].[Cl-]` became `[Na+]`, a different molecule returned as a
+/// success. #191 made that reachable by teaching the parser `.`, so the two
+/// changes ship together.
+///
+/// Components are found by exhaustion rather than by
+/// [`crate::core::graph::MoleculeGraph::connected_components`]: this function
+/// is generic over [`TraitMoleculeForSMILES`], which exposes neighbours but no
+/// graph, so anything not reached by the previous traversal starts the next.
 pub fn write_smiles_for_mol<T: TraitMoleculeForSMILES>(mol: &T, rankings: &[usize]) -> String {
-    let mut dp = DataPool::init();
-
-    // find the atom with minimum ranking to start
+    // Ranking order decides which component comes first and where each
+    // traversal starts, exactly as it did for the single-component case.
     let mut atom_indexes: Vec<usize> = (0..mol.count_of_atoms()).collect();
     atom_indexes.sort_by_key(|idx| mol.get_atom_ranking(idx, rankings));
 
-    get_closures_for_atom(mol, rankings, atom_indexes[0], None, &mut dp);
+    let mut written: Vec<usize> = Vec::new();
+    let mut components: Vec<String> = Vec::new();
 
-    dp.visited.clear();
-    build_smiles_for_atom(mol, rankings, atom_indexes[0], None, &mut dp)
+    for &start in &atom_indexes {
+        if written.contains(&start) {
+            continue;
+        }
+
+        // A fresh pool per component. Ring digits are freed as closures close,
+        // so sharing one would work — but a component that somehow leaked a
+        // digit would silently renumber the next one's rings, and a salt is not
+        // where anyone would look for that.
+        let mut dp = DataPool::init();
+        get_closures_for_atom(mol, rankings, start, None, &mut dp);
+
+        // What the closure pass reached *is* the component.
+        let reached = dp.visited.clone();
+        dp.visited.clear();
+
+        components.push(build_smiles_for_atom(mol, rankings, start, None, &mut dp));
+        written.extend(reached);
+    }
+
+    components.join(".")
 }
 
 /// SMILES writer with raw data
@@ -365,6 +503,97 @@ pub fn write_smiles_for_molecule(mol: &Molecule) -> String {
 mod tests {
     use super::*;
     use crate::io::smiles::parse_smiles;
+
+    /// The configuration of the one double bond, after a full round trip.
+    ///
+    /// Asserting on the *string* would pin a spelling rather than a molecule:
+    /// `C(/F)=C/F` legitimately comes back as `C(\F)=C\F`, which is the same
+    /// isomer written from a different starting atom. What has to survive is
+    /// the E or the Z.
+    fn stereo_after_round_trip(smiles: &str) -> BondStereo {
+        let written = write_smiles_for_molecule(&parse_smiles(smiles).expect(smiles));
+        parse_smiles(&written)
+            .unwrap_or_else(|e| panic!("{smiles} wrote {written}, which will not parse: {e}"))
+            .bonds()
+            .iter()
+            .find(|b| b.order() == BondOrder::Double)
+            .expect("a double bond")
+            .stereo()
+    }
+
+    #[test]
+    fn test_every_component_is_written() {
+        // The silent-corruption case. A single traversal wrote the component
+        // containing the lowest-ranked atom and dropped the rest, so a salt
+        // came back as one of its ions — a different molecule, returned as a
+        // success (#191).
+        let mol = parse_smiles("[Na+].[Cl-]").expect("valid SMILES");
+        let written = write_smiles_for_molecule(&mol);
+        assert_eq!(written, "[Na+].[Cl-]");
+
+        let back = parse_smiles(&written).expect("round trips");
+        assert_eq!(back.num_atoms(), 2);
+        assert_eq!(back.graph().connected_components().len(), 2);
+    }
+
+    #[test]
+    fn test_components_are_written_in_ranking_order() {
+        let mol = parse_smiles("CC.O").expect("valid SMILES");
+        assert_eq!(write_smiles_for_molecule(&mol), "CC.O");
+    }
+
+    #[test]
+    fn test_a_ring_closed_across_a_dot_writes_as_one_component() {
+        // `C1.C1` is bonded, so there is nothing to separate and no dot to
+        // write.
+        let mol = parse_smiles("C1.C1").expect("valid SMILES");
+        assert_eq!(write_smiles_for_molecule(&mol), "CC");
+    }
+
+    #[test]
+    fn test_chirality_round_trips() {
+        for smiles in ["N[C@H](C)C(=O)O", "N[C@@H](C)C(=O)O"] {
+            let mol = parse_smiles(smiles).expect(smiles);
+            let written = write_smiles_for_molecule(&mol);
+            assert_eq!(written, smiles, "chirality marker lost or flipped");
+        }
+    }
+
+    #[test]
+    fn test_e_and_z_survive_a_round_trip() {
+        assert_eq!(stereo_after_round_trip("F/C=C/F"), BondStereo::E);
+        assert_eq!(stereo_after_round_trip("F/C=C\\F"), BondStereo::Z);
+    }
+
+    #[test]
+    fn test_e_and_z_survive_from_the_reversed_spelling_too() {
+        // The writer and `resolve_directional_bonds` have to agree about the
+        // sign, and the reversed form is where disagreement shows: this
+        // molecule is written back with both markers flipped, which is only
+        // correct if both sides use the same rule.
+        assert_eq!(stereo_after_round_trip("C(/F)=C/F"), BondStereo::Z);
+        assert_eq!(stereo_after_round_trip("C(\\F)=C/F"), BondStereo::E);
+    }
+
+    #[test]
+    fn test_writing_is_idempotent_for_stereo() {
+        // A second pass must not flip anything. The first round trip may
+        // respell the molecule; the spelling it lands on has to be stable.
+        for smiles in ["F/C=C/F", "F/C=C\\F", "C(/F)=C/F"] {
+            let once = write_smiles_for_molecule(&parse_smiles(smiles).expect(smiles));
+            let twice = write_smiles_for_molecule(&parse_smiles(&once).expect(&once));
+            assert_eq!(once, twice, "{smiles} is not stable under rewriting");
+        }
+    }
+
+    #[test]
+    fn test_a_double_bond_without_stereo_writes_no_markers() {
+        // The common case must not gain slashes.
+        let mol = parse_smiles("FC=CF").expect("valid SMILES");
+        let written = write_smiles_for_molecule(&mol);
+        assert!(!written.contains('/'), "{written}");
+        assert!(!written.contains('\\'), "{written}");
+    }
 
     #[test]
     fn test_write_smiles() {

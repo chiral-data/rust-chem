@@ -304,6 +304,20 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
                 continue
             mine = max(others, key=lambda o: tanimoto(ours[name], ours[o]))
             yours = max(others, key=lambda o: tanimoto(theirs[name], theirs[o]))
+
+            # A molecule with nothing in common with anything has no nearest
+            # neighbour, only an arbitrary one: every candidate ties at zero
+            # and `max` returns whichever it saw first. Comparing those is
+            # comparing iteration orders, and it produced findings that moved
+            # whenever the corpus grew. Skipped with a note rather than
+            # silently, so the gap in coverage stays visible.
+            if tanimoto(ours[name], ours[mine]) == 0.0 or tanimoto(theirs[name], theirs[yours]) == 0.0:
+                report.note(
+                    f"{name}: shares no bits with any other corpus molecule, so "
+                    f"'nearest' is arbitrary — not compared"
+                )
+                continue
+
             if mine == yours:
                 report.ok()
                 if verbose:

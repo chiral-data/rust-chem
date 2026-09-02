@@ -20,7 +20,23 @@ re-run with `--promote` so it matches what the oracles actually say.
 - charges.smi: tetramethylammonium — rdkit cannot read the SDF chem wrote
 - charges.smi: tetramethylammonium — SDF round trip, openbabel says C[N+](C)(C)C -> CN(C)(C)C
 - charges.smi: glycine-zwitterion — SDF round trip, openbabel says [O-]C(=O)C[NH3+] -> NCC(=O)O
+- hard.smi: alanine — SDF round trip, rdkit says stereo parity (0 -> -); stereo type (1 -> -); tetrahedral stereo (2- -> -)
+- hard.smi: alanine — SDF round trip, openbabel says C[C@@H](C(=O)O)N -> CC(C(=O)O)N
+- hard.smi: cis-difluoroethene — SDF round trip, rdkit says double-bond stereo (2-1- -> 2-1+)
+- hard.smi: cis-difluoroethene — SDF round trip, openbabel says F/C=C\F -> F/C=C/F
+- hard.smi: sodium-chloride — SDF round trip, rdkit says formula (ClH.Na -> ClH.Na.H); hydrogens (1H; -> 1H;;); protonation (-1 -> -); charge (;+1 -> -)
+- hard.smi: sodium-chloride — SDF round trip, openbabel says [Na+].[Cl-] -> [NaH].Cl
 - hard.smi: pyrrole — rdkit cannot read the SDF chem wrote
 - hard.smi: pyrrole — SDF round trip, openbabel says c1ccc[nH]1 -> C1C=CC=N1
 - hard.smi: carbon-13-methane — SDF round trip, rdkit says isotope (1+1 -> -)
 - hard.smi: carbon-13-methane — SDF round trip, openbabel says [13CH4] -> C
+- stereo.smi: l-alanine — SDF round trip, rdkit says stereo parity (0 -> -); stereo type (1 -> -); tetrahedral stereo (2- -> -)
+- stereo.smi: l-alanine — SDF round trip, openbabel says C[C@@H](C(=O)O)N -> CC(C(=O)O)N
+- stereo.smi: d-alanine — SDF round trip, rdkit says stereo parity (1 -> -); stereo type (1 -> -); tetrahedral stereo (2- -> -)
+- stereo.smi: d-alanine — SDF round trip, openbabel says C[C@H](C(=O)O)N -> CC(C(=O)O)N
+- stereo.smi: cis — SDF round trip, rdkit says double-bond stereo (2-1- -> 2-1+)
+- stereo.smi: cis — SDF round trip, openbabel says F/C=C\F -> F/C=C/F
+- stereo.smi: trans-reversed-spelling — SDF round trip, rdkit says double-bond stereo (2-1- -> 2-1+)
+- stereo.smi: trans-reversed-spelling — SDF round trip, openbabel says F/C=C\F -> F/C=C/F
+- stereo.smi: trans-cyclohexanediol — SDF round trip, rdkit says tetrahedral stereo (5-,6+ -> -)
+- stereo.smi: trans-cyclohexanediol — SDF round trip, openbabel says O[C@@H]1CC[C@@H](CC1)O -> OC1CCC(CC1)O
