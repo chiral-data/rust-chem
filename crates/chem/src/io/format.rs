@@ -355,10 +355,23 @@ static FORMATS: &[FormatDescriptor] = &[
         // stereo are all listed under "What is not written" in
         // `sdf::write_sdf`; aromaticity survives as bond type 4. The data
         // fields the reader parses are not written back, so no PROPERTIES.
+        // Widened in #197, when the V2000 writer stopped emitting the smallest
+        // record that would parse. Charges and isotopes ride on `M  CHG` and
+        // `M  ISO`, chirality on the atom parity column and a wedge bond,
+        // data fields on the block after `M  END`.
+        //
+        // Every flag here was added only after
+        // `test_declared_masks_match_what_actually_survives` demanded it. The
+        // mask describes what a round trip *does*, not what the specification
+        // permits, so it is written last and by observation.
         carries: Carries::TOPOLOGY
             .or(Carries::COORDS_2D)
             .or(Carries::COORDS_3D)
-            .or(Carries::AROMATICITY),
+            .or(Carries::AROMATICITY)
+            .or(Carries::FORMAL_CHARGE)
+            .or(Carries::ISOTOPE)
+            .or(Carries::STEREO_ATOM)
+            .or(Carries::PROPERTIES),
         reader: Some(crate::io::reader::read_sdf),
         writer: Some(write_sdf_records),
     },

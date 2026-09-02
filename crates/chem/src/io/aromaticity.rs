@@ -199,8 +199,226 @@ fn mark_ring_aromatic(mol: &mut Molecule, ring: &[usize]) {
     }
 }
 
+/// Assigns a Kekulé form to a molecule's aromatic bonds, without changing it.
+///
+/// Returns one [`BondOrder`] per bond, or `None` when no valid assignment
+/// exists. The molecule's own aromatic perception is correct and stays; only a
+/// *file* needs the alternating form, so this hands back orders rather than
+/// mutating.
+///
+/// # Why a writer needs this
+///
+/// Molfile bond type 4 means "aromatic", which is a **query** bond type: it
+/// belongs in a substructure search, not in a structure record. Benzene
+/// survives it because a reader can kekulise `c1ccccc1` unambiguously. Pyrrole
+/// does not — without knowing the nitrogen carries a hydrogen there is no valid
+/// Kekulé form to recover, so RDKit rejects the record outright (#194).
+///
+/// # How
+///
+/// An aromatic atom needs exactly one double bond unless it donates a lone pair
+/// to the ring instead. That distinction is the whole difficulty, and it is
+/// decided by valence rather than by element: count what the atom already has,
+/// against what its element and charge allow. Pyrrole's N-H reaches its valence
+/// of three with two ring bonds and a hydrogen, so it needs nothing more;
+/// pyridine's N has only two, so it needs a double bond. Furan's O is full at
+/// two.
+///
+/// What remains is a perfect matching over the aromatic subgraph restricted to
+/// the atoms that need one, solved by backtracking. The molecules this crate
+/// sees have a handful of aromatic rings each, so the search is small.
+///
+/// Returning `None` rather than guessing is deliberate. A wrong Kekulé form is
+/// wrong chemistry in a file that reads perfectly; a type-4 bond is a
+/// portability gap that is already recorded and understood.
+pub fn kekulize(mol: &Molecule) -> Option<Vec<BondOrder>> {
+    let mut orders: Vec<BondOrder> = (0..mol.num_bonds()).map(|i| mol.bond(i).order()).collect();
+
+    let aromatic: Vec<usize> = (0..mol.num_bonds())
+        .filter(|&i| mol.bond(i).order() == BondOrder::Aromatic)
+        .collect();
+    if aromatic.is_empty() {
+        return Some(orders);
+    }
+
+    // Does this atom still need a double bond, or is it already satisfied?
+    let needs_double = |atom_idx: usize| -> bool {
+        let atom = mol.atom(atom_idx);
+        let typical = atom.element().typical_valence();
+        if typical == 0 {
+            return false;
+        }
+        // An aromatic bond counts as a single bond here: the question is what
+        // the atom would still be missing if every aromatic bond were single.
+        let used: f64 = mol
+            .neighbors(atom_idx)
+            .iter()
+            .map(|n| match mol.bond(n.bond_idx).order() {
+                BondOrder::Aromatic => 1.0,
+                other => other.value(),
+            })
+            .sum();
+        let charge = i32::from(atom.formal_charge());
+        let allowed = i32::from(typical) + charge;
+        let have = used as i32 + i32::from(atom.total_hydrogens());
+        allowed - have == 1
+    };
+
+    let mut wanted: Vec<usize> = Vec::new();
+    for &bond_idx in &aromatic {
+        for atom in [mol.bond(bond_idx).atom1(), mol.bond(bond_idx).atom2()] {
+            if !wanted.contains(&atom) && needs_double(atom) {
+                wanted.push(atom);
+            }
+        }
+    }
+
+    // An odd number of atoms needing a partner cannot be matched at all, and
+    // saying so here saves the search from proving it the slow way.
+    if !wanted.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let mut matched: Vec<bool> = vec![false; mol.num_atoms()];
+    if match_atoms(mol, &aromatic, &wanted, &mut matched, &mut orders) {
+        // Everything left aromatic in a matched system becomes single.
+        for &bond_idx in &aromatic {
+            if orders[bond_idx] == BondOrder::Aromatic {
+                orders[bond_idx] = BondOrder::Single;
+            }
+        }
+        Some(orders)
+    } else {
+        None
+    }
+}
+
+/// Backtracking perfect matching over the aromatic bonds.
+///
+/// Takes the first unmatched atom that needs a partner and tries each aromatic
+/// bond to another such atom, undoing the choice when the rest cannot be
+/// completed. Depth is half the number of atoms in the aromatic system.
+fn match_atoms(
+    mol: &Molecule,
+    aromatic: &[usize],
+    wanted: &[usize],
+    matched: &mut [bool],
+    orders: &mut [BondOrder],
+) -> bool {
+    let Some(&atom) = wanted.iter().find(|&&a| !matched[a]) else {
+        return true; // everyone has a partner
+    };
+
+    for &bond_idx in aromatic {
+        if orders[bond_idx] != BondOrder::Aromatic {
+            continue;
+        }
+        let bond = mol.bond(bond_idx);
+        let (a, b) = (bond.atom1(), bond.atom2());
+        let partner = if a == atom {
+            b
+        } else if b == atom {
+            a
+        } else {
+            continue;
+        };
+        if matched[partner] || !wanted.contains(&partner) {
+            continue;
+        }
+
+        matched[atom] = true;
+        matched[partner] = true;
+        orders[bond_idx] = BondOrder::Double;
+
+        if match_atoms(mol, aromatic, wanted, matched, orders) {
+            return true;
+        }
+
+        matched[atom] = false;
+        matched[partner] = false;
+        orders[bond_idx] = BondOrder::Aromatic;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
+
+    use crate::io::smiles::parse_smiles;
+
+    fn kekule_orders(smiles: &str) -> Vec<BondOrder> {
+        let mol = parse_smiles(smiles).expect(smiles);
+        kekulize(&mol).unwrap_or_else(|| panic!("{smiles} has no Kekule form"))
+    }
+
+    #[test]
+    fn test_every_aromatic_system_in_the_corpus_kekulises() {
+        // `None` here means the needs-a-double-bond rule is wrong, which is a
+        // cheaper diagnostic than reading the matching by hand.
+        for smiles in [
+            "c1ccccc1",
+            "c1ccncc1",
+            "c1ccoc1",
+            "c1ccsc1",
+            "c1cc[nH]c1",
+            "c1cnc[nH]1",
+            "C1CCc2ccccc2C1",
+            "[O-][N+](=O)c1ccccc1",
+        ] {
+            let mol = parse_smiles(smiles).expect(smiles);
+            assert!(kekulize(&mol).is_some(), "{smiles} has no Kekule form");
+        }
+    }
+
+    #[test]
+    fn test_no_aromatic_bond_survives_kekulisation() {
+        for smiles in ["c1ccccc1", "c1cc[nH]c1", "c1cnc[nH]1"] {
+            assert!(
+                !kekule_orders(smiles).contains(&BondOrder::Aromatic),
+                "{smiles} kept a query bond type"
+            );
+        }
+    }
+
+    #[test]
+    fn test_benzene_alternates_three_and_three() {
+        let orders = kekule_orders("c1ccccc1");
+        assert_eq!(
+            orders.iter().filter(|o| **o == BondOrder::Double).count(),
+            3
+        );
+        assert_eq!(
+            orders.iter().filter(|o| **o == BondOrder::Single).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_a_pyrrole_nitrogen_takes_no_double_bond() {
+        // The case that makes this more than counting: the N-H donates its lone
+        // pair, so it is already satisfied and must stay single-bonded. Treating
+        // it like pyridine's N is what leaves pyrrole unwritable.
+        let mol = parse_smiles("c1cc[nH]c1").expect("valid SMILES");
+        let orders = kekulize(&mol).expect("has a Kekule form");
+        let nitrogen = (0..mol.num_atoms())
+            .find(|&i| mol.atom(i).element().symbol() == "N")
+            .expect("a nitrogen");
+        for neighbour in mol.neighbors(nitrogen) {
+            assert_eq!(
+                orders[neighbour.bond_idx],
+                BondOrder::Single,
+                "the pyrrole nitrogen took a double bond"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_molecule_with_no_aromatic_bonds_is_returned_unchanged() {
+        let mol = parse_smiles("CCO").expect("valid SMILES");
+        let orders = kekulize(&mol).expect("nothing to do");
+        assert!(orders.iter().all(|o| *o == BondOrder::Single));
+    }
     use super::*;
 
     #[test]

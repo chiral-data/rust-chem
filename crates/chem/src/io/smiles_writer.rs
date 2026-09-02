@@ -92,6 +92,21 @@ pub trait TraitMoleculeForSMILES {
     fn get_neighbours_of_atom(&self, atom: &usize) -> Vec<usize>;
     fn get_bond_symbol(&self, atom_1: &usize, atom_2: &usize) -> String;
     fn get_atom_symbol(&self, atom: &usize) -> String;
+
+    /// The atom's token, given the order this traversal will write its
+    /// neighbours in.
+    ///
+    /// Only stereocentres care. [`Chirality`] is stored against sorted
+    /// neighbour order — see `normalise_chirality` in the parser — so a writer
+    /// has to convert into whatever order it is about to emit, and that order
+    /// is a property of the traversal rather than of the molecule.
+    ///
+    /// Defaults to ignoring it, so an implementation with no stereochemistry
+    /// need not care.
+    fn get_atom_symbol_written(&self, atom: &usize, written: &[usize]) -> String {
+        let _ = written;
+        self.get_atom_symbol(atom)
+    }
     fn get_atom_ranking(&self, atom: &usize, rankings: &[usize]) -> usize;
     fn count_of_atoms(&self) -> usize;
 }
@@ -132,6 +147,52 @@ impl TraitMoleculeForSMILES for MoleculeForSmiles {
 // ":" — parse_smiles fills in exactly this default itself (Aromatic if the
 // atom being connected to is aromatic, Single otherwise), so leaving it
 // implicit is what makes the output re-parse back to the same bond order.
+/// The implicit hydrogen's place in a written neighbour order.
+///
+/// Matches the parser's `IMPLICIT_H`: `usize::MAX`, so it sorts last, which is
+/// where every index-based convention puts it.
+const IMPLICIT_H_SLOT: usize = usize::MAX;
+
+/// The atom's token, with any chirality marker converted out of storage order
+/// into the order this traversal writes.
+///
+/// [`Chirality`] means "looking from the lowest-indexed neighbour, the rest in
+/// increasing index order". A SMILES marker means "looking from the first
+/// neighbour *as written*". The two agree when the written order is an even
+/// permutation of the sorted one and disagree when it is odd, which is exactly
+/// what the parser corrected for on the way in.
+///
+/// Without this, writing was self-consistent and meaningless: the stored value
+/// went out unchanged and came back unchanged, so a round trip through this
+/// crate looked perfect while `[C@@H](N)(C)C(=O)O` and `N[C@@H](C)C(=O)O`
+/// claimed different configurations for the same molecule.
+fn atom_symbol_in_order(mol: &Molecule, atom_idx: usize, written: &[usize]) -> String {
+    let chirality = mol.atom(atom_idx).chirality();
+    if chirality != Chirality::Clockwise && chirality != Chirality::CounterClockwise {
+        return atom_symbol(mol, atom_idx);
+    }
+
+    // Only the slots that actually name something: the hydrogen placeholder is
+    // present in the written order only when the atom has one.
+    let mut order: Vec<usize> = written.to_vec();
+    if mol.atom(atom_idx).total_hydrogens() == 0 {
+        order.retain(|slot| *slot != IMPLICIT_H_SLOT);
+    }
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+
+    let effective = if crate::io::smiles::permutation_is_odd(&order, &sorted) {
+        match chirality {
+            Chirality::Clockwise => Chirality::CounterClockwise,
+            _ => Chirality::Clockwise,
+        }
+    } else {
+        chirality
+    };
+
+    atom_symbol_with(mol, atom_idx, effective)
+}
+
 fn bond_order_symbol(order: BondOrder) -> &'static str {
     match order {
         BondOrder::Single | BondOrder::Aromatic => "",
@@ -146,6 +207,14 @@ fn bond_order_symbol(order: BondOrder) -> &'static str {
 // isotope need representing, since those can't be expressed in the
 // organic-subset shorthand.
 fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
+    atom_symbol_with(mol, atom_idx, mol.atom(atom_idx).chirality())
+}
+
+/// [`atom_symbol`], with the chirality marker stated explicitly.
+///
+/// Split out so a caller that has converted the configuration into its own
+/// neighbour order can say so, without cloning the molecule to carry one field.
+fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> String {
     let atom = mol.atom(atom_idx);
     let symbol = atom.element().symbol();
     let symbol = if atom.is_aromatic() {
@@ -157,7 +226,7 @@ fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
     let needs_brackets = atom.formal_charge() != 0
         || atom.isotope().is_some()
         || atom.explicit_hydrogens() > 0
-        || atom.chirality() != Chirality::None;
+        || chirality != Chirality::None;
     if !needs_brackets {
         return symbol;
     }
@@ -176,7 +245,7 @@ fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
     // than the input wrote them, so a round trip preserves the marker rather
     // than provably the configuration. Fixing that needs a canonical
     // neighbour order, which belongs to the canonical-writer story.
-    bracket += match atom.chirality() {
+    bracket += match chirality {
         Chirality::CounterClockwise => "@",
         Chirality::Clockwise => "@@",
         Chirality::None | Chirality::Unspecified => "",
@@ -303,6 +372,10 @@ impl TraitMoleculeForSMILES for Molecule {
         atom_symbol(self, *atom)
     }
 
+    fn get_atom_symbol_written(&self, atom: &usize, written: &[usize]) -> String {
+        atom_symbol_in_order(self, *atom, written)
+    }
+
     fn get_atom_ranking(&self, atom: &usize, rankings: &[usize]) -> usize {
         rankings[*atom]
     }
@@ -375,16 +448,30 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
         seq += &mol.get_bond_symbol(&atom_parent, &atom_current);
     }
 
-    seq += &mol.get_atom_symbol(&atom_current);
+    // The atom's own token is emitted last, once the order of everything after
+    // it is known: a chirality marker is defined against the order this
+    // traversal is about to write the neighbours in, and that is not settled
+    // until the closures and branches below have been laid out.
+    //
+    // `written` accumulates that order. The atom hung off comes first, then the
+    // bracket's hydrogen, then ring-closure digits, then branches.
+    let mut written: Vec<usize> = Vec::new();
+    if let Some(atom_parent) = atom_parent_opt {
+        written.push(atom_parent);
+    }
+    written.push(IMPLICIT_H_SLOT);
+
+    let mut after_symbol = String::new();
 
     if let Some(oadts) = dp.closing_closures.get_mut(&atom_current) {
         oadts.sort_by_key(|oadt| oadt.1); // close multiple rings, start from smaller digits
         for oadt in oadts.iter() {
-            seq += &mol.get_bond_symbol(&atom_current, &oadt.0);
+            after_symbol += &mol.get_bond_symbol(&atom_current, &oadt.0);
             if oadt.1 > 9 {
-                seq += "%";
+                after_symbol += "%";
             }
-            seq += &oadt.1.to_string();
+            after_symbol += &oadt.1.to_string();
+            written.push(oadt.0);
             dp.dh.remove(&oadt.1);
         }
     }
@@ -393,9 +480,10 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
         for oc in ocs.iter() {
             let digit = dp.dh.find();
             if digit > 9 {
-                seq += "%";
+                after_symbol += "%";
             }
-            seq += &digit.to_string();
+            after_symbol += &digit.to_string();
+            written.push(*oc);
             let oadts = dp.closing_closures.entry(*oc).or_default();
             oadts.push((atom_current, digit));
         }
@@ -407,6 +495,7 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
     let mut branches: Vec<String> = vec![];
     for n in nbors.iter() {
         if !dp.visited.contains(n) {
+            written.push(*n);
             branches.push(build_smiles_for_atom(
                 mol,
                 rankings,
@@ -416,6 +505,9 @@ fn build_smiles_for_atom<T: TraitMoleculeForSMILES>(
             ));
         }
     }
+
+    seq += &mol.get_atom_symbol_written(&atom_current, &written);
+    seq += &after_symbol;
 
     if branches.len() > 1 {
         for branch in branches[..(branches.len() - 1)].iter() {

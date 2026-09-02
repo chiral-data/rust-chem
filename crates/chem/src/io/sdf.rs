@@ -95,13 +95,84 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
         parse_bond_line(&mut mol, lines[line_idx])?;
     }
 
-    // Parse optional properties block (follows bond block)
+    // The `M  CHG` / `M  ISO` lines, before the data block.
+    //
+    // Written since #197 and, until #197, not read: the file was correct and
+    // RDKit could load it, while this crate's own round trip still lost the
+    // charge. `test_declared_masks_match_what_actually_survives` is what said
+    // so — the mask cannot claim `FORMAL_CHARGE` while only half the trip
+    // works.
     let prop_start = SDF_ATOM_BLOCK_START + num_atoms + num_bonds;
+    parse_atom_property_lines(&mut mol, &lines[prop_start..]);
+
+    // Parse optional properties block (follows bond block)
     parse_properties(&mut mol, &lines[prop_start..])?;
 
     // Calculate implicit hydrogens for each atom based on valence rules
     mol.calculate_implicit_hydrogens();
+
+    // Perceive aromaticity, rather than relying on the file to assert it.
+    //
+    // A molfile normally states a Kekulé form — alternating single and double
+    // bonds — because bond type 4 is a query type that belongs in a
+    // substructure search, not a structure record. So benzene arrives as three
+    // double bonds and three single ones, and a reader that takes the file
+    // literally hands back a molecule that is chemically benzene but claims no
+    // aromatic ring.
+    //
+    // That only became visible once `write_sdf` started emitting Kekulé forms
+    // (#197): the round trip lost the aromatic flag, and
+    // `test_declared_masks_match_what_actually_survives` refused the mask that
+    // still claimed it. Perceiving on read is what every toolkit does and what
+    // makes the claim true again.
+    crate::io::aromaticity::detect_aromaticity(&mut mol);
     Ok(mol)
+}
+
+/// Reads `M  CHG` and `M  ISO` lines into the atoms they name.
+///
+/// Both carry a count followed by that many `(atom, value)` pairs, atom indices
+/// 1-based. A malformed line is skipped rather than fatal: these are optional
+/// enrichments of an already-complete record, and a molfile with a mangled
+/// charge line still describes a molecule.
+///
+/// An `M  CHG` line supersedes the atom block's old `ccc` charge column, which
+/// this crate never wrote and does not read.
+fn parse_atom_property_lines(mol: &mut Molecule, lines: &[&str]) {
+    for line in lines {
+        let tag = if line.starts_with("M  CHG") {
+            true
+        } else if line.starts_with("M  ISO") {
+            false
+        } else {
+            if line.starts_with("M  END") {
+                break;
+            }
+            continue;
+        };
+
+        let fields: Vec<i32> = line[6..]
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        // First field is the count; the rest are pairs.
+        for pair in fields.iter().skip(1).collect::<Vec<_>>().chunks(2) {
+            let [index, value] = pair else { continue };
+            let Some(atom_idx) = usize::try_from(**index).ok().and_then(|i| i.checked_sub(1))
+            else {
+                continue;
+            };
+            if atom_idx >= mol.num_atoms() {
+                continue;
+            }
+            let atom = mol.atom(atom_idx).clone();
+            *mol.atom_mut(atom_idx) = if tag {
+                atom.with_charge(**value as i8)
+            } else {
+                atom.with_isotope(**value as u16)
+            };
+        }
+    }
 }
 
 /// Parses the counts line (line 3) of an SDF file.
@@ -175,8 +246,22 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, Sdf
     let element = Element::new(atomic_number as u8)
         .ok_or_else(|| SdfError::InvalidAtomLine(symbol.to_string()))?;
 
-    // Create and add atom to molecule
-    let atom = Atom::new(element);
+    // Fields after the symbol are `dd ccc sss`: mass difference, old-style
+    // charge, atom stereo parity. Only the parity is read — `M  CHG` and
+    // `M  ISO` carry the other two and supersede them.
+    //
+    // The parity's convention and this crate's `Chirality` are anchored to the
+    // same thing since #191's `normalise_chirality`: neighbours in increasing
+    // index order, implicit hydrogen last. So it maps straight across, and
+    // `write_sdf`'s `atom_parity` is the same mapping read backwards.
+    let parity = parts
+        .get(SDF_ATOM_FIELD + 2)
+        .and_then(|field| field.parse::<u8>().ok());
+    let atom = match parity {
+        Some(1) => Atom::new(element).with_chirality(Chirality::Clockwise),
+        Some(2) => Atom::new(element).with_chirality(Chirality::CounterClockwise),
+        _ => Atom::new(element),
+    };
     mol.add_atom(atom);
 
     // Fields 0-2 are x, y, z, all three kept. The caller decides from z
@@ -378,14 +463,28 @@ pub fn write_sdf(mol: &Molecule) -> String {
             .get(mol.atom(index).atomic_number() as usize)
             .copied()
             .unwrap_or("*");
+        // Columns after the symbol are `dd ccc sss ...`: mass difference,
+        // old-style charge, atom stereo parity. `dd` and `ccc` stay zero — the
+        // `M  CHG` and `M  ISO` lines above supersede them, and a reader seeing
+        // both forms is entitled to believe either.
+        let parity = atom_parity(mol, index);
         out.push_str(&format!(
-            "{x:>10.4}{y:>10.4}{z:>10.4} {symbol:<3} 0  0  0  0  0  0  0  0  0  0  0  0\n"
+            "{x:>10.4}{y:>10.4}{z:>10.4} {symbol:<3} 0  0{parity:>3}  0  0  0  0  0  0  0  0  0\n"
         ));
     }
 
+    // A Kekulé form when one exists, so the record carries structure bonds
+    // rather than the type-4 query bond. `None` means no valid assignment, and
+    // then type 4 is still the honest answer — see `kekulize`.
+    let kekulised = crate::io::aromaticity::kekulize(mol);
+    let wedge = wedge_bonds(mol);
+
     for index in 0..mol.num_bonds() {
         let bond = mol.bond(index);
-        let order = match bond.order() {
+        let effective_order = kekulised
+            .as_ref()
+            .map_or_else(|| bond.order(), |orders| orders[index]);
+        let order = match effective_order {
             BondOrder::Single => 1,
             BondOrder::Double => 2,
             BondOrder::Triple => 3,
@@ -395,17 +494,105 @@ pub fn write_sdf(mol: &Molecule) -> String {
             // not assert something false.
             _ => 8,
         };
-        // Molfile atom indices are 1-based.
+        // Molfile atom indices are 1-based. The field after the order is bond
+        // stereo: 1 is a wedge rising towards the reader, 6 a hash falling away.
+        //
+        // A wedge is directional in a way the other fields are not: its narrow
+        // end must sit on the stereocentre, which means the *first* atom of the
+        // line. Written in storage order instead, `N[C@@H](C)C(=O)O` put the
+        // narrow end on the nitrogen, and RDKit read it as a claim about the
+        // nitrogen — parsed the record happily, and reported no stereocentre at
+        // all.
+        let (stereo, (first, second)) = match wedge.get(&index) {
+            Some(&(centre, direction)) if centre == bond.atom2() => {
+                (direction, (bond.atom2(), bond.atom1()))
+            }
+            Some(&(_, direction)) => (direction, (bond.atom1(), bond.atom2())),
+            None => (0, (bond.atom1(), bond.atom2())),
+        };
         out.push_str(&format!(
-            "{:>3}{:>3}{order:>3}  0  0  0  0\n",
-            bond.atom1() + 1,
-            bond.atom2() + 1
+            "{:>3}{:>3}{order:>3}{stereo:>3}  0  0  0\n",
+            first + 1,
+            second + 1
         ));
     }
 
+    out.push_str(&property_lines(mol));
     out.push_str("M  END\n");
+    out.push_str(&data_block(mol));
     out.push_str(SDF_ENTRY_END);
     out.push('\n');
+    out
+}
+
+/// `M  CHG` and `M  ISO` lines, between the bond block and `M  END`.
+///
+/// These are what make a charged record *readable*, not merely lossless.
+/// Without `M  CHG` a quaternary nitrogen has four bonds and no charge, which
+/// is a valence error, so a strict reader refuses the whole record rather than
+/// quietly returning a neutral amine — `C[N+](C)(C)C` and `[O-][N+](=O)c1ccccc1`
+/// both did exactly that (#194).
+///
+/// Both lines carry a count in three columns followed by that many
+/// `(atom, value)` pairs in four columns each, atom indices 1-based as in the
+/// bond block. **Eight pairs per line at most**, so a molecule with more needs
+/// several — a limit that is easy to miss because nothing in a small corpus
+/// reaches it.
+fn property_lines(mol: &Molecule) -> String {
+    fn emit(tag: &str, entries: &[(usize, i32)]) -> String {
+        let mut out = String::new();
+        for chunk in entries.chunks(8) {
+            out.push_str(tag);
+            out.push_str(&format!("{:>3}", chunk.len()));
+            for (index, value) in chunk {
+                out.push_str(&format!("{:>4}{value:>4}", index + 1));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    let charges: Vec<(usize, i32)> = (0..mol.num_atoms())
+        .filter_map(|i| match mol.atom(i).formal_charge() {
+            0 => None,
+            c => Some((i, i32::from(c))),
+        })
+        .collect();
+
+    // The absolute mass number, not the difference from natural abundance. The
+    // atom line's `dd` column is the difference form and is superseded; it stays
+    // zero, because a reader that sees both is entitled to believe either.
+    let isotopes: Vec<(usize, i32)> = (0..mol.num_atoms())
+        .filter_map(|i| mol.atom(i).isotope().map(|iso| (i, i32::from(iso))))
+        .collect();
+
+    // Nothing to say means no line. `M  CHG  0` is legal and is noise.
+    format!("{}{}", emit("M  CHG", &charges), emit("M  ISO", &isotopes))
+}
+
+/// The data block: everything after `M  END` and before `$$$$`.
+///
+/// Data fields are why people choose SDF over SMILES — assay values, catalogue
+/// IDs, docking scores. `parse_sdf` has always read them into
+/// [`Molecule::properties`]; the writer never wrote them back, so an SDF to SDF
+/// round trip through this crate silently lost every one (#188).
+///
+/// Sorted by key, because `properties` is a `HashMap` and iterating it writes
+/// the same molecule differently between runs. #153 was that bug for ring
+/// closures, and the fix is the same one.
+fn data_block(mol: &Molecule) -> String {
+    let mut keys: Vec<&String> = mol.properties().keys().collect();
+    keys.sort();
+
+    let mut out = String::new();
+    for key in keys {
+        // The blank line is the field terminator, not decoration: a reader
+        // takes every line up to it as the value.
+        out.push_str(&format!(
+            "> <{key}>\n{}\n\n",
+            mol.properties()[key.as_str()]
+        ));
+    }
     out
 }
 
@@ -428,8 +615,278 @@ pub fn molecule_has_coords_for_sdf(mol: &Molecule) -> bool {
     mol.has_coords() || mol.has_coords3()
 }
 
+/// The atom stereo parity for the atom line's `sss` column, or 0 for none.
+///
+/// Both conventions are anchored to the same thing since `normalise_chirality`:
+/// neighbours in increasing index order, with an implicit hydrogen last. So
+/// this is a direct mapping rather than a permutation problem — the permutation
+/// was done once, at parse time, where the written order was still known.
+///
+/// Which way round the mapping goes is fixed by RDKit rather than by reading
+/// the specification: both alanine enantiomers must keep their distinct `/m0`
+/// and `/m1` InChI layers through an SDF trip, and a centre carrying a
+/// ring-closure digit must survive too.
+fn atom_parity(mol: &Molecule, atom_idx: usize) -> u8 {
+    let base = match mol.atom(atom_idx).chirality() {
+        Chirality::Clockwise => 1,
+        Chirality::CounterClockwise => 2,
+        Chirality::None | Chirality::Unspecified => return 0,
+    };
+
+    // A parity describes four things around a centre. Three neighbours and one
+    // implicit hydrogen is the common shape; anything else is not a tetrahedral
+    // centre this can describe.
+    let neighbours = mol.neighbors(atom_idx).len();
+    let hydrogens = usize::from(mol.atom(atom_idx).total_hydrogens());
+    if neighbours + hydrogens != 4 {
+        return 0;
+    }
+    base
+}
+
+/// Which bonds carry a wedge, in which direction, and around which centre.
+///
+/// A wedge is not another way of writing the parity — it is a claim about the
+/// *drawing*, so it only means anything when there is one. `core/layout.rs`
+/// places atoms with no knowledge of chirality, so deriving a wedge straight
+/// from [`Chirality`] would produce a marker that contradicts the picture it
+/// sits on, and a reader is entitled to believe either.
+///
+/// So the direction is not derived by formula. It is found by **simulating the
+/// reader**: build the 3D arrangement each candidate direction implies, work
+/// out the parity a reader would compute from it, and keep the one that agrees
+/// with [`atom_parity`]. A formula was tried first and got alanine right and
+/// *trans*-cyclohexanediol wrong — one centre of two — which is what a guess
+/// that happens to fit one arrangement looks like.
+///
+/// When neither direction reproduces the parity, or there is no layout, the
+/// parity stands alone: under-specified and readable, rather than confidently
+/// contradictory.
+fn wedge_bonds(mol: &Molecule) -> std::collections::HashMap<usize, (usize, u8)> {
+    let mut wedges = std::collections::HashMap::new();
+    let Some(points) = mol.coords() else {
+        return wedges; // no drawing, so nothing a wedge could mean
+    };
+
+    for atom_idx in 0..mol.num_atoms() {
+        let parity = atom_parity(mol, atom_idx);
+        if parity == 0 {
+            continue;
+        }
+
+        let neighbours = mol.neighbors(atom_idx);
+        // Prefer a bond to a low-degree neighbour, so the wedge reads as coming
+        // out of the centre rather than out of a ring.
+        let Some(chosen) = neighbours
+            .iter()
+            .min_by_key(|n| mol.graph().degree(n.atom_idx))
+        else {
+            continue;
+        };
+
+        for direction in [1u8, 6u8] {
+            if implied_parity(mol, points, atom_idx, chosen.atom_idx, direction) == Some(parity) {
+                wedges.insert(chosen.bond_idx, (atom_idx, direction));
+                break;
+            }
+        }
+    }
+    wedges
+}
+
+/// The parity a reader would compute from the drawing, if `wedged` were lifted
+/// out of the page (`1`) or pushed behind it (`6`).
+///
+/// Everything not wedged lies in the plane. An implicit hydrogen has no drawn
+/// position, so it is placed where a real one would go: opposite the sum of the
+/// other bonds.
+fn implied_parity(
+    mol: &Molecule,
+    points: &[Point2],
+    centre: usize,
+    wedged: usize,
+    direction: u8,
+) -> Option<u8> {
+    let origin = points[centre];
+    let mut vectors: Vec<(usize, [f64; 3])> = Vec::new();
+    for neighbour in mol.neighbors(centre) {
+        let p = points[neighbour.atom_idx];
+        let z = if neighbour.atom_idx == wedged {
+            if direction == 1 { 1.0 } else { -1.0 }
+        } else {
+            0.0
+        };
+        vectors.push((neighbour.atom_idx, [p.x - origin.x, p.y - origin.y, z]));
+    }
+
+    if mol.atom(centre).total_hydrogens() == 1 {
+        // Opposite everything else, and numbered highest — molfile treats an
+        // implicit hydrogen as the last neighbour.
+        let sum = vectors.iter().fold([0.0; 3], |acc, (_, v)| {
+            [acc[0] + v[0], acc[1] + v[1], acc[2] + v[2]]
+        });
+        vectors.push((usize::MAX, [-sum[0], -sum[1], -sum[2]]));
+    }
+    if vectors.len() != 4 {
+        return None;
+    }
+
+    // Molfile numbering order.
+    vectors.sort_by_key(|(idx, _)| *idx);
+
+    // With the highest-numbered neighbour pointing away, do the first three
+    // read clockwise? That is the sign of the determinant of the three, taken
+    // relative to the fourth.
+    let d = |a: [f64; 3], b: [f64; 3], c: [f64; 3]| {
+        a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0])
+    };
+    let det = d(vectors[0].1, vectors[1].1, vectors[2].1);
+    if det.abs() < 1e-9 {
+        return None; // the drawing is degenerate here
+    }
+    Some(if det < 0.0 { 1 } else { 2 })
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The `M  CHG` / `M  ISO` lines of a written record.
+    fn property_lines_of(smiles: &str) -> Vec<String> {
+        let mol = crate::io::smiles::parse_smiles(smiles).expect(smiles);
+        write_sdf(&mol)
+            .lines()
+            .filter(|l| l.starts_with("M  CHG") || l.starts_with("M  ISO"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_charges_are_written_as_a_property_line() {
+        assert_eq!(property_lines_of("[NH4+]"), ["M  CHG  1   1   1"]);
+        assert_eq!(property_lines_of("[Cl-]"), ["M  CHG  1   1  -1"]);
+        assert_eq!(property_lines_of("[Mg+2]"), ["M  CHG  1   1   2"]);
+    }
+
+    #[test]
+    fn test_a_neutral_molecule_writes_no_property_line() {
+        // `M  CHG  0` is legal and is noise.
+        assert!(property_lines_of("CCO").is_empty());
+    }
+
+    #[test]
+    fn test_more_than_eight_charges_wrap_onto_a_second_line() {
+        // The limit is 8 pairs per line. Nothing in the corpus reaches it, so
+        // without this the wrap would ship untested and break on the first real
+        // polyelectrolyte.
+        let nine = "[NH4+].".repeat(9);
+        let lines = property_lines_of(nine.trim_end_matches('.'));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("M  CHG  8"), "{}", lines[0]);
+        assert!(lines[1].starts_with("M  CHG  1"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn test_isotopes_are_written_as_the_absolute_mass_number() {
+        // 13, not 1: `M  ISO` supersedes the atom block's difference-from-
+        // natural-abundance column, which stays zero.
+        assert_eq!(property_lines_of("[13CH4]"), ["M  ISO  1   1  13"]);
+    }
+
+    #[test]
+    fn test_charge_and_isotope_survive_a_round_trip() {
+        for smiles in ["[NH4+]", "[Cl-]", "[Mg+2]", "[13CH4]"] {
+            let before = crate::io::smiles::parse_smiles(smiles).expect(smiles);
+            let after = parse_sdf(&write_sdf(&before)).expect(smiles);
+            assert_eq!(
+                after.atom(0).formal_charge(),
+                before.atom(0).formal_charge(),
+                "{smiles} lost its charge"
+            );
+            assert_eq!(
+                after.atom(0).isotope(),
+                before.atom(0).isotope(),
+                "{smiles} lost its isotope"
+            );
+        }
+    }
+
+    #[test]
+    fn test_data_fields_are_written_sorted_and_terminated() {
+        let mut mol = crate::io::smiles::parse_smiles("CCO").expect("valid SMILES");
+        mol.set_property("zeta".into(), "last".into());
+        mol.set_property("alpha".into(), "first".into());
+
+        let text = write_sdf(&mol);
+        let block = text.split("M  END\n").nth(1).expect("a data block");
+        // Sorted, because `properties` is a HashMap and iteration order would
+        // otherwise write the same molecule differently between runs (#153).
+        assert_eq!(block, "> <alpha>\nfirst\n\n> <zeta>\nlast\n\n$$$$\n");
+
+        let back = parse_sdf(&text).expect("round trips");
+        assert_eq!(back.property("alpha"), Some("first"));
+        assert_eq!(back.property("zeta"), Some("last"));
+    }
+
+    #[test]
+    fn test_aromatic_bonds_are_written_as_a_kekule_form() {
+        // Type 4 is a *query* bond type. Benzene survives it because a reader
+        // can kekulise unambiguously; pyrrole cannot, and RDKit rejects the
+        // record (#194).
+        for smiles in [
+            "c1ccccc1",
+            "c1cc[nH]c1",
+            "c1ccncc1",
+            "c1ccoc1",
+            "c1cnc[nH]1",
+        ] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect(smiles);
+            let text = write_sdf(&mol);
+            let type_four = text
+                .lines()
+                .skip(4 + mol.num_atoms())
+                .take(mol.num_bonds())
+                .filter(|l| l.split_whitespace().nth(2) == Some("4"))
+                .count();
+            assert_eq!(type_four, 0, "{smiles} still writes a query bond type");
+        }
+    }
+
+    #[test]
+    fn test_a_chiral_centre_writes_a_parity_and_reads_it_back() {
+        let before = crate::io::smiles::parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+        let after = parse_sdf(&write_sdf(&before)).expect("round trips");
+        assert_ne!(after.atom(1).chirality(), Chirality::None);
+        assert_eq!(after.atom(1).chirality(), before.atom(1).chirality());
+    }
+
+    #[test]
+    fn test_the_two_enantiomers_do_not_collapse_into_each_other() {
+        // The failure a self-consistent writer hides: emit one parity
+        // regardless of input and every round trip still looks perfect.
+        let l = crate::io::smiles::parse_smiles("N[C@@H](C)C(=O)O").expect("valid");
+        let d = crate::io::smiles::parse_smiles("N[C@H](C)C(=O)O").expect("valid");
+        let l_back = parse_sdf(&write_sdf(&l)).expect("round trips");
+        let d_back = parse_sdf(&write_sdf(&d)).expect("round trips");
+        assert_ne!(l_back.atom(1).chirality(), d_back.atom(1).chirality());
+    }
+
+    #[test]
+    fn test_no_layout_means_a_parity_and_no_wedge() {
+        // A wedge is a claim about a drawing. With no drawing it would be a
+        // claim about nothing, and a reader that trusts it over the parity gets
+        // a different molecule.
+        let mol = crate::io::smiles::parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+        assert!(mol.coords().is_none());
+        let text = write_sdf(&mol);
+        let wedges = text
+            .lines()
+            .skip(4 + mol.num_atoms())
+            .take(mol.num_bonds())
+            .filter(|l| matches!(l.split_whitespace().nth(3), Some("1") | Some("6")))
+            .count();
+        assert_eq!(wedges, 0, "wedge written with no layout to justify it");
+    }
     use super::*;
 
     // ---- writing ----------------------------------------------------------
