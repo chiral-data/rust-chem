@@ -8,9 +8,3 @@ divergence fails CI while these do not.
 Shrinking this file is the fidelity work. Never edit it by hand —
 re-run with `--promote` so it matches what the oracles actually say.
 
-- hard.smi: cis-difluoroethene — SDF round trip, rdkit says double-bond stereo (2-1- -> 2-1+)
-- hard.smi: cis-difluoroethene — SDF round trip, openbabel says F/C=C\F -> F/C=C/F
-- stereo.smi: cis — SDF round trip, rdkit says double-bond stereo (2-1- -> 2-1+)
-- stereo.smi: cis — SDF round trip, openbabel says F/C=C\F -> F/C=C/F
-- stereo.smi: trans-reversed-spelling — SDF round trip, rdkit says double-bond stereo (2-1- -> 2-1+)
-- stereo.smi: trans-reversed-spelling — SDF round trip, openbabel says F/C=C\F -> F/C=C/F
