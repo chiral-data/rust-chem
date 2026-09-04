@@ -552,8 +552,15 @@ pub fn write_sdf(mol: &Molecule) -> String {
         // from coordinates — ours included — would read a configuration the
         // molecule never claimed. Field 3 is "either", which is a statement of
         // ignorance rather than of geometry, and is what RDKit writes here.
+        //
+        // `None` is a bond that never claimed a configuration; `Unspecified`
+        // is one a previous read already recorded as declining to say (this
+        // same field 3, read back in). Both need the same treatment here —
+        // writing `Unspecified` through the plain path below would silently
+        // turn "no claim" into a false claim of whatever the coordinates
+        // happen to draw, the moment the molecule is written a second time.
         if bond.order() == BondOrder::Double
-            && bond.stereo() == BondStereo::None
+            && matches!(bond.stereo(), BondStereo::None | BondStereo::Unspecified)
             && geometry_is_inferrable(mol, bond.atom1(), bond.atom2())
         {
             out.push_str(&format!(
@@ -981,6 +988,48 @@ mod tests {
         let mut mol = parse_smiles(smiles).expect("valid SMILES");
         assert!(ensure_coords(&mut mol), "layout should succeed");
         mol
+    }
+
+    #[test]
+    fn test_an_unspecified_double_bond_still_says_so_after_a_second_round_trip() {
+        // Field 3 means "the file declines to say", not "the file forgot to
+        // say" — losing it on a second write turns a molecule that never
+        // stated a configuration into one that looks like it stated trans,
+        // since the coordinates for "no claim" and for trans are identical.
+        let mol = laid_out("FC=CF");
+        let double_bond_stereo_digit = |text: &str| -> String {
+            text.lines()
+                .skip(4 + mol.num_atoms())
+                .take(mol.num_bonds())
+                .find(|l| l.split_whitespace().nth(2) == Some("2"))
+                .expect("a double bond line")
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .to_string()
+        };
+
+        let first = write_sdf(&mol);
+        assert_eq!(double_bond_stereo_digit(&first), "3");
+
+        let reparsed = parse_sdf(&first).expect("round trips");
+        let double_bond = (0..reparsed.num_bonds())
+            .find(|&i| reparsed.bond(i).order() == BondOrder::Double)
+            .expect("a double bond");
+        assert_eq!(reparsed.bond(double_bond).stereo(), BondStereo::Unspecified);
+
+        let second = write_sdf(&reparsed);
+        assert_eq!(
+            double_bond_stereo_digit(&second),
+            "3",
+            "an already-unspecified bond must keep declining to say, not fall silent"
+        );
+
+        let reparsed_again = parse_sdf(&second).expect("round trips");
+        assert_eq!(
+            reparsed_again.bond(double_bond).stereo(),
+            BondStereo::Unspecified
+        );
     }
 
     #[test]
