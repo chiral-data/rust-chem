@@ -182,14 +182,34 @@ fn parse_atom_property_lines(mol: &mut Molecule, lines: &[&str]) {
     }
 }
 
+/// Extracts one fixed-width field, trimmed, or `None` if the line is too
+/// short there or the field is blank. A `%Nd`/`%N.Mf` field at its full
+/// width is written with no separating space, which is what makes reading
+/// this way necessary once a value reaches the field's width (#202).
+fn fixed_field(line: &str, start: usize, width: usize) -> Option<&str> {
+    line.get(start..start + width)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// Parses the counts line (line 3) of an SDF file.
 ///
-/// **FIXED**: Now handles both fixed-width format and whitespace-separated format.
+/// Tries the spec's fixed-width `%3d%3d` first, since a value that fills
+/// the field leaves no space before the next one — a 100-atom, 100-bond
+/// record writes `"100100"`, which `split_whitespace` alone reads as one
+/// token (#202). Falls back to whitespace splitting for files that pad
+/// loosely instead.
 ///
 /// Example: " 10  9  0  0  0  0  0  0  0  0999 V2000"
 ///           ^^^ ~~~
 ///          10 atoms, 9 bonds
 fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
+    if let (Some(a), Some(b)) = (fixed_field(line, 0, 3), fixed_field(line, 3, 3))
+        && let (Ok(num_atoms), Ok(num_bonds)) = (a.parse::<usize>(), b.parse::<usize>())
+    {
+        return Ok((num_atoms, num_bonds));
+    }
+
     let parts: Vec<&str> = line.split_whitespace().collect();
 
     if parts.len() < 2 {
@@ -209,13 +229,19 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 
 /// Parses a single atom line from the SDF atom block.
 ///
-/// **FIXED**: Now handles both fixed-width and whitespace-separated formats.
+/// The three `%10.4f` coordinate fields are tried fixed-width first: at
+/// full width — a coordinate of 1000 or more — they carry no space between
+/// them, so whitespace splitting alone would merge two into one (#202).
+/// Everything after the coordinates keeps its delimiters even in a strict
+/// file, so that remainder is still split on whitespace. Falls back to
+/// whitespace splitting the whole line when the coordinates aren't there
+/// or don't parse as floats.
 ///
 /// # Real-World SDF Atom Line Format
 /// Atom lines can vary in format:
 /// 1. **Fixed-width format** (classic V2000):
 ///    - Positions 0-9: X coordinate
-///    - Positions 10-19: Y coordinate  
+///    - Positions 10-19: Y coordinate
 ///    - Positions 20-29: Z coordinate
 ///    - Positions 31-33: Element symbol (right-aligned in 3 chars)
 ///
@@ -229,7 +255,18 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 ///        x         y         z   element
 /// ```
 fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, SdfError> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    let fixed_width = (|| {
+        let x = fixed_field(line, 0, 10)?;
+        let y = fixed_field(line, 10, 10)?;
+        let z = fixed_field(line, 20, 10)?;
+        x.parse::<f64>().ok()?;
+        y.parse::<f64>().ok()?;
+        z.parse::<f64>().ok()?;
+        let mut fields = vec![x, y, z];
+        fields.extend(line.get(30..).unwrap_or("").split_whitespace());
+        Some(fields)
+    })();
+    let parts: Vec<&str> = fixed_width.unwrap_or_else(|| line.split_whitespace().collect());
 
     // Real-world SDF files typically have at least 4 fields: x, y, z, symbol
     if parts.len() < SDF_ATOM_FIELD {
@@ -289,16 +326,30 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, Sdf
 
 /// Parses a single bond line from the SDF bond block.
 ///
-/// **ENHANCED**: Added better error messages and validation.
+/// Tries the spec's fixed-width `%3d%3d%3d%3d` first: once an atom index
+/// reaches 100, it fills its field and leaves no space before the next
+/// one — `" 99100  1  0  0  0  0"` splits into six tokens instead of
+/// seven, and the bond order is read from what was really atom2 (#202).
+/// Falls back to whitespace splitting for files that pad loosely instead.
 ///
-/// Bond lines are whitespace-separated: atom1 atom2 bond_type [stereo] [other fields]
 /// Example: "  1  2  1  0  0  0  0"
 ///             ^  ^  ^
 ///             |  |  └─ Bond type (1=single, 2=double, 3=triple, 4=aromatic)
 ///             |  └──── Second atom (1-based index)
 ///             └─────── First atom (1-based index)
 fn parse_bond_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    let fixed_width = (|| {
+        let atom1 = fixed_field(line, 0, 3)?;
+        let atom2 = fixed_field(line, 3, 3)?;
+        let bond_type = fixed_field(line, 6, 3)?;
+        atom1.parse::<usize>().ok()?;
+        atom2.parse::<usize>().ok()?;
+        bond_type.parse::<u8>().ok()?;
+        let mut fields = vec![atom1, atom2, bond_type];
+        fields.extend(fixed_field(line, 9, 3));
+        Some(fields)
+    })();
+    let parts: Vec<&str> = fixed_width.unwrap_or_else(|| line.split_whitespace().collect());
 
     // Bond line must have at least 3 fields: atom1, atom2, bond_type
     if parts.len() < SDF_MIN_BOND_FIELDS {
@@ -1109,6 +1160,25 @@ mod tests {
             v
         };
         assert_eq!(pairs(&back), pairs(&original));
+    }
+
+    #[test]
+    fn test_a_hundred_atom_bond_line_does_not_merge_under_split_whitespace() {
+        // Bond 99 joins atoms 99 and 100 (1-based), writing "99100" with no
+        // space between them once the second index reaches three digits (#202).
+        let mol = laid_out(&"C".repeat(100));
+        let back =
+            parse_sdf(&write_sdf(&mol)).expect("a spec-conformant 100-atom record must parse");
+        assert_eq!(back.num_atoms(), 100);
+        assert_eq!(back.num_bonds(), 99);
+    }
+
+    #[test]
+    fn test_ninety_nine_atoms_is_the_boundary_that_already_worked() {
+        let mol = laid_out(&"C".repeat(99));
+        let back = parse_sdf(&write_sdf(&mol)).expect("round trips");
+        assert_eq!(back.num_atoms(), 99);
+        assert_eq!(back.num_bonds(), 98);
     }
 
     #[test]
