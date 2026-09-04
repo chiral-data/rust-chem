@@ -177,8 +177,8 @@ fn parse_organic_two_char(input: &str) -> IResult<&str, String> {
 fn parse_organic_one_char(input: &str) -> IResult<&str, String> {
     match input.get(0..1) {
         Some(
-            one_char @ ("B" | "C" | "N" | "O" | "P" | "S" | "F" | "I" | "b" | "c" | "n" | "o"
-            | "p" | "s"),
+            one_char @ ("B" | "C" | "N" | "O" | "P" | "S" | "F" | "I" | "b" | "c" | "n" | "o" | "p"
+            | "s"),
         ) => Ok((&input[1..], one_char.to_string())),
         _ => Err(nom::Err::Error(nom::error::Error::new(
             input,
