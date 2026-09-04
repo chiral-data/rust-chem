@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.1] - 2026-09-04
+
+### Bug Fixes
+
+- **Bare two-letter symbols outside brackets read as full elements, so `Cn` parsed as copernicium instead of carbon followed by aromatic nitrogen.** Caffeine (`Cn1cnc2c1c(=O)n(C)c(=O)n2C`), written the way everyone writes it, silently came back as a 13-atom copernicium compound — `Cl`/`Br` are the only two-letter symbols the SMILES grammar allows bare; every other two-letter pair outside brackets is two atoms, not one. The same functions also panicked instead of returning a parse error on non-ASCII input (#203)
+
 ## [0.6.0] - 2026-08-28
 
 **`chem` is on crates.io.** Everything the workbench could do is now available as a library and a command-line tool: `chem = "0.6"` for the library, `cargo install chem --features cli` for the tool.
