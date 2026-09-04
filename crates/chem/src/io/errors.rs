@@ -46,6 +46,17 @@ pub enum SmilesError {
     #[error("No atoms in SMILES")]
     NoAtoms,
 
+    /// A bond symbol immediately followed by another one, with no atom
+    /// between them — `C##C`, `C###C`, `C==C`.
+    ///
+    /// These used to collapse silently into whichever symbol arrived last, so
+    /// `C##C` and `C###C` both parsed as ethyne. Silent acceptance of
+    /// malformed input is the failure mode hardest to notice downstream: a
+    /// typo in a generated file becomes a plausible molecule rather than a
+    /// reported skip (#190).
+    #[error("Two bond symbols in a row with no atom between them")]
+    RepeatedBondSymbol,
+
     /// A `.` with no component on one side of it — `CC.` or `.CC`.
     ///
     /// Named rather than folded into [`SmilesError::DanglingBond`]: a dot is

@@ -488,6 +488,12 @@ fn build_molecule(tokens: &[Token]) -> Result<Molecule, SmilesError> {
                     // times, and "No atoms in SMILES" names that mistake far
                     // better than "a bond has no atom to attach to" would.
                     dangling_bond = true;
+                } else if next_bond.is_some() {
+                    // `C##C`, `C###C`, `C==C` — a bond symbol right after
+                    // another one, with no atom between them. These used to
+                    // collapse silently into whichever symbol arrived last,
+                    // so `C##C` and `C###C` both parsed as ethyne (#190).
+                    return Err(SmilesError::RepeatedBondSymbol);
                 }
                 next_bond = Some(*bond_token);
             }
@@ -1469,6 +1475,19 @@ mod tests {
             assert!(
                 matches!(parse_smiles(input), Err(SmilesError::DanglingBond)),
                 "{input:?} should be DanglingBond, got {:?}",
+                parse_smiles(input).map(|m| (m.num_atoms(), m.num_bonds()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_repeated_bond_symbols_are_rejected() {
+        // These used to collapse silently into ethyne/ethene — whichever
+        // symbol arrived last won, and the extras vanished (#190).
+        for input in ["C##C", "C###C", "C==C", "C#=C"] {
+            assert!(
+                matches!(parse_smiles(input), Err(SmilesError::RepeatedBondSymbol)),
+                "{input:?} should be RepeatedBondSymbol, got {:?}",
                 parse_smiles(input).map(|m| (m.num_atoms(), m.num_bonds()))
             );
         }

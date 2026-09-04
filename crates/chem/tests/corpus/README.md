@@ -35,10 +35,10 @@ rejected and is not, and valid input the parser cannot read yet.
 
 Pinned rather than deleted, so the corpus describes the parser as it behaves.
 Closing a gap fails the test that pins it, which is the prompt to rename the
-entry and drop its comment — that is how #191's nine entries left this file.
+entry and drop its comment — that is how #191's nine entries left this
+file, and #190's two.
 
-The current ones are in `invalid.smi`: #190, where a run of bond symbols is
-silently collapsed so `C##C` parses as ethyne.
+None are currently pinned.
 
 The marker is the entry's *name*, not a nearby comment. The first version
 scanned for a `KNOWN GAP` comment, armed itself on the phrase appearing in a
