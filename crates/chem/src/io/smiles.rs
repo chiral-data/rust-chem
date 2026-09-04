@@ -158,7 +158,7 @@ fn parse_bracket_atom(input: &str) -> IResult<&str, AtomToken> {
 }
 
 fn parse_element_atom(input: &str) -> IResult<&str, AtomToken> {
-    let (remaining_input, symbol) = parse_element_symbol(input)?;
+    let (remaining_input, symbol) = parse_organic_symbol(input)?;
 
     // Determine aromaticity: lowercase first character indicates aromatic atom
     let aromatic = symbol.chars().next().unwrap().is_lowercase();
@@ -185,14 +185,52 @@ fn parse_element_atom(input: &str) -> IResult<&str, AtomToken> {
     ))
 }
 
-/// Parses element symbols from SMILES strings.
+/// Parses element symbols written outside brackets — the SMILES organic
+/// subset. Unlike inside brackets, longest-match-first is wrong here: the
+/// grammar admits only `Cl`/`Br` as bare two-letter symbols, so `Cn` is
+/// carbon followed by aromatic `n`, not copernicium. Used only by
+/// `parse_element_atom`; `parse_bracket_atom` goes through
+/// `parse_element_symbol` instead, which does try the full periodic table.
+fn parse_organic_symbol(input: &str) -> IResult<&str, String> {
+    alt((parse_organic_two_char, parse_organic_one_char)).parse(input)
+}
+
+/// Bare two-letter organic-subset symbols: only `Cl` and `Br`.
+fn parse_organic_two_char(input: &str) -> IResult<&str, String> {
+    match input.get(0..2) {
+        Some(two_chars @ ("Cl" | "Br")) => Ok((&input[2..], two_chars.to_string())),
+        _ => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        ))),
+    }
+}
+
+/// Bare one-letter organic-subset symbols: `B C N O P S F I`, plus aromatic
+/// `b c n o p s`.
+fn parse_organic_one_char(input: &str) -> IResult<&str, String> {
+    match input.get(0..1) {
+        Some(
+            one_char @ ("B" | "C" | "N" | "O" | "P" | "S" | "F" | "I" | "b" | "c" | "n" | "o" | "p"
+            | "s"),
+        ) => Ok((&input[1..], one_char.to_string())),
+        _ => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        ))),
+    }
+}
+
+/// Parses element symbols inside bracket atoms, e.g. `[Cn]`, `[13C]`.
 ///
 /// This parser handles:
 /// - All standard element symbols from the periodic table (case-sensitive)
 /// - SMILES aromatic lowercase symbols (b, c, n, o, p, s, se, as)
 ///
 /// The parser tries to match the longest possible symbol first (2 chars),
-/// then falls back to single character symbols.
+/// then falls back to single character symbols. Reached only via
+/// `parse_bracket_atom` — the bare (organic-subset) path uses
+/// `parse_organic_symbol` instead, which does not try the full table.
 fn parse_element_symbol(input: &str) -> IResult<&str, String> {
     alt((
         // Try 2-character symbols first (to avoid matching "C" when input is "Cl")
@@ -203,20 +241,20 @@ fn parse_element_symbol(input: &str) -> IResult<&str, String> {
     .parse(input)
 }
 
-/// Parses 2-character element symbols.
+/// Parses 2-character element symbols for bracket atoms.
 ///
 /// This dynamically generates parsers for all 2-character elements from ELEMENT_SYMBOLS,
 /// plus SMILES aromatic symbols (se, as).
 fn parse_two_char_element(input: &str) -> IResult<&str, String> {
-    // Need at least 2 characters
-    if input.len() < 2 {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )));
-    }
-
-    let two_chars = &input[0..2];
+    let two_chars = match input.get(0..2) {
+        Some(s) => s,
+        None => {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+    };
 
     // Check if it matches any 2-character element from ELEMENT_SYMBOLS
     let is_valid_element = ELEMENT_SYMBOLS
@@ -236,20 +274,21 @@ fn parse_two_char_element(input: &str) -> IResult<&str, String> {
     }
 }
 
-/// Parses 1-character element symbols.
+/// Parses 1-character element symbols for bracket atoms.
 ///
 /// This handles:
 /// - Single-letter elements from ELEMENT_SYMBOLS (H, B, C, N, O, F, P, S, I, etc.)
 /// - SMILES aromatic lowercase symbols (b, c, n, o, p, s)
 fn parse_one_char_element(input: &str) -> IResult<&str, String> {
-    if input.is_empty() {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )));
-    }
-
-    let one_char = &input[0..1];
+    let one_char = match input.get(0..1) {
+        Some(s) => s,
+        None => {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+    };
 
     // Check if it matches any 1-character element from ELEMENT_SYMBOLS
     let is_valid_element = ELEMENT_SYMBOLS
@@ -952,6 +991,83 @@ mod tests {
         assert_eq!(remaining, "OH");
         assert_eq!(atom.element, "Br");
         assert!(!atom.aromatic);
+    }
+
+    #[test]
+    fn test_bare_two_letter_pairs_are_not_full_elements() {
+        // Cn, Co, Cs, Sc are valid two-letter element symbols (copernicium,
+        // cobalt, caesium, scandium), but only inside brackets. Bare, the
+        // grammar admits just Cl/Br as two letters — everything else here
+        // is carbon (or sulfur) followed by an aromatic atom (#203).
+        let (remaining, atom) = parse_element_atom("Cn1").unwrap();
+        assert_eq!(remaining, "n1");
+        assert_eq!(atom.element, "C");
+        assert!(!atom.aromatic);
+
+        let (remaining, atom) = parse_element_atom("Co1").unwrap();
+        assert_eq!(remaining, "o1");
+        assert_eq!(atom.element, "C");
+
+        let (remaining, atom) = parse_element_atom("Cs1").unwrap();
+        assert_eq!(remaining, "s1");
+        assert_eq!(atom.element, "C");
+
+        let (remaining, atom) = parse_element_atom("Sc1").unwrap();
+        assert_eq!(remaining, "c1");
+        assert_eq!(atom.element, "S");
+
+        // Unaffected: "Cc" and "Nc" were never valid two-letter elements.
+        let (remaining, atom) = parse_element_atom("Cc1").unwrap();
+        assert_eq!(remaining, "c1");
+        assert_eq!(atom.element, "C");
+    }
+
+    #[test]
+    fn test_caffeine_is_not_copernicium() {
+        // #203: Cn1cnc2c1c(=O)n(C)c(=O)n2C parsed as a 13-atom copernicium
+        // compound (C7H7CnN3O2) instead of caffeine.
+        let mol = parse_smiles("Cn1cnc2c1c(=O)n(C)c(=O)n2C").unwrap();
+        assert_eq!(mol.num_atoms(), 14);
+        assert_eq!(mol.formula(), "C8H10N4O2");
+    }
+
+    #[test]
+    fn test_bare_two_letter_pairs_in_whole_molecules() {
+        // The ring heteroatom picks up a third bond from the exocyclic
+        // methyl (2 ring bonds + 1 substituent); since it's already at its
+        // neutral valence with the two ring bonds alone, that third bond
+        // adds no implicit H of its own, so these carry one more H than a
+        // same-sized all-carbon ring would.
+        assert_eq!(parse_smiles("Cn1ccccc1").unwrap().formula(), "C6H8N");
+        assert_eq!(parse_smiles("Co1cccc1").unwrap().formula(), "C5H7O");
+        assert_eq!(parse_smiles("Cs1cccc1").unwrap().formula(), "C5H7S");
+        // Here the heteroatom is the exocyclic substituent instead, so its
+        // valence math is unambiguous.
+        assert_eq!(parse_smiles("CSc1ccccc1").unwrap().formula(), "C7H8S");
+        assert_eq!(parse_smiles("Sc1ccccc1").unwrap().formula(), "C6H6S");
+
+        // Unaffected pairs: never valid two-letter elements.
+        assert_eq!(parse_smiles("Cc1ccccc1").unwrap().formula(), "C7H8"); // toluene
+        assert_eq!(parse_smiles("Nc1ccccc1").unwrap().formula(), "C6H7N"); // aniline
+    }
+
+    #[test]
+    fn test_bracket_two_letter_symbols_still_read_the_full_element() {
+        // Brackets are unambiguous, so longest-match-first is still correct
+        // there: [Cn] is copernicium, [Co] is cobalt, not carbon + n/o.
+        let mol = parse_smiles("[Cn]").unwrap();
+        assert_eq!(mol.atom(0).element().symbol(), "Cn");
+
+        let mol = parse_smiles("[Co]").unwrap();
+        assert_eq!(mol.atom(0).element().symbol(), "Co");
+    }
+
+    #[test]
+    fn test_non_ascii_input_is_a_parse_error_not_a_panic() {
+        // #203: byte-range slicing on a &str panics when the slice would
+        // land inside a multi-byte character, instead of returning Err.
+        assert!(parse_smiles("中C").is_err());
+        assert!(parse_smiles("éC").is_err());
     }
 
     #[test]
