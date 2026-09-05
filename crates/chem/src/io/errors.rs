@@ -124,6 +124,22 @@ pub enum MmcifError {
     InvalidElement(String),
 }
 
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum Mol2Error {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid bond line: {0}")]
+    InvalidBondLine(String),
+
+    #[error("Unsupported SYBYL atom type: {0}")]
+    UnsupportedAtomType(String),
+}
+
 /// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
 ///
 /// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,

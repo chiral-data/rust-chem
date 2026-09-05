@@ -493,6 +493,31 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(mmcif_supplier),
         writer_stream: Some(mmcif_writer_stream),
     },
+    FormatDescriptor {
+        name: "Mol2",
+        codes: &["mol2"],
+        extensions: &["mol2"],
+        // Docking-prep, not general comp-chem, per #173's own framing.
+        category: Category::MolecularDynamicsAndDocking,
+        // No FORMAL_CHARGE/ISOTOPE/STEREO_ATOM/STEREO_BOND/PROPERTIES --
+        // none of those have a column in this format. Mirrors SDF's own
+        // COORDS_2D|COORDS_3D pair: Mol2 has no dimensionality header
+        // either, so `io/mol2.rs` uses the same all-zero-z heuristic
+        // `parse_sdf` already does. The first format to claim
+        // PARTIAL_CHARGE -- `AtomSite::partial_charge`'s own doc comment
+        // already named Mol2 as the format this was modelled for (#225).
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_2D)
+            .or(Carries::COORDS_3D)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::AROMATICITY)
+            .or(Carries::RESIDUES)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_mol2_with_options),
+        writer: Some(write_mol2_records),
+        supplier: Some(mol2_supplier),
+        writer_stream: Some(mol2_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -519,6 +544,10 @@ fn mmcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Su
     Box::new(crate::io::supplier::MmcifSupplier::new(reader, options))
 }
 
+fn mol2_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::Mol2Supplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -541,6 +570,10 @@ fn pdb_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::MmcifWriter::new(writer, options))
+}
+
+fn mol2_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::Mol2Writer::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -615,6 +648,17 @@ fn write_mmcif_records(records: &[(String, Molecule)], _options: &WriteOptions) 
     out
 }
 
+fn write_mol2_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // Mol2 has no write options today.
+    let mut out = String::new();
+    for (name, molecule) in records {
+        let mut copy = molecule.clone();
+        copy.set_name(name.clone());
+        out.push_str(&crate::io::mol2::write_mol2(&copy));
+    }
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -639,6 +683,8 @@ impl Format {
     pub const PDB: Format = Format(4);
     /// mmCIF (#224) — no bonds at all, see [`crate::io::mmcif`].
     pub const MMCIF: Format = Format(5);
+    /// Mol2 (#225) — a curated SYBYL type subset, see [`crate::io::mol2`].
+    pub const MOL2: Format = Format(6);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1100,7 +1146,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 6);
+        assert_eq!(all().count(), 7);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
