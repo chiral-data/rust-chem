@@ -81,3 +81,25 @@ pub enum SdfError {
     #[error("Missing counts line")]
     MissingCountsLine,
 }
+
+/// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
+///
+/// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,
+/// where a bad record is data to report and move on from), a `Supplier`
+/// surfaces this as its iterator's `Err` — a genuinely new failure mode
+/// streaming introduces that one-shot reading never had: the underlying
+/// `Read` itself can fail (a broken pipe, a permissions error mid-file),
+/// not just a malformed record.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ReadError {
+    #[error("I/O error at record {position}: {source}")]
+    Io {
+        position: usize,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("record {position} failed to parse: {message}")]
+    Parse { position: usize, message: String },
+}

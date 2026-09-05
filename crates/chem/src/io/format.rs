@@ -1,6 +1,7 @@
 //! The format registry: what this crate can read and write, and how to ask.
 
 use std::fmt;
+use std::io::{BufRead, Write};
 use std::ops::{BitAnd, BitOr, Not};
 
 use crate::core::atom::Chirality;
@@ -8,6 +9,7 @@ use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
 use crate::io::options::{ReadOptions, WriteOptions};
 use crate::io::reader::ReadOutcome;
+use crate::io::supplier::{Supplier, Writer};
 
 /// What a format can carry across a conversion.
 ///
@@ -284,23 +286,26 @@ impl Category {
 }
 
 /// Parses a whole file into molecules.
-///
-/// Aliased rather than written inline because this signature is going to
-/// change again: the streaming story replaces `&str` with a reader. Naming
-/// it now means that is one edit rather than several.
 pub(crate) type ReadFn = fn(&str, &ReadOptions) -> ReadOutcome;
 
 /// Serialises named molecules into one file's worth of text.
 pub(crate) type WriteFn = fn(&[(String, Molecule)], &WriteOptions) -> String;
 
+/// Builds a streaming [`Supplier`] over a boxed reader (#213).
+pub(crate) type SupplierCtor = fn(Box<dyn BufRead>, &ReadOptions) -> Box<dyn Supplier>;
+
+/// Builds a streaming [`Writer`] over a boxed writer (#213).
+pub(crate) type WriterCtor = fn(Box<dyn Write>, &WriteOptions) -> Box<dyn Writer>;
+
 /// Everything the registry knows about one format.
 ///
 /// The reader and writer are function pointers rather than `dyn` trait
 /// objects. Both work in a `static`, but pointers keep the table a plain
-/// slice and skip a vtable for a call made once per file. Traits earn their
-/// place when a reader needs to keep state across records — and because
-/// these fields are not public, widening their signatures then is not a
-/// breaking change.
+/// slice and skip a vtable for a call made once per file. `supplier`/
+/// `writer_stream` build a `Box<dyn Supplier>`/`Box<dyn Writer>` instead —
+/// those really are trait objects, since a streaming reader keeps state
+/// across records — and because none of these four fields are public,
+/// widening any of their signatures is not a breaking change.
 pub struct FormatDescriptor {
     /// Human-readable name, as a format list would print it.
     pub name: &'static str,
@@ -316,6 +321,8 @@ pub struct FormatDescriptor {
 
     pub(crate) reader: Option<ReadFn>,
     pub(crate) writer: Option<WriteFn>,
+    pub(crate) supplier: Option<SupplierCtor>,
+    pub(crate) writer_stream: Option<WriterCtor>,
 }
 
 /// Every format compiled into this build.
@@ -344,6 +351,8 @@ static FORMATS: &[FormatDescriptor] = &[
             .or(Carries::STEREO_BOND),
         reader: Some(crate::io::reader::read_smiles_with_options),
         writer: Some(write_smiles_records),
+        supplier: Some(smiles_supplier),
+        writer_stream: Some(smiles_writer_stream),
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -379,8 +388,26 @@ static FORMATS: &[FormatDescriptor] = &[
             .or(Carries::PROPERTIES),
         reader: Some(crate::io::reader::read_sdf_with_options),
         writer: Some(write_sdf_records),
+        supplier: Some(sdf_supplier),
+        writer_stream: Some(sdf_writer_stream),
     },
 ];
+
+fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::SmilesSupplier::new(reader, options))
+}
+
+fn sdf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::SdfSupplier::new(reader, options))
+}
+
+fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
+}
+
+fn sdf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::SdfWriter::new(writer, options))
+}
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
     // SMILES has no write options today.
@@ -522,6 +549,32 @@ impl Format {
         self.descriptor()
             .writer
             .map(|writer| writer(records, options))
+    }
+
+    /// Streams molecules from `reader` one at a time, rather than
+    /// materializing the whole file first (#213), or `None` if the format
+    /// cannot be read.
+    pub fn supplier(
+        &self,
+        reader: impl BufRead + 'static,
+        options: &ReadOptions,
+    ) -> Option<Box<dyn Supplier>> {
+        self.descriptor()
+            .supplier
+            .map(|ctor| ctor(Box::new(reader), options))
+    }
+
+    /// Streams molecules to `writer` one at a time, rather than
+    /// materializing one `String` for the whole output first (#213), or
+    /// `None` if the format cannot be written.
+    pub fn writer_stream(
+        &self,
+        writer: impl Write + 'static,
+        options: &WriteOptions,
+    ) -> Option<Box<dyn Writer>> {
+        self.descriptor()
+            .writer_stream
+            .map(|ctor| ctor(Box::new(writer), options))
     }
 }
 

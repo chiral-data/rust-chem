@@ -39,6 +39,8 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 # cli
 clap = { version = "4.5", features = ["derive"], optional = true }
+# gzip — optional; see [features]
+flate2 = { version = "1", optional = true }
 
 [features]
 default = []
@@ -51,6 +53,13 @@ gpu = ["dep:wgpu", "dep:bytemuck", "dep:futures", "dep:pollster"]
 # Implies `gpu`: the CLI's `--backend gpu` calls into the GPU paths, and
 # headless GPU access is one of the reasons the tool exists.
 cli = ["dep:clap", "dep:pollster", "gpu"]
+# `flate2`'s default features (`rust_backend`/`miniz_oxide`) are pure Rust —
+# do not add `default-features = false` above, which would disable the only
+# backend enabled and break the build. The C-library backends (`zlib`,
+# `zlib-ng`, `cloudflare_zlib`, ...) are separate, non-default features on
+# `flate2` itself and must never be turned on here, or the CI purity gate
+# (#184/#195) fails on the resulting `-sys` crate.
+gzip = ["dep:flate2"]
 
 # The binary is `chem`; the package is too. `required-features` keeps clap out
 # of every library consumer's tree — Cargo has no bin-only dependency section,
