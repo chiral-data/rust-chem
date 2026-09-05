@@ -19,7 +19,5 @@ C1CC unclosed-ring-bond
 [C@@@H](C)(C)C invalid-chirality-marker
 c1ccccc benzene-missing-closure
 
-# KNOWN GAP #190: a run of bond symbols is silently collapsed, so each of
-# these parses to the molecule its first symbol describes instead of failing.
-C##C known-gap-doubled-triple-bond
-C==C known-gap-doubled-double-bond
+C##C doubled-triple-bond
+C==C doubled-double-bond
