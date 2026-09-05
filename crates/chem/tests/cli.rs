@@ -1504,3 +1504,92 @@ fn test_convert_list_shows_mmcif_has_no_bonds_claimed() {
     assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
 }
+
+const BENZENE_MOL2: &str = "\
+@<TRIPOS>MOLECULE
+benzene
+6 6 1 0 0
+SMALL
+USER_CHARGES
+@<TRIPOS>ATOM
+1 C1 0.000 1.396 0.000 C.ar 1 BNZ -0.1000
+2 C2 1.209 0.698 0.000 C.ar 1 BNZ -0.1000
+3 C3 1.209 -0.698 0.000 C.ar 1 BNZ -0.1000
+4 C4 0.000 -1.396 0.000 C.ar 1 BNZ -0.1000
+5 C5 -1.209 -0.698 0.000 C.ar 1 BNZ -0.1000
+6 C6 -1.209 0.698 0.000 C.ar 1 BNZ -0.1000
+@<TRIPOS>BOND
+1 1 2 ar
+2 2 3 ar
+3 3 4 ar
+4 4 5 ar
+5 5 6 ar
+6 6 1 ar
+@<TRIPOS>SUBSTRUCTURE
+1 BNZ 1 RESIDUE 1 A
+";
+
+#[test]
+fn test_convert_reads_a_literal_mol2_molecule() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            BENZENE_MOL2,
+            "--from",
+            "mol2",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_round_trips_mol2_with_charge_and_aromaticity() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            BENZENE_MOL2,
+            "--from",
+            "mol2",
+            "--to",
+            "mol2",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("C.ar"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("-0.1000"), "{:?}", r.stdout);
+    assert!(r.stdout.contains(" ar\n"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reports_dropping_partial_charge_when_writing_plain_sdf() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            BENZENE_MOL2,
+            "--from",
+            "mol2",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("partial_charge"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_list_shows_mol2_is_the_first_format_with_partial_charge() {
+    let r = run(&["convert", "-L", "mol2"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("partial_charge"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("aromaticity"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}
