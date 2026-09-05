@@ -1,5 +1,6 @@
 use crate::core::prelude::*;
 use crate::io::errors::SdfError;
+use crate::io::options::{MolfileVersion, SdfWriteOptions};
 
 const SDF_ENTRY_END: &str = "$$$$";
 const SDF_STRUCTURE_END: &str = "M END";
@@ -490,6 +491,12 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
 /// written with zeros, and [`molecule_has_coords_for_sdf`] lets a caller check
 /// first rather than discovering it in the file.
 pub fn write_sdf(mol: &Molecule) -> String {
+    write_sdf_with_options(mol, &SdfWriteOptions::default())
+}
+
+/// [`write_sdf`], with explicit per-format options (#212) — currently just
+/// which molfile dialect to write.
+pub fn write_sdf_with_options(mol: &Molecule, options: &SdfWriteOptions) -> String {
     // A molecule that states double-bond geometry but carries no drawing is
     // laid out first, because geometry is the *only* channel V2000 has for it:
     // there is no field to write, so a record with no coordinates cannot
@@ -533,10 +540,13 @@ pub fn write_sdf(mol: &Molecule) -> String {
     // Line 2 is a free-text comment; blank is more honest than inventing one.
     out.push('\n');
 
-    // Line 3: counts. The trailing fields are the spec's defaults —
-    // `0999 V2000` is the version marker every V2000 file carries.
+    // Line 3: counts. The trailing fields are the spec's defaults, followed
+    // by the version marker (#212) — only V2000 is implemented today.
+    let version_marker = match options.version {
+        MolfileVersion::V2000 => "0999 V2000",
+    };
     out.push_str(&format!(
-        "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000\n",
+        "{:>3}{:>3}  0  0  0  0  0  0  0  {version_marker}\n",
         mol.num_atoms(),
         mol.num_bonds()
     ));
@@ -734,9 +744,17 @@ fn data_block(mol: &Molecule) -> String {
 
 /// Writes several molecules as one SDF file.
 pub fn write_sdf_all<'a>(molecules: impl IntoIterator<Item = &'a Molecule>) -> String {
+    write_sdf_all_with_options(molecules, &SdfWriteOptions::default())
+}
+
+/// [`write_sdf_all`], with explicit per-format options (#212).
+pub fn write_sdf_all_with_options<'a>(
+    molecules: impl IntoIterator<Item = &'a Molecule>,
+    options: &SdfWriteOptions,
+) -> String {
     let mut out = String::new();
     for mol in molecules {
-        out.push_str(&write_sdf(mol));
+        out.push_str(&write_sdf_with_options(mol, options));
     }
     out
 }
@@ -1454,6 +1472,23 @@ $$$$";
         assert_eq!(conformer[0], Point3::new(0.1234, -0.5678, 1.2345));
         assert_eq!(conformer[1], Point3::new(1.5, 0.5, -0.75));
         assert!(!back.has_coords(), "a conformer must not become a layout");
+    }
+
+    #[test]
+    fn test_write_sdf_defaults_to_v2000_and_matches_explicit_options() {
+        // #212: write_sdf is a convenience over write_sdf_with_options with
+        // default options -- the two must agree, and the only implemented
+        // dialect is V2000.
+        let mol = laid_out("CCO");
+        let default = write_sdf(&mol);
+        let explicit = write_sdf_with_options(
+            &mol,
+            &SdfWriteOptions {
+                version: MolfileVersion::V2000,
+            },
+        );
+        assert_eq!(default, explicit);
+        assert!(default.lines().nth(3).unwrap().ends_with("999 V2000"));
     }
 
     #[test]

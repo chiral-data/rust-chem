@@ -21,6 +21,7 @@
 //! lets each front end decide what to do with them.
 
 use crate::core::molecule::Molecule;
+use crate::io::options::ReadOptions;
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
@@ -91,8 +92,14 @@ impl ReadOutcome {
 /// whole" contract [`ReadOutcome`] documents, rather than introducing a
 /// `Result` for a case the caller can already see in `skipped`.
 pub fn read(content: &str, format: Format) -> ReadOutcome {
+    read_with_options(content, format, &ReadOptions)
+}
+
+/// [`read`], with explicit per-format options (#212). No format has a read
+/// option yet; this exists so a future one only widens this signature once.
+pub fn read_with_options(content: &str, format: Format, options: &ReadOptions) -> ReadOutcome {
     match format.reader() {
-        Some(reader) => reader(content),
+        Some(reader) => reader(content, options),
         None => ReadOutcome {
             records: Vec::new(),
             skipped: vec![Skipped {
@@ -104,11 +111,16 @@ pub fn read(content: &str, format: Format) -> ReadOutcome {
     }
 }
 
+/// [`read_smiles_with_options`] with default options.
+pub fn read_smiles(content: &str) -> ReadOutcome {
+    read_smiles_with_options(content, &ReadOptions)
+}
+
 /// One molecule per line: the SMILES, then optionally a name.
 ///
 /// Blank lines and `#` comments are skipped silently — they are not failures,
 /// and counting them as such would make every commented file look broken.
-pub fn read_smiles(content: &str) -> ReadOutcome {
+pub fn read_smiles_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
 
     for (index, raw) in content.lines().enumerate() {
@@ -147,8 +159,13 @@ pub fn read_smiles(content: &str) -> ReadOutcome {
     out
 }
 
-/// One molecule per `$$$$`-terminated record.
+/// [`read_sdf_with_options`] with default options.
 pub fn read_sdf(content: &str) -> ReadOutcome {
+    read_sdf_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `$$$$`-terminated record.
+pub fn read_sdf_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let mut lines: Vec<&str> = Vec::new();
     let mut position = 0;
