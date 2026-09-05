@@ -389,6 +389,60 @@ fn push_pdb_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_mmcif_with_options`] with default options.
+pub fn read_mmcif(content: &str) -> ReadOutcome {
+    read_mmcif_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `data_` block (#224). A block boundary is a line
+/// starting with `data_`; a file with only one is one implicit record,
+/// today's common case for a single deposited structure. Within a block, a
+/// varying `pdbx_PDB_model_num` is [`crate::io::mmcif::parse_mmcif`]'s own
+/// job (its own doc explains why), not this splitter's.
+pub fn read_mmcif_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        let starts_new_block = line.trim_start().to_ascii_lowercase().starts_with("data_");
+        if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
+            position += 1;
+            push_mmcif_record(&mut out, &lines, position);
+            lines.clear();
+        }
+        lines.push(line);
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_mmcif_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_mmcif_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::mmcif::parse_mmcif(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

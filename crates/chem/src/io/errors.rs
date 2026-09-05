@@ -111,6 +111,19 @@ pub enum PdbError {
     InvalidElement(String),
 }
 
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum MmcifError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom_site row: {0}")]
+    InvalidAtomRow(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+}
+
 /// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
 ///
 /// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,

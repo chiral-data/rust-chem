@@ -273,6 +273,94 @@ impl<R: BufRead> PdbSupplier<R> {
     }
 }
 
+/// One molecule per `data_` block (#224). Unlike every other supplier
+/// here, the boundary is a *start* marker for the next record rather than
+/// an end marker for the current one, so a `data_` line has to be read one
+/// call ahead and carried over via `pending` -- mirrors
+/// [`crate::io::reader::read_mmcif_with_options`]'s splitting exactly, one
+/// line read at a time instead of over a pre-loaded string.
+pub struct MmcifSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    /// A `data_` line already read from the stream but not yet claimed by
+    /// the record currently being built -- it belongs to the next one.
+    pending: Option<String>,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> MmcifSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for MmcifSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim_start().to_ascii_lowercase().starts_with("data_");
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::mmcif::parse_mmcif(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
 impl<R: BufRead> Iterator for PdbSupplier<R> {
     type Item = Result<Record, ReadError>;
 
@@ -554,6 +642,29 @@ impl<W: Write> Writer for PdbWriter<W> {
     fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
         self.writer
             .write_all(crate::io::pdb::write_pdb(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams mmCIF out, one `data_` block per molecule (#224). No per-record
+/// name threaded through, same reasoning as [`PdbWriter`].
+pub struct MmcifWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> MmcifWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for MmcifWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::mmcif::write_mmcif(molecule).as_bytes())
     }
 
     fn finish(self: Box<Self>) -> std::io::Result<()> {
