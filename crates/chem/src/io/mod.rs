@@ -4,6 +4,7 @@ pub mod errors;
 pub mod format;
 pub mod open;
 pub mod options;
+pub mod pdb;
 pub mod reader;
 pub mod sdf;
 pub mod smiles;

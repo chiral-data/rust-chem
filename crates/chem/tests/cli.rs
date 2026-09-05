@@ -1312,3 +1312,86 @@ fn test_convert_list_shows_xyz_has_the_smallest_mask() {
     assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
 }
+
+const WATER_PDB: &str = "\
+HETATM    1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+HETATM    2  H1  HOH A   1       0.759   0.000   0.504  1.00 20.00           H
+HETATM    3  H2  HOH A   1       0.759   0.000  -0.504  1.00 20.00           H
+CONECT    1    2
+CONECT    1    3
+END
+";
+
+#[test]
+fn test_convert_reads_a_literal_pdb_structure() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_PDB,
+            "--from",
+            "pdb",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // Occupancy/B-factor aren't SDF columns, but the atoms/bonds/coords
+    // from CONECT should have made it through.
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_pdb_with_occupancy_and_b_factor() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_PDB,
+            "--from",
+            "pdb",
+            "--to",
+            "pdb",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("HETATM"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("20.00"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("CONECT"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_multi_model_pdb_as_multiple_records() {
+    let two_models =
+        format!("MODEL        1\n{WATER_PDB}ENDMDL\nMODEL        2\n{WATER_PDB}ENDMDL\n");
+    let path = fixture("multimodel.pdb", &two_models);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "pdb",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_pdb_has_no_stereo_or_charge() {
+    let r = run(&["convert", "-L", "pdb"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}

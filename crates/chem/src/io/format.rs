@@ -450,6 +450,29 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(xyz_supplier),
         writer_stream: Some(xyz_writer_stream),
     },
+    FormatDescriptor {
+        name: "PDB",
+        codes: &["pdb", "ent"],
+        extensions: &["pdb", "ent"],
+        category: Category::BiologicalData,
+        // No FORMAL_CHARGE/ISOTOPE/STEREO_ATOM/STEREO_BOND/AROMATICITY/
+        // PARTIAL_CHARGE/PROPERTIES: none of those have a real, reliably
+        // populated column in this format as this crate reads it. No
+        // synthesised bonds beyond explicit CONECT records either — real
+        // files leave standard polymer backbone bonding to residue-template
+        // inference this crate does not implement (#223), see
+        // `io/pdb.rs`'s module doc for why.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::RESIDUES)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_pdb_with_options),
+        writer: Some(write_pdb_records),
+        supplier: Some(pdb_supplier),
+        writer_stream: Some(pdb_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -468,6 +491,10 @@ fn xyz_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
     Box::new(crate::io::supplier::XyzSupplier::new(reader, options))
 }
 
+fn pdb_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::PdbSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -482,6 +509,10 @@ fn sdf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn xyz_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::XyzWriter::new(writer, options))
+}
+
+fn pdb_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::PdbWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -536,6 +567,16 @@ fn write_xyz_records(records: &[(String, Molecule)], _options: &WriteOptions) ->
     out
 }
 
+fn write_pdb_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // PDB has no write options today, and no per-record name to thread
+    // through -- see `PdbWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::pdb::write_pdb(molecule));
+    }
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -555,6 +596,9 @@ impl Format {
     pub const CXSMILES: Format = Format(2);
     /// XYZ (#222) — coordinates only, no unit cell, see [`crate::io::xyz`].
     pub const XYZ: Format = Format(3);
+    /// PDB (#223) — no synthesised bonds beyond `CONECT`, see
+    /// [`crate::io::pdb`].
+    pub const PDB: Format = Format(4);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -721,7 +765,11 @@ mod tests {
             assert_eq!(Format::from_code(code), Some(Format::SMILES), "{code}");
         }
         assert_eq!(Format::from_code("SDF"), Some(Format::SDF), "case");
-        assert_eq!(Format::from_code("pdb"), None, "not registered yet");
+        // #223: this used to assert `None`, "not registered yet" -- the day
+        // one is, per that comment's own point, is exactly this one.
+        for code in ["pdb", "ent"] {
+            assert_eq!(Format::from_code(code), Some(Format::PDB), "{code}");
+        }
     }
 
     #[test]
@@ -736,10 +784,10 @@ mod tests {
         }
         // Suffix matching, not "contains": a gzipped SDF is not an SDF here.
         assert_eq!(Format::from_filename("a.sdf.gz"), Format::SMILES);
-        // The case this issue exists for. It is SMILES today because no PDB
-        // format is registered; the day one is, this line changes and that is
-        // the point of the registry.
-        assert_eq!(Format::from_filename("a.pdb"), Format::SMILES);
+        // The case this test used to pin: `.pdb` fell back to SMILES because
+        // no PDB format was registered. #223 registered one, so this changed
+        // -- exactly the point the old comment here was making.
+        assert_eq!(Format::from_filename("a.pdb"), Format::PDB);
     }
 
     /// One minimal molecule per attribute, each holding that attribute and as
@@ -1012,7 +1060,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 4);
+        assert_eq!(all().count(), 5);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
