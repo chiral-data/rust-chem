@@ -1395,3 +1395,112 @@ fn test_convert_list_shows_pdb_has_no_stereo_or_charge() {
     assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
 }
+
+const WATER_MMCIF: &str = "\
+data_water
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.auth_comp_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.pdbx_PDB_model_num
+HETATM 1 O O . HOH A 1 A HOH . 0.000 0.000 0.000 1.00 20.00 1
+HETATM 2 H H1 . HOH A 1 A HOH . 0.759 0.000 0.504 1.00 20.00 1
+HETATM 3 H H2 . HOH A 1 A HOH . 0.759 0.000 -0.504 1.00 20.00 1
+";
+
+#[test]
+fn test_convert_reads_a_literal_mmcif_structure() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_MMCIF,
+            "--from",
+            "mmcif",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_round_trips_mmcif_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_MMCIF,
+            "--from",
+            "mmcif",
+            "--to",
+            "mmcif",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("HETATM"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("20.00"), "{:?}", r.stdout);
+
+    let back = run(
+        &[
+            "convert",
+            "--literal",
+            &r.stdout,
+            "--from",
+            "mmcif",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+}
+
+#[test]
+fn test_convert_reads_a_multi_block_mmcif_file_as_multiple_records() {
+    let two_blocks = format!("{WATER_MMCIF}{WATER_MMCIF}");
+    let path = fixture("multiblock.cif", &two_blocks);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "mmcif",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_mmcif_has_no_bonds_claimed() {
+    let r = run(&["convert", "-L", "mmcif"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}

@@ -112,6 +112,18 @@ def write_sdf(smiles: str) -> str | None:
     return result.stdout if result.stdout.strip() else None
 
 
+def convert_mmcif(text: str, to_format: str) -> str | None:
+    """Round-trips mmCIF text through `chem convert`, returning what it wrote.
+
+    Unlike `write_smiles`/`write_sdf`, the input here is a whole structure
+    file, not a `SMILES<space>name` line — `chem convert` takes it on stdin
+    unchanged and named by `--from mmcif` rather than sniffed from an
+    extension, since stdin has none.
+    """
+    result = run(["convert", "-", "--from", "mmcif", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
 def fingerprint(smiles: str, radius: int, nbits: int) -> list[int] | None:
     """The set bits of a Morgan fingerprint.
 

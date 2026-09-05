@@ -473,6 +473,26 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(pdb_supplier),
         writer_stream: Some(pdb_writer_stream),
     },
+    FormatDescriptor {
+        name: "mmCIF",
+        codes: &["mmcif", "cif"],
+        extensions: &["cif", "mmcif"],
+        category: Category::BiologicalData,
+        // Same mask as PDB, and for the same reasons -- see `io/pdb.rs`'s
+        // module doc. Stricter on bonds: not even CONECT's rough
+        // equivalent (`_struct_conn`) is read here (#224), so no bonds are
+        // claimed or produced at all.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::RESIDUES)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_mmcif_with_options),
+        writer: Some(write_mmcif_records),
+        supplier: Some(mmcif_supplier),
+        writer_stream: Some(mmcif_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -495,6 +515,10 @@ fn pdb_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
     Box::new(crate::io::supplier::PdbSupplier::new(reader, options))
 }
 
+fn mmcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::MmcifSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -513,6 +537,10 @@ fn xyz_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn pdb_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::PdbWriter::new(writer, options))
+}
+
+fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::MmcifWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -577,6 +605,16 @@ fn write_pdb_records(records: &[(String, Molecule)], _options: &WriteOptions) ->
     out
 }
 
+fn write_mmcif_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // mmCIF has no write options today, and no per-record name to thread
+    // through -- see `MmcifWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::mmcif::write_mmcif(molecule));
+    }
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -599,6 +637,8 @@ impl Format {
     /// PDB (#223) — no synthesised bonds beyond `CONECT`, see
     /// [`crate::io::pdb`].
     pub const PDB: Format = Format(4);
+    /// mmCIF (#224) — no bonds at all, see [`crate::io::mmcif`].
+    pub const MMCIF: Format = Format(5);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1060,7 +1100,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 5);
+        assert_eq!(all().count(), 6);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

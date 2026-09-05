@@ -331,11 +331,55 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
     return report
 
 
+MMCIF_CORPUS = CORPUS / "mmcif"
+
+
+def check_mmcif(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem`'s mmCIF round trip agree with gemmi's independent read?
+
+    Unlike every other check, this ignores `oracles` entirely (kept as a
+    parameter only so it fits `main()`'s generic dispatch) and drives
+    gemmi directly — neither RDKit nor OpenBabel can judge this format (see
+    `oracles/gemmi.py`'s module doc). Comparison is structural — atom
+    count, cell, chain ids, residue identities — computed by gemmi on both
+    the original fixture and on what `chem convert --from mmcif --to
+    mmcif` wrote back, rather than a text diff: this format has no
+    canonical spelling to hold either side to.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    summarize = gemmi_oracle.load_gemmi()
+    report = Report()
+    for path in sorted(MMCIF_CORPUS.glob("*.cif")):
+        original = path.read_text()
+        reference = summarize(original)
+        if reference is None:
+            report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+            continue
+
+        written = chem.convert_mmcif(original, "mmcif")
+        if written is None:
+            report.mismatch(f"{path.name}: chem could not round-trip this file")
+            continue
+
+        ours = summarize(written)
+        if ours is None:
+            report.mismatch(f"{path.name}: gemmi cannot read what chem wrote back")
+        elif ours != reference:
+            report.mismatch(f"{path.name}: chem's round trip disagrees with gemmi — {reference} vs {ours}")
+        else:
+            report.ok()
+            if verbose:
+                print(f"    ok         {path.name:<34} {reference.atom_count} atoms")
+    return report
+
+
 CHECKS = {
     "parse": check_parse,
     "write": check_write,
     "sdf": check_sdf,
     "fp": check_fp,
+    "mmcif": check_mmcif,
 }
 
 

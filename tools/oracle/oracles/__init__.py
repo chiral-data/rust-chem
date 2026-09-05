@@ -5,10 +5,13 @@ read this, what is its identity, and what bits does its fingerprint set. Keeping
 the surface that narrow is what lets a third one be added without touching any
 check.
 
-gemmi belongs here too and is deliberately absent: its value is mmCIF and PDB,
-and `chem` reads neither yet, so it would be a pinned dependency exercising
-nothing. Add it in the crystallography story, alongside the formats it can
-actually judge.
+gemmi (#224) answers a structurally different question — atoms/cell/chains/
+residues as deposited, for mmCIF and PDB, which `chem` reads starting with
+#223/#224 — and does not fit `Oracle`'s SMILES-shaped contract at all: there
+is no bare-SMILES `parses`/`identity` for a toolkit that only reads
+structures, so it is not part of `load()`'s list below. See `gemmi.py` and
+its own `load_gemmi()`, sanity-gated the same way, against a trivial mmCIF
+fixture instead of `SANITY` (`"CCO"` means nothing to gemmi).
 """
 
 from dataclasses import dataclass

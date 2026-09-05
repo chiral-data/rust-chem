@@ -3,3 +3,4 @@
 # and re-read the corpus report when you do.
 rdkit==2025.3.3
 openbabel-wheel==3.1.1.21
+gemmi==0.7.5

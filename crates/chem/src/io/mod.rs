@@ -2,6 +2,7 @@ pub mod aromaticity;
 pub mod cxsmiles;
 pub mod errors;
 pub mod format;
+pub mod mmcif;
 pub mod open;
 pub mod options;
 pub mod pdb;
