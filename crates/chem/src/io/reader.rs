@@ -333,6 +333,62 @@ pub fn read_xyz_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
     out
 }
 
+/// [`read_pdb_with_options`] with default options.
+pub fn read_pdb(content: &str) -> ReadOutcome {
+    read_pdb_with_options(content, &ReadOptions)
+}
+
+/// One molecule per structure. A file may hold several back to back via
+/// `MODEL`/`ENDMDL` (an NMR ensemble) -- `ENDMDL` is the record boundary,
+/// the same role SDF's `$$$$` and XYZ's atom count play; a file with
+/// neither `MODEL` nor `ENDMDL` at all (today's common case, a single
+/// deposited structure) is one implicit record, the whole file.
+pub fn read_pdb_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        lines.push(line);
+        if line.trim() == "ENDMDL" {
+            position += 1;
+            push_pdb_record(&mut out, &lines, position);
+            lines.clear();
+        }
+    }
+
+    // A trailing structure with no `ENDMDL` -- which a single-model file
+    // always is.
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_pdb_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_pdb_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::pdb::parse_pdb(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -253,6 +253,84 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
     }
 }
 
+/// One molecule per structure. `ENDMDL` is the record boundary for a file
+/// holding several back to back (#223), the same role SDF's `$$$$` plays;
+/// mirrors [`crate::io::reader::read_pdb_with_options`]'s splitting
+/// exactly, one line read at a time instead of over a pre-loaded string.
+pub struct PdbSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> PdbSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for PdbSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        loop {
+            let raw = match self.lines.next() {
+                None => {
+                    if !got_any_line || buffer.trim().is_empty() {
+                        return None;
+                    }
+                    // A trailing structure with no `ENDMDL` -- which a
+                    // single-model file always is.
+                    break;
+                }
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            got_any_line = true;
+            let is_terminator = raw.trim() == "ENDMDL";
+            buffer.push_str(&raw);
+            buffer.push('\n');
+            if is_terminator {
+                break;
+            }
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::pdb::parse_pdb(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
 /// One molecule per frame: a count line, a comment line, then that many
 /// atom lines (#222). Mirrors
 /// [`crate::io::reader::read_xyz_with_options`]'s splitting exactly, one
@@ -451,6 +529,31 @@ impl<W: Write> Writer for XyzWriter<W> {
         copy.set_name(name.to_string());
         self.writer
             .write_all(crate::io::xyz::write_xyz(&copy).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams PDB out, one structure per molecule (#223). Unlike SMILES/SDF/
+/// XYZ, `name` is not threaded through `write_pdb`: PDB has no single
+/// title-line concept for a record's name (`HEADER`/`COMPND` are out of
+/// scope, see `io/pdb.rs`'s module doc), so there is nowhere for it to go.
+pub struct PdbWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> PdbWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for PdbWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::pdb::write_pdb(molecule).as_bytes())
     }
 
     fn finish(self: Box<Self>) -> std::io::Result<()> {
