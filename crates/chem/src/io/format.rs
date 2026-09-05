@@ -539,6 +539,23 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(pdbqt_supplier),
         writer_stream: Some(pdbqt_writer_stream),
     },
+    FormatDescriptor {
+        name: "GRO",
+        codes: &["gro"],
+        extensions: &["gro"],
+        category: Category::MolecularDynamicsAndDocking,
+        // No OCCUPANCY/B_FACTOR/PARTIAL_CHARGE/FORMAL_CHARGE/ISOTOPE/
+        // STEREO_ATOM/STEREO_BOND/AROMATICITY/PROPERTIES -- none of those
+        // have a column in this format at all.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::RESIDUES)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_gro_with_options),
+        writer: Some(write_gro_records),
+        supplier: Some(gro_supplier),
+        writer_stream: Some(gro_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -573,6 +590,10 @@ fn pdbqt_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Su
     Box::new(crate::io::supplier::PdbqtSupplier::new(reader, options))
 }
 
+fn gro_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::GroSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -603,6 +624,10 @@ fn mol2_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn
 
 fn pdbqt_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::PdbqtWriter::new(writer, options))
+}
+
+fn gro_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::GroWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -698,6 +723,17 @@ fn write_pdbqt_records(records: &[(String, Molecule)], _options: &WriteOptions) 
     out
 }
 
+fn write_gro_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // GRO has no write options today.
+    let mut out = String::new();
+    for (name, molecule) in records {
+        let mut copy = molecule.clone();
+        copy.set_name(name.clone());
+        out.push_str(&crate::io::gro::write_gro(&copy));
+    }
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -727,6 +763,9 @@ impl Format {
     /// PDBQT (#226) — a new rotatable-bond/fragment-decomposition
     /// algorithm on write, see [`crate::io::pdbqt`].
     pub const PDBQT: Format = Format(7);
+    /// GRO (#227) — the one format needing a real nm/Å unit conversion,
+    /// see [`crate::io::gro`].
+    pub const GRO: Format = Format(8);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1188,7 +1227,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 8);
+        assert_eq!(all().count(), 9);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

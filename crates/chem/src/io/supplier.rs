@@ -881,6 +881,146 @@ impl<W: Write> Writer for PdbqtWriter<W> {
     }
 }
 
+/// One molecule per frame: a title line, a count line, that many atom
+/// lines, then a box-vector line (#227). Unlike every other supplier
+/// here, the title line is read literally rather than skip-blank first
+/// -- GRO's title may legitimately be empty, so "blank" carries no
+/// end-of-frame meaning the way it does for XYZ's comment line. Mirrors
+/// [`crate::io::reader::read_gro_with_options`]'s splitting exactly.
+pub struct GroSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> GroSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for GroSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let title = match self.lines.next()? {
+            Ok(line) => line,
+            Err(source) => {
+                self.position += 1;
+                return Some(Err(ReadError::Io {
+                    position: self.position,
+                    source,
+                }));
+            }
+        };
+
+        let count_line = match self.lines.next() {
+            Some(Ok(line)) => line,
+            Some(Err(source)) => {
+                self.position += 1;
+                return Some(Err(ReadError::Io {
+                    position: self.position,
+                    source,
+                }));
+            }
+            None => {
+                self.position += 1;
+                return Some(Err(ReadError::Parse {
+                    position: self.position,
+                    message: "missing atom count line".to_string(),
+                }));
+            }
+        };
+        let count: usize = match count_line.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.position += 1;
+                return Some(Err(ReadError::Parse {
+                    position: self.position,
+                    message: format!("invalid atom count: {count_line:?}"),
+                }));
+            }
+        };
+
+        let mut frame = title;
+        frame.push('\n');
+        frame.push_str(&count_line);
+        frame.push('\n');
+        // `count` atom lines plus one box-vector line.
+        for _ in 0..=count {
+            match self.lines.next() {
+                Some(Ok(line)) => {
+                    frame.push_str(&line);
+                    frame.push('\n');
+                }
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+                None => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Parse {
+                        position: self.position,
+                        message: format!("declared {count} atoms but the file ended early"),
+                    }));
+                }
+            }
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::gro::parse_gro(&frame)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// Streams GRO out, one frame per molecule (#227).
+pub struct GroWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> GroWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for GroWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        let mut copy = molecule.clone();
+        copy.set_name(name.to_string());
+        self.writer
+            .write_all(crate::io::gro::write_gro(&copy).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
