@@ -1,0 +1,23 @@
+# Input that must be REJECTED. The file the parse check exists for: a suite of
+# valid molecules only proves what a parser accepts, never what it refuses,
+# and a parser that accepts nonsense fails no valid-input test.
+#
+# Every line here is expected to produce a skipped record, not a molecule —
+# except those NAMED `known-gap-*`, which record where that is not true yet. A
+# gap is pinned rather than deleted so the corpus stays honest about what this
+# parser really does, and so the test fails when the gap is closed and the
+# marker needs removing.
+#
+# The marker is the entry's *name*, not a comment: a comment-scanning rule
+# armed on the word appearing in this very header and swept up every line
+# below it.
+
+CC( unbalanced-open-paren
+CC) unbalanced-close-paren
+C1CC unclosed-ring-bond
+[Xx] nonexistent-element
+[C@@@H](C)(C)C invalid-chirality-marker
+c1ccccc benzene-missing-closure
+
+C##C doubled-triple-bond
+C==C doubled-double-bond

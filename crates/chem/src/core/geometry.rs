@@ -1,4 +1,4 @@
-//! 2D geometry primitives for structure coordinates and depiction.
+//! Geometry primitives for structure coordinates, depiction and conformers.
 
 use std::fmt;
 use std::ops::{Add, Div, Mul, Sub};
@@ -109,6 +109,131 @@ impl fmt::Display for Point2 {
     }
 }
 
+/// A point (or vector) in 3D space.
+///
+/// Used for conformers — geometry a file states physically, as XYZ, PDB, Mol2
+/// and a 3D SDF all do. Distinct from [`Point2`], which holds a depiction
+/// layout; see the coordinate fields on [`Molecule`] for why the two are kept
+/// apart rather than one derived from the other.
+///
+/// Coordinates are Ångström, which is what every format in scope uses.
+///
+/// [`Molecule`]: crate::core::molecule::Molecule
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Point3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Point3 {
+    pub const ORIGIN: Point3 = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Point3 { x, y, z }
+    }
+
+    /// Straight-line distance to `other`.
+    pub fn distance(&self, other: Point3) -> f64 {
+        self.distance_squared(other).sqrt()
+    }
+
+    /// Squared distance to `other`. Cheaper than [`Self::distance`] when only
+    /// comparing distances against each other or against a squared threshold,
+    /// since it skips the square root.
+    pub fn distance_squared(&self, other: Point3) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+
+    /// The point halfway between this one and `other`.
+    pub fn midpoint(&self, other: Point3) -> Point3 {
+        Point3::new(
+            (self.x + other.x) / 2.0,
+            (self.y + other.y) / 2.0,
+            (self.z + other.z) / 2.0,
+        )
+    }
+
+    /// Length of this point treated as a vector from the origin.
+    pub fn length(&self) -> f64 {
+        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+    }
+
+    /// Dot product, treating both points as vectors from the origin.
+    ///
+    /// `a.dot(b) / (a.length() * b.length())` is the cosine of the angle
+    /// between them, which is how a unit cell's angles are recovered from its
+    /// basis vectors.
+    pub fn dot(&self, other: Point3) -> f64 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    /// Cross product, perpendicular to both and with magnitude equal to the
+    /// area of the parallelogram they span.
+    ///
+    /// With [`Self::dot`] this gives the scalar triple product, and so a cell
+    /// volume computed from the basis vectors rather than from the angle
+    /// formula — two independent routes to the same number.
+    pub fn cross(&self, other: Point3) -> Point3 {
+        Point3::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+    }
+
+    /// This point projected onto the xy plane, discarding z.
+    ///
+    /// Explicit, and deliberately not a `From` impl. Dropping z is lossy, and
+    /// on a real conformer it superimposes atoms that differ only in depth —
+    /// which is the bug this type exists to fix. Use it where z is known to be
+    /// zero; anywhere else, run a layout pass to get a depiction.
+    pub fn to_2d(self) -> Point2 {
+        Point2::new(self.x, self.y)
+    }
+}
+
+impl Add for Point3 {
+    type Output = Point3;
+    fn add(self, rhs: Point3) -> Point3 {
+        Point3::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+    }
+}
+
+impl Sub for Point3 {
+    type Output = Point3;
+    fn sub(self, rhs: Point3) -> Point3 {
+        Point3::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+}
+
+impl Mul<f64> for Point3 {
+    type Output = Point3;
+    fn mul(self, rhs: f64) -> Point3 {
+        Point3::new(self.x * rhs, self.y * rhs, self.z * rhs)
+    }
+}
+
+impl Div<f64> for Point3 {
+    type Output = Point3;
+    fn div(self, rhs: f64) -> Point3 {
+        Point3::new(self.x / rhs, self.y / rhs, self.z / rhs)
+    }
+}
+
+impl fmt::Display for Point3 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({:.4}, {:.4}, {:.4})", self.x, self.y, self.z)
+    }
+}
+
 /// An axis-aligned bounding box over a set of points.
 ///
 /// Fitting a structure into an on-screen rect needs its extent first, so the
@@ -158,6 +283,57 @@ impl BoundingBox {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_point3_distance_uses_all_three_axes() {
+        let a = Point3::new(0.0, 0.0, 0.0);
+        let b = Point3::new(0.0, 0.0, 3.0);
+        assert_eq!(a.distance(b), 3.0);
+
+        // The case Point2 cannot express: two points that differ only in
+        // depth are 1.0 apart, not 0.0.
+        let c = Point3::new(1.0, 2.0, 0.0);
+        let d = Point3::new(1.0, 2.0, 1.0);
+        assert_eq!(c.distance(d), 1.0);
+        assert_eq!(c.to_2d(), d.to_2d());
+    }
+
+    #[test]
+    fn test_point3_dot_and_cross() {
+        let x = Point3::new(1.0, 0.0, 0.0);
+        let y = Point3::new(0.0, 1.0, 0.0);
+        let z = Point3::new(0.0, 0.0, 1.0);
+
+        assert_eq!(x.dot(y), 0.0);
+        assert_eq!(x.dot(x), 1.0);
+        assert_eq!(x.cross(y), z);
+        assert_eq!(y.cross(x), z * -1.0);
+
+        // The scalar triple product of the axes is the unit volume.
+        assert_eq!(x.dot(y.cross(z)), 1.0);
+
+        // Recovering an angle, which is what the unit cell tests rely on.
+        let a = Point3::new(2.0, 0.0, 0.0);
+        let b = Point3::new(0.0, 3.0, 0.0);
+        let cos = a.dot(b) / (a.length() * b.length());
+        assert!((cos.acos().to_degrees() - 90.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_point3_arithmetic() {
+        let a = Point3::new(1.0, 2.0, 3.0);
+        let b = Point3::new(0.5, 0.5, 0.5);
+        assert_eq!(a + b, Point3::new(1.5, 2.5, 3.5));
+        assert_eq!(a - b, Point3::new(0.5, 1.5, 2.5));
+        assert_eq!(a * 2.0, Point3::new(2.0, 4.0, 6.0));
+        assert_eq!(a / 2.0, Point3::new(0.5, 1.0, 1.5));
+        assert_eq!(
+            a.midpoint(Point3::new(3.0, 4.0, 5.0)),
+            Point3::new(2.0, 3.0, 4.0)
+        );
+        assert_eq!(Point3::new(0.0, 3.0, 4.0).length(), 5.0);
+        assert_eq!(Point3::ORIGIN, Point3::default());
+    }
+
     use super::*;
 
     #[test]

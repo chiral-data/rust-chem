@@ -1,0 +1,14 @@
+# Aromaticity perception, the axis where RDKit and OpenBabel most visibly
+# disagree with each other. Disagreements here are findings, not failures.
+
+c1ccccc1 benzene
+c1ccncc1 pyridine
+c1ccoc1 furan
+c1ccsc1 thiophene
+# Pyrrole lives in hard.smi; duplicating it here made nearest-neighbour ties
+# arbitrary and the fingerprint report unreadable.
+c1cnc[nH]1 imidazole
+# Written Kekule; whether it comes back lowercase depends on perception.
+C1=CC=CC=C1 benzene-kekule
+# Aromatic ring fused to an aliphatic one.
+C1CCc2ccccc2C1 tetralin

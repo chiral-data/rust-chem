@@ -1,22 +1,30 @@
 pub mod atom;
 pub mod bond;
+pub mod cell;
 pub mod geometry;
 pub mod graph;
 pub mod layout;
 pub mod molecule;
+pub mod residue;
 pub mod rings;
+pub mod site;
+pub mod stereo;
 
 pub mod elements;
 
 pub mod prelude {
     pub use crate::core::atom::{Atom, Chirality, Element, Hybridization};
     pub use crate::core::bond::{Bond, BondOrder, BondStereo, BondType};
+    pub use crate::core::cell::{SpaceGroup, UnitCell};
     pub use crate::core::elements::{ATOMIC_MASSES, ELEMENT_NAMES, ELEMENT_SYMBOLS};
-    pub use crate::core::geometry::{BoundingBox, Point2};
+    pub use crate::core::geometry::{BoundingBox, Point2, Point3};
     pub use crate::core::graph::{MoleculeGraph, Neighbor};
     pub use crate::core::layout::{ensure_coords, layout};
     pub use crate::core::molecule::{Molecule, MoleculeError};
+    pub use crate::core::residue::{Chain, Residue};
     pub use crate::core::rings::{Ring, find_sssr, perceive_rings, ring_count};
+    pub use crate::core::site::AtomSite;
+    pub use crate::core::stereo::perceive_bond_stereo;
 }
 
 #[cfg(test)]

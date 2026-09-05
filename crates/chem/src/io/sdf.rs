@@ -18,10 +18,12 @@ const SDF_PROPERTY_PREFIX_LEN: usize = 3;
 ///
 /// This parser handles real-world SDF files with flexible formatting.
 ///
-/// Atom coordinates are preserved: SDF carries per-atom x/y/z, and the x/y are
-/// stored on the molecule for depiction. Coordinates are set only if every atom
-/// supplied a parseable pair — otherwise the molecule parses normally but
-/// without a layout.
+/// Atom coordinates are preserved. SDF carries per-atom x/y/z, and what that
+/// means depends on z: an all-zero z is a flat drawing and is stored as the
+/// molecule's 2D layout, while any non-zero z is a conformer and is stored as
+/// its 3D coordinates. Coordinates are set only if every atom supplied a
+/// parseable triple — otherwise the molecule parses normally but carries
+/// neither.
 pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     let lines: Vec<&str> = sdf.lines().collect();
 
@@ -44,7 +46,7 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     let (num_atoms, num_bonds) = parse_counts_line(counts_line)?;
 
     // Parse atom block (starts at line 4)
-    let mut coords: Vec<Point2> = Vec::with_capacity(num_atoms);
+    let mut coords: Vec<Point3> = Vec::with_capacity(num_atoms);
     let mut all_coords_parsed = true;
     for i in 0..num_atoms {
         let line_idx = SDF_ATOM_BLOCK_START + i;
@@ -55,7 +57,7 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
             Some(point) => coords.push(point),
             // An unparseable coordinate isn't fatal — the atom itself is
             // still valid, so the molecule parses as it always did, just
-            // without a layout.
+            // without geometry.
             None => all_coords_parsed = false,
         }
     }
@@ -65,8 +67,23 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     // to come after every atom is added. Only set them if every atom supplied
     // one, matching Molecule's all-or-nothing coordinate model.
     if all_coords_parsed && coords.len() == num_atoms {
-        mol.set_coords(coords)
-            .map_err(|e| SdfError::ParseError(e.to_string()))?;
+        // A molfile's atom block is x/y/z whether the record is a drawing or a
+        // conformer, and z is what distinguishes them. All-zero z is a 2D
+        // depiction and belongs in the layout; any non-zero z is geometry and
+        // belongs in the conformer.
+        //
+        // Filling both would claim a conformer for every flat drawing, and
+        // storing a 3D record's x/y as a layout is the projection that
+        // superimposes atoms differing only in depth — which is what this
+        // parser did until now, silently.
+        if coords.iter().all(|point| point.z == 0.0) {
+            let flat: Vec<Point2> = coords.iter().map(|point| point.to_2d()).collect();
+            mol.set_coords(flat)
+                .map_err(|e| SdfError::ParseError(e.to_string()))?;
+        } else {
+            mol.set_coords3(coords)
+                .map_err(|e| SdfError::ParseError(e.to_string()))?;
+        }
     }
 
     // Parse bond block (follows atom block)
@@ -78,23 +95,121 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
         parse_bond_line(&mut mol, lines[line_idx])?;
     }
 
-    // Parse optional properties block (follows bond block)
+    // The `M  CHG` / `M  ISO` lines, before the data block.
+    //
+    // Written since #197 and, until #197, not read: the file was correct and
+    // RDKit could load it, while this crate's own round trip still lost the
+    // charge. `test_declared_masks_match_what_actually_survives` is what said
+    // so — the mask cannot claim `FORMAL_CHARGE` while only half the trip
+    // works.
     let prop_start = SDF_ATOM_BLOCK_START + num_atoms + num_bonds;
+    parse_atom_property_lines(&mut mol, &lines[prop_start..]);
+
+    // Parse optional properties block (follows bond block)
     parse_properties(&mut mol, &lines[prop_start..])?;
 
     // Calculate implicit hydrogens for each atom based on valence rules
     mol.calculate_implicit_hydrogens();
+
+    // Perceive aromaticity, rather than relying on the file to assert it.
+    //
+    // A molfile normally states a Kekulé form — alternating single and double
+    // bonds — because bond type 4 is a query type that belongs in a
+    // substructure search, not a structure record. So benzene arrives as three
+    // double bonds and three single ones, and a reader that takes the file
+    // literally hands back a molecule that is chemically benzene but claims no
+    // aromatic ring.
+    //
+    // That only became visible once `write_sdf` started emitting Kekulé forms
+    // (#197): the round trip lost the aromatic flag, and
+    // `test_declared_masks_match_what_actually_survives` refused the mask that
+    // still claimed it. Perceiving on read is what every toolkit does and what
+    // makes the claim true again.
+    crate::io::aromaticity::detect_aromaticity(&mut mol);
+
+    // Double-bond geometry, for the same reason and from the same place: a
+    // molfile states where the atoms are, not which isomer they make, so a
+    // reader that takes it literally returns a molecule that is drawn cis and
+    // claims nothing. Left alone where the drawing does not say — a substituent
+    // on one end only has no configuration to read (#198).
+    crate::core::stereo::perceive_bond_stereo(&mut mol);
     Ok(mol)
+}
+
+/// Reads `M  CHG` and `M  ISO` lines into the atoms they name.
+///
+/// Both carry a count followed by that many `(atom, value)` pairs, atom indices
+/// 1-based. A malformed line is skipped rather than fatal: these are optional
+/// enrichments of an already-complete record, and a molfile with a mangled
+/// charge line still describes a molecule.
+///
+/// An `M  CHG` line supersedes the atom block's old `ccc` charge column, which
+/// this crate never wrote and does not read.
+fn parse_atom_property_lines(mol: &mut Molecule, lines: &[&str]) {
+    for line in lines {
+        let tag = if line.starts_with("M  CHG") {
+            true
+        } else if line.starts_with("M  ISO") {
+            false
+        } else {
+            if line.starts_with("M  END") {
+                break;
+            }
+            continue;
+        };
+
+        let fields: Vec<i32> = line[6..]
+            .split_whitespace()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        // First field is the count; the rest are pairs.
+        for pair in fields.iter().skip(1).collect::<Vec<_>>().chunks(2) {
+            let [index, value] = pair else { continue };
+            let Some(atom_idx) = usize::try_from(**index).ok().and_then(|i| i.checked_sub(1))
+            else {
+                continue;
+            };
+            if atom_idx >= mol.num_atoms() {
+                continue;
+            }
+            let atom = mol.atom(atom_idx).clone();
+            *mol.atom_mut(atom_idx) = if tag {
+                atom.with_charge(**value as i8)
+            } else {
+                atom.with_isotope(**value as u16)
+            };
+        }
+    }
+}
+
+/// Extracts one fixed-width field, trimmed, or `None` if the line is too
+/// short there or the field is blank. A `%Nd`/`%N.Mf` field at its full
+/// width is written with no separating space, which is what makes reading
+/// this way necessary once a value reaches the field's width (#202).
+fn fixed_field(line: &str, start: usize, width: usize) -> Option<&str> {
+    line.get(start..start + width)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Parses the counts line (line 3) of an SDF file.
 ///
-/// **FIXED**: Now handles both fixed-width format and whitespace-separated format.
+/// Tries the spec's fixed-width `%3d%3d` first, since a value that fills
+/// the field leaves no space before the next one — a 100-atom, 100-bond
+/// record writes `"100100"`, which `split_whitespace` alone reads as one
+/// token (#202). Falls back to whitespace splitting for files that pad
+/// loosely instead.
 ///
 /// Example: " 10  9  0  0  0  0  0  0  0  0999 V2000"
 ///           ^^^ ~~~
 ///          10 atoms, 9 bonds
 fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
+    if let (Some(a), Some(b)) = (fixed_field(line, 0, 3), fixed_field(line, 3, 3))
+        && let (Ok(num_atoms), Ok(num_bonds)) = (a.parse::<usize>(), b.parse::<usize>())
+    {
+        return Ok((num_atoms, num_bonds));
+    }
+
     let parts: Vec<&str> = line.split_whitespace().collect();
 
     if parts.len() < 2 {
@@ -114,13 +229,19 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 
 /// Parses a single atom line from the SDF atom block.
 ///
-/// **FIXED**: Now handles both fixed-width and whitespace-separated formats.
+/// The three `%10.4f` coordinate fields are tried fixed-width first: at
+/// full width — a coordinate of 1000 or more — they carry no space between
+/// them, so whitespace splitting alone would merge two into one (#202).
+/// Everything after the coordinates keeps its delimiters even in a strict
+/// file, so that remainder is still split on whitespace. Falls back to
+/// whitespace splitting the whole line when the coordinates aren't there
+/// or don't parse as floats.
 ///
 /// # Real-World SDF Atom Line Format
 /// Atom lines can vary in format:
 /// 1. **Fixed-width format** (classic V2000):
 ///    - Positions 0-9: X coordinate
-///    - Positions 10-19: Y coordinate  
+///    - Positions 10-19: Y coordinate
 ///    - Positions 20-29: Z coordinate
 ///    - Positions 31-33: Element symbol (right-aligned in 3 chars)
 ///
@@ -133,8 +254,19 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 ///     ^^^^^^    ^^^^^^    ^^^^^^ ^
 ///        x         y         z   element
 /// ```
-fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point2>, SdfError> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, SdfError> {
+    let fixed_width = (|| {
+        let x = fixed_field(line, 0, 10)?;
+        let y = fixed_field(line, 10, 10)?;
+        let z = fixed_field(line, 20, 10)?;
+        x.parse::<f64>().ok()?;
+        y.parse::<f64>().ok()?;
+        z.parse::<f64>().ok()?;
+        let mut fields = vec![x, y, z];
+        fields.extend(line.get(30..).unwrap_or("").split_whitespace());
+        Some(fields)
+    })();
+    let parts: Vec<&str> = fixed_width.unwrap_or_else(|| line.split_whitespace().collect());
 
     // Real-world SDF files typically have at least 4 fields: x, y, z, symbol
     if parts.len() < SDF_ATOM_FIELD {
@@ -158,17 +290,34 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point2>, Sdf
     let element = Element::new(atomic_number as u8)
         .ok_or_else(|| SdfError::InvalidAtomLine(symbol.to_string()))?;
 
-    // Create and add atom to molecule
-    let atom = Atom::new(element);
+    // Fields after the symbol are `dd ccc sss`: mass difference, old-style
+    // charge, atom stereo parity. Only the parity is read — `M  CHG` and
+    // `M  ISO` carry the other two and supersede them.
+    //
+    // The parity's convention and this crate's `Chirality` are anchored to the
+    // same thing since #191's `normalise_chirality`: neighbours in increasing
+    // index order, implicit hydrogen last. So it maps straight across, and
+    // `write_sdf`'s `atom_parity` is the same mapping read backwards.
+    let parity = parts
+        .get(SDF_ATOM_FIELD + 2)
+        .and_then(|field| field.parse::<u8>().ok());
+    let atom = match parity {
+        Some(1) => Atom::new(element).with_chirality(Chirality::Clockwise),
+        Some(2) => Atom::new(element).with_chirality(Chirality::CounterClockwise),
+        _ => Atom::new(element),
+    };
     mol.add_atom(atom);
 
-    // Fields 0-2 are x, y, z. Only x/y are kept — coordinate storage is 2D,
-    // and for a 3D SDF this is a straight projection down the z axis, which is
-    // a serviceable starting depiction but can superimpose atoms that are only
-    // separated in z. A non-numeric coordinate yields None (no layout) rather
-    // than an error, so files that parsed before this change still parse.
-    let point = match (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-        (Ok(x), Ok(y)) => Some(Point2::new(x, y)),
+    // Fields 0-2 are x, y, z, all three kept. The caller decides from z
+    // whether they are a layout or a conformer. A non-numeric coordinate
+    // yields None (no geometry) rather than an error, so files that parsed
+    // before this change still parse.
+    let point = match (
+        parts[0].parse::<f64>(),
+        parts[1].parse::<f64>(),
+        parts[2].parse::<f64>(),
+    ) {
+        (Ok(x), Ok(y), Ok(z)) => Some(Point3::new(x, y, z)),
         _ => None,
     };
 
@@ -177,16 +326,30 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point2>, Sdf
 
 /// Parses a single bond line from the SDF bond block.
 ///
-/// **ENHANCED**: Added better error messages and validation.
+/// Tries the spec's fixed-width `%3d%3d%3d%3d` first: once an atom index
+/// reaches 100, it fills its field and leaves no space before the next
+/// one — `" 99100  1  0  0  0  0"` splits into six tokens instead of
+/// seven, and the bond order is read from what was really atom2 (#202).
+/// Falls back to whitespace splitting for files that pad loosely instead.
 ///
-/// Bond lines are whitespace-separated: atom1 atom2 bond_type [stereo] [other fields]
 /// Example: "  1  2  1  0  0  0  0"
 ///             ^  ^  ^
 ///             |  |  └─ Bond type (1=single, 2=double, 3=triple, 4=aromatic)
 ///             |  └──── Second atom (1-based index)
 ///             └─────── First atom (1-based index)
 fn parse_bond_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    let fixed_width = (|| {
+        let atom1 = fixed_field(line, 0, 3)?;
+        let atom2 = fixed_field(line, 3, 3)?;
+        let bond_type = fixed_field(line, 6, 3)?;
+        atom1.parse::<usize>().ok()?;
+        atom2.parse::<usize>().ok()?;
+        bond_type.parse::<u8>().ok()?;
+        let mut fields = vec![atom1, atom2, bond_type];
+        fields.extend(fixed_field(line, 9, 3));
+        Some(fields)
+    })();
+    let parts: Vec<&str> = fixed_width.unwrap_or_else(|| line.split_whitespace().collect());
 
     // Bond line must have at least 3 fields: atom1, atom2, bond_type
     if parts.len() < SDF_MIN_BOND_FIELDS {
@@ -229,8 +392,23 @@ fn parse_bond_line(mol: &mut Molecule, line: &str) -> Result<(), SdfError> {
         }
     };
 
+    // The field after the type is bond stereo. Value 3 on a double bond means
+    // "cis or trans, either" — the file declining to say, which is different
+    // from the file not mentioning it. Recorded as `Unspecified` so
+    // `perceive_bond_stereo` knows to leave the bond alone rather than read a
+    // configuration out of coordinates the writer never intended as a claim.
+    let declines_to_say = bond_order == BondOrder::Double
+        && parts.get(3).and_then(|f| f.parse::<u8>().ok()) == Some(3);
+
+    let bond = Bond::new(atom1, atom2, bond_order);
+    let bond = if declines_to_say {
+        bond.with_stereo(BondStereo::Unspecified)
+    } else {
+        bond
+    };
+
     // Add bond to molecule (validates atom indices internally)
-    mol.add_bond(Bond::new(atom1, atom2, bond_order))
+    mol.add_bond(bond)
         .map_err(|e| SdfError::ParseError(format!("Failed to add bond: {}", e)))?;
 
     Ok(())
@@ -306,17 +484,53 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
 /// form would be more portable and needs a Kekulisation pass that does not
 /// exist yet.
 ///
-/// A molecule with no coordinates is written with zeros, and
-/// [`molecule_has_coords_for_sdf`] lets a caller check first rather than
-/// discovering it in the file.
+/// Geometry is written from whichever coordinate set the molecule carries: a
+/// conformer goes out as x/y/z with the header's dimensional code set to `3D`,
+/// a layout goes out as x/y with a zero z and `2D`. A molecule with neither is
+/// written with zeros, and [`molecule_has_coords_for_sdf`] lets a caller check
+/// first rather than discovering it in the file.
 pub fn write_sdf(mol: &Molecule) -> String {
+    // A molecule that states double-bond geometry but carries no drawing is
+    // laid out first, because geometry is the *only* channel V2000 has for it:
+    // there is no field to write, so a record with no coordinates cannot
+    // express cis at all.
+    //
+    // Without this the attribute would survive for a molecule that happens to
+    // have been laid out and vanish for one that has not, and `Carries` is a
+    // per-format claim with no way to say "sometimes". Generating the layout
+    // makes the claim true for every molecule rather than most of them.
+    //
+    // Narrow on purpose: only when there is a configuration to lose and no
+    // drawing to hold it. An ordinary molecule with no coordinates is still
+    // written with zeros, as the caller expects.
+    let laid_out;
+    let mol = if mol.coords().is_none() && needs_geometry_for_stereo(mol) {
+        laid_out = crate::core::layout::with_coords(mol);
+        &laid_out
+    } else {
+        mol
+    };
+
     let mut out = String::with_capacity(128 + mol.num_atoms() * 70 + mol.num_bonds() * 22);
 
     // Line 0: the name. Lines 1 and 2 are the program line and a comment; both
     // may be blank, and blank is more honest than inventing content.
     out.push_str(mol.name().unwrap_or(""));
     out.push('\n');
-    out.push('\n');
+
+    // Line 1 is the program line, whose columns 21-22 carry the dimensional
+    // code. A reader that trusts the header rather than sniffing z needs it to
+    // say 3D, and that is the difference between a conformer surviving a trip
+    // through another toolkit and being treated as a drawing. Blank when there
+    // is nothing to declare — claiming 2D for a molecule with no coordinates
+    // at all would be inventing content.
+    out.push_str(match (mol.has_coords3(), mol.has_coords()) {
+        (true, _) => "                    3D\n",
+        (false, true) => "                    2D\n",
+        (false, false) => "\n",
+    });
+
+    // Line 2 is a free-text comment; blank is more honest than inventing one.
     out.push('\n');
 
     // Line 3: counts. The trailing fields are the spec's defaults —
@@ -327,28 +541,44 @@ pub fn write_sdf(mol: &Molecule) -> String {
         mol.num_bonds()
     ));
 
+    let coords3 = mol.coords3();
     let coords = mol.coords();
     for index in 0..mol.num_atoms() {
-        // z is always 0: coordinate storage is 2D. A molecule read from a 3D
-        // SDF already lost its z on the way in, so writing 0 is reporting what
-        // is held rather than flattening something.
-        let (x, y) = match coords {
-            Some(points) => (points[index].x, points[index].y),
-            None => (0.0, 0.0),
+        // The conformer wins when there is one: it is the physical geometry,
+        // and a layout alongside it is a drawing of the same molecule rather
+        // than a competing set of positions. A zero z on the layout path is
+        // reporting what is held, not flattening something.
+        let (x, y, z) = match (coords3, coords) {
+            (Some(points), _) => (points[index].x, points[index].y, points[index].z),
+            (None, Some(points)) => (points[index].x, points[index].y, 0.0),
+            (None, None) => (0.0, 0.0, 0.0),
         };
         let symbol = ELEMENT_SYMBOLS
             .get(mol.atom(index).atomic_number() as usize)
             .copied()
             .unwrap_or("*");
+        // Columns after the symbol are `dd ccc sss ...`: mass difference,
+        // old-style charge, atom stereo parity. `dd` and `ccc` stay zero — the
+        // `M  CHG` and `M  ISO` lines above supersede them, and a reader seeing
+        // both forms is entitled to believe either.
+        let parity = atom_parity(mol, index);
         out.push_str(&format!(
-            "{x:>10.4}{y:>10.4}{:>10.4} {symbol:<3} 0  0  0  0  0  0  0  0  0  0  0  0\n",
-            0.0
+            "{x:>10.4}{y:>10.4}{z:>10.4} {symbol:<3} 0  0{parity:>3}  0  0  0  0  0  0  0  0  0\n"
         ));
     }
 
+    // A Kekulé form when one exists, so the record carries structure bonds
+    // rather than the type-4 query bond. `None` means no valid assignment, and
+    // then type 4 is still the honest answer — see `kekulize`.
+    let kekulised = crate::io::aromaticity::kekulize(mol);
+    let wedge = wedge_bonds(mol);
+
     for index in 0..mol.num_bonds() {
         let bond = mol.bond(index);
-        let order = match bond.order() {
+        let effective_order = kekulised
+            .as_ref()
+            .map_or_else(|| bond.order(), |orders| orders[index]);
+        let order = match effective_order {
             BondOrder::Single => 1,
             BondOrder::Double => 2,
             BondOrder::Triple => 3,
@@ -358,17 +588,147 @@ pub fn write_sdf(mol: &Molecule) -> String {
             // not assert something false.
             _ => 8,
         };
-        // Molfile atom indices are 1-based.
+        // Molfile atom indices are 1-based. The field after the order is bond
+        // stereo: 1 is a wedge rising towards the reader, 6 a hash falling away.
+        //
+        // A wedge is directional in a way the other fields are not: its narrow
+        // end must sit on the stereocentre, which means the *first* atom of the
+        // line. Written in storage order instead, `N[C@@H](C)C(=O)O` put the
+        // narrow end on the nitrogen, and RDKit read it as a claim about the
+        // nitrogen — parsed the record happily, and reported no stereocentre at
+        // all.
+        // A double bond that states no configuration, but whose ends both
+        // carry a substituent, needs saying so explicitly. Any 2D drawing puts
+        // those substituents on *some* side, so a reader perceiving geometry
+        // from coordinates — ours included — would read a configuration the
+        // molecule never claimed. Field 3 is "either", which is a statement of
+        // ignorance rather than of geometry, and is what RDKit writes here.
+        //
+        // `None` is a bond that never claimed a configuration; `Unspecified`
+        // is one a previous read already recorded as declining to say (this
+        // same field 3, read back in). Both need the same treatment here —
+        // writing `Unspecified` through the plain path below would silently
+        // turn "no claim" into a false claim of whatever the coordinates
+        // happen to draw, the moment the molecule is written a second time.
+        if bond.order() == BondOrder::Double
+            && matches!(bond.stereo(), BondStereo::None | BondStereo::Unspecified)
+            && geometry_is_inferrable(mol, bond.atom1(), bond.atom2())
+        {
+            out.push_str(&format!(
+                "{:>3}{:>3}{order:>3}  3  0  0  0\n",
+                bond.atom1() + 1,
+                bond.atom2() + 1
+            ));
+            continue;
+        }
+
+        let (stereo, (first, second)) = match wedge.get(&index) {
+            Some(&(centre, direction)) if centre == bond.atom2() => {
+                (direction, (bond.atom2(), bond.atom1()))
+            }
+            Some(&(_, direction)) => (direction, (bond.atom1(), bond.atom2())),
+            None => (0, (bond.atom1(), bond.atom2())),
+        };
         out.push_str(&format!(
-            "{:>3}{:>3}{order:>3}  0  0  0  0\n",
-            bond.atom1() + 1,
-            bond.atom2() + 1
+            "{:>3}{:>3}{order:>3}{stereo:>3}  0  0  0\n",
+            first + 1,
+            second + 1
         ));
     }
 
+    out.push_str(&property_lines(mol));
     out.push_str("M  END\n");
+    out.push_str(&data_block(mol));
     out.push_str(SDF_ENTRY_END);
     out.push('\n');
+    out
+}
+
+/// Whether a reader would derive a configuration for this double bond from a
+/// drawing of it — that is, whether both ends carry something to be on a side.
+fn geometry_is_inferrable(mol: &Molecule, left: usize, right: usize) -> bool {
+    let has_other =
+        |atom: usize, partner: usize| mol.neighbors(atom).iter().any(|n| n.atom_idx != partner);
+    has_other(left, right) && has_other(right, left)
+}
+
+/// Whether this molecule states a double-bond configuration that only a
+/// drawing can carry.
+fn needs_geometry_for_stereo(mol: &Molecule) -> bool {
+    (0..mol.num_bonds()).any(|i| {
+        let bond = mol.bond(i);
+        bond.order() == BondOrder::Double && matches!(bond.stereo(), BondStereo::E | BondStereo::Z)
+    })
+}
+
+/// `M  CHG` and `M  ISO` lines, between the bond block and `M  END`.
+///
+/// These are what make a charged record *readable*, not merely lossless.
+/// Without `M  CHG` a quaternary nitrogen has four bonds and no charge, which
+/// is a valence error, so a strict reader refuses the whole record rather than
+/// quietly returning a neutral amine — `C[N+](C)(C)C` and `[O-][N+](=O)c1ccccc1`
+/// both did exactly that (#194).
+///
+/// Both lines carry a count in three columns followed by that many
+/// `(atom, value)` pairs in four columns each, atom indices 1-based as in the
+/// bond block. **Eight pairs per line at most**, so a molecule with more needs
+/// several — a limit that is easy to miss because nothing in a small corpus
+/// reaches it.
+fn property_lines(mol: &Molecule) -> String {
+    fn emit(tag: &str, entries: &[(usize, i32)]) -> String {
+        let mut out = String::new();
+        for chunk in entries.chunks(8) {
+            out.push_str(tag);
+            out.push_str(&format!("{:>3}", chunk.len()));
+            for (index, value) in chunk {
+                out.push_str(&format!("{:>4}{value:>4}", index + 1));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    let charges: Vec<(usize, i32)> = (0..mol.num_atoms())
+        .filter_map(|i| match mol.atom(i).formal_charge() {
+            0 => None,
+            c => Some((i, i32::from(c))),
+        })
+        .collect();
+
+    // The absolute mass number, not the difference from natural abundance. The
+    // atom line's `dd` column is the difference form and is superseded; it stays
+    // zero, because a reader that sees both is entitled to believe either.
+    let isotopes: Vec<(usize, i32)> = (0..mol.num_atoms())
+        .filter_map(|i| mol.atom(i).isotope().map(|iso| (i, i32::from(iso))))
+        .collect();
+
+    // Nothing to say means no line. `M  CHG  0` is legal and is noise.
+    format!("{}{}", emit("M  CHG", &charges), emit("M  ISO", &isotopes))
+}
+
+/// The data block: everything after `M  END` and before `$$$$`.
+///
+/// Data fields are why people choose SDF over SMILES — assay values, catalogue
+/// IDs, docking scores. `parse_sdf` has always read them into
+/// [`Molecule::properties`]; the writer never wrote them back, so an SDF to SDF
+/// round trip through this crate silently lost every one (#188).
+///
+/// Sorted by key, because `properties` is a `HashMap` and iterating it writes
+/// the same molecule differently between runs. #153 was that bug for ring
+/// closures, and the fix is the same one.
+fn data_block(mol: &Molecule) -> String {
+    let mut keys: Vec<&String> = mol.properties().keys().collect();
+    keys.sort();
+
+    let mut out = String::new();
+    for key in keys {
+        // The blank line is the field terminator, not decoration: a reader
+        // takes every line up to it as the value.
+        out.push_str(&format!(
+            "> <{key}>\n{}\n\n",
+            mol.properties()[key.as_str()]
+        ));
+    }
     out
 }
 
@@ -381,17 +741,288 @@ pub fn write_sdf_all<'a>(molecules: impl IntoIterator<Item = &'a Molecule>) -> S
     out
 }
 
-/// Whether writing this molecule would record real coordinates.
+/// Whether writing this molecule would record real coordinates, of either
+/// kind.
 ///
 /// Exposed so a caller can warn before writing rather than after: a file full
 /// of zeros is a plausible-looking result that is entirely useless, and the
 /// difference is invisible in the output.
 pub fn molecule_has_coords_for_sdf(mol: &Molecule) -> bool {
-    mol.has_coords()
+    mol.has_coords() || mol.has_coords3()
+}
+
+/// The atom stereo parity for the atom line's `sss` column, or 0 for none.
+///
+/// Both conventions are anchored to the same thing since `normalise_chirality`:
+/// neighbours in increasing index order, with an implicit hydrogen last. So
+/// this is a direct mapping rather than a permutation problem — the permutation
+/// was done once, at parse time, where the written order was still known.
+///
+/// Which way round the mapping goes is fixed by RDKit rather than by reading
+/// the specification: both alanine enantiomers must keep their distinct `/m0`
+/// and `/m1` InChI layers through an SDF trip, and a centre carrying a
+/// ring-closure digit must survive too.
+fn atom_parity(mol: &Molecule, atom_idx: usize) -> u8 {
+    let base = match mol.atom(atom_idx).chirality() {
+        Chirality::Clockwise => 1,
+        Chirality::CounterClockwise => 2,
+        Chirality::None | Chirality::Unspecified => return 0,
+    };
+
+    // A parity describes four things around a centre. Three neighbours and one
+    // implicit hydrogen is the common shape; anything else is not a tetrahedral
+    // centre this can describe.
+    let neighbours = mol.neighbors(atom_idx).len();
+    let hydrogens = usize::from(mol.atom(atom_idx).total_hydrogens());
+    if neighbours + hydrogens != 4 {
+        return 0;
+    }
+    base
+}
+
+/// Which bonds carry a wedge, in which direction, and around which centre.
+///
+/// A wedge is not another way of writing the parity — it is a claim about the
+/// *drawing*, so it only means anything when there is one. `core/layout.rs`
+/// places atoms with no knowledge of chirality, so deriving a wedge straight
+/// from [`Chirality`] would produce a marker that contradicts the picture it
+/// sits on, and a reader is entitled to believe either.
+///
+/// So the direction is not derived by formula. It is found by **simulating the
+/// reader**: build the 3D arrangement each candidate direction implies, work
+/// out the parity a reader would compute from it, and keep the one that agrees
+/// with [`atom_parity`]. A formula was tried first and got alanine right and
+/// *trans*-cyclohexanediol wrong — one centre of two — which is what a guess
+/// that happens to fit one arrangement looks like.
+///
+/// When neither direction reproduces the parity, or there is no layout, the
+/// parity stands alone: under-specified and readable, rather than confidently
+/// contradictory.
+fn wedge_bonds(mol: &Molecule) -> std::collections::HashMap<usize, (usize, u8)> {
+    let mut wedges = std::collections::HashMap::new();
+    let Some(points) = mol.coords() else {
+        return wedges; // no drawing, so nothing a wedge could mean
+    };
+
+    for atom_idx in 0..mol.num_atoms() {
+        let parity = atom_parity(mol, atom_idx);
+        if parity == 0 {
+            continue;
+        }
+
+        let neighbours = mol.neighbors(atom_idx);
+        // Prefer a bond to a low-degree neighbour, so the wedge reads as coming
+        // out of the centre rather than out of a ring.
+        let Some(chosen) = neighbours
+            .iter()
+            .min_by_key(|n| mol.graph().degree(n.atom_idx))
+        else {
+            continue;
+        };
+
+        for direction in [1u8, 6u8] {
+            if implied_parity(mol, points, atom_idx, chosen.atom_idx, direction) == Some(parity) {
+                wedges.insert(chosen.bond_idx, (atom_idx, direction));
+                break;
+            }
+        }
+    }
+    wedges
+}
+
+/// The parity a reader would compute from the drawing, if `wedged` were lifted
+/// out of the page (`1`) or pushed behind it (`6`).
+///
+/// Everything not wedged lies in the plane. An implicit hydrogen has no drawn
+/// position, so it is placed where a real one would go: opposite the sum of the
+/// other bonds.
+fn implied_parity(
+    mol: &Molecule,
+    points: &[Point2],
+    centre: usize,
+    wedged: usize,
+    direction: u8,
+) -> Option<u8> {
+    let origin = points[centre];
+    let mut vectors: Vec<(usize, [f64; 3])> = Vec::new();
+    for neighbour in mol.neighbors(centre) {
+        let p = points[neighbour.atom_idx];
+        let z = if neighbour.atom_idx == wedged {
+            if direction == 1 { 1.0 } else { -1.0 }
+        } else {
+            0.0
+        };
+        vectors.push((neighbour.atom_idx, [p.x - origin.x, p.y - origin.y, z]));
+    }
+
+    if mol.atom(centre).total_hydrogens() == 1 {
+        // Opposite everything else, and numbered highest — molfile treats an
+        // implicit hydrogen as the last neighbour.
+        let sum = vectors.iter().fold([0.0; 3], |acc, (_, v)| {
+            [acc[0] + v[0], acc[1] + v[1], acc[2] + v[2]]
+        });
+        vectors.push((usize::MAX, [-sum[0], -sum[1], -sum[2]]));
+    }
+    if vectors.len() != 4 {
+        return None;
+    }
+
+    // Molfile numbering order.
+    vectors.sort_by_key(|(idx, _)| *idx);
+
+    // With the highest-numbered neighbour pointing away, do the first three
+    // read clockwise? That is the sign of the determinant of the three, taken
+    // relative to the fourth.
+    let d = |a: [f64; 3], b: [f64; 3], c: [f64; 3]| {
+        a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0])
+    };
+    let det = d(vectors[0].1, vectors[1].1, vectors[2].1);
+    if det.abs() < 1e-9 {
+        return None; // the drawing is degenerate here
+    }
+    Some(if det < 0.0 { 1 } else { 2 })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The `M  CHG` / `M  ISO` lines of a written record.
+    fn property_lines_of(smiles: &str) -> Vec<String> {
+        let mol = crate::io::smiles::parse_smiles(smiles).expect(smiles);
+        write_sdf(&mol)
+            .lines()
+            .filter(|l| l.starts_with("M  CHG") || l.starts_with("M  ISO"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_charges_are_written_as_a_property_line() {
+        assert_eq!(property_lines_of("[NH4+]"), ["M  CHG  1   1   1"]);
+        assert_eq!(property_lines_of("[Cl-]"), ["M  CHG  1   1  -1"]);
+        assert_eq!(property_lines_of("[Mg+2]"), ["M  CHG  1   1   2"]);
+    }
+
+    #[test]
+    fn test_a_neutral_molecule_writes_no_property_line() {
+        // `M  CHG  0` is legal and is noise.
+        assert!(property_lines_of("CCO").is_empty());
+    }
+
+    #[test]
+    fn test_more_than_eight_charges_wrap_onto_a_second_line() {
+        // The limit is 8 pairs per line. Nothing in the corpus reaches it, so
+        // without this the wrap would ship untested and break on the first real
+        // polyelectrolyte.
+        let nine = "[NH4+].".repeat(9);
+        let lines = property_lines_of(nine.trim_end_matches('.'));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("M  CHG  8"), "{}", lines[0]);
+        assert!(lines[1].starts_with("M  CHG  1"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn test_isotopes_are_written_as_the_absolute_mass_number() {
+        // 13, not 1: `M  ISO` supersedes the atom block's difference-from-
+        // natural-abundance column, which stays zero.
+        assert_eq!(property_lines_of("[13CH4]"), ["M  ISO  1   1  13"]);
+    }
+
+    #[test]
+    fn test_charge_and_isotope_survive_a_round_trip() {
+        for smiles in ["[NH4+]", "[Cl-]", "[Mg+2]", "[13CH4]"] {
+            let before = crate::io::smiles::parse_smiles(smiles).expect(smiles);
+            let after = parse_sdf(&write_sdf(&before)).expect(smiles);
+            assert_eq!(
+                after.atom(0).formal_charge(),
+                before.atom(0).formal_charge(),
+                "{smiles} lost its charge"
+            );
+            assert_eq!(
+                after.atom(0).isotope(),
+                before.atom(0).isotope(),
+                "{smiles} lost its isotope"
+            );
+        }
+    }
+
+    #[test]
+    fn test_data_fields_are_written_sorted_and_terminated() {
+        let mut mol = crate::io::smiles::parse_smiles("CCO").expect("valid SMILES");
+        mol.set_property("zeta".into(), "last".into());
+        mol.set_property("alpha".into(), "first".into());
+
+        let text = write_sdf(&mol);
+        let block = text.split("M  END\n").nth(1).expect("a data block");
+        // Sorted, because `properties` is a HashMap and iteration order would
+        // otherwise write the same molecule differently between runs (#153).
+        assert_eq!(block, "> <alpha>\nfirst\n\n> <zeta>\nlast\n\n$$$$\n");
+
+        let back = parse_sdf(&text).expect("round trips");
+        assert_eq!(back.property("alpha"), Some("first"));
+        assert_eq!(back.property("zeta"), Some("last"));
+    }
+
+    #[test]
+    fn test_aromatic_bonds_are_written_as_a_kekule_form() {
+        // Type 4 is a *query* bond type. Benzene survives it because a reader
+        // can kekulise unambiguously; pyrrole cannot, and RDKit rejects the
+        // record (#194).
+        for smiles in [
+            "c1ccccc1",
+            "c1cc[nH]c1",
+            "c1ccncc1",
+            "c1ccoc1",
+            "c1cnc[nH]1",
+        ] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect(smiles);
+            let text = write_sdf(&mol);
+            let type_four = text
+                .lines()
+                .skip(4 + mol.num_atoms())
+                .take(mol.num_bonds())
+                .filter(|l| l.split_whitespace().nth(2) == Some("4"))
+                .count();
+            assert_eq!(type_four, 0, "{smiles} still writes a query bond type");
+        }
+    }
+
+    #[test]
+    fn test_a_chiral_centre_writes_a_parity_and_reads_it_back() {
+        let before = crate::io::smiles::parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+        let after = parse_sdf(&write_sdf(&before)).expect("round trips");
+        assert_ne!(after.atom(1).chirality(), Chirality::None);
+        assert_eq!(after.atom(1).chirality(), before.atom(1).chirality());
+    }
+
+    #[test]
+    fn test_the_two_enantiomers_do_not_collapse_into_each_other() {
+        // The failure a self-consistent writer hides: emit one parity
+        // regardless of input and every round trip still looks perfect.
+        let l = crate::io::smiles::parse_smiles("N[C@@H](C)C(=O)O").expect("valid");
+        let d = crate::io::smiles::parse_smiles("N[C@H](C)C(=O)O").expect("valid");
+        let l_back = parse_sdf(&write_sdf(&l)).expect("round trips");
+        let d_back = parse_sdf(&write_sdf(&d)).expect("round trips");
+        assert_ne!(l_back.atom(1).chirality(), d_back.atom(1).chirality());
+    }
+
+    #[test]
+    fn test_no_layout_means_a_parity_and_no_wedge() {
+        // A wedge is a claim about a drawing. With no drawing it would be a
+        // claim about nothing, and a reader that trusts it over the parity gets
+        // a different molecule.
+        let mol = crate::io::smiles::parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+        assert!(mol.coords().is_none());
+        let text = write_sdf(&mol);
+        let wedges = text
+            .lines()
+            .skip(4 + mol.num_atoms())
+            .take(mol.num_bonds())
+            .filter(|l| matches!(l.split_whitespace().nth(3), Some("1") | Some("6")))
+            .count();
+        assert_eq!(wedges, 0, "wedge written with no layout to justify it");
+    }
     use super::*;
 
     // ---- writing ----------------------------------------------------------
@@ -408,6 +1039,48 @@ mod tests {
         let mut mol = parse_smiles(smiles).expect("valid SMILES");
         assert!(ensure_coords(&mut mol), "layout should succeed");
         mol
+    }
+
+    #[test]
+    fn test_an_unspecified_double_bond_still_says_so_after_a_second_round_trip() {
+        // Field 3 means "the file declines to say", not "the file forgot to
+        // say" — losing it on a second write turns a molecule that never
+        // stated a configuration into one that looks like it stated trans,
+        // since the coordinates for "no claim" and for trans are identical.
+        let mol = laid_out("FC=CF");
+        let double_bond_stereo_digit = |text: &str| -> String {
+            text.lines()
+                .skip(4 + mol.num_atoms())
+                .take(mol.num_bonds())
+                .find(|l| l.split_whitespace().nth(2) == Some("2"))
+                .expect("a double bond line")
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .to_string()
+        };
+
+        let first = write_sdf(&mol);
+        assert_eq!(double_bond_stereo_digit(&first), "3");
+
+        let reparsed = parse_sdf(&first).expect("round trips");
+        let double_bond = (0..reparsed.num_bonds())
+            .find(|&i| reparsed.bond(i).order() == BondOrder::Double)
+            .expect("a double bond");
+        assert_eq!(reparsed.bond(double_bond).stereo(), BondStereo::Unspecified);
+
+        let second = write_sdf(&reparsed);
+        assert_eq!(
+            double_bond_stereo_digit(&second),
+            "3",
+            "an already-unspecified bond must keep declining to say, not fall silent"
+        );
+
+        let reparsed_again = parse_sdf(&second).expect("round trips");
+        assert_eq!(
+            reparsed_again.bond(double_bond).stereo(),
+            BondStereo::Unspecified
+        );
     }
 
     #[test]
@@ -487,6 +1160,25 @@ mod tests {
             v
         };
         assert_eq!(pairs(&back), pairs(&original));
+    }
+
+    #[test]
+    fn test_a_hundred_atom_bond_line_does_not_merge_under_split_whitespace() {
+        // Bond 99 joins atoms 99 and 100 (1-based), writing "99100" with no
+        // space between them once the second index reaches three digits (#202).
+        let mol = laid_out(&"C".repeat(100));
+        let back =
+            parse_sdf(&write_sdf(&mol)).expect("a spec-conformant 100-atom record must parse");
+        assert_eq!(back.num_atoms(), 100);
+        assert_eq!(back.num_bonds(), 99);
+    }
+
+    #[test]
+    fn test_ninety_nine_atoms_is_the_boundary_that_already_worked() {
+        let mol = laid_out(&"C".repeat(99));
+        let back = parse_sdf(&write_sdf(&mol)).expect("round trips");
+        assert_eq!(back.num_atoms(), 99);
+        assert_eq!(back.num_bonds(), 98);
     }
 
     #[test]
@@ -703,10 +1395,101 @@ M  END
 $$$$";
 
         let mol = parse_sdf(sdf).unwrap();
-        assert_eq!(mol.coords().expect("coordinates").len(), mol.num_atoms());
-        // A 3D file: z differs between atoms 6 and 7, but only x/y is stored,
-        // so they project onto the same 2D point.
-        assert_eq!(mol.coord(5), mol.coord(6));
+
+        // A 3D file, so the coordinates are a conformer and not a layout.
+        // Until #174 this stored x/y as a 2D layout, which projected atoms 6
+        // and 7 — identical but for z — onto the same point. The molecule is
+        // left with no layout deliberately: `ensure_coords` can compute a
+        // readable one, and a flattened conformer is not that.
+        assert!(!mol.has_coords(), "a conformer is not a depiction");
+        let conformer = mol.coords3().expect("conformer");
+        assert_eq!(conformer.len(), mol.num_atoms());
+
+        assert_ne!(mol.coord3(5), mol.coord3(6));
+        assert_eq!(mol.coord3(5).unwrap().z, 0.8900);
+        assert_eq!(mol.coord3(6).unwrap().z, -0.8900);
+    }
+
+    #[test]
+    fn test_flat_sdf_is_a_layout_not_a_conformer() {
+        // Every z is zero, so this is a drawing. Storing it as a conformer
+        // would claim geometry the file does not assert, and would put a
+        // planar "structure" into any 3D format written from it.
+        let sdf = "\
+Flat
+
+
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    1.5000    0.5000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+M  END
+$$$$";
+
+        let mol = parse_sdf(sdf).unwrap();
+        assert!(mol.has_coords());
+        assert!(!mol.has_coords3());
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.5)));
+    }
+
+    #[test]
+    fn test_conformer_survives_a_write_read_round_trip() {
+        // The point of the whole change: z has to come back. Before #174 the
+        // writer emitted a hardcoded 0.0 in the z column, so this molecule
+        // came back flat.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        mol.set_coords3(vec![
+            Point3::new(0.1234, -0.5678, 1.2345),
+            Point3::new(1.5000, 0.5000, -0.7500),
+        ])
+        .unwrap();
+
+        let text = write_sdf(&mol);
+        let back = parse_sdf(&text).unwrap();
+
+        let conformer = back.coords3().expect("conformer should survive");
+        assert_eq!(conformer[0], Point3::new(0.1234, -0.5678, 1.2345));
+        assert_eq!(conformer[1], Point3::new(1.5, 0.5, -0.75));
+        assert!(!back.has_coords(), "a conformer must not become a layout");
+    }
+
+    #[test]
+    fn test_writer_declares_the_dimensional_code() {
+        // Columns 21-22 of the program line. A reader that trusts the header
+        // instead of sniffing z gets the right answer only if we write it.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        mol.set_coords3(vec![Point3::new(0.0, 0.0, 1.0)]).unwrap();
+        assert_eq!(
+            write_sdf(&mol).lines().nth(1).unwrap().trim_end(),
+            "                    3D"
+        );
+
+        let mut flat = Molecule::new();
+        flat.add_atom(Atom::new(Element::carbon()));
+        flat.set_coords(vec![Point2::new(0.0, 0.0)]).unwrap();
+        assert_eq!(
+            write_sdf(&flat).lines().nth(1).unwrap().trim_end(),
+            "                    2D"
+        );
+
+        let mut bare = Molecule::new();
+        bare.add_atom(Atom::new(Element::carbon()));
+        assert_eq!(write_sdf(&bare).lines().nth(1).unwrap(), "");
+    }
+
+    #[test]
+    fn test_has_coords_for_sdf_accepts_either_kind() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        assert!(!molecule_has_coords_for_sdf(&mol));
+
+        mol.set_coords3(vec![Point3::new(0.0, 0.0, 1.0)]).unwrap();
+        assert!(molecule_has_coords_for_sdf(&mol));
     }
 
     #[test]

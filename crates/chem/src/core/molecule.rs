@@ -1,8 +1,11 @@
 use crate::core::atom::Atom;
 use crate::core::bond::Bond;
+use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ATOMIC_MASSES;
-use crate::core::geometry::Point2;
+use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
+use crate::core::residue::{Chain, Residue};
+use crate::core::site::AtomSite;
 
 use std::{collections::HashMap, fmt};
 
@@ -33,6 +36,21 @@ pub enum MoleculeError {
 
     #[error("Expected {expected} coordinates (one per atom), got {got}")]
     CoordinateCountMismatch { expected: usize, got: usize },
+
+    #[error("Expected {expected} atom sites (one per atom), got {got}")]
+    SiteCountMismatch { expected: usize, got: usize },
+
+    /// A single variant rather than one per failure mode: topology has five
+    /// distinct ways to be wrong and structured variants for each would be
+    /// permanent API bought for very little. The message names the offending
+    /// index and the rule it broke.
+    #[error("Invalid residue topology: {0}")]
+    InvalidTopology(String),
+
+    /// Stringly-typed for the same reason as [`Self::InvalidTopology`]: a cell
+    /// has several unrelated ways to be wrong and the message names which.
+    #[error("Invalid unit cell: {0}")]
+    InvalidCell(String),
 }
 
 /// Represents a complete molecule with atoms, bonds, and connectivity.
@@ -53,6 +71,58 @@ pub struct Molecule {
     /// all-or-nothing in practice — there's no meaningful state where only
     /// some atoms have positions.
     coords: Option<Vec<Point2>>,
+    /// 3D coordinates — a conformer, one per atom, indexed in parallel with
+    /// `atoms`. `None` when the molecule has no geometry, which is the common
+    /// case: SMILES carries none, and a flat SDF carries a drawing rather than
+    /// a conformer.
+    ///
+    /// Kept alongside `coords` rather than replacing it because the two are
+    /// different artefacts and neither is derivable from the other. A layout
+    /// is computed for drawing; a conformer is physical. A molecule read from
+    /// a 3D file and then laid out for the structure view legitimately has
+    /// both, and depiction wants the first while a conversion to XYZ wants the
+    /// second.
+    coords3: Option<Vec<Point3>>,
+    /// Per-atom file data — names, partial charges, occupancies, temperature
+    /// factors — one per atom, indexed in parallel with `atoms`. `None` for
+    /// every molecule that did not come from a format carrying such columns,
+    /// which is most of them.
+    ///
+    /// A third side table rather than fields on [`Atom`] for the reason the
+    /// coordinates give: `Atom` derives `Eq`, and these are floats. It is also
+    /// the honest shape — an element is a fact about a species, while a
+    /// B-factor is a fact about one observation of it, and two files of the
+    /// same molecule will disagree about the second while agreeing on the
+    /// first.
+    sites: Option<Vec<AtomSite>>,
+    /// Chains, in file order. Empty for every molecule that did not come from a
+    /// format organised by chain, which is most of them.
+    ///
+    /// A plain `Vec` rather than an `Option<Vec>` like the three tables above:
+    /// chains are not indexed in parallel with `atoms`, so "empty" is already
+    /// the natural absent state and an `Option` would add noise for nothing.
+    chains: Vec<Chain>,
+    /// Residues, in file order, each owning a contiguous range of atoms.
+    ///
+    /// Ranges rather than a per-atom residue index because PDB and mmCIF
+    /// already order their records that way and it costs nothing per atom. The
+    /// price is that a residue's atoms must be contiguous and the ranges must
+    /// ascend — the latter is what makes [`Molecule::residue_of`]'s binary
+    /// search correct, so both are enforced by [`Molecule::set_topology`]
+    /// rather than trusted.
+    residues: Vec<Residue>,
+    /// The lattice, for a periodic structure. `None` for every molecule that
+    /// is not a crystal, which is most of them.
+    ///
+    /// **Unlike every other optional field on this type, the cell survives
+    /// [`Molecule::add_atom`].** The coordinate tables, the site table and the
+    /// topology are all indexed by or into the atoms, so appending invalidates
+    /// them. A lattice references nothing atom-indexed — adding an atom to a
+    /// crystal does not change its unit cell.
+    cell: Option<UnitCell>,
+    /// The space group, as the source stated it. Survives `add_atom` for the
+    /// same reason the cell does.
+    space_group: Option<SpaceGroup>,
 }
 
 impl Molecule {
@@ -64,6 +134,12 @@ impl Molecule {
             name: None,
             properties: HashMap::new(),
             coords: None,
+            coords3: None,
+            sites: None,
+            chains: Vec::new(),
+            residues: Vec::new(),
+            cell: None,
+            space_group: None,
         }
     }
 
@@ -75,6 +151,12 @@ impl Molecule {
             name: None,
             properties: HashMap::new(),
             coords: None,
+            coords3: None,
+            sites: None,
+            chains: Vec::new(),
+            residues: Vec::new(),
+            cell: None,
+            space_group: None,
         }
     }
 
@@ -93,8 +175,28 @@ impl Molecule {
         // The new atom has no position, so any existing coordinate set is now
         // one short and no longer indexable in parallel with `atoms`. Drop it
         // rather than leave the two out of sync — the layout has to be redone
-        // to place the new atom anyway.
+        // to place the new atom anyway. The conformer goes for the same
+        // reason, and there is no way to invent a position for the new atom.
+        // The site table is dropped on the same grounds: it is indexed in
+        // parallel with `atoms` too, and a file supplied it for a set of atoms
+        // this is no longer.
         self.coords = None;
+        self.coords3 = None;
+        self.sites = None;
+
+        // Topology goes too. Appending does not strictly invalidate the
+        // existing ranges — indices 0..n keep their meaning — but it produces
+        // an atom belonging to no residue, which a PDB write would silently
+        // drop. One rule for everything is easier to reason about than an
+        // exception here: what a file said about a set of atoms stops applying
+        // when that is no longer the set.
+        self.chains.clear();
+        self.residues.clear();
+
+        // The cell and space group deliberately do NOT go. They index nothing
+        // and reference no atom, so adding one leaves them exactly as true as
+        // they were. This is the one exception to the rule above, and it is
+        // easier to find here than in a field comment.
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -203,6 +305,291 @@ impl Molecule {
     /// [`Self::set_coords`] to establish one first.
     pub fn coords_mut(&mut self) -> Option<&mut [Point2]> {
         self.coords.as_deref_mut()
+    }
+
+    /// This molecule's 3D coordinates, one per atom, or `None` if it carries
+    /// no conformer. Independent of [`Self::coords`]: a molecule may have
+    /// either, both or neither.
+    pub fn coords3(&self) -> Option<&[Point3]> {
+        self.coords3.as_deref()
+    }
+
+    /// The 3D coordinate of a single atom, or `None` if this molecule has no
+    /// conformer or `atom_idx` is out of range.
+    pub fn coord3(&self, atom_idx: usize) -> Option<Point3> {
+        self.coords3.as_ref()?.get(atom_idx).copied()
+    }
+
+    pub fn has_coords3(&self) -> bool {
+        self.coords3.is_some()
+    }
+
+    /// Sets this molecule's 3D coordinates.
+    ///
+    /// # Errors
+    /// [`MoleculeError::CoordinateCountMismatch`] if `coords.len()` isn't
+    /// exactly one per atom — the same all-or-nothing rule
+    /// [`Self::set_coords`] enforces, and for the same reason.
+    pub fn set_coords3(&mut self, coords: Vec<Point3>) -> Result<(), MoleculeError> {
+        if coords.len() != self.atoms.len() {
+            return Err(MoleculeError::CoordinateCountMismatch {
+                expected: self.atoms.len(),
+                got: coords.len(),
+            });
+        }
+        self.coords3 = Some(coords);
+        Ok(())
+    }
+
+    /// Discards any conformer, leaving a 2D layout untouched.
+    pub fn clear_coords3(&mut self) {
+        self.coords3 = None;
+    }
+
+    /// Mutable access to the conformer, for a pass refining positions in
+    /// place. `None` if this molecule has no conformer yet — use
+    /// [`Self::set_coords3`] to establish one first.
+    pub fn coords3_mut(&mut self) -> Option<&mut [Point3]> {
+        self.coords3.as_deref_mut()
+    }
+
+    /// This molecule's per-atom file data, one entry per atom, or `None` if it
+    /// carries none. Independent of both coordinate sets.
+    pub fn sites(&self) -> Option<&[AtomSite]> {
+        self.sites.as_deref()
+    }
+
+    /// The site record for a single atom, or `None` if this molecule has no
+    /// site data or `atom_idx` is out of range.
+    ///
+    /// Returns a reference rather than a copy, unlike [`Self::coord3`]:
+    /// `AtomSite` holds a `String` and is not `Copy`.
+    pub fn site(&self, atom_idx: usize) -> Option<&AtomSite> {
+        self.sites.as_ref()?.get(atom_idx)
+    }
+
+    pub fn has_sites(&self) -> bool {
+        self.sites.is_some()
+    }
+
+    /// Sets this molecule's per-atom file data.
+    ///
+    /// # Errors
+    /// [`MoleculeError::SiteCountMismatch`] if `sites.len()` isn't exactly one
+    /// per atom — the same all-or-nothing rule [`Self::set_coords`] enforces,
+    /// and for the same reason: the table is indexed in parallel with `atoms`,
+    /// so a mismatched length would silently misattribute a charge or a
+    /// B-factor to the wrong atom.
+    pub fn set_sites(&mut self, sites: Vec<AtomSite>) -> Result<(), MoleculeError> {
+        if sites.len() != self.atoms.len() {
+            return Err(MoleculeError::SiteCountMismatch {
+                expected: self.atoms.len(),
+                got: sites.len(),
+            });
+        }
+        self.sites = Some(sites);
+        Ok(())
+    }
+
+    /// Discards any per-atom file data, leaving both coordinate sets untouched.
+    pub fn clear_sites(&mut self) {
+        self.sites = None;
+    }
+
+    /// Mutable access to the site table, for a pass filling in a column the
+    /// reader could not. `None` if this molecule has no site data yet — use
+    /// [`Self::set_sites`] to establish it first.
+    pub fn sites_mut(&mut self) -> Option<&mut [AtomSite]> {
+        self.sites.as_deref_mut()
+    }
+
+    /// This molecule's chains, in file order. Empty if it carries no topology.
+    pub fn chains(&self) -> &[Chain] {
+        &self.chains
+    }
+
+    /// This molecule's residues, in file order, each owning a contiguous and
+    /// ascending range of atoms.
+    pub fn residues(&self) -> &[Residue] {
+        &self.residues
+    }
+
+    pub fn has_topology(&self) -> bool {
+        !self.residues.is_empty()
+    }
+
+    /// Sets this molecule's chain and residue topology.
+    ///
+    /// The ranges are the only thing tying residues to atoms, so they are
+    /// validated rather than trusted — a bad range would silently attribute an
+    /// atom to the wrong residue, which is exactly the class of error this
+    /// structure exists to prevent.
+    ///
+    /// Ranges need not cover every atom: a ligand appended without residue
+    /// information is a legal molecule, and [`Self::residue_of`] answers `None`
+    /// for it.
+    ///
+    /// # Errors
+    /// [`MoleculeError::InvalidTopology`], naming the offending index, if an
+    /// atom range runs past the last atom, if residue ranges overlap or do not
+    /// ascend, if a chain's residue range is out of bounds or does not ascend,
+    /// or if a residue's `chain_ix` disagrees with the chain that claims it.
+    pub fn set_topology(
+        &mut self,
+        chains: Vec<Chain>,
+        residues: Vec<Residue>,
+    ) -> Result<(), MoleculeError> {
+        let invalid = |msg: String| Err(MoleculeError::InvalidTopology(msg));
+
+        // Residue atom ranges: in bounds, ascending, non-overlapping. Ascending
+        // is not cosmetic — `residue_of` binary-searches these.
+        let mut previous_end = 0usize;
+        for (ix, residue) in residues.iter().enumerate() {
+            if residue.atoms.start > residue.atoms.end {
+                return invalid(format!(
+                    "residue {ix} has a backwards atom range {}..{}",
+                    residue.atoms.start, residue.atoms.end
+                ));
+            }
+            if residue.atoms.end > self.atoms.len() {
+                return invalid(format!(
+                    "residue {ix} covers atoms {}..{} but the molecule has {}",
+                    residue.atoms.start,
+                    residue.atoms.end,
+                    self.atoms.len()
+                ));
+            }
+            if ix > 0 && residue.atoms.start < previous_end {
+                return invalid(format!(
+                    "residue {ix} starts at atom {} but residue {} already ends at {previous_end}; \
+                     residue atom ranges must ascend and must not overlap",
+                    residue.atoms.start,
+                    ix - 1
+                ));
+            }
+            previous_end = residue.atoms.end;
+
+            if residue.chain_ix >= chains.len() {
+                return invalid(format!(
+                    "residue {ix} names chain {} but there are {} chains",
+                    residue.chain_ix,
+                    chains.len()
+                ));
+            }
+        }
+
+        // Chain residue ranges: same three rules, one level up.
+        let mut previous_end = 0usize;
+        for (ix, chain) in chains.iter().enumerate() {
+            if chain.residues.start > chain.residues.end {
+                return invalid(format!(
+                    "chain {ix} has a backwards residue range {}..{}",
+                    chain.residues.start, chain.residues.end
+                ));
+            }
+            if chain.residues.end > residues.len() {
+                return invalid(format!(
+                    "chain {ix} covers residues {}..{} but there are {}",
+                    chain.residues.start,
+                    chain.residues.end,
+                    residues.len()
+                ));
+            }
+            if ix > 0 && chain.residues.start < previous_end {
+                return invalid(format!(
+                    "chain {ix} starts at residue {} but chain {} already ends at {previous_end}; \
+                     chain residue ranges must ascend and must not overlap",
+                    chain.residues.start,
+                    ix - 1
+                ));
+            }
+            previous_end = chain.residues.end;
+
+            // The two directions have to agree, or a writer grouping by chain
+            // and a reader following `chain_ix` would disagree about the same
+            // structure.
+            for residue_ix in chain.residues.clone() {
+                if residues[residue_ix].chain_ix != ix {
+                    return invalid(format!(
+                        "chain {ix} claims residue {residue_ix}, but that residue names chain {}",
+                        residues[residue_ix].chain_ix
+                    ));
+                }
+            }
+        }
+
+        self.chains = chains;
+        self.residues = residues;
+        Ok(())
+    }
+
+    /// Discards chain and residue topology, leaving every per-atom table alone.
+    pub fn clear_topology(&mut self) {
+        self.chains.clear();
+        self.residues.clear();
+    }
+
+    /// This molecule's unit cell, if it is a periodic structure.
+    ///
+    /// Returned by value — [`UnitCell`] is six `f64`s and `Copy`.
+    pub fn cell(&self) -> Option<UnitCell> {
+        self.cell
+    }
+
+    pub fn has_cell(&self) -> bool {
+        self.cell.is_some()
+    }
+
+    /// Sets the unit cell.
+    ///
+    /// # Errors
+    /// [`MoleculeError::InvalidCell`] for a cell that describes no real
+    /// lattice — see [`UnitCell::validate`]. Rejecting here rather than
+    /// storing a degenerate cell keeps `NaN` out of every coordinate a later
+    /// conversion would produce.
+    pub fn set_cell(&mut self, cell: UnitCell) -> Result<(), MoleculeError> {
+        cell.validate().map_err(MoleculeError::InvalidCell)?;
+        self.cell = Some(cell);
+        Ok(())
+    }
+
+    pub fn clear_cell(&mut self) {
+        self.cell = None;
+    }
+
+    /// The space group, as the source file stated it. Never validated against
+    /// the cell or against itself — see [`SpaceGroup`].
+    pub fn space_group(&self) -> Option<&SpaceGroup> {
+        self.space_group.as_ref()
+    }
+
+    pub fn set_space_group(&mut self, group: SpaceGroup) {
+        self.space_group = Some(group);
+    }
+
+    pub fn clear_space_group(&mut self) {
+        self.space_group = None;
+    }
+
+    /// The residue owning `atom_idx`, or `None` if this molecule has no
+    /// topology or the atom belongs to no residue.
+    ///
+    /// `O(log n)` — a binary search over the ascending ranges, which is the
+    /// cost of storing ranges instead of a residue index on every atom.
+    pub fn residue_of(&self, atom_idx: usize) -> Option<&Residue> {
+        let found = self
+            .residues
+            .partition_point(|residue| residue.atoms.end <= atom_idx);
+        self.residues
+            .get(found)
+            .filter(|residue| residue.contains_atom(atom_idx))
+    }
+
+    /// The chain owning `atom_idx`, or `None` on the same terms as
+    /// [`Self::residue_of`].
+    pub fn chain_of(&self, atom_idx: usize) -> Option<&Chain> {
+        let residue = self.residue_of(atom_idx)?;
+        self.chains.get(residue.chain_ix)
     }
 
     pub fn set_name(&mut self, name: String) {
@@ -356,6 +743,7 @@ mod tests {
     use super::*;
     use crate::core::atom::Element;
     use crate::core::bond::BondOrder;
+    use std::ops::Range;
 
     #[test]
     fn test_molecule_creation() {
@@ -449,6 +837,601 @@ mod tests {
         assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
         // Out of range, even though the molecule does have a layout.
         assert!(mol.coord(2).is_none());
+    }
+
+    #[test]
+    fn test_conformer_is_independent_of_the_layout() {
+        // Both, at once, holding different values. A molecule read from a 3D
+        // file and then laid out for drawing is exactly this state, and
+        // neither set may overwrite the other.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        assert!(!mol.has_coords3());
+        assert!(mol.coords3().is_none());
+
+        mol.set_coords3(vec![
+            Point3::new(0.0, 0.0, -1.0),
+            Point3::new(1.0, 0.0, 1.0),
+        ])
+        .unwrap();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+
+        assert_eq!(mol.coord3(1), Some(Point3::new(1.0, 0.0, 1.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
+
+        // Clearing one leaves the other standing.
+        mol.clear_coords3();
+        assert!(!mol.has_coords3());
+        assert!(mol.has_coords());
+    }
+
+    #[test]
+    fn test_set_coords3_rejects_wrong_count() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        let too_few = mol.set_coords3(vec![Point3::ORIGIN]);
+        assert!(matches!(
+            too_few,
+            Err(MoleculeError::CoordinateCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert!(!mol.has_coords3());
+    }
+
+    #[test]
+    fn test_sites_are_independent_of_both_coordinate_sets() {
+        // The state a PDB reader produces: geometry from the file, site data
+        // from the same file, and a layout computed later for drawing. All
+        // three are indexed in parallel with `atoms` and none may disturb the
+        // others.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert!(!mol.has_sites());
+        assert!(mol.sites().is_none());
+        assert!(mol.site(0).is_none());
+
+        mol.set_coords3(vec![
+            Point3::new(0.0, 0.0, -1.0),
+            Point3::new(1.0, 0.0, 1.0),
+        ])
+        .unwrap();
+        mol.set_coords(vec![Point2::new(0.0, 0.0), Point2::new(1.5, 0.0)])
+            .unwrap();
+        mol.set_sites(vec![
+            AtomSite {
+                name: Some("CA".to_string()),
+                occupancy: Some(1.0),
+                b_factor: Some(23.45),
+                ..AtomSite::default()
+            },
+            AtomSite {
+                name: Some("OD1".to_string()),
+                partial_charge: Some(-0.4157),
+                ..AtomSite::default()
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(mol.site(0).unwrap().name.as_deref(), Some("CA"));
+        assert_eq!(mol.site(1).unwrap().partial_charge, Some(-0.4157));
+        assert_eq!(mol.coord3(1), Some(Point3::new(1.0, 0.0, 1.0)));
+        assert_eq!(mol.coord(1), Some(Point2::new(1.5, 0.0)));
+
+        // Clearing one leaves the other two standing.
+        mol.clear_sites();
+        assert!(!mol.has_sites());
+        assert!(mol.has_coords());
+        assert!(mol.has_coords3());
+    }
+
+    #[test]
+    fn test_a_b_factor_survives_untouched() {
+        // Pinned deliberately. OpenBabel zeroes this column on every PDB write,
+        // and a predicted structure reuses it for per-atom confidence — so the
+        // value has to come back exactly, and being different from that
+        // behaviour is the point rather than an accident.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.set_sites(vec![AtomSite {
+            b_factor: Some(87.31),
+            ..AtomSite::default()
+        }])
+        .unwrap();
+
+        let cloned = mol.clone();
+        assert_eq!(cloned.site(0).unwrap().b_factor, Some(87.31));
+
+        if let Some(sites) = mol.sites_mut() {
+            sites[0].occupancy = Some(0.5);
+        }
+        assert_eq!(mol.site(0).unwrap().b_factor, Some(87.31));
+        assert_eq!(mol.site(0).unwrap().occupancy, Some(0.5));
+    }
+
+    #[test]
+    fn test_set_sites_rejects_wrong_count() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        let too_few = mol.set_sites(vec![AtomSite::empty()]);
+        assert!(matches!(
+            too_few,
+            Err(MoleculeError::SiteCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert!(!mol.has_sites());
+
+        let too_many = mol.set_sites(vec![
+            AtomSite::empty(),
+            AtomSite::empty(),
+            AtomSite::empty(),
+        ]);
+        assert!(matches!(
+            too_many,
+            Err(MoleculeError::SiteCountMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+        assert!(!mol.has_sites());
+    }
+
+    // ---- residue and chain topology ------------------------------------
+
+    /// A two-chain structure: chain A with LYS 58 (3 atoms) and GLY 59 (2),
+    /// chain B with its own LYS 58 (2), then a trailing water in no residue.
+    fn two_chain_molecule() -> Molecule {
+        let mut mol = Molecule::new();
+        for _ in 0..8 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        mol
+    }
+
+    fn residue(name: &str, sequence: i32, chain_ix: usize, atoms: Range<usize>) -> Residue {
+        Residue {
+            name: name.to_string(),
+            sequence,
+            insertion_code: None,
+            label_seq: None,
+            chain_ix,
+            is_hetero: false,
+            atoms,
+        }
+    }
+
+    fn chain(id: &str, residues: Range<usize>) -> Chain {
+        Chain {
+            id: id.to_string(),
+            label_id: None,
+            residues,
+        }
+    }
+
+    fn two_chain_topology() -> (Vec<Chain>, Vec<Residue>) {
+        (
+            vec![chain("A", 0..2), chain("B", 2..3)],
+            vec![
+                residue("LYS", 58, 0, 0..3),
+                residue("GLY", 59, 0, 3..5),
+                residue("LYS", 58, 1, 5..7),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_the_same_residue_number_in_two_chains_stays_distinguishable() {
+        // The case a flat atom list cannot represent, and the reason topology
+        // exists: LYS 58 of chain A and LYS 58 of chain B are different
+        // residues, and a structure that conflates them is wrong in a way no
+        // atom-level check would catch.
+        let mut mol = two_chain_molecule();
+        let (chains, residues) = two_chain_topology();
+        mol.set_topology(chains, residues).unwrap();
+
+        assert!(mol.has_topology());
+        assert_eq!(mol.chains().len(), 2);
+        assert_eq!(mol.residues().len(), 3);
+
+        let a58 = mol.residue_of(0).unwrap();
+        let b58 = mol.residue_of(5).unwrap();
+        assert_eq!(a58.to_string(), "LYS 58");
+        assert_eq!(b58.to_string(), "LYS 58");
+        assert_ne!(a58.chain_ix, b58.chain_ix);
+        assert_eq!(mol.chain_of(0).unwrap().id, "A");
+        assert_eq!(mol.chain_of(5).unwrap().id, "B");
+    }
+
+    #[test]
+    fn test_residue_of_resolves_every_atom_and_admits_none() {
+        let mut mol = two_chain_molecule();
+        let (chains, residues) = two_chain_topology();
+        mol.set_topology(chains, residues).unwrap();
+
+        for atom in 0..3 {
+            assert_eq!(mol.residue_of(atom).unwrap().name, "LYS");
+        }
+        for atom in 3..5 {
+            assert_eq!(mol.residue_of(atom).unwrap().name, "GLY");
+        }
+        assert_eq!(mol.residue_of(6).unwrap().sequence, 58);
+
+        // Atoms 7 is past every range — a ligand appended without residue
+        // information is a legal molecule, not an error.
+        assert!(mol.residue_of(7).is_none());
+        assert!(mol.chain_of(7).is_none());
+        assert!(mol.residue_of(999).is_none());
+    }
+
+    #[test]
+    fn test_insertion_codes_make_three_residues_from_one_number() {
+        // 58, 58A and 58B are distinct residues. Without the code, a structure
+        // with an insertion collapses to a single residue and the extra atoms
+        // are silently reattributed.
+        let mut mol = Molecule::new();
+        for _ in 0..3 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        let residues = vec![
+            residue("LYS", 58, 0, 0..1),
+            Residue {
+                insertion_code: Some('A'),
+                ..residue("SER", 58, 0, 1..2)
+            },
+            Residue {
+                insertion_code: Some('B'),
+                ..residue("THR", 58, 0, 2..3)
+            },
+        ];
+        mol.set_topology(vec![chain("A", 0..3)], residues).unwrap();
+
+        let rendered: Vec<String> = mol.residues().iter().map(|r| r.to_string()).collect();
+        assert_eq!(rendered, vec!["LYS 58", "SER 58A", "THR 58B"]);
+        assert_ne!(mol.residues()[0], mol.residues()[1]);
+    }
+
+    #[test]
+    fn test_both_numbering_schemes_are_kept() {
+        // mmCIF's label_* and auth_* frequently disagree and neither is
+        // derivable from the other, so storing one renumbers the structure on
+        // write. A water carries label_seq: None, which is what mmCIF itself
+        // writes for a non-polymer.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        let residues = vec![
+            Residue {
+                label_seq: Some(12),
+                ..residue("LYS", 58, 0, 0..1)
+            },
+            Residue {
+                is_hetero: true,
+                label_seq: None,
+                ..residue("HOH", 401, 0, 1..2)
+            },
+        ];
+        mol.set_topology(
+            vec![Chain {
+                label_id: Some("C".to_string()),
+                ..chain("A", 0..2)
+            }],
+            residues,
+        )
+        .unwrap();
+
+        let lys = &mol.residues()[0];
+        assert_eq!((lys.sequence, lys.label_seq), (58, Some(12)));
+        let water = &mol.residues()[1];
+        assert_eq!((water.sequence, water.label_seq), (401, None));
+        assert!(water.is_hetero && !lys.is_hetero);
+        assert_eq!(mol.chains()[0].id, "A");
+        assert_eq!(mol.chains()[0].label_id.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn test_set_topology_rejects_every_broken_shape() {
+        // The ranges are the only thing tying residues to atoms, so each of
+        // these would silently attribute an atom to the wrong residue.
+        let base = two_chain_molecule;
+
+        // 1. an atom range past the last atom
+        let mut mol = base();
+        let err = mol
+            .set_topology(vec![chain("A", 0..1)], vec![residue("LYS", 1, 0, 0..99)])
+            .unwrap_err();
+        assert!(format!("{err}").contains("but the molecule has 8"), "{err}");
+        assert!(!mol.has_topology());
+
+        // 2. overlapping residue ranges
+        let mut mol = base();
+        let err = mol
+            .set_topology(
+                vec![chain("A", 0..2)],
+                vec![residue("LYS", 1, 0, 0..4), residue("GLY", 2, 0, 2..6)],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("must ascend"), "{err}");
+        assert!(!mol.has_topology());
+
+        // 3. a residue naming a chain that does not exist
+        let mut mol = base();
+        let err = mol
+            .set_topology(vec![chain("A", 0..1)], vec![residue("LYS", 1, 7, 0..3)])
+            .unwrap_err();
+        assert!(format!("{err}").contains("there are 1 chains"), "{err}");
+        assert!(!mol.has_topology());
+
+        // 4. a chain claiming more residues than exist
+        let mut mol = base();
+        let err = mol
+            .set_topology(vec![chain("A", 0..5)], vec![residue("LYS", 1, 0, 0..3)])
+            .unwrap_err();
+        assert!(format!("{err}").contains("but there are 1"), "{err}");
+        assert!(!mol.has_topology());
+
+        // 5. the two directions disagreeing about who owns a residue
+        let mut mol = base();
+        let err = mol
+            .set_topology(
+                vec![chain("A", 0..1), chain("B", 1..2)],
+                vec![residue("LYS", 1, 0, 0..3), residue("GLY", 2, 0, 3..5)],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("names chain 0"), "{err}");
+        assert!(!mol.has_topology());
+    }
+
+    /// Many residues, arranged to include every awkward shape: a gap before
+    /// the first, single-atom residues, gaps between residues, several chains,
+    /// and a tail of atoms past the last residue.
+    fn gappy_structure() -> Molecule {
+        const RESIDUES: usize = 200;
+        const CHAINS: usize = 5;
+        const PER_CHAIN: usize = RESIDUES / CHAINS;
+
+        let mut residues = Vec::with_capacity(RESIDUES);
+        let mut cursor = 2; // leading gap: atoms 0 and 1 belong to nothing
+        for ix in 0..RESIDUES {
+            // Alternating sizes, so single-atom residues are covered.
+            let size = if ix % 2 == 0 { 1 } else { 3 };
+            residues.push(residue(
+                "RES",
+                ix as i32,
+                ix / PER_CHAIN,
+                cursor..cursor + size,
+            ));
+            cursor += size;
+            // A gap after every fifth residue.
+            if ix % 5 == 4 {
+                cursor += 2;
+            }
+        }
+        let chains: Vec<Chain> = (0..CHAINS)
+            .map(|c| {
+                chain(
+                    "ABCDE".get(c..c + 1).unwrap(),
+                    c * PER_CHAIN..(c + 1) * PER_CHAIN,
+                )
+            })
+            .collect();
+
+        let mut mol = Molecule::new();
+        for _ in 0..cursor + 3 {
+            // trailing atoms past the last residue
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        mol.set_topology(chains, residues).unwrap();
+        mol
+    }
+
+    #[test]
+    fn test_residue_of_agrees_with_a_linear_scan_at_every_atom() {
+        // `residue_of` is a binary search over the ascending ranges, and a
+        // wrong predicate is an off-by-one that shows only at a boundary.
+        // Rather than guess which boundaries matter, check every atom against
+        // the obvious slow answer over a deliberately awkward layout. Size is
+        // not the point here — coverage of the boundaries is.
+        let mol = gappy_structure();
+        assert_eq!(mol.residues().len(), 200);
+        assert_eq!(mol.chains().len(), 5);
+
+        let mut hits = 0;
+        let mut misses = 0;
+        for atom in 0..mol.num_atoms() {
+            let expected = mol.residues().iter().find(|r| r.atoms.contains(&atom));
+            assert_eq!(mol.residue_of(atom), expected, "residue_of({atom})");
+
+            match expected {
+                Some(res) => {
+                    hits += 1;
+                    assert_eq!(
+                        mol.chain_of(atom),
+                        mol.chains().get(res.chain_ix),
+                        "chain_of({atom})"
+                    );
+                }
+                None => {
+                    misses += 1;
+                    assert!(mol.chain_of(atom).is_none(), "chain_of({atom})");
+                }
+            }
+        }
+
+        // The fixture has to actually contain both kinds of atom, or this
+        // whole test could pass vacuously.
+        assert!(
+            hits > 0 && misses > 0,
+            "{hits} in residues, {misses} in gaps"
+        );
+        assert!(mol.residue_of(mol.num_atoms()).is_none());
+        assert!(mol.residue_of(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_an_atom_in_a_gap_answers_none_rather_than_its_neighbour() {
+        // The `filter` after the binary search is what guarantees this: if the
+        // search lands on the wrong residue, membership rejects it and the
+        // answer is a miss rather than a confidently wrong residue. Anyone
+        // optimising that filter away would turn misses into wrong answers,
+        // so the property is pinned rather than left implicit.
+        let mut mol = Molecule::new();
+        for _ in 0..6 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        // Atoms 2 and 3 are in neither residue.
+        mol.set_topology(
+            vec![chain("A", 0..2)],
+            vec![residue("LYS", 1, 0, 0..2), residue("GLY", 2, 0, 4..6)],
+        )
+        .unwrap();
+
+        assert_eq!(mol.residue_of(1).unwrap().name, "LYS");
+        assert!(mol.residue_of(2).is_none());
+        assert!(mol.residue_of(3).is_none());
+        assert_eq!(mol.residue_of(4).unwrap().name, "GLY");
+    }
+
+    #[test]
+    fn test_clear_topology_leaves_the_per_atom_tables_alone() {
+        let mut mol = two_chain_molecule();
+        let (chains, residues) = two_chain_topology();
+        mol.set_topology(chains, residues).unwrap();
+        mol.set_coords(vec![Point2::ORIGIN; 8]).unwrap();
+
+        mol.clear_topology();
+        assert!(!mol.has_topology());
+        assert!(mol.residues().is_empty() && mol.chains().is_empty());
+        assert!(mol.has_coords());
+    }
+
+    // ---- unit cell -----------------------------------------------------
+
+    #[test]
+    fn test_the_cell_survives_adding_an_atom() {
+        // The one exception to the rule the test below asserts. Every other
+        // optional field is indexed by or into the atoms, so appending
+        // invalidates it. A lattice is not: adding an atom to a crystal leaves
+        // its unit cell exactly as true as it was, and clearing it here would
+        // throw away data for no reason.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        let cell = UnitCell::new(9.42, 10.15, 11.32, 88.7, 79.4, 64.2);
+        mol.set_cell(cell).unwrap();
+        mol.set_space_group(SpaceGroup::from_number(2));
+        mol.set_coords(vec![Point2::ORIGIN]).unwrap();
+
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert!(!mol.has_coords(), "the layout still goes");
+        assert_eq!(mol.cell(), Some(cell), "the cell must not");
+        assert_eq!(mol.space_group().unwrap().number, Some(2));
+    }
+
+    #[test]
+    fn test_set_cell_rejects_a_cell_that_describes_no_lattice() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        // Legal angles individually, impossible together.
+        let err = mol
+            .set_cell(UnitCell::new(5.0, 5.0, 5.0, 170.0, 170.0, 170.0))
+            .unwrap_err();
+        assert!(format!("{err}").contains("describe no real cell"), "{err}");
+        assert!(!mol.has_cell());
+
+        let err = mol
+            .set_cell(UnitCell::new(0.0, 5.0, 5.0, 90.0, 90.0, 90.0))
+            .unwrap_err();
+        assert!(format!("{err}").contains("edge a"), "{err}");
+        assert!(!mol.has_cell());
+
+        // And a good one still lands.
+        assert!(mol.set_cell(UnitCell::cubic(4.0)).is_ok());
+        assert!(mol.has_cell());
+        mol.clear_cell();
+        assert!(!mol.has_cell());
+    }
+
+    #[test]
+    fn test_the_cell_converts_this_molecules_coordinates() {
+        // The reason the cell lives on the molecule rather than beside it: a
+        // conformer read as fractional coordinates becomes Cartesian through
+        // the structure's own lattice, and back again for writing.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::oxygen()));
+        mol.set_cell(UnitCell::new(9.42, 10.15, 11.32, 88.7, 79.4, 64.2))
+            .unwrap();
+
+        let fractional = [Point3::new(0.25, 0.5, 0.75), Point3::new(0.9, 0.1, 0.3)];
+        let cell = mol.cell().unwrap();
+        mol.set_coords3(fractional.iter().map(|f| cell.to_cartesian(*f)).collect())
+            .unwrap();
+
+        for (ix, original) in fractional.iter().enumerate() {
+            let back = cell.to_fractional(mol.coord3(ix).unwrap());
+            assert!((back.x - original.x).abs() < 1e-12);
+            assert!((back.y - original.y).abs() < 1e-12);
+            assert!((back.z - original.z).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_adding_an_atom_drops_everything_a_file_supplied() {
+        // The conformer goes for the same reason the layout does: it would be
+        // one short, and there is no position to invent for the new atom. The
+        // site table goes with them, and so does the topology — `add_atom` is
+        // the only method that can change the atom count, so it is the only
+        // place this invariant has to be maintained, and missing one table
+        // here is how a charge silently ends up on the wrong atom or an atom
+        // vanishes from a PDB write by belonging to no residue.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.set_coords3(vec![Point3::ORIGIN]).unwrap();
+        mol.set_coords(vec![Point2::ORIGIN]).unwrap();
+        mol.set_sites(vec![AtomSite {
+            b_factor: Some(12.0),
+            ..AtomSite::default()
+        }])
+        .unwrap();
+
+        mol.set_topology(
+            vec![Chain {
+                id: "A".to_string(),
+                label_id: None,
+                residues: 0..1,
+            }],
+            vec![Residue {
+                name: "LIG".to_string(),
+                sequence: 1,
+                insertion_code: None,
+                label_seq: None,
+                chain_ix: 0,
+                is_hetero: true,
+                atoms: 0..1,
+            }],
+        )
+        .unwrap();
+
+        mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert!(!mol.has_coords3());
+        assert!(!mol.has_coords());
+        assert!(!mol.has_sites());
+        assert!(!mol.has_topology());
     }
 
     #[test]

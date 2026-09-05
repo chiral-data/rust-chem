@@ -108,6 +108,78 @@ jobs:
             exit 1
           fi
 
+      # --- the crate stays pure Rust -------------------------------------------
+      #
+      # The milestone's central constraint: no FFI, no `*-sys` crate, no build.rs
+      # invoking a C compiler, no run-time subprocess to a chemistry toolkit. It
+      # was a paragraph in the tracking issue, enforced by nothing, and the risk
+      # it manages is decay rather than intent — a transitive bump pulls in a C
+      # dependency and the constraint is gone with a green build.
+      #
+      # These are not the strongest check. The `Web (WASM) Build` job is:
+      # nothing needing a C compiler survives wasm32-unknown-unknown. These are
+      # the *legible* one. They make the intent visible to whoever next
+      # considers a -sys crate, and they fail with a sentence rather than with a
+      # linker error on a target the author was not thinking about. Do not
+      # delete them as redundant.
+      #
+      # Scoped to the lean build on purpose. `--all-features` pulls wgpu, whose
+      # tree legitimately contains objc-sys, js-sys, web-sys, windows-sys and
+      # friends — platform and JavaScript bindings, not bundled C. Banning those
+      # would mean banning `gpu`. What must stay pure is what a consumer gets by
+      # default. The toolkit rule below is the one that applies everywhere.
+      - name: The lean build binds no C library
+        run: |
+          lean() { cargo tree -p chem --no-default-features -e "$1" --prefix none -f '{p}' | awk '{print $1}' | sort -u; }
+
+          if lean normal | grep -qE -- '-sys$'; then
+            echo "::error::a -sys crate reached the default build; the crate must need only a Rust toolchain"
+            lean normal | grep -E -- '-sys$'
+            exit 1
+          fi
+
+          # `links` is how a package declares it binds a native library, and is
+          # the honest signal — a crate need not be named *-sys to bind one.
+          cargo metadata --format-version 1 \
+            | jq -r '.packages[] | select(.links != null) | .name' | sort -u > /tmp/links.txt
+          if lean normal > /tmp/lean.txt && grep -Fxf /tmp/links.txt /tmp/lean.txt; then
+            echo "::error::a package in the default build declares a native library (links key)"
+            exit 1
+          fi
+
+          # Directly encodes "no build.rs invoking a C compiler".
+          #
+          # `normal,build` rather than `build`: on its own, `-e build` walks
+          # only build edges *from the root*, so it reports `chem` and nothing
+          # else however much C is further down. Adding a dependency on
+          # libz-sys left it green while the -sys rules above both fired;
+          # `normal,build` surfaces the cc, pkg-config and vcpkg underneath it.
+          if lean normal,build | grep -qE '^(cc|cmake|bindgen|pkg-config)$'; then
+            echo "::error::a C-toolchain build dependency reached the default build"
+            lean normal,build | grep -E '^(cc|cmake|bindgen|pkg-config)$'
+            exit 1
+          fi
+
+      - name: The chemistry toolkits stay oracles, never dependencies
+        run: |
+          # Unlike the rules above this applies at every feature set: a toolkit
+          # behind an optional feature is still a toolkit in the tree.
+          #
+          # chemfiles is named because it is the trap — a pure-Rust-looking API
+          # with C++ underneath, and exactly what someone reaches for when a
+          # format looks tedious. RDKit and OpenBabel belong in tools/oracle/,
+          # which drives them as subprocesses in their own image and is never
+          # named in any Cargo.toml.
+          if cargo tree -e normal --all-features | grep -qEi 'openbabel|rdkit|chemfiles'; then
+            echo "::error::a chemistry toolkit reached the dependency graph; it belongs in tools/oracle/"
+            cargo tree -e normal --all-features | grep -Ei 'openbabel|rdkit|chemfiles'
+            exit 1
+          fi
+          if grep -rn 'Command::new' crates/*/src | grep -Ei 'obabel|rdkit|python'; then
+            echo "::error::the library shells out to a chemistry toolkit at run time"
+            exit 1
+          fi
+
       - name: Packaging is publishable
         run: cargo publish -p chem --dry-run --locked --all-features
 
@@ -183,3 +255,22 @@ jobs:
       - name: Build web bundle
         working-directory: crates/chem-app
         run: trunk build --release
+
+  oracle:
+    name: Differential oracles
+    runs-on: ubuntu-latest
+
+    # Its own job, parallel to the Rust ones, because it needs Docker and will
+    # be the slowest thing in this file. A `cargo fmt` fix must not wait on
+    # RDKit and OpenBabel installing.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the oracle image
+        run: docker build -t chem-oracle -f tools/oracle/Dockerfile .
+
+      # Fails on `chem` disagreeing with an oracle. Oracle-vs-oracle
+      # disagreements and pinned known gaps are reported and do not fail —
+      # see the module docstring in tools/oracle/run.py.
+      - name: Run the corpus against RDKit and OpenBabel
+        run: docker run --rm chem-oracle

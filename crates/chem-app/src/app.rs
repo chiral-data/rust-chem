@@ -62,7 +62,9 @@ pub struct WorkbenchApp {
 impl WorkbenchApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self {
-            state: AppState::new(),
+            // The frame loop itself, so work that finishes off-frame can wake
+            // it rather than waiting for the user's next input (#186).
+            state: AppState::new(&cc.egui_ctx),
             views: Views::default(),
             windows: WindowRegistry::default(),
             fps_counter: 0.0,

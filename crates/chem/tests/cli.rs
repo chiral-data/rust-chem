@@ -484,8 +484,71 @@ fn test_coords_output_actually_carries_the_coordinates() {
     let rows: Vec<&str> = info.stdout.lines().skip(1).collect();
     assert_eq!(rows.len(), 3);
     for row in rows {
-        assert!(row.ends_with("\tyes"), "no coordinates in {row:?}");
+        // The 2D column specifically: `chem coords` computes a depiction, and
+        // a layout written to SDF comes back a layout rather than a conformer.
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(fields[3], "yes", "no layout in {row:?}");
+        assert_eq!(fields[4], "no", "a layout must not become a conformer");
     }
+}
+
+#[test]
+fn test_coords_on_a_3d_file_writes_the_depiction_it_computed() {
+    // A conformer outranks a layout in the SDF writer, so without an explicit
+    // drop `chem coords` would report "laid out 1" and then emit the input
+    // untouched — doing the work and discarding it. The depiction has to win
+    // here, because producing one is the entire command.
+    let sdf = "\
+Acetone
+APtclcactv06051922463D 0   0.00000     0.00000
+
+  4  3  0  0  0  0  0  0  0  0999 V2000
+    1.3051    0.6772    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000   -0.0763    0.8900 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -1.3051    0.6772   -0.8900 C   0  0  0  0  0  0  0  0  0  0  0  0
+   -0.0000   -1.2839    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+  2  3  1  0  0  0  0
+  2  4  2  0  0  0  0
+M  END
+$$$$
+";
+    let path = fixture("coords-3d.sdf", sdf);
+    let r = run(&["coords", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    assert!(
+        r.stderr
+            .contains("discarded the 3D conformer of 1 molecules"),
+        "dropping geometry has to be announced: {:?}",
+        r.stderr
+    );
+
+    // Every z is zero now, and the header says 2D rather than 3D.
+    let z: Vec<&str> = r
+        .stdout
+        .lines()
+        .skip(4)
+        .take(4)
+        .map(|line| line.split_whitespace().nth(2).unwrap())
+        .collect();
+    assert_eq!(
+        z,
+        vec!["0.0000", "0.0000", "0.0000", "0.0000"],
+        "{:?}",
+        r.stdout
+    );
+    assert!(r.stdout.lines().nth(1).unwrap().contains("2D"));
+
+    // And reading it back finds a layout, not a conformer.
+    let info = run(&["info", "--format", "sdf"], Some(&r.stdout));
+    let row = info.stdout.lines().nth(1).unwrap();
+    let fields: Vec<&str> = row.split('\t').collect();
+    assert_eq!(fields[3], "yes", "no layout in {row:?}");
+    assert_eq!(
+        fields[4], "no",
+        "conformer should have been dropped: {row:?}"
+    );
 }
 
 #[test]
@@ -493,14 +556,16 @@ fn test_coords_warns_rather_than_silently_discarding_the_result() {
     let path = fixture("coords-warn.smi", KEKULE);
 
     // Explicitly asking for SMILES is allowed — connectivity only is a real
-    // want — but it must say what it is costing.
+    // want — but it must say what it is costing. The wording comes from the
+    // format registry now rather than a hand-written string, so this asserts
+    // on the attribute that was lost rather than on a sentence.
     let r = run(
         &["coords", path.to_str().unwrap(), "--out-format", "smiles"],
         None,
     );
     assert_eq!(r.code, 0);
-    assert!(r.stderr.contains("warning:"), "{:?}", r.stderr);
-    assert!(r.stderr.contains("cannot store them"));
+    assert!(r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("coords_2d"), "{:?}", r.stderr);
 
     // And an output name that is not .sdf is the same mistake made implicitly.
     // Named `-dest` rather than reusing the fixture stem: the first draft of
@@ -516,7 +581,99 @@ fn test_coords_warns_rather_than_silently_discarding_the_result() {
         ],
         None,
     );
-    assert!(r.stderr.contains("will be discarded"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("coords_2d"), "{:?}", r.stderr);
+}
+
+/// Two nitro compounds, whose charges an SDF write drops.
+///
+/// The registry says `Format::SDF` does not carry `formal_charge`, because
+/// `write_sdf` documents that it does not write the field. Real files in
+/// `test.smi` hit this, so it is not a contrived case.
+/// Two molecules that lose the *same* attribute when written.
+///
+/// **Coordinates on the way to SMILES**, which is a structural limit rather
+/// than a gap: a SMILES string has nowhere to put a position and never will.
+///
+/// The earlier choices both stopped being losses as the writers improved —
+/// formal charge until #197 taught V2000 `M  CHG`, then double-bond geometry
+/// until #198 taught the layout to draw it — and each time these tests failed
+/// by reporting *nothing*, which was the drop report being honest rather than
+/// broken. Picking a loss that cannot be fixed stops that recurring.
+const LAID_OUT: &str = "F/C=C/F trans-difluoroethene\nF/C=C\\F cis-difluoroethene\n";
+
+#[test]
+fn test_a_write_that_loses_nothing_says_nothing() {
+    // The regression a general mechanism most easily introduces: noise on the
+    // path that was previously quiet. SMILES in, SMILES out drops nothing.
+    let path = fixture("drops-none.smi", GOOD);
+    let r = run(&["aromatic", path.to_str().unwrap()], None);
+
+    assert_eq!(r.code, 0);
+    assert!(
+        !r.stderr.contains("cannot carry"),
+        "a lossless write reported a loss: {:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_the_summary_names_each_lost_attribute_once() {
+    // Two molecules lose the same attribute, and the default report is one
+    // line with a count rather than one line per molecule — the whole reason
+    // the per-molecule form is behind a flag.
+    let path = fixture("drops-charge.smi", LAID_OUT);
+    let dest = std::env::temp_dir().join("chem-cli-test-drops-charge-out.smi");
+    let _ = std::fs::remove_file(&dest);
+
+    // `coords` computes a layout, and SMILES has nowhere to keep it.
+    let r = run(
+        &[
+            "coords",
+            path.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    );
+
+    assert_eq!(r.code, 0);
+    assert!(r.stderr.contains("coords_2d (2)"), "{:?}", r.stderr);
+    // The molecules are not named without the flag.
+    assert!(!r.stderr.contains("difluoroethene"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("--explain-drops"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_explain_drops_names_the_molecules() {
+    let path = fixture("drops-explain.smi", LAID_OUT);
+    let dest = std::env::temp_dir().join("chem-cli-test-drops-explain-out.smi");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(
+        &[
+            "coords",
+            path.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+            "--explain-drops",
+        ],
+        None,
+    );
+
+    assert_eq!(r.code, 0);
+    assert!(
+        r.stderr.contains("trans-difluoroethene: coords_2d"),
+        "{:?}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("cis-difluoroethene: coords_2d"),
+        "{:?}",
+        r.stderr
+    );
+    // The pointer to the flag is pointless once the flag is on.
+    assert!(!r.stderr.contains("--explain-drops"), "{:?}", r.stderr);
 }
 
 #[test]

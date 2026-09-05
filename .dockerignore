@@ -1,0 +1,7 @@
+# The oracle image builds from the repository root, because it needs the crate
+# to build the binary it drives. Without this it also ships `target/`, which is
+# multi-gigabyte, invalidates the build cache on every local `cargo build`, and
+# filled this machine's disk the first time the harness was iterated on.
+target/
+crates/chem-app/dist-e2e/
+.git/

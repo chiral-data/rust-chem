@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use backend::Backend;
 use chem::draw::structure::{StructureOptions, StructureTheme};
 use chem::draw::svg::structure_to_svg;
+use chem::io::format::Carries;
 use chem::io::reader::Format;
 use clap::{Parser, Subcommand, ValueEnum};
 use emath::Vec2;
@@ -55,6 +56,14 @@ struct Cli {
     /// away the other 999. On for a job that must not half-succeed.
     #[arg(long, global = true)]
     strict: bool,
+
+    /// List the molecules behind a "cannot carry" summary, one line each.
+    ///
+    /// Off by default because the summary is what a hundred-thousand-molecule
+    /// file needs; on when a conversion surprised you and the question is
+    /// which records it touched.
+    #[arg(long, global = true)]
+    explain_drops: bool,
 }
 
 #[derive(Subcommand)]
@@ -222,8 +231,14 @@ impl Theme {
     }
 }
 
-/// `chem::io::reader::Format` is not ours to derive `ValueEnum` on, so this is the
-/// clap-facing mirror. Kept adjacent to its conversion so the two cannot drift.
+/// `chem::io::reader::Format` is a registry handle and not ours to derive
+/// `ValueEnum` on, so this is the clap-facing mirror. Kept adjacent to its
+/// conversion so the two cannot drift.
+///
+/// The mirror stays hand-written on purpose while the CLI exposes exactly two
+/// input formats. Generating the value list from the registry is what the
+/// `-L formats` story does, and doing it here first would mean two half-built
+/// mechanisms.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FormatArg {
     Smiles,
@@ -233,8 +248,8 @@ enum FormatArg {
 impl From<FormatArg> for Format {
     fn from(value: FormatArg) -> Self {
         match value {
-            FormatArg::Smiles => Format::Smiles,
-            FormatArg::Sdf => Format::Sdf,
+            FormatArg::Smiles => Format::SMILES,
+            FormatArg::Sdf => Format::SDF,
         }
     }
 }
@@ -370,7 +385,10 @@ fn run(cli: &Cli) -> Result<i32> {
                 records.len()
             );
 
-            let format = OutputFormat::resolve(*out_format, false, output.as_deref());
+            // Perceiving aromaticity adds nothing a format has to make room
+            // for, so no format is required and the default stands.
+            let format = OutputFormat::resolve(*out_format, Carries::empty(), output.as_deref());
+            write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
             stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
@@ -400,6 +418,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut laid_out = 0;
             let mut kept = 0;
             let mut failed = 0;
+            let mut flattened = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
                 let mut molecule = record.molecule.clone();
@@ -416,11 +435,41 @@ fn run(cli: &Cli) -> Result<i32> {
                 } else {
                     laid_out += 1;
                 }
+
+                // This command produces a depiction, and an SDF atom block
+                // holds one set of positions. A conformer outranks a layout on
+                // write — it is the more valuable data — so leaving it in place
+                // would emit the input unchanged after reporting that a layout
+                // was computed. Drop it, and say so rather than let someone
+                // find a 3D file where they asked for a drawing.
+                //
+                // Reported here rather than by `write::report_drops`, and not
+                // for want of trying: `Carries` is a set of per-attribute
+                // capabilities, and SDF genuinely carries both COORDS_2D and
+                // COORDS_3D. What it cannot do is carry them *at the same
+                // time*, which a flat mask has no way to say. This loss is
+                // also this command's own decision rather than the format's
+                // limit, so deriving it from the mask would report a true
+                // thing for a false reason.
+                if ok && molecule.has_coords3() {
+                    molecule.clear_coords3();
+                    flattened += 1;
+                }
+
                 records.push((record.name.clone(), molecule));
             }
             eprintln!("laid out {laid_out}, kept {kept} existing, {failed} without coordinates");
+            if flattened > 0 {
+                eprintln!(
+                    "discarded the 3D conformer of {flattened} molecules: this writes a 2D depiction, and one atom block cannot carry both"
+                );
+            }
 
-            let format = OutputFormat::resolve(*out_format, true, output.as_deref());
+            // A layout is the thing this command produced, so the default
+            // format is whichever registered one can hold it — SDF — rather
+            // than SDF by name.
+            let format = OutputFormat::resolve(*out_format, Carries::COORDS_2D, output.as_deref());
+            write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
             stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
@@ -617,15 +666,21 @@ fn note_cpu_only(cli: &Cli) {
 /// A tab-separated row per molecule: parseable by `cut` and `awk`, which is the
 /// point of stdout being data.
 fn describe(read: &stream::Input) -> String {
-    let mut out = String::from("name\tatoms\tbonds\tcoords\n");
+    // Two coordinate columns rather than one, because a layout and a conformer
+    // are different things and a file can carry either. Folding them into a
+    // single `coords` column would report "no" for a 3D structure that has
+    // geometry but no depiction, which is the wrong answer to the question
+    // anyone is actually asking.
+    let mut out = String::from("name\tatoms\tbonds\tcoords2d\tcoords3d\n");
     for record in &read.outcome.records {
         let molecule = &record.molecule;
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             record.name,
             molecule.num_atoms(),
             molecule.num_bonds(),
             if molecule.has_coords() { "yes" } else { "no" },
+            if molecule.has_coords3() { "yes" } else { "no" },
         ));
     }
     out

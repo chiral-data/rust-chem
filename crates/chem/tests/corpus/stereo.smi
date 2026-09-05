@@ -1,0 +1,18 @@
+# Stereochemistry: tetrahedral centres and double-bond geometry.
+#
+# Every line here was a pinned gap until #191 — the parser rejected chirality
+# markers and directional bonds outright, so none of them loaded at all. They
+# now parse and round-trip.
+#
+# The reversed spellings are the ones worth keeping: `C(/F)=C/F` carries the
+# same two `/` as `F/C=C/F` and means the opposite, because the first marker
+# is written pointing away from the double bond. A writer and a parser that
+# disagree about that sign flip cis and trans between them.
+
+N[C@@H](C)C(=O)O l-alanine
+N[C@H](C)C(=O)O d-alanine
+F/C=C/F trans
+F/C=C\F cis
+C(/F)=C/F trans-reversed-spelling
+C(\F)=C/F cis-reversed-spelling
+O[C@H]1CC[C@@H](O)CC1 trans-cyclohexanediol

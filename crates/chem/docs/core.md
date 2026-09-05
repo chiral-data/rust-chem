@@ -10,6 +10,9 @@ ChemCore provides the fundamental building blocks for representing molecules:
 - **Bonds**: Connections with order and stereochemistry
 - **Molecules**: Complete molecular structures
 - **Graph**: Efficient connectivity queries
+- **Side tables**: Per-atom data a file supplied — 2D layout, 3D conformer, atom sites
+- **Topology**: Chains and residues, for the formats organised by them
+- **Unit cell**: Lattice and space group, for periodic structures
 
 ## Quick Start
 
@@ -302,6 +305,16 @@ Graph (star):
 - Aromaticity flag
 - Implicit hydrogens (calculated or set)
 
+Note what is **not** here: no coordinates, no partial charge, no occupancy, no
+temperature factor, no atom name. Those live on the molecule as side tables, for
+two reasons.
+
+The mechanical one is that `Atom` derives `Eq`, and every one of them is a float.
+The honest one is that they are a different kind of fact. An element is a
+property of a species; a B-factor is a property of one *observation* of it. Two
+files describing the same molecule will agree on the first and disagree on the
+second.
+
 ### 2. Bonds Store Connectivity
 
 - Two atom indices
@@ -314,6 +327,113 @@ Graph (star):
 - Collection of bonds
 - Graph for fast queries
 - Properties (metadata)
+- Up to three per-atom side tables, each independently present or absent
+- Chain and residue topology, for structural formats
+- A unit cell and space group, for periodic structures
+
+### 3a. The Side Tables
+
+Each is `Option<Vec<T>>`, indexed in parallel with `atoms`, and all-or-nothing —
+there is no meaningful state where only some atoms have a position.
+
+| Table | Type | Comes from | Accessors |
+|---|---|---|---|
+| 2D layout | `Point2` | a layout pass, or a flat SDF | `coords`, `coord`, `set_coords`, … |
+| 3D conformer | `Point3` | a file that states geometry: XYZ, PDB, Mol2, a 3D SDF | `coords3`, `coord3`, `set_coords3`, … |
+| Atom sites | `AtomSite` | file columns: name, alt-loc, partial charge, occupancy, B-factor, radius | `sites`, `site`, `set_sites`, … |
+
+**The layout and the conformer are different artefacts, and neither is derivable
+from the other.** A layout is computed for drawing; a conformer is physical. A
+molecule read from a 3D file and then laid out for display legitimately has both,
+and depiction wants the first while a conversion to XYZ wants the second.
+Projecting a conformer to get a layout superimposes atoms that differ only in
+depth, which is why `Point3::to_2d` is explicit rather than a `From` impl.
+
+`set_*` rejects a length that is not exactly one per atom, because the tables are
+positional: a mismatch would silently attribute a charge or a B-factor to the
+wrong atom.
+
+### 3b. Residue and Chain Topology
+
+Separate from the side tables, because chains and residues are not indexed in
+parallel with the atoms — they are collections that *own* ranges of them.
+
+```
+Molecule
+ ├── chains:   Vec<Chain>     — each owns a Range into residues
+ └── residues: Vec<Residue>   — each owns a Range into atoms
+```
+
+Empty means absent; there is no `Option` wrapper, unlike the side tables above.
+
+**Ranges, not a residue index on every atom.** PDB and mmCIF already order their
+records this way and it costs nothing per atom. The price is real and enforced:
+a residue's atoms must be *contiguous*, and the ranges must *ascend* — the
+latter because `residue_of` binary-searches them. `set_topology` validates both,
+plus that ranges stay in bounds and that a residue's `chain_ix` agrees with the
+chain claiming it. An interleaved file is rejected rather than represented.
+
+Ranges need not cover every atom. A ligand appended with no residue information
+is a legal molecule, and `residue_of` answers `None` for it.
+
+**Every residue is numbered twice.** `sequence` is the depositor's number
+(`auth_seq_id`) — what PDB files carry and what papers cite — and `label_seq` is
+mmCIF's canonical one, which is `None` for waters and ligands. They frequently
+disagree and neither is derivable from the other, so reading one and writing the
+other silently renumbers a structure. Chains carry the same pair as `id` and
+`label_id`.
+
+Residue identity is the **(chain, sequence, insertion code)** triple, never the
+number alone: `58`, `58A` and `58B` are three residues, and two chains may each
+have their own `58`.
+
+**`add_atom` drops all three tables and the topology.** It is the only method
+that can change the atom count — there is no `remove_atom`, and `atoms_mut()`
+returns a slice, so the length cannot change through it. That single choke point
+is what makes the parallel-array model safe. Appending does not strictly
+invalidate a residue range, but it leaves an atom belonging to no residue that a
+PDB write would silently drop, so one rule covers everything.
+
+### 3c. The Unit Cell
+
+For a periodic structure — CIF, ShelX, VASP, CASTEP — the lattice is not
+metadata attached to the coordinates. Without it the coordinates do not mean
+anything.
+
+```
+Molecule
+ ├── cell:        Option<UnitCell>    — a, b, c (Ångström) and α, β, γ (degrees)
+ └── space_group: Option<SpaceGroup>  — number and symbol, as the file wrote them
+```
+
+**The orientation is a convention, and getting it wrong is silent.** A lattice
+can be placed in Cartesian space in more than one way, and the choices differ by
+a rotation. This uses the near-universal setting — **a along x, b in the xy
+plane, c taking up the rest** — the one PDB, CIF and every toolkit assume. Pick
+differently and bond lengths are still right, the volume is still right, nothing
+throws, and every coordinate sits in a rotated frame.
+
+That is why the tests assert the convention directly (`to_cartesian(1,0,0)` must
+be `(a, 0, 0)`) and recover the six cell parameters back out of the basis
+vectors, rather than only round-tripping. A round trip passes under a wrong
+convention — the matrix is still invertible.
+
+**Fractional coordinates are not a third coordinate set.** They convert to
+Cartesian on read and back on write; `Molecule` always holds Cartesian.
+Storing fractional directly would give the conformer two meanings depending on
+a flag somewhere else.
+
+**Space groups are stored exactly as given and never validated.** Real files
+pair a number with a symbol that contradicts it. Round-tripping what was
+supplied is most of what correctness means, and a converter that refuses a
+self-inconsistent file is less useful than one that reads it faithfully.
+Symmetry *operations* — expanding an asymmetric unit into a full cell — are out
+of scope here; this records which group, not the operator list.
+
+**The cell survives `add_atom`**, alone among the optional fields. Everything in
+3a and 3b is indexed by or into the atoms, so appending invalidates it. A
+lattice references nothing atom-indexed: adding an atom to a crystal does not
+change its unit cell.
 
 ### 4. Graph Enables Queries
 

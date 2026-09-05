@@ -235,12 +235,12 @@ mod tests {
         let mut files = LoadedFiles::new(
             "first.smi".to_string(),
             dataset_of(&["C", "CC"]),
-            DatasetFormat::Smiles,
+            DatasetFormat::SMILES,
         );
         files.add_and_activate(
             "second.sdf".to_string(),
             dataset_of(&["c1ccccc1"]),
-            DatasetFormat::Sdf,
+            DatasetFormat::SDF,
         );
 
         // The list shows all three of these per entry; before `entries` it
@@ -260,8 +260,8 @@ mod tests {
     #[test]
     fn test_entries_are_in_load_order_not_activation_order() {
         let mut files =
-            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::Smiles);
-        files.add_and_activate("b".to_string(), dataset_of(&["CC"]), DatasetFormat::Smiles);
+            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::SMILES);
+        files.add_and_activate("b".to_string(), dataset_of(&["CC"]), DatasetFormat::SMILES);
         files.activate(0);
 
         // Switching back must not reorder the list under the user.
@@ -273,16 +273,16 @@ mod tests {
     /// Three entries whose molecule counts identify them: 1, 2 and 3.
     fn three_files() -> LoadedFiles {
         let mut files =
-            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::Smiles);
+            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::SMILES);
         files.add_and_activate(
             "b".to_string(),
             dataset_of(&["C", "CC"]),
-            DatasetFormat::Smiles,
+            DatasetFormat::SMILES,
         );
         files.add_and_activate(
             "c".to_string(),
             dataset_of(&["C", "CC", "CCC"]),
-            DatasetFormat::Smiles,
+            DatasetFormat::SMILES,
         );
         files
     }
@@ -348,7 +348,7 @@ mod tests {
         let mut files = LoadedFiles::new(
             "only".to_string(),
             dataset_of(&["C"]),
-            DatasetFormat::Smiles,
+            DatasetFormat::SMILES,
         );
 
         assert!(!files.can_remove());
@@ -384,11 +384,11 @@ mod tests {
     #[test]
     fn test_reloading_a_name_replaces_it_rather_than_appending() {
         let mut files =
-            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::Smiles);
+            LoadedFiles::new("a".to_string(), dataset_of(&["C"]), DatasetFormat::SMILES);
         files.add_and_activate(
             "a".to_string(),
             dataset_of(&["C", "CC", "CCC"]),
-            DatasetFormat::Smiles,
+            DatasetFormat::SMILES,
         );
 
         assert_eq!(files.entries().len(), 1);
