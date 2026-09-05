@@ -518,6 +518,27 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(mol2_supplier),
         writer_stream: Some(mol2_writer_stream),
     },
+    FormatDescriptor {
+        name: "PDBQT",
+        codes: &["pdbqt"],
+        extensions: &["pdbqt"],
+        category: Category::MolecularDynamicsAndDocking,
+        // PDB's own mask plus PARTIAL_CHARGE (the new AutoDock charge
+        // column) and AROMATICITY (the `A` atom type). No UNIT_CELL --
+        // real ligand PDBQT carries no cell; AutoGrid's cell lives in a
+        // separate grid-parameter file, not the ligand PDBQT itself.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::RESIDUES)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::AROMATICITY),
+        reader: Some(crate::io::reader::read_pdbqt_with_options),
+        writer: Some(write_pdbqt_records),
+        supplier: Some(pdbqt_supplier),
+        writer_stream: Some(pdbqt_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -548,6 +569,10 @@ fn mol2_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Sup
     Box::new(crate::io::supplier::Mol2Supplier::new(reader, options))
 }
 
+fn pdbqt_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::PdbqtSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -574,6 +599,10 @@ fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dy
 
 fn mol2_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::Mol2Writer::new(writer, options))
+}
+
+fn pdbqt_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::PdbqtWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -659,6 +688,16 @@ fn write_mol2_records(records: &[(String, Molecule)], _options: &WriteOptions) -
     out
 }
 
+fn write_pdbqt_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // PDBQT has no write options today, and no per-record name to thread
+    // through -- see `PdbqtWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::pdbqt::write_pdbqt(molecule));
+    }
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -685,6 +724,9 @@ impl Format {
     pub const MMCIF: Format = Format(5);
     /// Mol2 (#225) — a curated SYBYL type subset, see [`crate::io::mol2`].
     pub const MOL2: Format = Format(6);
+    /// PDBQT (#226) — a new rotatable-bond/fragment-decomposition
+    /// algorithm on write, see [`crate::io::pdbqt`].
+    pub const PDBQT: Format = Format(7);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1146,7 +1188,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 7);
+        assert_eq!(all().count(), 8);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

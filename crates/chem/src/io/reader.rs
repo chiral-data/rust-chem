@@ -497,6 +497,58 @@ fn push_mol2_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_pdbqt_with_options`] with default options.
+pub fn read_pdbqt(content: &str) -> ReadOutcome {
+    read_pdbqt_with_options(content, &ReadOptions)
+}
+
+/// One molecule per structure. `ENDMDL` is the record boundary for a
+/// `MODEL`/`ENDMDL`-wrapped multi-pose file (AutoDock Vina's real docked-
+/// results output shape) (#226) -- mirrors [`read_pdb_with_options`]
+/// exactly, since PDBQT borrows this framing directly from PDB.
+pub fn read_pdbqt_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        lines.push(line);
+        if line.trim() == "ENDMDL" {
+            position += 1;
+            push_pdbqt_record(&mut out, &lines, position);
+            lines.clear();
+        }
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_pdbqt_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_pdbqt_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::pdbqt::parse_pdbqt(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

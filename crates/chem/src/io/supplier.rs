@@ -782,6 +782,105 @@ impl<W: Write> Writer for Mol2Writer<W> {
     }
 }
 
+/// One molecule per structure. `ENDMDL` is the record boundary for a
+/// `MODEL`/`ENDMDL`-wrapped multi-pose file (#226), mirroring
+/// [`PdbSupplier`] exactly -- PDBQT borrows this framing directly from PDB.
+pub struct PdbqtSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> PdbqtSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for PdbqtSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        loop {
+            let raw = match self.lines.next() {
+                None => {
+                    if !got_any_line || buffer.trim().is_empty() {
+                        return None;
+                    }
+                    break;
+                }
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            got_any_line = true;
+            let is_terminator = raw.trim() == "ENDMDL";
+            buffer.push_str(&raw);
+            buffer.push('\n');
+            if is_terminator {
+                break;
+            }
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::pdbqt::parse_pdbqt(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// Streams PDBQT out, one ligand per molecule (#226). No per-record name
+/// threaded through -- PDBQT has no title-line concept for a record's
+/// name, same reasoning as [`PdbWriter`].
+pub struct PdbqtWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> PdbqtWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for PdbqtWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::pdbqt::write_pdbqt(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
