@@ -257,6 +257,82 @@ fn push_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_xyz_with_options`] with default options.
+pub fn read_xyz(content: &str) -> ReadOutcome {
+    read_xyz_with_options(content, &ReadOptions)
+}
+
+/// One molecule per frame: a count line, a comment line, then that many
+/// atom lines (#222). A frame's own declared count is its record boundary,
+/// the role SDF's `$$$$` terminator plays -- so a trajectory (many frames
+/// back to back) reads as many records, not one.
+pub fn read_xyz_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let all_lines: Vec<&str> = content.lines().collect();
+    let mut position = 0;
+    let mut i = 0;
+
+    while i < all_lines.len() {
+        if all_lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let count_line = all_lines[i];
+        let count: usize = match count_line.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                position += 1;
+                out.skipped.push(Skipped {
+                    position,
+                    input: count_line.to_string(),
+                    error: format!("invalid atom count: {count_line:?}"),
+                });
+                i += 1;
+                continue;
+            }
+        };
+
+        let frame_len = 2 + count;
+        if i + frame_len > all_lines.len() {
+            position += 1;
+            out.skipped.push(Skipped {
+                position,
+                input: count_line.to_string(),
+                error: format!(
+                    "declared {count} atoms but only {} lines remain",
+                    all_lines.len().saturating_sub(i + 2)
+                ),
+            });
+            break;
+        }
+
+        let frame = all_lines[i..i + frame_len].join("\n");
+        position += 1;
+        match crate::io::xyz::parse_xyz(&frame) {
+            Ok(molecule) => {
+                let name = molecule
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{position}"));
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: frame,
+                error: e.to_string(),
+            }),
+        }
+        i += frame_len;
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
