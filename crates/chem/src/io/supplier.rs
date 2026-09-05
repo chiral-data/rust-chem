@@ -150,8 +150,8 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
     }
 }
 
-/// Streams SMILES out, one line per molecule — the same shape
-/// [`crate::io::format::write_smiles_records`] produces in one pass.
+/// Streams SMILES out, one line per molecule — the same shape the one-shot
+/// SMILES writer produces in one pass.
 pub struct SmilesWriter<W> {
     writer: W,
 }
