@@ -1079,3 +1079,76 @@ fn test_convert_refuses_to_clobber_its_own_input() {
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("pass --force"), "{:?}", r.stderr);
 }
+
+#[test]
+fn test_format_bogus_is_an_error_not_a_clap_panic() {
+    // #215: --format used to be a clap ValueEnum, so an unknown value was
+    // rejected by clap itself. Now it's a registry lookup -- same outcome,
+    // different mechanism, and the message should say so plainly.
+    let r = run(&["info", "--format", "bogus"], Some(GOOD));
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_formats_lists_every_registered_code() {
+    let r = run(&["convert", "-L", "formats"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("smi"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("sdf"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_one_format_shows_its_detail() {
+    let r = run(&["convert", "-L", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("sdf"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("codes:"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("extensions:"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("category:"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("carries:"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_unrecognized_code_is_an_error() {
+    let r = run(&["convert", "-L", "bogus"], None);
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_describe_reports_no_options_exposed_yet() {
+    let r = run(&["convert", "-H", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("no format-specific options are exposed"),
+        "{:?}",
+        r.stdout
+    );
+
+    let r = run(&["convert", "-H", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("no format-specific options are exposed"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_list_and_describe_are_pure_queries_that_run_no_conversion() {
+    // Neither flag should require --literal/input/--to -- they're pure
+    // queries against the registry, resolved before any of that is checked.
+    let r = run(&["convert", "-L", "formats"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    let r = run(&["convert", "-H", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+}

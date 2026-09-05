@@ -8,82 +8,59 @@ use anyhow::{Result, bail};
 use chem::core::molecule::Molecule;
 use chem::io::format::{self, Carries, held};
 use chem::io::reader::Format;
-use clap::ValueEnum;
 use std::path::Path;
 
-/// Where a command's molecules should be written, and in what format.
+/// Picks a format, given what the caller asked for and what the command
+/// just produced.
 ///
-/// Output format is not a preference for these two commands, it is a
-/// correctness question. `chem coords` computes geometry, and **SMILES cannot
-/// carry coordinates** — writing SMILES would silently discard the entire
-/// result. So the format follows what the data needs, and the reason is
-/// reported rather than left for the user to notice from an unexpected file.
-/// `chem::io::reader::Format` is a registry handle and not ours to derive
-/// `ValueEnum` on, so this is the clap-facing mirror — the same arrangement
-/// `FormatArg` uses for input. Kept adjacent to its conversion so the two
-/// cannot drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum OutputFormat {
-    Smiles,
-    Sdf,
-}
-
-impl From<OutputFormat> for Format {
-    fn from(value: OutputFormat) -> Self {
-        match value {
-            OutputFormat::Smiles => Format::SMILES,
-            OutputFormat::Sdf => Format::SDF,
-        }
-    }
-}
-
-impl OutputFormat {
-    /// Picks a format, given what the caller asked for and what the command
-    /// just produced.
-    ///
-    /// `produced` is what the operation added to the molecules — `COORDS_2D`
-    /// for `chem coords`, nothing for `chem aromatic`. A command that produced
-    /// something defaults to a format that can hold it, because the
-    /// alternative is writing a file missing the thing that was just computed.
-    ///
-    /// It used to be a `needs_coords: bool` that the call site passed in, with
-    /// `main.rs` hardcoding `true` for one command and `false` for the other —
-    /// a fact about the *format* living everywhere except the format table. The
-    /// call site now states what it produced, which is the thing it actually
-    /// knows, and the registry answers which formats can keep it.
-    ///
-    /// No warning here any more. An explicit request is still honoured, and
-    /// what a write drops is reported once, by [`report_drops`], from the data
-    /// rather than from a guess about it.
-    pub fn resolve(requested: Option<Self>, produced: Carries, path: Option<&Path>) -> Self {
-        if let Some(explicit) = requested {
-            return explicit;
-        }
-
-        // A named file's extension is a clear request, so honour it.
-        if let Some(p) = path.filter(|p| p.as_os_str() != "-") {
-            // Through the registry rather than a second copy of the
-            // `.sdf`-or-else rule, which is what this used to be.
-            return if Format::from_filename(&p.to_string_lossy()) == Format::SDF {
-                OutputFormat::Sdf
-            } else {
-                OutputFormat::Smiles
-            };
-        }
-
-        // Nothing named a format, so pick the first registered one that can
-        // hold what was just computed. `contains` is vacuously true for an
-        // empty `produced`, so a command that produced nothing lands on the
-        // first entry — SMILES — exactly as it did before.
-        match format::all().find(|f| f.carries().contains(produced)) {
-            Some(f) if f == Format::SDF => OutputFormat::Sdf,
-            _ => OutputFormat::Smiles,
-        }
+/// Output format is not a preference for `chem aromatic`/`chem coords`, it
+/// is a correctness question. `chem coords` computes geometry, and **SMILES
+/// cannot carry coordinates** — writing SMILES would silently discard the
+/// entire result. So the format follows what the data needs, and the reason
+/// is reported rather than left for the user to notice from an unexpected
+/// file.
+///
+/// `produced` is what the operation added to the molecules — `COORDS_2D`
+/// for `chem coords`, nothing for `chem aromatic`. A command that produced
+/// something defaults to a format that can hold it, because the
+/// alternative is writing a file missing the thing that was just computed.
+///
+/// It used to be a `needs_coords: bool` that the call site passed in, with
+/// `main.rs` hardcoding `true` for one command and `false` for the other —
+/// a fact about the *format* living everywhere except the format table. The
+/// call site now states what it produced, which is the thing it actually
+/// knows, and the registry answers which formats can keep it.
+///
+/// No warning here any more. An explicit request is still honoured, and
+/// what a write drops is reported once, by [`report_drops`], from the data
+/// rather than from a guess about it.
+///
+/// Operates on [`Format`] directly (#215) rather than a hand-written
+/// two-variant mirror, so a third registered format that can hold
+/// `produced` becomes reachable here with no further edit — the old
+/// version's fallback only ever recognised SDF specifically, because SDF
+/// and SMILES were the only two variants that existed to recognise.
+pub fn resolve_output_format(
+    requested: Option<Format>,
+    produced: Carries,
+    path: Option<&Path>,
+) -> Format {
+    if let Some(explicit) = requested {
+        return explicit;
     }
 
-    pub fn label(&self) -> &'static str {
-        Format::from(*self).label()
+    // A named file's extension is a clear request, so honour it.
+    if let Some(p) = path.filter(|p| p.as_os_str() != "-") {
+        return Format::from_filename(&p.to_string_lossy());
     }
+
+    // Nothing named a format, so pick the first registered one that can
+    // hold what was just computed. `contains` is vacuously true for an
+    // empty `produced`, so a command that produced nothing lands on the
+    // first entry — SMILES — exactly as it did before.
+    format::all()
+        .find(|f| f.carries().contains(produced))
+        .unwrap_or(Format::SMILES)
 }
 
 /// Says on stderr what a write is about to throw away.
@@ -165,12 +142,12 @@ impl DropTracker {
 
 /// [`DropTracker`] over a whole slice already in memory — what every
 /// non-streaming write command (`chem aromatic`, `chem coords`) uses.
-pub fn report_drops(format: OutputFormat, records: &[(String, Molecule)], explain: bool) {
-    let mut tracker = DropTracker::new(Format::from(format).carries());
+pub fn report_drops(format: Format, records: &[(String, Molecule)], explain: bool) {
+    let mut tracker = DropTracker::new(format.carries());
     for (name, molecule) in records {
         tracker.record(name, molecule);
     }
-    tracker.report(Format::from(format).label(), explain);
+    tracker.report(format.label(), explain);
 }
 
 /// Serialises molecules, carrying their names.
@@ -179,8 +156,7 @@ pub fn report_drops(format: OutputFormat, records: &[(String, Molecule)], explai
 /// lookup rather than a `match` that grows a arm per format. Every registered
 /// format writes today; `expect` documents that rather than hiding a `None`
 /// the caller cannot act on.
-pub fn render(format: OutputFormat, records: &[(String, Molecule)]) -> String {
-    let format = Format::from(format);
+pub fn render(format: Format, records: &[(String, Molecule)]) -> String {
     format
         .write(records)
         .unwrap_or_else(|| panic!("{} has no writer", format.name()))
@@ -221,4 +197,47 @@ pub fn refuse_to_clobber_input(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_an_explicit_request_wins_over_everything_else() {
+        let path = PathBuf::from("out.sdf");
+        assert_eq!(
+            resolve_output_format(Some(Format::SMILES), Carries::COORDS_2D, Some(&path)),
+            Format::SMILES
+        );
+    }
+
+    #[test]
+    fn test_a_named_files_extension_is_honoured() {
+        let path = PathBuf::from("out.sdf");
+        assert_eq!(
+            resolve_output_format(None, Carries::empty(), Some(&path)),
+            Format::SDF
+        );
+    }
+
+    #[test]
+    fn test_nothing_named_falls_back_to_whatever_registered_format_holds_produced() {
+        // Not a hardcoded "is it SDF" check (that only worked because SDF and
+        // SMILES were the only two variants that could exist) -- whichever
+        // registered format actually carries what was produced.
+        assert_eq!(
+            resolve_output_format(None, Carries::COORDS_2D, None),
+            Format::SDF
+        );
+    }
+
+    #[test]
+    fn test_producing_nothing_falls_back_to_smiles() {
+        assert_eq!(
+            resolve_output_format(None, Carries::empty(), None),
+            Format::SMILES
+        );
+    }
 }
