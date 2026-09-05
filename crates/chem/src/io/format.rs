@@ -6,6 +6,7 @@ use std::ops::{BitAnd, BitOr, Not};
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
+use crate::io::options::{ReadOptions, WriteOptions};
 use crate::io::reader::ReadOutcome;
 
 /// What a format can carry across a conversion.
@@ -284,23 +285,22 @@ impl Category {
 
 /// Parses a whole file into molecules.
 ///
-/// Aliased rather than written inline because both of these signatures are
-/// going to change: the option-bag story adds an `&OptionSet` parameter, and
-/// the streaming story replaces `&str` with a reader. Naming them now means
-/// that is one edit rather than four.
-pub(crate) type ReadFn = fn(&str) -> ReadOutcome;
+/// Aliased rather than written inline because this signature is going to
+/// change again: the streaming story replaces `&str` with a reader. Naming
+/// it now means that is one edit rather than several.
+pub(crate) type ReadFn = fn(&str, &ReadOptions) -> ReadOutcome;
 
 /// Serialises named molecules into one file's worth of text.
-pub(crate) type WriteFn = fn(&[(String, Molecule)]) -> String;
+pub(crate) type WriteFn = fn(&[(String, Molecule)], &WriteOptions) -> String;
 
 /// Everything the registry knows about one format.
 ///
-/// The reader and writer are function pointers rather than `dyn` trait objects.
-/// Both work in a `static`, but pointers keep the table a plain slice and skip
-/// a vtable for a call made once per file. Traits earn their place when
-/// per-format options arrive and a reader needs state — and because these
-/// fields are not public, widening their signatures then is not a breaking
-/// change.
+/// The reader and writer are function pointers rather than `dyn` trait
+/// objects. Both work in a `static`, but pointers keep the table a plain
+/// slice and skip a vtable for a call made once per file. Traits earn their
+/// place when a reader needs to keep state across records — and because
+/// these fields are not public, widening their signatures then is not a
+/// breaking change.
 pub struct FormatDescriptor {
     /// Human-readable name, as a format list would print it.
     pub name: &'static str,
@@ -342,7 +342,7 @@ static FORMATS: &[FormatDescriptor] = &[
             .or(Carries::ISOTOPE)
             .or(Carries::STEREO_ATOM)
             .or(Carries::STEREO_BOND),
-        reader: Some(crate::io::reader::read_smiles),
+        reader: Some(crate::io::reader::read_smiles_with_options),
         writer: Some(write_smiles_records),
     },
     FormatDescriptor {
@@ -377,12 +377,13 @@ static FORMATS: &[FormatDescriptor] = &[
             // reads the difference back.
             .or(Carries::STEREO_BOND)
             .or(Carries::PROPERTIES),
-        reader: Some(crate::io::reader::read_sdf),
+        reader: Some(crate::io::reader::read_sdf_with_options),
         writer: Some(write_sdf_records),
     },
 ];
 
-fn write_smiles_records(records: &[(String, Molecule)]) -> String {
+fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // SMILES has no write options today.
     let mut out = String::new();
     for (name, molecule) in records {
         // `name<TAB>` is not the convention: the reader splits on whitespace
@@ -398,14 +399,14 @@ fn write_smiles_records(records: &[(String, Molecule)]) -> String {
     out
 }
 
-fn write_sdf_records(records: &[(String, Molecule)]) -> String {
+fn write_sdf_records(records: &[(String, Molecule)], options: &WriteOptions) -> String {
     let mut molecules = Vec::with_capacity(records.len());
     for (name, molecule) in records {
         let mut copy = molecule.clone();
         copy.set_name(name.clone());
         molecules.push(copy);
     }
-    crate::io::sdf::write_sdf_all(&molecules)
+    crate::io::sdf::write_sdf_all_with_options(&molecules, &options.sdf)
 }
 
 /// A format this build supports.
@@ -501,15 +502,26 @@ impl Format {
         self.descriptor().reader
     }
 
-    /// Serialises molecules in this format, carrying their names, or `None`
-    /// if the format cannot be written.
+    /// Serialises molecules in this format with default options, carrying
+    /// their names, or `None` if the format cannot be written.
     ///
     /// The public way to reach a writer. The function pointer itself stays
-    /// private so the option-bag story can widen its signature without that
-    /// being a breaking change — and because the binary is a separate crate,
-    /// `pub(crate)` would not reach it anyway.
+    /// private — the binary is a separate crate, so `pub(crate)` would not
+    /// reach it anyway.
     pub fn write(&self, records: &[(String, Molecule)]) -> Option<String> {
-        self.descriptor().writer.map(|writer| writer(records))
+        self.write_with_options(records, &WriteOptions::default())
+    }
+
+    /// [`Self::write`], with explicit per-format options (#212) — e.g. which
+    /// molfile dialect to write for SDF.
+    pub fn write_with_options(
+        &self,
+        records: &[(String, Molecule)],
+        options: &WriteOptions,
+    ) -> Option<String> {
+        self.descriptor()
+            .writer
+            .map(|writer| writer(records, options))
     }
 }
 
@@ -805,6 +817,23 @@ mod tests {
         // And what was written reads back as the same two atoms, which is the
         // property that makes the table's reader and writer a matched pair.
         assert_eq!(crate::io::reader::read(&sdf, Format::SDF).len(), 1);
+    }
+
+    #[test]
+    fn test_write_with_options_reaches_the_sdf_writer() {
+        // #212: the registry's WriteFn now threads WriteOptions through to
+        // the actual writer -- default options must produce the same output
+        // as the no-options convenience.
+        use crate::core::prelude::*;
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        let records = vec![("m".to_string(), mol)];
+
+        assert_eq!(
+            Format::SDF.write(&records),
+            Format::SDF.write_with_options(&records, &WriteOptions::default())
+        );
     }
 
     #[test]
