@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.0] - 2026-09-05
+
+**The data model can now represent what the next 150 formats need.** Coordinates, atom sites, residues and unit cells didn't exist a release ago — `core` could not express what PDB, mmCIF, Mol2 or PDBQT carry, regardless of how good a parser was written for them. That gap is closed. This release builds the intermediate representation, the format registry, and a differential harness against RDKit and OpenBabel to verify both — the parts nothing else in the file-conversion project could start ahead of.
+
+`chem convert` and pure-Rust readers/writers for anything beyond SMILES/SDF move to v0.8.0. Two formats existed when the CI purity gate landed, both core, leaving nothing real to feature-gate — that half of #184 stays open for whichever v0.8.0 story adds the first non-core format.
+
+### Features
+
+- **3D coordinates.** `Point3` and a conformer table alongside the existing 2D layout, so a molecule can carry both without one overwriting the other (#174)
+- **An `AtomSite` side table** for atom name, alt-loc, partial charge, occupancy and B-factor — kept off `Atom` itself, since `Atom` derives `Eq` and floats cannot satisfy that (#176)
+- **Residue and chain topology**, enough to round-trip a multi-chain structure (#177)
+- **`UnitCell`, space group, and fractional-to-Cartesian conversion** (#178)
+- **A format registry and `FormatDescriptor`**, replacing the two-variant `Format` enum. `Format` itself is deprecated rather than deleted — public API in a published crate keeps it for one release as a `#[deprecated]` shim, so 0.6 → 0.7 is a compiler warning, not a rewrite (#182)
+- **`Carries` bitflags and a per-molecule drop report.** Every format descriptor declares what it carries — topology, coordinates, charge, isotope, stereo, aromaticity, residues, B-factor, unit cell, and so on — and every conversion reports what it's about to throw away, by name, rather than discarding it silently (#183)
+- **A CI gate that keeps the crate pure Rust.** Four rules in the existing lean-build job check that no `-sys` crate, no native `links` declaration, and no chemistry toolkit (RDKit, OpenBabel, `chemfiles`) ever reaches the dependency graph — scoped to the lean build for the tree checks, since `--all-features` legitimately pulls `wgpu`'s own platform bindings, and to every feature set for the toolkit check, since a toolkit behind an optional feature is still a toolkit (#184, the CI half — the format-gating half is deferred, see above)
+- **A fixture corpus and a differential harness** running RDKit, OpenBabel and gemmi as oracles against `chem`'s own output — living in `tools/oracle/`, never referenced from `Cargo.toml`, so the toolkits stay comparison tools rather than dependencies (#4)
+
+### Bug Fixes
+
+Eight, all found by the harness above or by pointing something new at an existing parser — every one invisible to the tests that existed when it was introduced.
+
+- **`write_sdf` emitted records RDKit refuses to read.** No `M  CHG` block, so a charged atom became a valence error; type-4 aromatic bonds pyrrole cannot kekulise back from; and every data field `parse_sdf` reads was silently dropped on write. `parse_sdf` accepted all of it, so only an external reader could see the defect — three issues, one writer, one fix (#188, #194, #197)
+- **`parse_smiles` rejected chirality, directional bonds and dot disconnection**, though `Chirality` and `BondStereo` already existed in the data model. Four of the seven lines in the harness's own table of hard cases (#191)
+- **SDF wrote every double bond trans**, because the 2D layout placed atoms without consulting `BondStereo` — a cis molecule was written as a valid file asserting the wrong isomer, on screen and on disk. A second defect found while fixing the first: a double bond that states no configuration didn't survive a second SDF read/write cycle, and silently turned into a false claim of whatever the redrawn coordinates happened to show (#198)
+- **`parse_sdf` couldn't read a molfile with 100 or more atoms.** A `%3d` field at its full width leaves no space before the next one, so `split_whitespace` merged two fields into one — not just our own output, since RDKit, OpenBabel and gemmi write the same fixed widths. Now tries the spec's fixed-width columns first and falls back to whitespace splitting (#202)
+- **`parse_smiles` silently accepted a bond symbol right after another one.** `C##C`, `C###C` and `C==C` all collapsed into whichever symbol arrived last instead of being rejected — the failure mode hardest to notice downstream, since a typo in a generated file became a plausible molecule rather than a reported skip (#190)
+- **The Morgan atom invariant omitted formal charge and hydrogen count**, though both are on `Atom` with public accessors. Two atoms differing only in charge or H count hashed identically, understating nitrobenzene's and the glycine zwitterion's true environment count against RDKit (14 vs 16, 9 vs 11) — fixed on both the CPU and GPU paths, term for term identically. Bit positions shift for any molecule with a charged or explicit-H atom (#192)
+- **`chem-app` didn't repaint when async work finished**, so a completed dataset load or search sat invisible until the next mouse move — every deferred-work site wrote its result and returned without telling `egui` a repaint was due (#186)
+
+This release also absorbs the v0.6.1 hotfix below — `main` and `v070` diverged after 0.6.0, and were reconciled with a merge before this release.
+
 ## [0.6.1] - 2026-09-04
 
 ### Bug Fixes
