@@ -199,10 +199,11 @@ impl<W: Write> SmilesWriter<W> {
 
 impl<W: Write> Writer for SmilesWriter<W> {
     fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        // Canonical (#220), matching the non-streaming registry writer.
         writeln!(
             self.writer,
             "{} {}",
-            crate::io::smiles_writer::write_smiles_for_molecule(molecule),
+            crate::io::smiles_writer::write_smiles_for_molecule_canonical(molecule),
             name
         )
     }

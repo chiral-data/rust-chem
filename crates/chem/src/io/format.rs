@@ -416,9 +416,10 @@ fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions)
         // `name<TAB>` is not the convention: the reader splits on whitespace
         // and takes everything after the first token as the name, so a space
         // is what round-trips.
-        out.push_str(&crate::io::smiles_writer::write_smiles_for_molecule(
-            molecule,
-        ));
+        //
+        // Canonical (#220): the same molecule, built with atoms in a
+        // different order, always writes the same string.
+        out.push_str(&crate::io::smiles_writer::write_smiles_for_molecule_canonical(molecule));
         out.push(' ');
         out.push_str(name);
         out.push('\n');
