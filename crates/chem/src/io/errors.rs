@@ -140,6 +140,22 @@ pub enum Mol2Error {
     UnsupportedAtomType(String),
 }
 
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum PdbqtError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid AutoDock atom type: {0}")]
+    InvalidAtomType(String),
+
+    #[error("Invalid torsion tree line: {0}")]
+    InvalidTorsionTree(String),
+}
+
 /// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
 ///
 /// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,

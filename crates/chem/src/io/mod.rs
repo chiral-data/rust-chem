@@ -7,6 +7,7 @@ pub mod mol2;
 pub mod open;
 pub mod options;
 pub mod pdb;
+pub mod pdbqt;
 pub mod reader;
 pub mod sdf;
 pub mod smiles;

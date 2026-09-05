@@ -1043,7 +1043,14 @@ fn test_convert_output_format_is_ambiguous_without_to_or_a_named_extension() {
 
 #[test]
 fn test_convert_unrecognized_format_code_is_an_error() {
-    let r = run(&["convert", "--literal", "CCO", "--to", "pdbqt"], None);
+    // Not "pdbqt": that used to be an unrecognized-code example, but #226
+    // registered it -- pinning a code this crate might register later
+    // would make this test flip again for the same reason, so a code with
+    // no chemistry meaning at all is used instead.
+    let r = run(
+        &["convert", "--literal", "CCO", "--to", "not-a-format"],
+        None,
+    );
     assert_ne!(r.code, 0);
     assert!(
         r.stderr.contains("unrecognized format code"),
@@ -1592,4 +1599,66 @@ fn test_convert_list_shows_mol2_is_the_first_format_with_partial_charge() {
     assert!(r.stdout.contains("partial_charge"), "{:?}", r.stdout);
     assert!(r.stdout.contains("aromaticity"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_a_rigid_molecule_as_pdbqt_with_torsdof_zero() {
+    let r = run(&["convert", "--literal", "c1ccccc1", "--to", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ROOT"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("TORSDOF 0"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("BRANCH"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_a_branched_ligand_as_pdbqt_with_torsion_tree() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "c1ccc(cc1)-c1ccc(cc1)-c1ccccc1",
+            "--to",
+            "pdbqt",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("TORSDOF 2"), "{:?}", r.stdout);
+    let branch_lines = r.stdout.lines().filter(|l| l.starts_with("BRANCH")).count();
+    assert_eq!(branch_lines, 2, "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_literal_pdbqt_structure() {
+    let text = "\
+ROOT
+ATOM      1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00     0.000 C \n\
+ATOM      2  C2  LIG A   1       1.500   0.000   0.000  1.00  0.00     0.000 C \n\
+ENDROOT
+TORSDOF 0
+";
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            text,
+            "--from",
+            "pdbqt",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_shows_pdbqt_mask() {
+    let r = run(&["convert", "-L", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("partial_charge"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("aromaticity"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("unit_cell"), "{:?}", r.stdout);
 }
