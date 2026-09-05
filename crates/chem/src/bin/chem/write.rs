@@ -86,7 +86,7 @@ impl OutputFormat {
     }
 }
 
-/// Says on stderr what this write is about to throw away.
+/// Says on stderr what a write is about to throw away.
 ///
 /// One mechanism instead of a message per format pair. There used to be two
 /// hand-written warnings — one for `--out-format smiles` after `chem coords`,
@@ -94,58 +94,83 @@ impl OutputFormat {
 /// the pairs are not enumerable. Every silent loss is a bug nobody notices,
 /// which is how OpenBabel came to zero the B-factor column on every PDB write.
 ///
-/// Summarised by default: a per-molecule line is right for a handful and
-/// unusable for a hundred thousand, so the default names each lost attribute
-/// once with a count, and `--explain-drops` gives the breakdown.
-///
-/// Silent when nothing is lost. The common case must not gain noise.
-pub fn report_drops(format: OutputFormat, records: &[(String, Molecule)], explain: bool) {
-    let target = Format::from(format).carries();
+/// Accumulates one record at a time rather than over a pre-built slice, so a
+/// streaming writer (`chem convert`, #214) can call [`Self::record`] as it
+/// goes without materializing the whole file just to report what it drops.
+/// [`report_drops`] is the non-streaming convenience over the same thing.
+pub struct DropTracker {
+    target: Carries,
+    // Accumulated in a Vec in first-seen order rather than a map, so the
+    // report reads the same way every run and two invocations can be diffed.
+    losses: Vec<(&'static str, usize)>,
+    per_molecule: Vec<(String, Vec<&'static str>)>,
+}
 
-    // Accumulated in a Vec in first-seen order rather than a map, so the report
-    // reads the same way every run and two invocations can be diffed.
-    let mut losses: Vec<(&'static str, usize)> = Vec::new();
-    let mut per_molecule: Vec<(&str, Vec<&'static str>)> = Vec::new();
+impl DropTracker {
+    pub fn new(target: Carries) -> Self {
+        Self {
+            target,
+            losses: Vec::new(),
+            per_molecule: Vec::new(),
+        }
+    }
 
-    for (name, molecule) in records {
-        let dropped = held(molecule).difference(target);
+    pub fn record(&mut self, name: &str, molecule: &Molecule) {
+        let dropped = held(molecule).difference(self.target);
         if dropped.is_empty() {
-            continue;
+            return;
         }
         let names: Vec<&'static str> = dropped.names().collect();
         for attribute in &names {
-            match losses.iter_mut().find(|(a, _)| a == attribute) {
+            match self.losses.iter_mut().find(|(a, _)| a == attribute) {
                 Some((_, count)) => *count += 1,
-                None => losses.push((attribute, 1)),
+                None => self.losses.push((attribute, 1)),
             }
         }
-        per_molecule.push((name, names));
+        self.per_molecule.push((name.to_string(), names));
     }
 
-    if losses.is_empty() {
-        return;
-    }
+    /// Summarised by default: a per-molecule line is right for a handful and
+    /// unusable for a hundred thousand, so the default names each lost
+    /// attribute once with a count, and `explain` gives the breakdown.
+    ///
+    /// Silent when nothing is lost. The common case must not gain noise.
+    pub fn report(&self, format_label: &str, explain: bool) {
+        if self.losses.is_empty() {
+            return;
+        }
 
-    let summary = losses
-        .iter()
-        .map(|(attribute, count)| format!("{attribute} ({count})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!(
-        "{} cannot carry: {summary}{}",
-        Format::from(format).label(),
+        let summary = self
+            .losses
+            .iter()
+            .map(|(attribute, count)| format!("{attribute} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "{format_label} cannot carry: {summary}{}",
+            if explain {
+                ""
+            } else {
+                " \u{2014} pass --explain-drops for the molecules"
+            }
+        );
+
         if explain {
-            ""
-        } else {
-            " \u{2014} pass --explain-drops for the molecules"
-        }
-    );
-
-    if explain {
-        for (name, names) in per_molecule {
-            eprintln!("  {name}: {}", names.join(", "));
+            for (name, names) in &self.per_molecule {
+                eprintln!("  {name}: {}", names.join(", "));
+            }
         }
     }
+}
+
+/// [`DropTracker`] over a whole slice already in memory — what every
+/// non-streaming write command (`chem aromatic`, `chem coords`) uses.
+pub fn report_drops(format: OutputFormat, records: &[(String, Molecule)], explain: bool) {
+    let mut tracker = DropTracker::new(Format::from(format).carries());
+    for (name, molecule) in records {
+        tracker.record(name, molecule);
+    }
+    tracker.report(Format::from(format).label(), explain);
 }
 
 /// Serialises molecules, carrying their names.
