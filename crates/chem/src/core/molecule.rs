@@ -6,6 +6,7 @@ use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
+use crate::core::stereo_group::StereoGroup;
 
 use std::{collections::HashMap, fmt};
 
@@ -51,6 +52,10 @@ pub enum MoleculeError {
     /// has several unrelated ways to be wrong and the message names which.
     #[error("Invalid unit cell: {0}")]
     InvalidCell(String),
+
+    /// Stringly-typed for the same reason as [`Self::InvalidTopology`].
+    #[error("Invalid stereo groups: {0}")]
+    InvalidStereoGroups(String),
 }
 
 /// Represents a complete molecule with atoms, bonds, and connectivity.
@@ -123,6 +128,14 @@ pub struct Molecule {
     /// The space group, as the source stated it. Survives `add_atom` for the
     /// same reason the cell does.
     space_group: Option<SpaceGroup>,
+    /// Enhanced stereochemistry groups (CXSMILES `&n:`/`on:`/`a:`), in file
+    /// order. Empty for every molecule that carries no such assertion, which
+    /// is most of them.
+    ///
+    /// A plain `Vec`, same reasoning as `chains`: not indexed in parallel
+    /// with `atoms`, so there is no natural absent value to distinguish from
+    /// empty.
+    stereo_groups: Vec<StereoGroup>,
 }
 
 impl Molecule {
@@ -140,6 +153,7 @@ impl Molecule {
             residues: Vec::new(),
             cell: None,
             space_group: None,
+            stereo_groups: Vec::new(),
         }
     }
 
@@ -157,6 +171,7 @@ impl Molecule {
             residues: Vec::new(),
             cell: None,
             space_group: None,
+            stereo_groups: Vec::new(),
         }
     }
 
@@ -195,8 +210,13 @@ impl Molecule {
 
         // The cell and space group deliberately do NOT go. They index nothing
         // and reference no atom, so adding one leaves them exactly as true as
-        // they were. This is the one exception to the rule above, and it is
-        // easier to find here than in a field comment.
+        // they were.
+        //
+        // Stereo groups also survive, for a different reason: unlike chains
+        // and residues, they carry no completeness invariant (a group is
+        // just "these atoms", not a range required to cover every atom), so
+        // an existing group's meaning is untouched by a new atom that was
+        // never a member of it.
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -527,6 +547,43 @@ impl Molecule {
     pub fn clear_topology(&mut self) {
         self.chains.clear();
         self.residues.clear();
+    }
+
+    /// This molecule's enhanced stereochemistry groups, in file order. Empty
+    /// if it asserts none.
+    pub fn stereo_groups(&self) -> &[StereoGroup] {
+        &self.stereo_groups
+    }
+
+    /// Sets this molecule's enhanced stereochemistry groups.
+    ///
+    /// Each group's atom indices are validated against the atom count, the
+    /// same reasoning as [`Self::set_topology`]: an out-of-range index would
+    /// otherwise silently claim a stereo relationship for the wrong atom, or
+    /// panic later at whatever unlucky point first indexes with it.
+    ///
+    /// # Errors
+    /// [`MoleculeError::InvalidStereoGroups`], naming the offending group and
+    /// index, if any atom index is out of bounds.
+    pub fn set_stereo_groups(&mut self, groups: Vec<StereoGroup>) -> Result<(), MoleculeError> {
+        for (ix, group) in groups.iter().enumerate() {
+            for &atom_idx in &group.atoms {
+                if atom_idx >= self.atoms.len() {
+                    return Err(MoleculeError::InvalidStereoGroups(format!(
+                        "group {ix} names atom {atom_idx} but the molecule has {}",
+                        self.atoms.len()
+                    )));
+                }
+            }
+        }
+        self.stereo_groups = groups;
+        Ok(())
+    }
+
+    /// Discards enhanced stereochemistry groups, leaving `Chirality` markers
+    /// on the atoms themselves alone.
+    pub fn clear_stereo_groups(&mut self) {
+        self.stereo_groups.clear();
     }
 
     /// This molecule's unit cell, if it is a periodic structure.

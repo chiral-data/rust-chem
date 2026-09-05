@@ -60,6 +60,11 @@ impl Carries {
     /// [`held`]: the data model has nothing to detect until query molecules
     /// arrive in the reaction and 2D-drawing wave.
     pub const QUERY: Carries = Carries(1 << 14);
+    /// Enhanced stereochemistry groups
+    /// ([`crate::core::stereo_group::StereoGroup`]) — a relative, rather
+    /// than absolute, configuration asserted across a set of stereocentres.
+    /// CXSMILES is the only format that carries these today (#221).
+    pub const STEREO_GROUP: Carries = Carries(1 << 15);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -78,6 +83,7 @@ impl Carries {
         (Carries::UNIT_CELL, "unit_cell"),
         (Carries::PROPERTIES, "properties"),
         (Carries::QUERY, "query"),
+        (Carries::STEREO_GROUP, "stereo_group"),
     ];
 
     pub const fn empty() -> Carries {
@@ -183,6 +189,9 @@ pub fn held(molecule: &Molecule) -> Carries {
     }
     if !molecule.properties().is_empty() {
         carries = carries | Carries::PROPERTIES;
+    }
+    if !molecule.stereo_groups().is_empty() {
+        carries = carries | Carries::STEREO_GROUP;
     }
 
     for atom in molecule.atoms() {
@@ -391,10 +400,45 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(sdf_supplier),
         writer_stream: Some(sdf_writer_stream),
     },
+    FormatDescriptor {
+        name: "CXSMILES",
+        codes: &["cxsmiles"],
+        extensions: &["cxsmiles"],
+        // One of the formats RDKit has that OpenBabel lacks (#173's Goal
+        // section) — deliberately not lumped in with plain SMILES's
+        // category, since it is a different toolkit's extension of it.
+        category: Category::OtherCheminformatics,
+        // A strict superset of plain SMILES's own mask (#221 is layered on
+        // top of it, never modifies it), plus the one thing CXSMILES adds
+        // that plain SMILES cannot express: enhanced stereo groups. Every
+        // other CXSMILES feature (coordinates, atom labels, atomProp,
+        // aromatic-bond markers, radical/valence flags) is out of scope for
+        // this crate today and so is not claimed here.
+        //
+        // Appended after SDF rather than placed next to plain SMILES:
+        // `Format::SMILES`/`Format::SDF` are hardcoded indices into this
+        // slice (`Format(0)`/`Format(1)`), so a new entry has to go at the
+        // end, not wherever it reads best, or it silently renumbers them.
+        carries: Carries::TOPOLOGY
+            .or(Carries::AROMATICITY)
+            .or(Carries::FORMAL_CHARGE)
+            .or(Carries::ISOTOPE)
+            .or(Carries::STEREO_ATOM)
+            .or(Carries::STEREO_BOND)
+            .or(Carries::STEREO_GROUP),
+        reader: Some(crate::io::reader::read_cxsmiles_with_options),
+        writer: Some(write_cxsmiles_records),
+        supplier: Some(cxsmiles_supplier),
+        writer_stream: Some(cxsmiles_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::SmilesSupplier::new(reader, options))
+}
+
+fn cxsmiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::CxSmilesSupplier::new(reader, options))
 }
 
 fn sdf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -403,6 +447,10 @@ fn sdf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
+}
+
+fn cxsmiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::CxSmilesWriter::new(writer, options))
 }
 
 fn sdf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -420,6 +468,19 @@ fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions)
         // Canonical (#220): the same molecule, built with atoms in a
         // different order, always writes the same string.
         out.push_str(&crate::io::smiles_writer::write_smiles_for_molecule_canonical(molecule));
+        out.push(' ');
+        out.push_str(name);
+        out.push('\n');
+    }
+    out
+}
+
+fn write_cxsmiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // CXSMILES has no write options of its own today, beyond what plain
+    // SMILES already has none of.
+    let mut out = String::new();
+    for (name, molecule) in records {
+        out.push_str(&crate::io::cxsmiles::write_cxsmiles(molecule));
         out.push(' ');
         out.push_str(name);
         out.push('\n');
@@ -451,6 +512,9 @@ impl Format {
     pub const SMILES: Format = Format(0);
     /// MDL MOL / SDF.
     pub const SDF: Format = Format(1);
+    /// CXSMILES (#221) — enhanced stereo groups only, see
+    /// [`crate::io::cxsmiles`].
+    pub const CXSMILES: Format = Format(2);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -652,6 +716,7 @@ mod tests {
         use crate::core::geometry::{Point2, Point3};
         use crate::core::residue::{Chain, Residue};
         use crate::core::site::AtomSite;
+        use crate::core::stereo_group::{StereoGroup, StereoGroupKind};
         use crate::io::smiles::parse_smiles;
 
         let ethane = || parse_smiles("CC").expect("valid SMILES");
@@ -715,6 +780,16 @@ mod tests {
         // SMILES as losing something that was never expressible.
         let with_stereo_atom = parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
         let with_stereo_bond = parse_smiles("F/C=C/F").expect("valid SMILES");
+        let with_stereo_group = {
+            let mut m = parse_smiles("N[C@@H](C)C(=O)O").expect("valid SMILES");
+            m.set_stereo_groups(vec![StereoGroup::new(
+                StereoGroupKind::And,
+                Some(1),
+                vec![1],
+            )])
+            .expect("valid stereo groups");
+            m
+        };
 
         vec![
             (Carries::TOPOLOGY, ethane()),
@@ -743,6 +818,7 @@ mod tests {
             (Carries::UNIT_CELL, with_cell),
             (Carries::PROPERTIES, with_properties),
             (Carries::RESIDUES, with_residues),
+            (Carries::STEREO_GROUP, with_stereo_group),
         ]
     }
 
@@ -891,8 +967,12 @@ mod tests {
     }
 
     #[test]
-    fn test_both_formats_read_and_write() {
-        assert_eq!(all().count(), 2);
+    fn test_every_registered_format_reads_and_writes() {
+        // Named for what it checks rather than a count that was only ever
+        // true while there happened to be exactly two: every format the
+        // registry has grown since (#221's CXSMILES included) has to keep
+        // satisfying this, not just the first two.
+        assert_eq!(all().count(), 3);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
