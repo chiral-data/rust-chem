@@ -20,10 +20,18 @@ use crate::io::supplier::{Supplier, Writer};
 /// first, if present, so `ligand.sdf.gz` resolves as SDF rather than
 /// falling through to the unrecognised-extension default.
 pub fn open_supplier(path: &Path, options: &ReadOptions) -> io::Result<Box<dyn Supplier>> {
-    let name = path.to_string_lossy();
-    let format_name = name.strip_suffix(".gz").unwrap_or(&name);
-    let format = Format::from_filename(format_name);
+    open_supplier_as(path, format_for_path(path), options)
+}
 
+/// [`open_supplier`], with the format given explicitly rather than resolved
+/// from `path` — for a caller that already knows (or was told, e.g. `chem
+/// convert --from`) which format the bytes are in regardless of the name
+/// on disk.
+pub fn open_supplier_as(
+    path: &Path,
+    format: Format,
+    options: &ReadOptions,
+) -> io::Result<Box<dyn Supplier>> {
     let file = BufReader::new(File::open(path)?);
     let reader = maybe_decompress(file)?;
 
@@ -39,10 +47,19 @@ pub fn open_supplier(path: &Path, options: &ReadOptions) -> io::Result<Box<dyn S
 /// time. Compresses on write when `path` ends `.gz` and the `gzip` feature
 /// is compiled in.
 pub fn open_writer(path: &Path, options: &WriteOptions) -> io::Result<Box<dyn Writer>> {
+    open_writer_as(path, format_for_path(path), options)
+}
+
+/// [`open_writer`], with the format given explicitly rather than resolved
+/// from `path` — for a caller that already knows (or was told, e.g. `chem
+/// convert --to`) which format to write regardless of the name on disk.
+pub fn open_writer_as(
+    path: &Path,
+    format: Format,
+    options: &WriteOptions,
+) -> io::Result<Box<dyn Writer>> {
     let name = path.to_string_lossy();
     let is_gz = name.ends_with(".gz");
-    let format_name = name.strip_suffix(".gz").unwrap_or(&name);
-    let format = Format::from_filename(format_name);
 
     let file = BufWriter::new(File::create(path)?);
     let writer = maybe_compress(file, is_gz);
@@ -53,6 +70,15 @@ pub fn open_writer(path: &Path, options: &WriteOptions) -> io::Result<Box<dyn Wr
             format!("{} cannot be written, only read", format.name()),
         )
     })
+}
+
+/// The format a bare path resolves to: a trailing `.gz` removed first, if
+/// present, so `ligand.sdf.gz` resolves as SDF rather than falling through
+/// to the unrecognised-extension default.
+fn format_for_path(path: &Path) -> Format {
+    let name = path.to_string_lossy();
+    let format_name = name.strip_suffix(".gz").unwrap_or(&name);
+    Format::from_filename(format_name)
 }
 
 /// Peeks the first two bytes for gzip's magic number (`\x1f\x8b`) — the
@@ -110,8 +136,9 @@ mod tests {
         std::fs::write(&path, "CCO ethanol\n").unwrap();
 
         let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
-        let mol = supplier.next().unwrap().unwrap();
-        assert_eq!(mol.formula(), "C2H6O");
+        let record = supplier.next().unwrap().unwrap();
+        assert_eq!(record.molecule.formula(), "C2H6O");
+        assert_eq!(record.name, "ethanol");
         assert!(supplier.next().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -140,7 +167,7 @@ mod tests {
 
         let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
         let read_back = supplier.next().unwrap().unwrap();
-        assert_eq!(read_back.num_atoms(), mol.num_atoms());
+        assert_eq!(read_back.molecule.num_atoms(), mol.num_atoms());
         assert!(supplier.next().is_none());
 
         std::fs::remove_dir_all(&dir).ok();

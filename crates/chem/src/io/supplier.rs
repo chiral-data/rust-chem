@@ -10,17 +10,23 @@ use std::io::{BufRead, Write};
 use crate::core::molecule::Molecule;
 use crate::io::errors::ReadError;
 use crate::io::options::{ReadOptions, WriteOptions};
+use crate::io::reader::Record;
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
 /// Streams molecules one record at a time from a [`BufRead`], rather than
 /// materializing a whole file first.
 ///
+/// Yields [`Record`] — the same type the one-shot reader collects into a
+/// `Vec` — rather than a bare `Molecule`, so a record's name (or its
+/// generated `Molecule_N` fallback) survives streaming exactly as it does
+/// one-shot.
+///
 /// A blanket impl over the right kind of `Iterator` rather than a trait
 /// with its own methods — every format's supplier is already exactly an
 /// iterator, and giving it a name is all this adds.
-pub trait Supplier: Iterator<Item = Result<Molecule, ReadError>> {}
-impl<T: Iterator<Item = Result<Molecule, ReadError>>> Supplier for T {}
+pub trait Supplier: Iterator<Item = Result<Record, ReadError>> {}
+impl<T: Iterator<Item = Result<Record, ReadError>>> Supplier for T {}
 
 /// Accepts molecules one at a time and writes them to a [`Write`], rather
 /// than materializing one `String` for the whole output first.
@@ -54,7 +60,7 @@ impl<R: BufRead> SmilesSupplier<R> {
 }
 
 impl<R: BufRead> Iterator for SmilesSupplier<R> {
-    type Item = Result<Molecule, ReadError>;
+    type Item = Result<Record, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -79,11 +85,25 @@ impl<R: BufRead> Iterator for SmilesSupplier<R> {
             let Some(smiles) = parts.next() else {
                 continue;
             };
+            let rest: Vec<&str> = parts.collect();
+            let name = if rest.is_empty() {
+                format!("Molecule_{}", self.position)
+            } else {
+                rest.join(" ")
+            };
 
-            return Some(parse_smiles(smiles).map_err(|e| ReadError::Parse {
-                position: self.position,
-                message: e.to_string(),
-            }));
+            return Some(
+                parse_smiles(smiles)
+                    .map(|molecule| Record {
+                        molecule,
+                        name,
+                        smiles: Some(smiles.to_owned()),
+                    })
+                    .map_err(|e| ReadError::Parse {
+                        position: self.position,
+                        message: e.to_string(),
+                    }),
+            );
         }
     }
 }
@@ -108,7 +128,7 @@ impl<R: BufRead> SdfSupplier<R> {
 }
 
 impl<R: BufRead> Iterator for SdfSupplier<R> {
-    type Item = Result<Molecule, ReadError>;
+    type Item = Result<Record, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut buffer = String::new();
@@ -143,10 +163,25 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
         }
 
         self.position += 1;
-        Some(parse_sdf(&buffer).map_err(|e| ReadError::Parse {
-            position: self.position,
-            message: e.to_string(),
-        }))
+        let position = self.position;
+        Some(
+            parse_sdf(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
     }
 }
 
@@ -217,6 +252,9 @@ mod tests {
 
     #[test]
     fn test_smiles_supplier_agrees_with_the_one_shot_reader() {
+        // Names too, not just molecules -- a streamed record used to drop
+        // its name entirely, a gap the previous version of this test did
+        // not catch because it only compared formulas.
         let text = "# a comment\n\nCCO ethanol\nnot-a-smiles bad\nc1ccccc1\n";
 
         let one_shot = read_smiles_with_options(text, &options());
@@ -226,12 +264,12 @@ mod tests {
         let streamed_ok: Vec<_> = streamed
             .iter()
             .filter_map(|r| r.as_ref().ok())
-            .map(|m| m.formula())
+            .map(|r| (r.molecule.formula(), r.name.clone()))
             .collect();
         let one_shot_ok: Vec<_> = one_shot
             .records
             .iter()
-            .map(|r| r.molecule.formula())
+            .map(|r| (r.molecule.formula(), r.name.clone()))
             .collect();
         assert_eq!(streamed_ok, one_shot_ok);
 
@@ -241,14 +279,24 @@ mod tests {
 
     #[test]
     fn test_sdf_supplier_agrees_with_the_one_shot_reader() {
-        let sdf_one = crate::io::sdf::write_sdf(&{
-            let mut mol = crate::core::molecule::Molecule::new();
-            mol.add_atom(crate::core::atom::Atom::new(
-                crate::core::atom::Element::carbon(),
-            ));
-            mol
-        });
-        let text = format!("{sdf_one}{sdf_one}");
+        // One titled record and one untitled -- the untitled one exercises
+        // the Molecule_N fallback, which a streamed record used to skip
+        // entirely.
+        let mut titled = crate::core::molecule::Molecule::new();
+        titled.add_atom(crate::core::atom::Atom::new(
+            crate::core::atom::Element::carbon(),
+        ));
+        titled.set_name("my-molecule".to_string());
+        let mut untitled = crate::core::molecule::Molecule::new();
+        untitled.add_atom(crate::core::atom::Atom::new(
+            crate::core::atom::Element::oxygen(),
+        ));
+
+        let text = format!(
+            "{}{}",
+            crate::io::sdf::write_sdf(&titled),
+            crate::io::sdf::write_sdf(&untitled)
+        );
 
         let one_shot = read_sdf_with_options(&text, &options());
         let streamed: Vec<_> =
@@ -256,11 +304,12 @@ mod tests {
 
         assert_eq!(streamed.len(), one_shot.records.len());
         for (streamed, one_shot) in streamed.iter().zip(one_shot.records.iter()) {
-            assert_eq!(
-                streamed.as_ref().unwrap().num_atoms(),
-                one_shot.molecule.num_atoms()
-            );
+            let streamed = streamed.as_ref().unwrap();
+            assert_eq!(streamed.molecule.num_atoms(), one_shot.molecule.num_atoms());
+            assert_eq!(streamed.name, one_shot.name);
         }
+        assert_eq!(one_shot.records[0].name, "my-molecule");
+        assert_eq!(one_shot.records[1].name, "Molecule_2");
     }
 
     #[test]

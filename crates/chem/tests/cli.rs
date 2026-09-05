@@ -950,3 +950,132 @@ fn test_drawing_an_unusable_file_exits_before_writing_anything() {
     assert_eq!(r.code, 2);
     assert!(!dir.exists(), "no directory should be created for nothing");
 }
+
+#[test]
+fn test_convert_round_trips_smiles_to_sdf_and_back() {
+    let path = fixture("convert-in.smi", GOOD);
+    let sdf = std::env::temp_dir().join("chem-cli-test-convert-out.sdf");
+    let _ = std::fs::remove_file(&sdf);
+
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "-o",
+            sdf.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 3, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+    let written = std::fs::read_to_string(&sdf).expect("output file");
+    assert!(written.contains("ethanol"));
+    assert!(written.contains("$$$$"));
+
+    // And back, to stdout as SMILES via --to.
+    let r = run(&["convert", sdf.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ethanol"));
+    assert!(r.stdout.contains("benzene"));
+}
+
+#[test]
+fn test_convert_from_and_to_override_the_extension() {
+    // Named .txt, so the extension alone would resolve to neither format.
+    let path = fixture("convert-wrong-ext.txt", GOOD);
+    let dest = std::env::temp_dir().join("chem-cli-test-convert-wrong-ext-out.txt");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "smi",
+            "--to",
+            "sdf",
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    let written = std::fs::read_to_string(&dest).expect("output file");
+    assert!(written.contains("$$$$"));
+}
+
+#[test]
+fn test_convert_literal_reads_the_string_directly() {
+    let r = run(&["convert", "--literal", "c1ccccc1O", "--to", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"));
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_gen3d_is_rejected_with_a_clear_message() {
+    let r = run(
+        &["convert", "--literal", "CCO", "--to", "sdf", "--gen3d"],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("does not generate 3D coordinates"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_output_format_is_ambiguous_without_to_or_a_named_extension() {
+    let r = run(&["convert", "--literal", "CCO"], None);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("ambiguous"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_unrecognized_format_code_is_an_error() {
+    let r = run(&["convert", "--literal", "CCO", "--to", "pdbqt"], None);
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_strict_exits_partial_on_a_skipped_record() {
+    let path = fixture("convert-mixed.smi", MIXED);
+    let r = run(
+        &["--strict", "convert", path.to_str().unwrap(), "--to", "sdf"],
+        None,
+    );
+    assert_eq!(r.code, 4);
+}
+
+#[test]
+fn test_convert_refuses_to_clobber_its_own_input() {
+    let path = fixture("convert-clobber.sdf", SDF);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--to",
+            "smi",
+            "-o",
+            path.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("pass --force"), "{:?}", r.stderr);
+}

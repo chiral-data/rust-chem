@@ -27,11 +27,15 @@ use backend::Backend;
 use chem::draw::structure::{StructureOptions, StructureTheme};
 use chem::draw::svg::structure_to_svg;
 use chem::io::format::Carries;
+use chem::io::open::{open_supplier_as, open_writer_as};
+use chem::io::options::{ReadOptions, WriteOptions};
 use chem::io::reader::Format;
+use chem::io::supplier::{Supplier, Writer};
 use clap::{Parser, Subcommand, ValueEnum};
 use emath::Vec2;
 use fpfile::FingerprintFile;
-use std::path::PathBuf;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use write::OutputFormat;
 
@@ -157,6 +161,55 @@ enum Command {
         /// those read from an SDF.
         #[arg(long)]
         relayout: bool,
+
+        /// Allow writing over the input file.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Read format A, write format B — a general converter for the pairs
+    /// this crate registers a reader and a writer for.
+    ///
+    /// Streams rather than materializing the whole file, and reads/writes
+    /// gzip transparently when the `gzip` feature is compiled in.
+    ///
+    /// `-o`/`--output` keeps this CLI's own established meaning (the output
+    /// path, same as every other subcommand) rather than following
+    /// `obabel`'s convention, where `-o` is the output *format* and `-O` is
+    /// the path — `--from`/`--to` name the format instead, so nothing here
+    /// means something different depending on which subcommand you're
+    /// reading.
+    Convert {
+        /// Input file. Reads standard input when absent or `-`.
+        input: Option<PathBuf>,
+
+        /// Input format code (e.g. `smi`, `sdf`). Inferred from the input's
+        /// extension when omitted, or SMILES when there is no filename to
+        /// infer from (standard input, `--literal`).
+        #[arg(long, short = 'i')]
+        from: Option<String>,
+
+        /// Output format code. Inferred from `--output`'s extension when
+        /// omitted. Ambiguous, and an error, when neither is given and
+        /// output is standard output — unlike `chem aromatic`/`chem
+        /// coords`, a general converter has no format its own output
+        /// naturally needs, so guessing would just be a guess.
+        #[arg(long, short = 't')]
+        to: Option<String>,
+
+        /// Write to a file instead of standard output.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Treat this text as the input directly, in `--from`'s format,
+        /// instead of reading a file.
+        #[arg(long, conflicts_with = "input")]
+        literal: Option<String>,
+
+        /// Rejected: coordinate generation is out of scope for this crate.
+        /// `chem coords` computes a 2D layout; there is no 3D equivalent.
+        #[arg(long)]
+        gen3d: bool,
 
         /// Allow writing over the input file.
         #[arg(long)]
@@ -479,6 +532,74 @@ fn run(cli: &Cli) -> Result<i32> {
             Ok(exit::OK)
         }
 
+        Command::Convert {
+            input,
+            from,
+            to,
+            output,
+            literal,
+            gen3d,
+            force,
+        } => {
+            if *gen3d {
+                bail!(
+                    "chem convert does not generate 3D coordinates (out of scope for this crate) \
+                     -- use `chem coords` for a 2D layout, or generate 3D externally before converting"
+                );
+            }
+            write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
+            note_cpu_only(cli);
+
+            let from_format = from
+                .as_deref()
+                .map(|code| {
+                    Format::from_code(code)
+                        .ok_or_else(|| anyhow::anyhow!("unrecognized format code: {code:?}"))
+                })
+                .transpose()?;
+            let (mut supplier, label): (Box<dyn Supplier>, String) =
+                resolve_convert_input(input.as_deref(), literal.as_deref(), from_format)?;
+
+            let to_format = to
+                .as_deref()
+                .map(|code| {
+                    Format::from_code(code)
+                        .ok_or_else(|| anyhow::anyhow!("unrecognized format code: {code:?}"))
+                })
+                .transpose()?;
+            let format = resolve_convert_output_format(to_format, output.as_deref())?;
+            let mut writer = resolve_convert_output(format, output.as_deref())?;
+
+            let mut tracker = write::DropTracker::new(format.carries());
+            let mut written = 0usize;
+            let mut skipped = 0usize;
+            for (i, item) in supplier.by_ref().enumerate() {
+                match item {
+                    Ok(record) => {
+                        tracker.record(&record.name, &record.molecule);
+                        writer.write_molecule(&record.name, &record.molecule)?;
+                        written += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("skipping record {} of {label}: {e}", i + 1);
+                        skipped += 1;
+                    }
+                }
+            }
+            writer.finish()?;
+            tracker.report(format.label(), cli.explain_drops);
+            eprintln!("converted {written}, skipped {skipped}");
+
+            if written == 0 {
+                eprintln!("nothing readable in {label}");
+                return Ok(exit::NO_INPUT);
+            }
+            if cli.strict && skipped > 0 {
+                return Ok(exit::PARTIAL);
+            }
+            Ok(exit::OK)
+        }
+
         Command::Draw {
             input,
             format,
@@ -640,6 +761,75 @@ fn run(cli: &Cli) -> Result<i32> {
             stream::write_output(output.as_ref(), &out)?;
             Ok(exit::OK)
         }
+    }
+}
+
+/// Resolves `chem convert`'s input into a streaming [`Supplier`], and a
+/// label for its skip/error messages.
+///
+/// `--literal` bypasses the filesystem entirely; a real path streams
+/// through [`open_supplier`]/[`open_supplier_as`] (gzip-aware, per #213);
+/// standard input has no name to infer a format from, so `--from` or the
+/// SMILES fallback decides it, the same rule `stream::read_input` already
+/// uses for `-`.
+fn resolve_convert_input(
+    input: Option<&Path>,
+    literal: Option<&str>,
+    from: Option<Format>,
+) -> Result<(Box<dyn Supplier>, String)> {
+    if let Some(text) = literal {
+        let format = from.unwrap_or(Format::SMILES);
+        let supplier = format
+            .supplier(Cursor::new(text.as_bytes().to_vec()), &ReadOptions)
+            .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
+        return Ok((supplier, "<literal>".to_string()));
+    }
+
+    match input.filter(|p| p.as_os_str() != "-") {
+        Some(path) => {
+            let supplier = match from {
+                Some(format) => open_supplier_as(path, format, &ReadOptions)?,
+                None => chem::io::open::open_supplier(path, &ReadOptions)?,
+            };
+            Ok((supplier, path.display().to_string()))
+        }
+        None => {
+            let format = from.unwrap_or(Format::SMILES);
+            let supplier = format
+                .supplier(std::io::stdin().lock(), &ReadOptions)
+                .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
+            Ok((supplier, "-".to_string()))
+        }
+    }
+}
+
+/// Resolves `chem convert`'s output format. Unlike `chem aromatic`/`chem
+/// coords` (which fall back to whatever format can hold what they just
+/// computed), a general converter has no such fallback — guessing here
+/// would be exactly the kind of silent choice this crate's drop-report
+/// philosophy exists to avoid, so an unresolvable case is an error rather
+/// than a default.
+fn resolve_convert_output_format(to: Option<Format>, output: Option<&Path>) -> Result<Format> {
+    if let Some(format) = to {
+        return Ok(format);
+    }
+    if let Some(path) = output.filter(|p| p.as_os_str() != "-") {
+        let name = path.to_string_lossy();
+        let format_name = name.strip_suffix(".gz").unwrap_or(&name);
+        return Ok(Format::from_filename(format_name));
+    }
+    bail!(
+        "output format is ambiguous — pass --to <code>, or --output <path> with a recognized extension"
+    );
+}
+
+/// Resolves `chem convert`'s output into a streaming [`Writer`].
+fn resolve_convert_output(format: Format, output: Option<&Path>) -> Result<Box<dyn Writer>> {
+    match output.filter(|p| p.as_os_str() != "-") {
+        Some(path) => Ok(open_writer_as(path, format, &WriteOptions::default())?),
+        None => format
+            .writer_stream(std::io::stdout().lock(), &WriteOptions::default())
+            .ok_or_else(|| anyhow::anyhow!("{} cannot be written, only read", format.name())),
     }
 }
 
