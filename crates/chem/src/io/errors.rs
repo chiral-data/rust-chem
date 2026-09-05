@@ -82,6 +82,22 @@ pub enum SdfError {
     MissingCountsLine,
 }
 
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum XyzError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    #[error("Declared {expected} atoms but found {got}")]
+    AtomCountMismatch { expected: usize, got: usize },
+}
+
 /// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
 ///
 /// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,

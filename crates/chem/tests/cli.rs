@@ -1220,3 +1220,95 @@ fn test_convert_list_shows_cxsmiles_is_registered() {
     assert_eq!(r.code, 0, "{:?}", r.stderr);
     assert!(r.stdout.contains("stereo_group"), "{:?}", r.stdout);
 }
+
+const WATER_XYZ: &str = "3\nwater\nO 0.000000 0.000000 0.000000\nH 0.758602 0.000000 0.504284\nH 0.758602 0.000000 -0.504284\n";
+
+#[test]
+fn test_convert_reads_a_literal_xyz_frame() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_XYZ,
+            "--from",
+            "xyz",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("water"), "{:?}", r.stdout);
+    // A real 3D conformer, not a flat drawing -- the y column is nonzero
+    // nowhere in this molecule, but z is, and 0.504284 is one atom's.
+    assert!(
+        r.stdout.contains("0.5043") || r.stdout.contains("0.5042"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_writes_xyz_and_it_reads_back_the_same_atom_count() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_XYZ,
+            "--from",
+            "xyz",
+            "--to",
+            "xyz",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.starts_with("3\n"), "{:?}", r.stdout);
+
+    let back = run(
+        &[
+            "convert",
+            "--literal",
+            &r.stdout,
+            "--from",
+            "xyz",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+}
+
+#[test]
+fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
+    let path = fixture(
+        "trajectory.xyz",
+        &format!("{WATER_XYZ}{WATER_XYZ}{WATER_XYZ}"),
+    );
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "xyz",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 3, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_xyz_has_the_smallest_mask() {
+    let r = run(&["convert", "-L", "xyz"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
+}

@@ -431,6 +431,25 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(cxsmiles_supplier),
         writer_stream: Some(cxsmiles_writer_stream),
     },
+    FormatDescriptor {
+        name: "XYZ",
+        codes: &["xyz"],
+        extensions: &["xyz"],
+        category: Category::ComputationalChemistry,
+        // The smallest mask registered so far: nothing else about an atom —
+        // charge, isotope, stereo, aromaticity, residue membership — has a
+        // column in this format at all. Deliberately no UNIT_CELL: extended
+        // XYZ's `Lattice=` names Cartesian basis vectors in whatever
+        // orientation the file's writer used, not necessarily this crate's
+        // fixed orientation convention (`core/cell.rs`), and reading it
+        // correctly would mean rotating every atom's coordinate to match —
+        // not attempted here (#222), see `io/xyz.rs`'s module doc.
+        carries: Carries::TOPOLOGY.or(Carries::COORDS_3D),
+        reader: Some(crate::io::reader::read_xyz_with_options),
+        writer: Some(write_xyz_records),
+        supplier: Some(xyz_supplier),
+        writer_stream: Some(xyz_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -445,6 +464,10 @@ fn sdf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
     Box::new(crate::io::supplier::SdfSupplier::new(reader, options))
 }
 
+fn xyz_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::XyzSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -455,6 +478,10 @@ fn cxsmiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box
 
 fn sdf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SdfWriter::new(writer, options))
+}
+
+fn xyz_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::XyzWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -498,6 +525,17 @@ fn write_sdf_records(records: &[(String, Molecule)], options: &WriteOptions) -> 
     crate::io::sdf::write_sdf_all_with_options(&molecules, &options.sdf)
 }
 
+fn write_xyz_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // XYZ has no write options today.
+    let mut out = String::new();
+    for (name, molecule) in records {
+        let mut copy = molecule.clone();
+        copy.set_name(name.clone());
+        out.push_str(&crate::io::xyz::write_xyz(&copy));
+    }
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -515,6 +553,8 @@ impl Format {
     /// CXSMILES (#221) — enhanced stereo groups only, see
     /// [`crate::io::cxsmiles`].
     pub const CXSMILES: Format = Format(2);
+    /// XYZ (#222) — coordinates only, no unit cell, see [`crate::io::xyz`].
+    pub const XYZ: Format = Format(3);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -972,7 +1012,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 3);
+        assert_eq!(all().count(), 4);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

@@ -253,6 +253,104 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
     }
 }
 
+/// One molecule per frame: a count line, a comment line, then that many
+/// atom lines (#222). Mirrors
+/// [`crate::io::reader::read_xyz_with_options`]'s splitting exactly, one
+/// line read at a time instead of over a pre-loaded string.
+pub struct XyzSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> XyzSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for XyzSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let count_line = loop {
+            match self.lines.next()? {
+                Ok(line) if line.trim().is_empty() => continue,
+                Ok(line) => break line,
+                Err(source) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            }
+        };
+
+        let count: usize = match count_line.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.position += 1;
+                return Some(Err(ReadError::Parse {
+                    position: self.position,
+                    message: format!("invalid atom count: {count_line:?}"),
+                }));
+            }
+        };
+
+        let mut frame = count_line;
+        frame.push('\n');
+        // The comment line plus `count` atom lines.
+        for _ in 0..=count {
+            match self.lines.next() {
+                Some(Ok(line)) => {
+                    frame.push_str(&line);
+                    frame.push('\n');
+                }
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+                None => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Parse {
+                        position: self.position,
+                        message: format!("declared {count} atoms but the file ended early"),
+                    }));
+                }
+            }
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::xyz::parse_xyz(&frame)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
 /// Streams SMILES out, one line per molecule — the same shape the one-shot
 /// SMILES writer produces in one pass.
 pub struct SmilesWriter<W> {
@@ -329,6 +427,30 @@ impl<W: Write> Writer for SdfWriter<W> {
         copy.set_name(name.to_string());
         self.writer
             .write_all(crate::io::sdf::write_sdf_with_options(&copy, &self.options).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams XYZ out, one frame per molecule (#222).
+pub struct XyzWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> XyzWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for XyzWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        let mut copy = molecule.clone();
+        copy.set_name(name.to_string());
+        self.writer
+            .write_all(crate::io::xyz::write_xyz(&copy).as_bytes())
     }
 
     fn finish(self: Box<Self>) -> std::io::Result<()> {
