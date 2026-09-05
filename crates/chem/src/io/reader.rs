@@ -159,6 +159,53 @@ pub fn read_smiles_with_options(content: &str, _options: &ReadOptions) -> ReadOu
     out
 }
 
+/// [`read_cxsmiles_with_options`] with default options.
+pub fn read_cxsmiles(content: &str) -> ReadOutcome {
+    read_cxsmiles_with_options(content, &ReadOptions)
+}
+
+/// One molecule per line: a SMILES, optionally followed by a `|...|`
+/// enhanced-stereo-group block, then optionally a name (#221). A strict
+/// superset of [`read_smiles_with_options`]'s own convention — a line with
+/// no block reads exactly the same way.
+pub fn read_cxsmiles_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+
+    for (index, raw) in content.lines().enumerate() {
+        let position = index + 1;
+        let line = raw.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (smiles, block, name_parts) = crate::io::cxsmiles::split_cxsmiles_line(line);
+        if smiles.is_empty() {
+            continue;
+        }
+        let name = if name_parts.is_empty() {
+            format!("Molecule_{position}")
+        } else {
+            name_parts.join(" ")
+        };
+
+        match crate::io::cxsmiles::parse_cxsmiles(smiles, block) {
+            Ok(molecule) => out.records.push(Record {
+                molecule,
+                name,
+                smiles: Some(smiles.to_owned()),
+            }),
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: smiles.to_owned(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    out
+}
+
 /// [`read_sdf_with_options`] with default options.
 pub fn read_sdf(content: &str) -> ReadOutcome {
     read_sdf_with_options(content, &ReadOptions)

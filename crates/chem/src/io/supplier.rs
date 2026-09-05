@@ -108,6 +108,74 @@ impl<R: BufRead> Iterator for SmilesSupplier<R> {
     }
 }
 
+/// One molecule per line: a SMILES, optionally followed by a `|...|`
+/// enhanced-stereo-group block, then optionally a name (#221). Mirrors
+/// [`crate::io::reader::read_cxsmiles_with_options`]'s splitting exactly,
+/// one line read at a time instead of over a pre-loaded string.
+pub struct CxSmilesSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> CxSmilesSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for CxSmilesSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let raw = match self.lines.next()? {
+                Ok(line) => line,
+                Err(source) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            self.position += 1;
+            let line = raw.trim();
+
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let (smiles, block, name_parts) = crate::io::cxsmiles::split_cxsmiles_line(line);
+            if smiles.is_empty() {
+                continue;
+            }
+            let name = if name_parts.is_empty() {
+                format!("Molecule_{}", self.position)
+            } else {
+                name_parts.join(" ")
+            };
+
+            return Some(
+                crate::io::cxsmiles::parse_cxsmiles(smiles, block)
+                    .map(|molecule| Record {
+                        molecule,
+                        name,
+                        smiles: Some(smiles.to_owned()),
+                    })
+                    .map_err(|e| ReadError::Parse {
+                        position: self.position,
+                        message: e.to_string(),
+                    }),
+            );
+        }
+    }
+}
+
 /// One molecule per `$$$$`-terminated record. Mirrors
 /// [`crate::io::reader::read_sdf_with_options`]'s splitting exactly, one
 /// line read at a time instead of over a pre-loaded string.
@@ -204,6 +272,33 @@ impl<W: Write> Writer for SmilesWriter<W> {
             self.writer,
             "{} {}",
             crate::io::smiles_writer::write_smiles_for_molecule_canonical(molecule),
+            name
+        )
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams CXSMILES out, one line per molecule (#221) — the same shape the
+/// one-shot writer produces in one pass.
+pub struct CxSmilesWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> CxSmilesWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for CxSmilesWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        writeln!(
+            self.writer,
+            "{} {}",
+            crate::io::cxsmiles::write_cxsmiles(molecule),
             name
         )
     }

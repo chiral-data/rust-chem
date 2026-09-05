@@ -1152,3 +1152,71 @@ fn test_convert_list_and_describe_are_pure_queries_that_run_no_conversion() {
     let r = run(&["convert", "-H", "sdf"], None);
     assert_eq!(r.code, 0, "{:?}", r.stderr);
 }
+
+#[test]
+fn test_convert_writes_an_enhanced_stereo_group_as_cxsmiles() {
+    // #221: --to cxsmiles needed no main.rs changes at all, since #215
+    // already made every format-code flag a registry lookup.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "N[C@@H](C)C(=O)O",
+            "--from",
+            "smi",
+            "--to",
+            "cxsmiles",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // Plain SMILES has no stereo groups, so nothing to write -- confirms
+    // the block is genuinely omitted rather than always present.
+    assert!(!r.stdout.contains('|'), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_round_trips_an_enhanced_stereo_group_through_cxsmiles() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "N[C@@H](C)C(=O)O |&1:1|",
+            "--from",
+            "cxsmiles",
+            "--to",
+            "cxsmiles",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("|&1:1|"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reports_dropping_a_stereo_group_when_writing_plain_smiles() {
+    // Plain SMILES's carries mask does not include STEREO_GROUP, so the
+    // drop report (#214's DropTracker) should fire rather than silently
+    // discard the group.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "N[C@@H](C)C(=O)O |&1:1|",
+            "--from",
+            "cxsmiles",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("stereo_group"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_list_shows_cxsmiles_is_registered() {
+    let r = run(&["convert", "-L", "cxsmiles"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("stereo_group"), "{:?}", r.stdout);
+}
