@@ -96,7 +96,7 @@ pub struct GpuAtom {
     is_aromatic: u32,
     chirality: u32,
     formal_charge: i32,
-    _padding1: u32,
+    total_hydrogens: u32,
     _padding2: u32,
     _padding3: u32,
 }
@@ -565,7 +565,7 @@ impl GpuMorganFingerprint {
                         crate::core::atom::Chirality::Clockwise => 3,
                     },
                     formal_charge: atom.formal_charge() as i32,
-                    _padding1: 0,
+                    total_hydrogens: atom.total_hydrogens() as u32,
                     _padding2: 0,
                     _padding3: 0,
                 });
@@ -671,7 +671,7 @@ impl GpuMorganFingerprint {
                 is_aromatic: 0,
                 chirality: 0,
                 formal_charge: 0,
-                _padding1: 0,
+                total_hydrogens: 0,
                 _padding2: 0,
                 _padding3: 0,
             });

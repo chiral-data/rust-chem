@@ -38,7 +38,7 @@ struct Atom {
     is_aromatic: u32,
     chirality: u32,
     formal_charge: i32,
-    _padding1: u32,
+    total_hydrogens: u32,
     _padding2: u32,
     _padding3: u32,
 }
@@ -290,9 +290,13 @@ fn init_invariants_batch(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let atom = atoms[mol.atom_start + local_atom_idx];
 
-    // Compute initial invariant
+    // Compute initial invariant. Mirrors MorganAtomInvGenerator::
+    // get_connectivity_invariants on the CPU side exactly, term for term and
+    // in the same order, so CPU and GPU hash identically (#192).
     var inv = atom.atomic_number;
     inv = inv * 100u + atom.degree;
+    inv = inv * 100u + atom.total_hydrogens;
+    inv = inv * 20u + u32(atom.formal_charge + 5);
 
     if (atom.is_aromatic != 0u) {
         inv = inv * 2u;

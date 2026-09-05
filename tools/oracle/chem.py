@@ -117,10 +117,29 @@ def fingerprint(smiles: str, radius: int, nbits: int) -> list[int] | None:
 
     `chem fp` writes `name<TAB>hex`, least-significant-bit-first within each
     nibble, so bit *n* is character *n // 4* at position *n % 4*.
+
+    Piped through `chem aromatic` first, matching the documented
+    `chem aromatic x.smi | chem fp` pipeline: `chem fp` deliberately does not
+    perceive aromaticity on its own (#192), and comparing against RDKit's
+    fingerprint — which perceives aromaticity as part of RDKit's own
+    sanitization — only makes sense against the same pipeline a real user
+    would run for that comparison.
     """
+    perceived = run(["aromatic", "-", "--format", "smiles"], stdin=f"{smiles} probe\n")
+    if perceived.code != 0:
+        return None
+    rows = [
+        line
+        for line in perceived.stdout.splitlines()
+        if line and not line.startswith("#")
+    ]
+    if not rows:
+        return None
+    perceived_smiles = rows[0].split()[0]
+
     result = run(
         ["fp", "-", "--radius", str(radius), "--size", str(nbits), "-b", "cpu"],
-        stdin=f"{smiles} probe\n",
+        stdin=f"{perceived_smiles} probe\n",
     )
     if result.code != 0:
         return None
