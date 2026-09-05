@@ -747,6 +747,7 @@ dependencies = [
  "ecolor",
  "emath",
  "env_logger",
+ "flate2",
  "futures",
  "fxhash",
  "log",

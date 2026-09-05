@@ -1,8 +1,10 @@
 pub mod aromaticity;
 pub mod errors;
 pub mod format;
+pub mod open;
 pub mod options;
 pub mod reader;
 pub mod sdf;
 pub mod smiles;
 pub mod smiles_writer;
+pub mod supplier;
