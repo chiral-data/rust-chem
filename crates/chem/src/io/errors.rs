@@ -172,6 +172,25 @@ pub enum GroError {
     AtomCountMismatch { expected: usize },
 }
 
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum CmlError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom element: {0}")]
+    InvalidAtomElement(String),
+
+    #[error("Invalid bond element: {0}")]
+    InvalidBondElement(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    #[error("Bond references unknown atom id: {0}")]
+    UnknownAtomReference(String),
+}
+
 /// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
 ///
 /// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,

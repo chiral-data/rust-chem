@@ -631,6 +631,82 @@ pub fn read_gro_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
     out
 }
 
+/// [`read_cml_with_options`] with default options.
+pub fn read_cml(content: &str) -> ReadOutcome {
+    read_cml_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `<molecule>` element (#228). A byte-offset scan over
+/// the raw text, not a per-line scan like every prior format's framing
+/// (mmCIF's `data_`, Mol2's `@<TRIPOS>MOLECULE`, PDB/PDBQT's `ENDMDL`) --
+/// XML is not line-oriented, and a `<molecule>` start or `</molecule>` end
+/// can fall anywhere on a line, including both on the same line for
+/// compact output. Nested `<molecule>` elements are out of scope: each
+/// record is assumed to run from its own `<molecule` start to the very
+/// next `</molecule>` close, not a depth-balanced match -- see
+/// `io/cml.rs`'s module doc.
+pub fn read_cml_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut position = 0;
+    let mut search_from = 0;
+
+    while let Some(start) = find_molecule_start(content, search_from) {
+        let close_tag = "</molecule>";
+        let (record, next_search_from) = match content[start..].find(close_tag) {
+            Some(rel_end) => {
+                let end = start + rel_end + close_tag.len();
+                (&content[start..end], end)
+            }
+            None => (&content[start..], content.len()),
+        };
+
+        position += 1;
+        match crate::io::cml::parse_cml(record) {
+            Ok(molecule) => {
+                let name = molecule
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{position}"));
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: record.to_string(),
+                error: e.to_string(),
+            }),
+        }
+
+        if next_search_from >= content.len() {
+            break;
+        }
+        search_from = next_search_from;
+    }
+
+    out
+}
+
+/// Finds the byte offset of the next `<molecule` start tag at or after
+/// `from`, requiring the character right after `<molecule` to be a real
+/// tag boundary (whitespace, `>`, `/`, or end of input) so `<moleculeList>`
+/// and similar tags are never mistaken for a record start.
+fn find_molecule_start(content: &str, from: usize) -> Option<usize> {
+    let mut search_from = from;
+    loop {
+        let rel = content[search_from..].find("<molecule")?;
+        let idx = search_from + rel;
+        let after = &content[idx + "<molecule".len()..];
+        match after.chars().next() {
+            Some(c) if c.is_whitespace() || c == '>' || c == '/' => return Some(idx),
+            None => return Some(idx),
+            _ => search_from = idx + "<molecule".len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

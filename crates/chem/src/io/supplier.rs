@@ -1021,6 +1021,168 @@ impl<W: Write> Writer for GroWriter<W> {
     }
 }
 
+/// One molecule per `<molecule>` element (#228). Line-based, unlike
+/// [`crate::io::reader::read_cml_with_options`]'s whole-text byte scan --
+/// streaming only ever has one line at a time, so this looks for a
+/// `<molecule` start and then accumulates lines until it finds that
+/// record's own `</molecule>` close, carrying over whatever followed the
+/// close tag on the same physical line (a container's own closing tag,
+/// e.g. `</cml>`) as `pending` rather than losing or misparsing it.
+pub struct CmlSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> CmlSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            _options: *options,
+        }
+    }
+}
+
+/// The byte offset of a `<molecule` start tag within one line, requiring a
+/// real tag boundary right after it (matches
+/// [`crate::io::reader::find_molecule_start`], per-line instead of
+/// whole-text).
+fn find_molecule_start_in_line(line: &str) -> Option<usize> {
+    let mut search_from = 0;
+    loop {
+        let rel = line[search_from..].find("<molecule")?;
+        let idx = search_from + rel;
+        let after = &line[idx + "<molecule".len()..];
+        match after.chars().next() {
+            Some(c) if c.is_whitespace() || c == '>' || c == '/' => return Some(idx),
+            None => return Some(idx),
+            _ => search_from = idx + "<molecule".len(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for CmlSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut started = false;
+        let mut carry = self.pending.take();
+
+        loop {
+            let raw = match carry.take() {
+                Some(line) => line,
+                None => match self.lines.next() {
+                    None => break,
+                    Some(Ok(line)) => line,
+                    Some(Err(source)) => {
+                        self.position += 1;
+                        return Some(Err(ReadError::Io {
+                            position: self.position,
+                            source,
+                        }));
+                    }
+                },
+            };
+
+            if !started {
+                match find_molecule_start_in_line(&raw) {
+                    Some(idx) => {
+                        started = true;
+                        buffer.push_str(&raw[idx..]);
+                        buffer.push('\n');
+                    }
+                    None => continue,
+                }
+            } else {
+                buffer.push_str(&raw);
+                buffer.push('\n');
+            }
+
+            if let Some(rel) = buffer.find("</molecule>") {
+                let end = rel + "</molecule>".len();
+                let tail = buffer[end..].to_string();
+                buffer.truncate(end);
+                self.pending = if tail.trim().is_empty() {
+                    None
+                } else {
+                    Some(tail)
+                };
+                break;
+            }
+        }
+
+        if !started || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::cml::parse_cml(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        molecule,
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// Streams CML out, one `<molecule>` element per molecule (#228).
+/// Wraps every molecule in a single `<cml>` root, opened on the first
+/// [`Writer::write_molecule`] call and closed in [`Writer::finish`] --
+/// several sibling `<molecule>` elements with no enclosing root is not
+/// valid XML (a strict parser stops after the first), confirmed against
+/// OpenBabel's own CML reader during this story's verification.
+pub struct CmlWriter<W> {
+    writer: W,
+    wrote_header: bool,
+}
+
+impl<W: Write> CmlWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self {
+            writer,
+            wrote_header: false,
+        }
+    }
+}
+
+impl<W: Write> Writer for CmlWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        if !self.wrote_header {
+            self.writer
+                .write_all(b"<cml xmlns=\"http://www.xml-cml.org/schema\">\n")?;
+            self.wrote_header = true;
+        }
+        let mut copy = molecule.clone();
+        copy.set_name(name.to_string());
+        self.writer
+            .write_all(crate::io::cml::write_cml(&copy).as_bytes())
+    }
+
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        if self.wrote_header {
+            self.writer.write_all(b"</cml>\n")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
