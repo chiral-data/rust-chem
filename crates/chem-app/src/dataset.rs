@@ -28,16 +28,25 @@ impl MoleculeDataset {
     ///
     /// The parallel-vector shape is what the views consume; the skipped records
     /// are the caller's to report, which is why they are not swallowed here.
-    pub fn from_outcome(outcome: &ReadOutcome) -> Self {
+    pub fn from_outcome(outcome: &ReadOutcome, format: DatasetFormat) -> Self {
         let mut dataset = Self::new();
         for record in &outcome.records {
             dataset.molecules.push(record.molecule.clone());
-            // SDF carries coordinates and connectivity rather than a SMILES
-            // string. The placeholder is a display decision, so it is made
-            // here rather than in the library that read the file.
-            dataset
-                .smiles
-                .push(record.smiles.clone().unwrap_or_else(|| "(SDF)".to_owned()));
+            // Most formats carry coordinates and connectivity rather than a
+            // SMILES string, so the column needs something to say. The
+            // placeholder is a display decision, made here rather than in the
+            // library that read the file.
+            //
+            // It names the format it came from. This used to be the literal
+            // `(SDF)`, which was true while SDF was the only structure format
+            // registered and a lie for the nine v0.8.0 added -- open a PDB and
+            // every row claimed to be an SDF record (#266).
+            dataset.smiles.push(
+                record
+                    .smiles
+                    .clone()
+                    .unwrap_or_else(|| format!("({})", format.label())),
+            );
             dataset.names.push(record.name.clone());
         }
         dataset
@@ -82,7 +91,7 @@ CC(C)(C)C Neopentane
                 skipped.error
             );
         }
-        Self::from_outcome(&outcome)
+        Self::from_outcome(&outcome, DatasetFormat::SMILES)
     }
 }
 
@@ -227,7 +236,7 @@ mod tests {
         let content = smiles.join("\n");
         let outcome = reader::read_smiles(&content);
         assert!(outcome.skipped.is_empty(), "fixture should parse cleanly");
-        MoleculeDataset::from_outcome(&outcome)
+        MoleculeDataset::from_outcome(&outcome, DatasetFormat::SMILES)
     }
 
     #[test]

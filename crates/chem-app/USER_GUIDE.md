@@ -59,7 +59,10 @@ Each is movable and resizable, and each can be closed from its own **✕** or to
 In the **Datasets** window, or from the **File** menu:
 
 - **📋 Load Examples** — loads 15 built-in molecules (methane, benzene, phenol, aniline, aspirin-adjacent structures, etc.) instantly. Good default if you just want to try things out.
-- **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file, or a `.sdf` file, from disk.
+- **📂 Load File** — pick any format the library reads, from disk. As of v0.8.0 that is eleven: SMILES (`.smi`/`.smiles`/`.txt`), SDF (`.sdf`), CXSMILES (`.cxsmiles`), XYZ (`.xyz`), PDB (`.pdb`/`.ent`), mmCIF (`.cif`/`.mmcif`), Mol2 (`.mol2`), PDBQT (`.pdbqt`), GRO (`.gro`), CML (`.cml`) and commonchem JSON (`.json`). The dialog's list is generated from the format registry, so it stays in step with what the library supports.
+  - The file's extension decides how it is read; an unrecognised one is treated as SMILES.
+  - Formats that carry structures rather than SMILES strings — PDB, mmCIF, Mol2 and the rest — show their own name in the SMILES column, e.g. `(PDB)`.
+  - A structure file's 3D coordinates are not a 2D drawing: **2D Coordinates** computes a fresh layout from the connectivity rather than flattening the conformer, so the depiction shows what is bonded to what and not the real geometry.
   - SMILES format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
   - Each load adds a new entry to the **Files** list rather than replacing what's already there — click any entry to switch back to it. Each is shown with its format and molecule count, so two SMILES files are told apart without switching between them. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.

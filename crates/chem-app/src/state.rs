@@ -18,6 +18,7 @@ use chem::core::layout::ensure_coords;
 use chem::core::molecule::Molecule;
 use chem::draw::structure::StructureOptions;
 use chem::io::aromaticity::detect_aromaticity;
+use chem::io::format;
 use chem::io::smiles::parse_smiles;
 use chem::search::{FingerprintSearch, SearchResult};
 
@@ -252,6 +253,45 @@ pub struct AppState {
     repaint: egui::Context,
 }
 
+/// The file dialog's filters: everything readable first, then one per format.
+///
+/// Generated from the registry rather than written out. The list used to be two
+/// `add_filter` calls naming SMILES and SDF, duplicated across the two `cfg`
+/// arms of [`AppState::load_dataset_from_file`] -- so the nine formats v0.8.0
+/// added could not be picked at all, and the two copies were free to drift
+/// (#266).
+///
+/// Readable formats only: offering a file the reader would refuse is worse than
+/// not offering it. The combined entry comes first because that is the one rfd
+/// preselects, and someone opening a `.pdb` should not have to know which entry
+/// claims it.
+fn molecule_file_filters() -> Vec<(&'static str, Vec<&'static str>)> {
+    let readable = || format::all().filter(|f| f.can_read());
+
+    let mut every: Vec<&'static str> = Vec::new();
+    for extension in readable().flat_map(|f| f.extensions().iter().copied()) {
+        // Two formats may claim one extension -- the registry pins codes as
+        // unique but not extensions -- and a repeat in this list would show up
+        // in the dialog.
+        if !every.contains(&extension) {
+            every.push(extension);
+        }
+    }
+
+    let mut filters = vec![("Molecule files", every)];
+    filters.extend(readable().map(|f| (f.label(), f.extensions().to_vec())));
+    filters
+}
+
+/// A file dialog that offers every format this build can read.
+fn molecule_file_dialog() -> rfd::AsyncFileDialog {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    for (name, extensions) in molecule_file_filters() {
+        dialog = dialog.add_filter(name, &extensions);
+    }
+    dialog
+}
+
 impl AppState {
     pub fn new(ctx: &egui::Context) -> Self {
         Self::with_engine(ctx, FingerprintSearch::new())
@@ -391,11 +431,7 @@ impl AppState {
         // is safe on native since blocking the calling thread doesn't stop
         // other threads from driving the future forward.
         let picked = pollster::block_on(async {
-            let file = rfd::AsyncFileDialog::new()
-                .add_filter("SMILES", &["smi", "smiles", "txt"])
-                .add_filter("SDF", &["sdf"])
-                .pick_file()
-                .await?;
+            let file = molecule_file_dialog().pick_file().await?;
             let name = file.file_name();
             Some((name, file.read().await))
         });
@@ -414,11 +450,7 @@ impl AppState {
         let slot = self.pending_file_load.clone();
         let ctx = self.repaint.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let file = rfd::AsyncFileDialog::new()
-                .add_filter("SMILES", &["smi", "smiles", "txt"])
-                .add_filter("SDF", &["sdf"])
-                .pick_file()
-                .await;
+            let file = molecule_file_dialog().pick_file().await;
             if let Some(file) = file {
                 let name = file.file_name();
                 let bytes = file.read().await;
@@ -443,7 +475,7 @@ impl AppState {
 
         let format = DatasetFormat::from_filename(&name);
         let outcome = chem::io::reader::read(&content, format);
-        let dataset = MoleculeDataset::from_outcome(&outcome);
+        let dataset = MoleculeDataset::from_outcome(&outcome, format);
 
         // Records that failed used to be logged and never surfaced, so a file
         // that half-loaded looked like a file that fully loaded. Reading now
@@ -1158,5 +1190,87 @@ mod tests {
         assert!(state.query_error.is_some());
         assert!(state.search.failed());
         assert!(state.results_epoch() > epoch);
+    }
+
+    #[test]
+    fn test_the_file_dialog_offers_every_readable_format() {
+        // Asserted against the registry rather than a count, so registering a
+        // twelfth format cannot silently go un-offered -- which is exactly what
+        // happened to the nine v0.8.0 added (#266).
+        let filters = molecule_file_filters();
+        let (combined, every) = &filters[0];
+        assert_eq!(*combined, "Molecule files");
+
+        for expected in format::all().filter(|f| f.can_read()) {
+            assert!(
+                filters.iter().any(|(name, _)| *name == expected.label()),
+                "{} has no filter entry",
+                expected.label()
+            );
+            for extension in expected.extensions() {
+                assert!(
+                    every.contains(extension),
+                    "{extension} missing from the combined filter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_dialog_offers_nothing_it_cannot_read() {
+        // Offering a file the reader would refuse is worse than not offering
+        // it: the picker would accept it and the load would fail afterwards.
+        let filters = molecule_file_filters();
+        for format in format::all().filter(|f| !f.can_read()) {
+            assert!(
+                !filters.iter().any(|(name, _)| *name == format.label()),
+                "{} cannot be read but is offered",
+                format.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_combined_filter_lists_each_extension_once() {
+        // The registry pins codes as unique but not extensions, so two formats
+        // may claim one and a repeat would reach the dialog.
+        let filters = molecule_file_filters();
+        let mut seen = filters[0].1.clone();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            before,
+            seen.len(),
+            "the combined filter repeats an extension"
+        );
+    }
+
+    #[test]
+    fn test_a_structure_file_loads_and_is_labelled_by_its_own_format() {
+        // The `(SDF)` placeholder was applied to every molecule that arrived
+        // without a SMILES string, so a PDB's rows claimed to be SDF records
+        // (#266). PDB is the right fixture precisely because it has no SMILES.
+        let mut state = AppState::cpu_only();
+        let pdb = "\
+ATOM      1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+ATOM      2  H1  HOH A   1       0.759   0.000   0.504  1.00 20.00           H
+CONECT    1    2
+END
+";
+        state.apply_loaded_file_bytes("water.pdb".to_string(), pdb.as_bytes().to_vec());
+
+        let dataset = state.loaded_files.active_dataset();
+        assert_eq!(dataset.len(), 1);
+        assert_eq!(dataset.smiles[0], "(PDB)");
+        assert!(
+            !dataset.smiles[0].contains("SDF"),
+            "a PDB must not describe itself as an SDF"
+        );
+        assert!(
+            state.dataset_status.contains("PDB"),
+            "{}",
+            state.dataset_status
+        );
     }
 }

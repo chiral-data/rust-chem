@@ -114,6 +114,58 @@ iterating, not fine as evidence.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
 
+### Every registered format (#266)
+
+The app reads whatever the library registers — eleven formats as of v0.8.0, where
+it used to offer two. `Format::from_filename` picks the reader, so what a file is
+called decides how it is read.
+
+Generate one file per format rather than hunting for samples:
+
+```sh
+printf 'CCO ethanol\nc1ccccc1 benzene\n' > /tmp/d.smi
+for f in sdf cxsmiles xyz pdb mmcif mol2 pdbqt gro cml commonchem; do
+  chem convert /tmp/d.smi --to $f -o /tmp/d.$f --force
+done
+```
+
+- **Open each one.** The Files list must name the *right* format, and the molecule
+  count must match what `chem info` reports for the same file. A file that
+  half-loads looks exactly like one that fully loaded, which is why the status
+  line reports skipped records.
+- **The SMILES column.** A format that carries no SMILES string shows its own name
+  in parentheses — `(PDB)`, `(mmCIF)`, `(Mol2)`. It must never say `(SDF)` for
+  anything but an SDF; that placeholder was applied to every structure format
+  before #266.
+
+**What each format brings, measured.** This decides what the Structure column can
+show before anything is computed:
+
+| arrives with | formats | Structure column |
+|---|---|---|
+| a 2D layout | SDF, Mol2 | drawn immediately |
+| a 3D conformer only | XYZ, mmCIF, GRO, PDB, PDBQT | dash until **2D Coordinates** runs |
+| no coordinates | SMILES, CXSMILES, CML, commonchem | dash until **2D Coordinates** runs |
+
+- **Run 2D Coordinates on a 3D format.** It computes a *fresh graph layout* and
+  ignores the conformer entirely — `ensure_coords` only asks whether a 2D layout
+  exists. The drawing is therefore a valid depiction of the connectivity and not a
+  picture of the real geometry. For a file with no bonds (XYZ, mmCIF, GRO) the
+  atoms come out evenly spaced on a line, which is honest rather than wrong; a
+  scribble or a pile at the origin would be a finding.
+- **PDB and PDBQT merge multi-record files** (#267). Three molecules written to
+  one PDB read back as a single molecule with three disconnected fragments —
+  every atom present, the record boundaries gone. Expect this until #267 lands.
+- **Detail windows, Formula and MW** work for every format; they read the
+  molecule, not the file it came from.
+- **Open something that is not a molecule at all.** A binary file is refused with
+  "not valid UTF-8" and the current dataset is left alone. A *text* file named
+  `.pdb`/`.cif`/`.mol2`/`.pdbqt` is a known gap (#268): those four readers ignore
+  unrecognised lines by design, so they accept it as one molecule with no atoms
+  and the status line reports a successful load. One empty row is the expected
+  wrong answer until that lands; anything named `.smi`, `.sdf`, `.xyz`, `.gro`,
+  `.cml` or `.json` is correctly rejected.
+
 ### SVG export (#109)
 
 - **Export a molecule from its detail window**, then open the file. Bonds should
