@@ -27,7 +27,7 @@
 //! assert_eq!(write_smiles(atom_symbols, atom_neighbours, atom_rankings, bond_symbols), "c1ccccc1=O".to_string());
 //! ```
 
-use crate::core::atom::Chirality;
+use crate::core::atom::{Chirality, Element};
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
 use crate::core::rings::find_sssr;
@@ -203,10 +203,27 @@ fn bond_order_symbol(order: BondOrder) -> &'static str {
     }
 }
 
+/// Whether this element may be written as a bare symbol, with no brackets.
+///
+/// The exact set [`crate::io::smiles`]'s `parse_organic_two_char` and
+/// `parse_organic_one_char` accept outside brackets, and the two are a pair:
+/// a symbol written bare here that the parser will not read bare is an
+/// unreadable file. Silicon is the demonstration -- `CSi` was written happily
+/// and then failed to parse, because `S` matched sulfur and `i` was left over
+/// (#241).
+///
+/// The aromatic set is smaller than the aliphatic one: no halogens.
+fn writes_bare(element: Element, aromatic: bool) -> bool {
+    match element.symbol() {
+        "B" | "C" | "N" | "O" | "P" | "S" => true,
+        "F" | "Cl" | "Br" | "I" => !aromatic,
+        _ => false,
+    }
+}
+
 // Writes an atom's SMILES token. Plain element symbol (lowercase if
-// aromatic) for the common case; bracket notation only when charge or
-// isotope need representing, since those can't be expressed in the
-// organic-subset shorthand.
+// aromatic) for the common case; bracket notation whenever the bare form
+// would not read back as this same atom.
 fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
     atom_symbol_with(mol, atom_idx, mol.atom(atom_idx).chirality())
 }
@@ -224,10 +241,21 @@ fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> St
         symbol.to_string()
     };
 
-    let needs_brackets = atom.formal_charge() != 0
+    // One question: would the bare organic-subset form read back as this exact
+    // atom? Anything the shorthand cannot say has to be spelled out.
+    //
+    // The hydrogen term compares against what the reader would fill in rather
+    // than against zero, which is what makes `[nH]` fall out of the general
+    // rule: a pyrrole nitrogen's two aromatic bonds imply no hydrogen, so the
+    // one it has must be written. Before #241 this asked
+    // `explicit_hydrogens() > 0` -- whether the *input* had spelled a count --
+    // so a molecule that arrived from SDF, CML or commonchem with its
+    // hydrogens implicit was written bare and read back short.
+    let needs_brackets = !writes_bare(atom.element(), atom.is_aromatic())
+        || atom.formal_charge() != 0
         || atom.isotope().is_some()
-        || atom.explicit_hydrogens() > 0
-        || chirality != Chirality::None;
+        || chirality != Chirality::None
+        || atom.total_hydrogens() != mol.implied_hydrogens(atom_idx);
     if !needs_brackets {
         return symbol;
     }
@@ -251,7 +279,12 @@ fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> St
         Chirality::Clockwise => "@@",
         Chirality::None | Chirality::Unspecified => "",
     };
-    match atom.explicit_hydrogens() {
+    // `total_hydrogens`, not `explicit_hydrogens`: a bracket states the atom's
+    // whole hydrogen count, and which half of the model it is stored in is a
+    // record of how the input was spelled (#241). `atom_symbol_in_order` has
+    // always used `total_hydrogens` for the stereo neighbour slot -- the
+    // chirality machinery treated it as the truth while the printing did not.
+    match atom.total_hydrogens() {
         0 => {}
         1 => bracket += "H",
         h => bracket += &format!("H{}", h),
@@ -762,7 +795,100 @@ pub fn write_smiles_for_molecule_canonical(mol: &Molecule) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::atom::Atom;
+    use crate::core::bond::Bond;
     use crate::io::smiles::parse_smiles;
+
+    /// A molecule written out, then read back, then written again -- through
+    /// SDF, which stores hydrogen counts implicitly.
+    ///
+    /// SMILES-to-SMILES cannot see #241: `parse_smiles` fills
+    /// `explicit_hydrogens` from the input's own brackets, so the writer's old
+    /// `explicit_hydrogens() > 0` test happened to be right for exactly the
+    /// atoms that arrived bracketed. Every other format stores the count
+    /// implicitly, which is where a bracket came out empty.
+    fn through_sdf(smiles: &str) -> String {
+        let mol = parse_smiles(smiles).expect("valid SMILES");
+        let sdf = crate::io::sdf::write_sdf(&mol);
+        let outcome = crate::io::reader::read_sdf(&sdf);
+        let back = &outcome.records.first().expect("one record").molecule;
+        write_smiles_for_molecule_canonical(back)
+    }
+
+    #[test]
+    fn test_an_aromatic_nitrogen_keeps_its_hydrogen() {
+        // The headline case. `c1ccnc1` is not merely a different spelling --
+        // it is an aromatic ring with no valid Kekule form, which RDKit
+        // refuses outright, so this was a file no other toolkit could read.
+        for smiles in ["c1cc[nH]c1", "c1cnc[nH]1"] {
+            let written = through_sdf(smiles);
+            assert!(
+                written.contains("[nH]"),
+                "{smiles} lost its aromatic N-H: {written}"
+            );
+            parse_smiles(&written).expect("what we write, we can read");
+        }
+    }
+
+    #[test]
+    fn test_a_bracketed_atom_states_its_whole_hydrogen_count() {
+        // Charge, isotope: the two that force brackets for their own reason
+        // and then have to print the count they actually hold.
+        assert_eq!(through_sdf("[NH4+]"), "[NH4+]");
+        assert_eq!(through_sdf("[13CH4]"), "[13CH4]");
+        assert_eq!(through_sdf("[OH-]"), "[OH-]");
+    }
+
+    #[test]
+    fn test_brackets_are_compared_against_the_implied_count_not_assumed() {
+        // `[CH2]` holds two where a bare carbon with one bond implies three,
+        // so it must stay bracketed; `[CH3]` holds exactly the implied three,
+        // so it may shed them. A predicate that always bracketed, or never
+        // did, would get one of these wrong.
+        let write = |s: &str| write_smiles_for_molecule_canonical(&parse_smiles(s).expect("valid"));
+        assert_eq!(
+            write("[CH2]C"),
+            "[CH2]C",
+            "differs from implied, keeps brackets"
+        );
+        assert_eq!(write("[CH3]C"), "CC", "matches implied, sheds them");
+    }
+
+    #[test]
+    fn test_an_element_outside_the_bare_subset_is_bracketed() {
+        // Written bare, `CSi` fails this crate's own parser: `S` matches
+        // sulfur and `i` is left over. The writer never consulted the element
+        // before #241.
+        for (z, symbol) in [(14u8, "[Si]"), (34, "[Se]"), (33, "[As]"), (11, "[Na]")] {
+            let mut mol = Molecule::new();
+            mol.add_atom(Atom::new(Element::new(z).expect("real element")));
+            mol.add_atom(Atom::new(Element::carbon()));
+            mol.add_bond(Bond::new(0, 1, BondOrder::Single))
+                .expect("valid bond");
+            mol.calculate_implicit_hydrogens();
+
+            let written = write_smiles_for_molecule_canonical(&mol);
+            assert!(written.contains(symbol), "z={z} wrote {written}");
+            parse_smiles(&written).expect("what we write, we can read");
+        }
+    }
+
+    #[test]
+    fn test_the_bare_forms_stay_bare() {
+        // The regression guard: every atom whose implied count already
+        // matches must not acquire brackets, or ordinary output turns into
+        // [CH3][CH2][OH].
+        for smiles in [
+            "CCO",
+            "c1ccccc1",
+            "c1ccncc1",
+            "c1ccoc1",
+            "Cc1ccccc1",
+            "CC(=O)O",
+        ] {
+            assert_eq!(through_sdf(smiles), smiles, "{smiles} should be unchanged");
+        }
+    }
 
     /// The configuration of the one double bond, after a full round trip.
     ///
