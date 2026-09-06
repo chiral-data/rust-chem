@@ -58,6 +58,41 @@ impl FingerprintFile {
         out
     }
 
+    /// The same fingerprints as chemfp's FPS format (#243).
+    ///
+    /// A second serialiser rather than a replacement: `chem search` parses the
+    /// native form above and nothing reads FPS back, here or in OpenBabel, which
+    /// marks its own `fps` write-only. This exists so the bits can leave — FPS is
+    /// what a similarity-search tool outside this crate expects.
+    ///
+    /// `#type` names *this crate's* Morgan bits deliberately. The hash differs
+    /// from RDKit's on purpose (#192), so a search mixing the two would produce
+    /// plausible similarities from unrelated bit positions. Namespacing the type
+    /// string is what tells a reader not to.
+    pub fn to_fps(&self) -> String {
+        let mut out =
+            String::with_capacity(self.fingerprints.len() * (self.size as usize / 4 + 32));
+        // `#FPS1` is the only line the format requires; the rest are conventional
+        // and carry what a reader needs to use these sensibly. FPS has no radius
+        // field of its own, so it rides in `#type`, which is where chemfp's own
+        // RDKit-Morgan strings put it.
+        out.push_str("#FPS1\n");
+        out.push_str(&format!("#num_bits={}\n", self.size));
+        out.push_str(&format!(
+            "#type=chem-Morgan/1 radius={} fpSize={}\n",
+            self.radius, self.size
+        ));
+        out.push_str(&format!("#software=chem/{}\n", env!("CARGO_PKG_VERSION")));
+        for (name, fp) in self.names.iter().zip(&self.fingerprints) {
+            // Hex first, name second -- the reverse of the native format above.
+            out.push_str(&to_fps_hex(fp));
+            out.push('\t');
+            out.push_str(name);
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         // Checked before anything else: pointing `chem search` at a SMILES
         // file is an ordinary mistake, and "line 2: expected name<TAB>
@@ -117,6 +152,37 @@ impl FingerprintFile {
 
 /// Least-significant-bit-first within each nibble, so bit *n* of the
 /// fingerprint is at a position derivable from *n* alone.
+/// Hex in FPS's bit order, which is not this file's own.
+///
+/// FPS packs bit *i* as bit *i % 8* of byte *i / 8* -- little-endian within
+/// each byte -- while [`to_hex`] above is little-endian within each *nibble*.
+/// The two differ by swapping the hex characters of every byte, and the
+/// difference is invisible: both produce a plausible fingerprint that a reader
+/// will happily compare against the wrong bits.
+///
+/// Verified against OpenBabel's own FPS output rather than derived. Decoding
+/// one of its lines four ways against the bits it reports set:
+///
+/// ```text
+/// msb          [516, 532, 665]   no
+/// nibble_lsb   [519, 535, 666]   no      <- to_hex's convention
+/// byte_le      [515, 531, 670]   yes, == OpenBabel's 1-indexed bits
+/// byte_be      [516, 532, 665]   no
+/// ```
+fn to_fps_hex(fp: &BitVec) -> String {
+    let mut out = String::with_capacity(fp.len() / 4 + 2);
+    for byte in fp.chunks(8) {
+        let mut value = 0u8;
+        for (i, bit) in byte.iter().enumerate() {
+            if *bit {
+                value |= 1 << i;
+            }
+        }
+        out.push_str(&format!("{value:02x}"));
+    }
+    out
+}
+
 fn to_hex(fp: &BitVec) -> String {
     let mut out = String::with_capacity(fp.len() / 4 + 1);
     for chunk in fp.chunks(4) {
@@ -170,6 +236,90 @@ mod tests {
             names: vec!["ethanol".into(), "empty".into()],
             fingerprints: vec![a, BitVec::repeat(false, 16)],
         }
+    }
+
+    /// Bit indices decoded from FPS hex: byte *k*, bit *i % 8* little-endian
+    /// within it -- the convention `to_fps_hex` writes and `to_hex` does not.
+    fn decode_fps_hex(hex: &str) -> Vec<usize> {
+        let mut bits = Vec::new();
+        for (k, pair) in hex.as_bytes().chunks(2).enumerate() {
+            let byte = u8::from_str_radix(std::str::from_utf8(pair).expect("ascii"), 16)
+                .expect("hex byte");
+            for offset in 0..8 {
+                if byte & (1 << offset) != 0 {
+                    bits.push(k * 8 + offset);
+                }
+            }
+        }
+        bits
+    }
+
+    #[test]
+    fn test_fps_header_names_this_crate_not_rdkit() {
+        let text = sample().to_fps();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "#FPS1", "the one line the format requires");
+        assert!(lines.contains(&"#num_bits=16"), "{text}");
+        // The hash differs from RDKit's deliberately (#192), so a reader has
+        // to be able to tell these are not RDKit-Morgan bits.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("#type=chem-Morgan/1 radius=2")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_fps_uses_its_own_bit_order_not_ours() {
+        // The failure this format can ship while looking entirely plausible:
+        // reusing `to_hex` produces a well-formed file whose bits are in the
+        // wrong places, and every reader would compare against them happily.
+        let file = sample();
+        let fps_hex = file.to_fps();
+        let row = fps_hex
+            .lines()
+            .find(|l| l.starts_with(|c: char| c.is_ascii_hexdigit()));
+        let hex = row
+            .expect("a data row")
+            .split('\t')
+            .next()
+            .expect("hex field");
+
+        assert_eq!(
+            decode_fps_hex(hex),
+            vec![0, 5, 15],
+            "decoded FPS bits must be the ones the fingerprint actually holds"
+        );
+        // And the two conventions genuinely differ here, or the test above
+        // would pass for the wrong reason.
+        assert_ne!(hex, to_hex(&file.fingerprints[0]), "to_hex was reused");
+    }
+
+    #[test]
+    fn test_fps_puts_the_hex_first_and_the_name_second() {
+        // Reversed from the native format, and easy to lose.
+        let text = sample().to_fps();
+        let row = text.lines().find(|l| l.contains("ethanol")).expect("a row");
+        let (hex, name) = row.split_once('\t').expect("two fields");
+        assert_eq!(name, "ethanol");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{row}");
+    }
+
+    #[test]
+    fn test_fps_with_no_fingerprints_is_still_a_valid_file() {
+        let empty = FingerprintFile {
+            radius: 2,
+            size: 16,
+            names: vec![],
+            fingerprints: vec![],
+        };
+        let text = empty.to_fps();
+        assert!(text.starts_with("#FPS1\n"), "{text}");
+        assert!(
+            text.lines().all(|l| l.starts_with('#')),
+            "a header and no rows, not a malformed file: {text}"
+        );
     }
 
     #[test]

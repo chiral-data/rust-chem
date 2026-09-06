@@ -2037,3 +2037,67 @@ fn test_convert_sdf_to_smiles_keeps_an_aromatic_nitrogen_hydrogen() {
     );
     assert_eq!(again.code, 0, "{:?}", again.stderr);
 }
+
+#[test]
+fn test_fp_writes_chemfp_fps_on_request() {
+    // FPS is a published interchange format (#243), so the header is what a
+    // foreign reader keys on -- and `#type` is what tells it these are this
+    // crate's Morgan bits and not RDKit's, which differ by design (#192).
+    let path = fixture("fps-out.smi", "CCO ethanol\nc1ccccc1 benzene\n");
+    let r = run(&["fp", path.to_str().unwrap(), "--out-format", "fps"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines[0], "#FPS1", "{:?}", r.stdout);
+    assert!(r.stdout.contains("#num_bits=2048"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("#type=chem-Morgan/1"), "{:?}", r.stdout);
+
+    // Hex first, name second -- reversed from this crate's own file.
+    let row = lines.iter().find(|l| l.contains("ethanol")).expect("a row");
+    let (hex, name) = row.split_once('\t').expect("two fields");
+    assert_eq!(name, "ethanol");
+    assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{row}");
+}
+
+#[test]
+fn test_fp_still_writes_its_own_format_by_default() {
+    // The regression that would matter: `chem search` reads only this form,
+    // and its parser refuses anything else outright.
+    let path = fixture("fps-default.smi", "CCO ethanol\nc1ccccc1 benzene\n");
+    let fp = run(&["fp", path.to_str().unwrap()], None);
+    assert_eq!(fp.code, 0, "{:?}", fp.stderr);
+    assert!(
+        fp.stdout.starts_with("# chem-fingerprints 1"),
+        "{:?}",
+        fp.stdout
+    );
+
+    let fp_path = fixture("fps-default.fp", &fp.stdout);
+    let search = run(
+        &["search", fp_path.to_str().unwrap(), "--query", "CCO"],
+        None,
+    );
+    assert_eq!(search.code, 0, "{:?}", search.stderr);
+    assert!(search.stdout.contains("ethanol"), "{:?}", search.stdout);
+}
+
+#[test]
+fn test_search_refuses_an_fps_file() {
+    // FPS is write-only here, as it is in OpenBabel. Pointing `search` at one
+    // must name the problem rather than rank nothing.
+    let path = fixture("fps-refused.smi", "CCO ethanol\n");
+    let fps = run(&["fp", path.to_str().unwrap(), "--out-format", "fps"], None);
+    assert_eq!(fps.code, 0, "{:?}", fps.stderr);
+
+    let fps_path = fixture("fps-refused.fps", &fps.stdout);
+    let search = run(
+        &["search", fps_path.to_str().unwrap(), "--query", "CCO"],
+        None,
+    );
+    assert_ne!(search.code, 0, "an FPS file is not a chem fingerprint file");
+    assert!(
+        search.stderr.contains("chem-fingerprints"),
+        "{:?}",
+        search.stderr
+    );
+}

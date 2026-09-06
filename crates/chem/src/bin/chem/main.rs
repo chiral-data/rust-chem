@@ -70,6 +70,16 @@ struct Cli {
     explain_drops: bool,
 }
 
+/// How `chem fp` writes its fingerprints.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FpFormat {
+    /// This crate's own format, carrying radius and size so `chem search`
+    /// can refuse a mismatched query rather than guess.
+    Chem,
+    /// chemfp's FPS format (#243).
+    Fps,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Read the input and report what is in it.
@@ -112,6 +122,13 @@ enum Command {
         /// Fingerprint length in bits.
         #[arg(long, default_value_t = 2048)]
         size: u32,
+
+        /// Output format. `chem` is this crate's own self-describing file,
+        /// the only one `chem search` reads. `fps` is chemfp's interchange
+        /// format, for handing the bits to another tool -- write-only here,
+        /// as it is everywhere else.
+        #[arg(long, value_enum, default_value_t = FpFormat::Chem)]
+        out_format: FpFormat,
     },
 
     /// Perceive aromatic rings and write the molecules back out.
@@ -358,6 +375,7 @@ fn run(cli: &Cli) -> Result<i32> {
             output,
             radius,
             size,
+            out_format,
         } => {
             let read =
                 stream::read_input(input.as_deref(), resolve_format_code(format.as_deref())?)?;
@@ -399,7 +417,11 @@ fn run(cli: &Cli) -> Result<i32> {
                     .collect(),
                 fingerprints,
             };
-            stream::write_output(output.as_ref(), &file.to_text())?;
+            let text = match out_format {
+                FpFormat::Chem => file.to_text(),
+                FpFormat::Fps => file.to_fps(),
+            };
+            stream::write_output(output.as_ref(), &text)?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
