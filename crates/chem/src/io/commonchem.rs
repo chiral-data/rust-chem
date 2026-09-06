@@ -45,10 +45,13 @@
 //! an atom object means *the default*, never zero.
 //!
 //! **Bond stereo maps exactly, because neither side assumes CIP.** See
-//! [`bond_stereo_out`] and [`bond_stereo_in`]: this crate defines
+//! `bond_stereo_out` and `bond_stereo_in` below: this crate defines
 //! [`BondStereo::E`]/[`BondStereo::Z`] relative to the lowest-indexed
-//! substituent at each end ([`crate::io::smiles_writer::reference_substituent`]),
-//! and commonchem names its two reference atoms explicitly in `stereoAtoms`.
+//! substituent at each end (`smiles_writer::reference_substituent`), and
+//! commonchem names its two reference atoms explicitly in `stereoAtoms`.
+//! Those three are private, so they are named here rather than linked —
+//! rustdoc rejects a public doc linking a private item, and CI builds docs
+//! with `-D warnings`.
 //! The two are the same convention, so `cis`/`trans` is a rename rather than a
 //! reinterpretation — as long as the reference atoms travel with it, which is
 //! what makes this the one place in the module that can be silently wrong.
