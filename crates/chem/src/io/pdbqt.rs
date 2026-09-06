@@ -678,6 +678,25 @@ mod tests {
     use crate::io::smiles::parse_smiles;
 
     #[test]
+    fn test_deprotonation_makes_a_heteroatom_a_hydrogen_bond_acceptor() {
+        // `autodock_type_for` types nitrogen and sulfur by whether they carry
+        // a hydrogen, so #240's wrong hydrogen counts reached this column:
+        // a thiolate looked protonated and was typed `S` rather than `SA`.
+        // AutoDock reads this to decide what can accept a hydrogen bond, so
+        // it is the one place outside formula and mass where that defect
+        // changed a file rather than a number.
+        let type_of = |smiles: &str, atom_idx: usize| {
+            let mol = parse_smiles(smiles).expect("valid SMILES");
+            autodock_type_for(&mol, atom_idx)
+        };
+
+        assert_eq!(type_of("C[S-]", 1), "SA", "a thiolate accepts");
+        assert_eq!(type_of("CCS", 2), "S", "a thiol donates, and does not");
+        assert_eq!(type_of("C[N-]C", 1), "NA", "a deprotonated amine accepts");
+        assert_eq!(type_of("CNC", 1), "N", "a secondary amine still has its H");
+    }
+
+    #[test]
     fn test_a_rigid_molecule_writes_root_only_with_torsdof_zero() {
         let mut mol = parse_smiles("c1ccccc1").expect("valid SMILES");
         mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])

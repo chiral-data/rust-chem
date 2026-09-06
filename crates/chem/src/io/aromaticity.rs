@@ -258,8 +258,12 @@ pub fn kekulize(mol: &Molecule) -> Option<Vec<BondOrder>> {
                 other => other.value(),
             })
             .sum();
-        let charge = i32::from(atom.formal_charge());
-        let allowed = i32::from(typical) + charge;
+        // The second caller of this rule, and the reason it lives on
+        // `Element` rather than in either function: this copy used to say
+        // `typical + charge`, which is right for the nitrogen, oxygen and
+        // sulfur `kekulize` actually meets and wrong for carbon in the other
+        // direction. Two copies that already disagreed (#240).
+        let allowed = i32::from(atom.element().valence_for_charge(atom.formal_charge()));
         let have = used as i32 + i32::from(atom.total_hydrogens());
         allowed - have == 1
     };
