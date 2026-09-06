@@ -2101,3 +2101,77 @@ fn test_search_refuses_an_fps_file() {
         search.stderr
     );
 }
+
+#[test]
+fn test_the_drop_report_names_bonds_when_the_target_has_none() {
+    // The defect that made `Carries::BONDS` necessary (#257): XYZ, mmCIF,
+    // PDBQT and GRO all read back zero bonds while declaring TOPOLOGY, so a
+    // conversion into one turned benzene into six unbonded carbons and the
+    // loss report named only the coordinates.
+    let path = fixture("bonds-drop.smi", "c1ccccc1 benzene\n");
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "xyz"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("XYZ cannot carry: bonds"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_the_drop_report_stays_quiet_about_bonds_a_molecule_never_had() {
+    // `held` keys on the molecule, not the format. A salt has two atoms and no
+    // bonds, so there is nothing to drop -- a warning here would mean the flag
+    // was being read off the source format instead.
+    let path = fixture("bonds-none.smi", "[Na+].[Cl-] salt\n");
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "xyz"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(!r.stderr.contains("bonds"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_l_matrix_prints_a_row_per_format_and_names_its_exceptions() {
+    // #257. The table is derived from the registry, so what makes it true is
+    // the pair test in `io/format.rs` -- this pins that the CLI renders it,
+    // marks the cells that deviate, and explains them rather than leaving a
+    // bare symbol in a grid.
+    let r = run(&["convert", "-L", "matrix"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+
+    for code in [
+        "smi", "sdf", "xyz", "pdb", "mmcif", "mol2", "pdbqt", "gro", "cml",
+    ] {
+        assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
+    }
+
+    // XYZ carries atoms and a conformer and nothing else, so its own diagonal
+    // cell is the shortest in the table.
+    assert!(r.stdout.contains("\nxyz "), "{}", r.stdout);
+
+    // Supplied attributes are lowercase: `smi -> pdb` invents the residue,
+    // B-factor and occupancy columns rather than carrying them across.
+    assert!(r.stdout.contains("TB3rfo"), "{}", r.stdout);
+
+    // Both exception classes are named, not just marked.
+    assert!(
+        r.stdout.contains("the conversion also loses atoms:")
+            && r.stdout.contains("pdbqt      -> pdbqt"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("lost anyway:") && r.stdout.contains("cml        -> smi"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_l_still_details_a_single_format() {
+    // `matrix` is special-cased before the code lookup, the same shape as
+    // `formats`. A format code must not be shadowed by it.
+    let r = run(&["convert", "-L", "pdb"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("carries:"), "{}", r.stdout);
+    assert!(r.stdout.contains("bonds"), "{}", r.stdout);
+}

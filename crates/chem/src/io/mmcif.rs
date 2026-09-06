@@ -347,6 +347,20 @@ fn read_atom_site_loop(
     Ok(())
 }
 
+/// A CIF value, or `fallback` when there is nothing to write.
+///
+/// CIF has no empty token: a value is a word, `.` (inapplicable) or `?`
+/// (unknown). An empty string reaches the file as *nothing*, so the row ends
+/// up with fewer values than its `loop_` header declares and every column
+/// after it shifts -- which is how a second mmCIF write used to move the
+/// B-factor into the model-number column (#260).
+fn cif_token<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {
+    match value {
+        Some(text) if !text.is_empty() => text,
+        _ => fallback,
+    }
+}
+
 /// Writes one mmCIF `data_` block.
 pub fn write_mmcif(mol: &Molecule) -> String {
     let mut out = String::from("data_chem\n");
@@ -393,13 +407,13 @@ pub fn write_mmcif(mol: &Molecule) -> String {
 
         let is_hetero = residue.map(|r| r.is_hetero).unwrap_or(false);
         let group = if is_hetero { "HETATM" } else { "ATOM" };
-        let res_name = residue.map(|r| r.name.as_str()).unwrap_or("UNK");
+        let res_name = cif_token(residue.map(|r| r.name.as_str()), "UNK");
         let res_seq = residue.map(|r| r.sequence).unwrap_or(1);
         let icode = residue
             .and_then(|r| r.insertion_code)
             .map(String::from)
             .unwrap_or_else(|| "?".to_string());
-        let chain_id = chain.map(|c| c.id.as_str()).unwrap_or(".");
+        let chain_id = cif_token(chain.map(|c| c.id.as_str()), ".");
         let alt_loc = site
             .and_then(|s| s.alt_loc)
             .map(String::from)
@@ -536,6 +550,46 @@ HETATM 3 H H2 . HOH A 1 A HOH . 0.759 0.000 -0.504 1.00 20.00 1
                     _atom_site.Cartn_y\n_atom_site.Cartn_z\nC not-a-number 0.0 0.0\n";
         let err = parse_mmcif(text).unwrap_err();
         assert!(matches!(err, MmcifError::InvalidAtomRow(_)), "{err}");
+    }
+
+    #[test]
+    fn test_a_second_write_keeps_every_column_aligned() {
+        // #260. CIF has no empty token, so a chain whose id is the empty
+        // string used to reach the file as *nothing* -- 17 values under a
+        // header declaring 19, shifting B_iso_or_equiv into the model-number
+        // column. Only the second write showed it, because the empty id came
+        // from reading back our own `.`, which is why one round trip in the
+        // oracle harness never caught it.
+        let mut mol = crate::io::smiles::parse_smiles("CC").expect("valid SMILES");
+        let mut site = crate::core::site::AtomSite::empty();
+        site.b_factor = Some(42.0);
+        mol.set_sites(vec![site, crate::core::site::AtomSite::empty()])
+            .expect("one per atom");
+
+        let tags = |text: &str| {
+            text.lines()
+                .filter(|l| l.trim_start().starts_with("_atom_site."))
+                .count()
+        };
+
+        let mut current = mol;
+        for pass in 1..=3 {
+            let text = write_mmcif(&current);
+            let columns = tags(&text);
+            for row in text.lines().filter(|l| l.starts_with("ATOM")) {
+                assert_eq!(
+                    row.split_whitespace().count(),
+                    columns,
+                    "pass {pass}: {row:?} does not fill its {columns} declared tags"
+                );
+            }
+            current = parse_mmcif(&text).expect("our own output reads back");
+            assert_eq!(
+                current.site(0).and_then(|s| s.b_factor),
+                Some(42.0),
+                "pass {pass}: the b-factor moved out of its column"
+            );
+        }
     }
 
     #[test]
