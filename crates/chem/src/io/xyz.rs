@@ -22,6 +22,7 @@
 //! [`crate::io::supplier::XyzSupplier`]), not this module's — this file
 //! parses and writes exactly one frame, mirroring [`crate::io::sdf::parse_sdf`].
 
+use crate::core::geometry::is_placeholder_3d;
 use crate::core::molecule::Molecule;
 use crate::io::errors::XyzError;
 
@@ -71,8 +72,13 @@ pub fn parse_xyz(text: &str) -> Result<Molecule, XyzError> {
         ));
     }
 
-    mol.set_coords3(coords)
-        .map_err(|e| XyzError::ParseError(e.to_string()))?;
+    // Zeros in these columns are what a format with no room to say "unknown"
+    // writes for a molecule that has no conformer, so believing them back is
+    // how a converted molecule ended up undrawable (#270).
+    if !is_placeholder_3d(&coords) {
+        mol.set_coords3(coords)
+            .map_err(|e| XyzError::ParseError(e.to_string()))?;
+    }
     Ok(mol)
 }
 
@@ -220,5 +226,26 @@ mod tests {
             written.contains("C 0.000000 0.000000 0.000000"),
             "{written}"
         );
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_conformer() {
+        // A format with mandatory coordinate columns writes zeros for a
+        // molecule that has none; believing them back leaves every atom at the
+        // origin (#270).
+        let text = "3\nethanol\nC 0.0 0.0 0.0\nC 0.0 0.0 0.0\nO 0.0 0.0 0.0\n";
+        let mol = parse_xyz(text).expect("valid XYZ");
+        assert_eq!(mol.num_atoms(), 3);
+        assert!(
+            !mol.has_coords3(),
+            "all-zero is a placeholder, not a conformer"
+        );
+    }
+
+    #[test]
+    fn test_real_coordinates_are_still_read() {
+        let text = "2\nreal\nC 0.0 0.0 0.0\nO 1.4 0.0 0.0\n";
+        let mol = parse_xyz(text).expect("valid XYZ");
+        assert!(mol.has_coords3());
     }
 }

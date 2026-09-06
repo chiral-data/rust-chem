@@ -35,7 +35,7 @@
 use crate::core::atom::{Atom, Element};
 use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ELEMENT_SYMBOLS;
-use crate::core::geometry::Point3;
+use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
@@ -219,8 +219,13 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
         i += 1;
     }
 
-    mol.set_coords3(coords)
-        .map_err(|e| MmcifError::ParseError(e.to_string()))?;
+    // Zeros in these columns are what a format with no room to say "unknown"
+    // writes for a molecule that has no conformer, so believing them back is
+    // how a converted molecule ended up undrawable (#270).
+    if !is_placeholder_3d(&coords) {
+        mol.set_coords3(coords)
+            .map_err(|e| MmcifError::ParseError(e.to_string()))?;
+    }
     mol.set_sites(sites)
         .map_err(|e| MmcifError::ParseError(e.to_string()))?;
 
@@ -598,5 +603,22 @@ HETATM 3 H H2 . HOH A 1 A HOH . 0.759 0.000 -0.504 1.00 20.00 1
                     _atom_site.Cartn_y\n_atom_site.Cartn_z\nXx 0.0 0.0 0.0\n";
         let err = parse_mmcif(text).unwrap_err();
         assert!(matches!(err, MmcifError::InvalidElement(_)), "{err}");
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_conformer() {
+        // #270.
+        let text = "data_x\nloop_\n_atom_site.group_PDB\n_atom_site.id\n\
+_atom_site.type_symbol\n_atom_site.label_atom_id\n_atom_site.label_comp_id\n\
+_atom_site.label_asym_id\n_atom_site.auth_seq_id\n_atom_site.auth_asym_id\n\
+_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n\
+ATOM 1 C C UNK A 1 A 0.000 0.000 0.000\n\
+ATOM 2 O O UNK A 1 A 0.000 0.000 0.000\n";
+        let mol = parse_mmcif(text).expect("valid mmCIF");
+        assert_eq!(mol.num_atoms(), 2);
+        assert!(
+            !mol.has_coords3(),
+            "all-zero is a placeholder, not a conformer"
+        );
     }
 }

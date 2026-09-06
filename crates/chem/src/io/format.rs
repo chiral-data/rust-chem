@@ -1053,34 +1053,11 @@ pub fn all() -> impl Iterator<Item = Format> {
 /// carrying it is affected. `test_every_format_pair_carries_the_intersection_of_its_masks`
 /// asserts this is exactly the set that appears.
 static SUPPLIED: &[(Format, Carries, &str)] = &[
-    // Coordinates. The atom line has columns for them, so an input with no
-    // conformer writes zeros and reads back with one.
-    (Format::XYZ, Carries::COORDS_3D, "no conformer writes zeros"),
-    (Format::GRO, Carries::COORDS_3D, "no conformer writes zeros"),
-    (Format::PDB, Carries::COORDS_3D, "no conformer writes zeros"),
-    (
-        Format::MMCIF,
-        Carries::COORDS_3D,
-        "no conformer writes zeros",
-    ),
-    (
-        Format::PDBQT,
-        Carries::COORDS_3D,
-        "no conformer writes zeros",
-    ),
-    // The same zeros, read back as a *drawing*: both these readers classify an
-    // all-zero z as a 2D layout rather than a flat conformer. The molfile even
-    // labels the record `3D` on write and reads it back as 2D.
-    (
-        Format::SDF,
-        Carries::COORDS_2D,
-        "no coordinates writes zeros, read back as a layout",
-    ),
-    (
-        Format::MOL2,
-        Carries::COORDS_2D,
-        "no coordinates writes zeros, read back as a layout",
-    ),
+    // Coordinates used to be here -- all seven of them, five claiming a
+    // conformer and two a drawing, and every one of them zeros a writer had put
+    // in a column it could not leave empty. They came out with #270: the readers
+    // no longer mistake a format's placeholder for a measurement, so there is
+    // nothing supplied left to record.
     // Residue identity. Every atom line names one; absent input writes a
     // placeholder, `LIG` for a docking ligand and `UNK` elsewhere.
     (
@@ -1593,6 +1570,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_a_converted_molecule_can_still_be_drawn() {
+        // The defect #270 was reported for, end to end: a SMILES molecule
+        // converted to any format and read back must still produce a usable
+        // layout. It did not, and every mask assertion in this file passed
+        // anyway -- `held` reports COORDS_2D whether the layout distinguishes
+        // the atoms or stacks them all on one point.
+        //
+        // Counting *distinct* positions is what makes this fail. `has_coords`
+        // was true the whole time.
+        let outcome = crate::io::reader::read("CCO ethanol\n", Format::SMILES);
+        let records: Vec<(String, Molecule)> = outcome
+            .records
+            .iter()
+            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .collect();
+
+        for format in all() {
+            let text = format.write(&records).expect("every format writes");
+            let back = crate::io::reader::read(&text, format);
+            let mut molecule = back.records[0].molecule.clone();
+            crate::core::layout::ensure_coords(&mut molecule);
+
+            let coords = molecule.coords().expect("a layout, computed or read");
+            let mut seen: Vec<String> = coords
+                .iter()
+                .map(|p| format!("{:.3},{:.3}", p.x, p.y))
+                .collect();
+            seen.sort();
+            seen.dedup();
+
+            assert_eq!(
+                seen.len(),
+                molecule.num_atoms(),
+                "{} leaves atoms on top of each other, so it cannot be drawn",
+                format.name()
+            );
         }
     }
 

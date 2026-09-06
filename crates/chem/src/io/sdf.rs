@@ -1,3 +1,4 @@
+use crate::core::geometry::is_placeholder_2d;
 use crate::core::prelude::*;
 use crate::io::errors::SdfError;
 use crate::io::options::{MolfileVersion, SdfWriteOptions};
@@ -83,10 +84,17 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
         // storing a 3D record's x/y as a layout is the projection that
         // superimposes atoms differing only in depth — which is what this
         // parser did until now, silently.
+        //
+        // All-zero is a third case, and neither: a molfile has no way to say
+        // "no coordinates", so a molecule that has none is written as zeros.
+        // Reading those back as a layout is how a converted molecule came out
+        // with every atom stacked at the origin, undrawable (#270).
         if coords.iter().all(|point| point.z == 0.0) {
             let flat: Vec<Point2> = coords.iter().map(|point| point.to_2d()).collect();
-            mol.set_coords(flat)
-                .map_err(|e| SdfError::ParseError(e.to_string()))?;
+            if !is_placeholder_2d(&flat) {
+                mol.set_coords(flat)
+                    .map_err(|e| SdfError::ParseError(e.to_string()))?;
+            }
         } else {
             mol.set_coords3(coords)
                 .map_err(|e| SdfError::ParseError(e.to_string()))?;
@@ -1719,5 +1727,31 @@ $$$$";
         assert_eq!(mol.num_atoms(), 2);
         assert_eq!(mol.num_bonds(), 1);
         assert!(!mol.has_coords());
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_layout() {
+        // A molfile has no way to say "no coordinates", so a molecule that has
+        // none is written as zeros. Reading those back as a layout left every
+        // atom stacked at the origin, and the depiction collapsed to one point
+        // (#270).
+        let text = "\
+ethanol
+     RDKit          2D
+
+  3  2  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0
+    0.0000    0.0000    0.0000 C   0  0
+    0.0000    0.0000    0.0000 O   0  0
+  1  2  1  0
+  2  3  1  0
+M  END
+";
+        let mol = parse_sdf(text).expect("valid molfile");
+        assert_eq!(mol.num_atoms(), 3);
+        assert!(!mol.has_coords(), "all-zero is a placeholder, not a layout");
+        assert!(!mol.has_coords3());
+        // The topology is real and must survive.
+        assert_eq!(mol.num_bonds(), 2);
     }
 }
