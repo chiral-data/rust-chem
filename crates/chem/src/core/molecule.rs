@@ -669,36 +669,57 @@ impl Molecule {
         &self.properties
     }
 
+    /// How many hydrogens the organic-subset shorthand implies for this atom:
+    /// the valence its element supports at this charge, less the bond orders
+    /// already accounted for.
+    ///
+    /// Shared between the two sides of a round trip on purpose. The reader
+    /// uses it to fill in what a bare `C` left unsaid
+    /// ([`Self::calculate_implicit_hydrogens`]), and
+    /// [`crate::io::smiles_writer`] uses it to decide whether an atom can be
+    /// written bare at all -- an atom holding some other number needs bracket
+    /// notation to say so (#241). Two functions answering that question
+    /// separately would let the writer emit a bare atom the reader fills
+    /// differently, which is a silently wrong molecule rather than a
+    /// formatting difference.
+    ///
+    /// Aromatic bonds count 1.5 apiece and the sum is rounded, so a pyrrole
+    /// nitrogen's two aromatic bonds come to 3 and imply no hydrogen -- which
+    /// is why its real hydrogen has to be written as `[nH]`.
+    ///
+    /// Zero for an element with no typical valence, and for an atom whose
+    /// bonds already meet or exceed it.
+    pub fn implied_hydrogens(&self, atom_idx: usize) -> u8 {
+        let atom = &self.atoms[atom_idx];
+
+        // How a charge moves the valence is not uniform across the periodic
+        // table, so the rule lives on `Element` and is shared with
+        // `io::aromaticity::kekulize` rather than re-derived here (#240).
+        let adjusted_valence = atom.element().valence_for_charge(atom.formal_charge());
+        if adjusted_valence == 0 {
+            return 0;
+        }
+
+        let mut explicit_valence = 0.0_f64;
+        for neighbor in self.graph.neighbors(atom_idx) {
+            let bond = &self.bonds[neighbor.bond_idx];
+            explicit_valence += bond.order().value();
+        }
+        adjusted_valence.saturating_sub(explicit_valence.round() as u8)
+    }
+
     pub fn calculate_implicit_hydrogens(&mut self) {
         for atom_idx in 0..self.atoms.len() {
-            let atom = &self.atoms[atom_idx];
-
-            // Skip if explicit H count is already set
-            if atom.explicit_hydrogens() > 0 {
+            // The input already said how many, so it is not this function's
+            // business. Note that a bracket atom written with *no* hydrogen
+            // count is indistinguishable from one that said nothing at all,
+            // so `[C]` is filled here as though it were a bare `C` -- #244.
+            if self.atoms[atom_idx].explicit_hydrogens() > 0 {
                 continue;
             }
 
-            let element = atom.element();
-            let typical_valence = element.typical_valence();
-
-            if typical_valence == 0 {
-                continue;
-            }
-
-            let mut explicit_valence = 0.0_f64;
-            for neighbor in self.graph.neighbors(atom_idx) {
-                let bond = &self.bonds[neighbor.bond_idx];
-                explicit_valence += bond.order().value();
-            }
-
-            // How a charge moves the valence is not uniform across the
-            // periodic table, so the rule lives on `Element` and is shared
-            // with `io::aromaticity::kekulize` rather than re-derived here
-            // (#240).
-            let adjusted_valence = element.valence_for_charge(atom.formal_charge());
-
-            if (explicit_valence.round() as u8) < adjusted_valence {
-                let implicit_h = adjusted_valence - explicit_valence.round() as u8;
+            let implicit_h = self.implied_hydrogens(atom_idx);
+            if implicit_h > 0 {
                 self.atoms[atom_idx].set_implicit_hydrogens(implicit_h);
             }
         }
@@ -855,6 +876,48 @@ mod tests {
         mol.atoms_mut()[0].set_implicit_hydrogens(2);
         let weight = mol.molecular_weight();
         assert!((weight - 18.016).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_implied_hydrogens_across_the_aromatic_cases() {
+        // The count the organic-subset shorthand implies, which is what the
+        // SMILES writer compares an atom against to decide brackets (#241).
+        // Aromatic bonds contribute 1.5 apiece and the sum is rounded, so
+        // these rows are the ones worth pinning independently of the writer.
+        let implied = |smiles: &str, atom_idx: usize| {
+            crate::io::smiles::parse_smiles(smiles)
+                .expect("valid SMILES")
+                .implied_hydrogens(atom_idx)
+        };
+
+        assert_eq!(implied("c1ccccc1", 0), 1, "benzene C: two aromatic bonds");
+        assert_eq!(
+            implied("c1ccncc1", 3),
+            0,
+            "pyridine N: saturated by its ring"
+        );
+        // The one that matters: a pyrrole nitrogen's ring bonds already meet
+        // its valence, so the hydrogen it really has is not implied -- which
+        // is why it has to be written as `[nH]`.
+        assert_eq!(implied("c1cc[nH]c1", 3), 0, "pyrrole N implies none");
+        assert_eq!(implied("Cc1ccccc1", 1), 0, "toluene's substituted ring C");
+        assert_eq!(implied("CC", 0), 3, "a carbon with one single bond");
+        assert_eq!(implied("CCO", 2), 1, "hydroxyl O");
+    }
+
+    #[test]
+    fn test_implied_hydrogens_is_zero_where_there_is_no_valence_left() {
+        let implied = |smiles: &str, atom_idx: usize| {
+            crate::io::smiles::parse_smiles(smiles)
+                .expect("valid SMILES")
+                .implied_hydrogens(atom_idx)
+        };
+        // No typical valence at all, and an anion whose charge spends it.
+        assert_eq!(implied("[Na+].[Cl-]", 0), 0, "sodium");
+        assert_eq!(implied("[Na+].[Cl-]", 1), 0, "chloride");
+        assert_eq!(implied("CC(=O)[O-]", 3), 0, "carboxylate O");
+        // Saturated past its valence rather than short of it.
+        assert_eq!(implied("C[N+](C)(C)C", 1), 0, "quaternary N");
     }
 
     /// #240: how many hydrogens does the charged atom end up carrying?

@@ -1997,3 +1997,43 @@ fn test_convert_formats_lists_the_json_category() {
     assert!(r.stdout.contains("JSON formats"), "{:?}", r.stdout);
     assert!(r.stdout.contains("commonchem"), "{:?}", r.stdout);
 }
+
+#[test]
+fn test_convert_sdf_to_smiles_keeps_an_aromatic_nitrogen_hydrogen() {
+    // The user-visible shape of #241: a molecule goes out to a format that
+    // stores hydrogens implicitly and comes back as `c1ccnc1`, an aromatic
+    // ring with no valid Kekule form that no other toolkit will read.
+    let sdf = run(
+        &[
+            "convert",
+            "--literal",
+            "c1cc[nH]c1",
+            "--from",
+            "smi",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(sdf.code, 0, "{:?}", sdf.stderr);
+
+    let path = fixture("pyrrole-241.sdf", &sdf.stdout);
+    let smi = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(smi.code, 0, "{:?}", smi.stderr);
+    assert!(smi.stdout.contains("[nH]"), "{:?}", smi.stdout);
+
+    // And what came back is readable again, which `c1ccnc1` was not.
+    let again = run(
+        &[
+            "convert",
+            "--literal",
+            smi.stdout.split_whitespace().next().expect("a SMILES"),
+            "--from",
+            "smi",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(again.code, 0, "{:?}", again.stderr);
+}
