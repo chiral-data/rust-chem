@@ -209,7 +209,7 @@ mod tests {
 
         let mut many_h = Molecule::new();
         let idx = many_h.add_atom(Atom::new(Element::carbon()));
-        many_h.atom_mut(idx).set_implicit_hydrogens(3);
+        many_h.atom_mut(idx).set_hydrogens(3);
 
         let generator = MorganAtomInvGenerator::new(false);
         assert_ne!(

@@ -123,8 +123,15 @@ pub struct Atom {
     is_aromatic: bool,
     hybridization: Hybridization,
     chirality: Chirality,
-    implicit_hydrogens: u8,
-    explicit_hydrogens: u8,
+    /// Hydrogens attached to this atom but not present as their own graph
+    /// nodes -- and whether the source said anything about them at all.
+    ///
+    /// `None` means the input was silent, so a reader may fill it in by
+    /// valence ([`crate::core::molecule::Molecule::calculate_implicit_hydrogens`]).
+    /// `Some(0)` means the input said *none*, and nothing may add any. A bare
+    /// SMILES `C` is the first; `[C]` and `[CH0]` are the second. Before #244
+    /// both were a plain `0` and `[C]` parsed as methane.
+    hydrogens: Option<u8>,
 }
 
 impl Atom {
@@ -136,8 +143,7 @@ impl Atom {
             is_aromatic: false,
             hybridization: Hybridization::Unknown,
             chirality: Chirality::None,
-            implicit_hydrogens: 0,
-            explicit_hydrogens: 0,
+            hydrogens: None,
         }
     }
 
@@ -198,24 +204,39 @@ impl Atom {
         self
     }
 
-    pub const fn implicit_hydrogens(&self) -> u8 {
-        self.implicit_hydrogens
+    /// The hydrogen count as the source stated it, or `None` if it did not.
+    ///
+    /// Use this to tell "said none" from "said nothing"; use
+    /// [`Self::total_hydrogens`] when only the number matters, which is most
+    /// callers.
+    pub const fn hydrogens(&self) -> Option<u8> {
+        self.hydrogens
     }
 
-    pub fn set_implicit_hydrogens(&mut self, count: u8) {
-        self.implicit_hydrogens = count;
+    pub fn set_hydrogens(&mut self, count: u8) {
+        self.hydrogens = Some(count);
     }
 
-    pub const fn explicit_hydrogens(&self) -> u8 {
-        self.explicit_hydrogens
+    pub const fn with_hydrogens(mut self, count: u8) -> Self {
+        self.hydrogens = Some(count);
+        self
     }
 
-    pub fn set_explicit_hydrogens(&mut self, count: u8) {
-        self.explicit_hydrogens = count;
+    /// Forget the count, so a reader may fill it in again.
+    pub fn clear_hydrogens(&mut self) {
+        self.hydrogens = None;
     }
 
+    /// How many hydrogens this atom carries, treating "unstated" as none.
+    ///
+    /// The number every consumer that just wants a count should ask for --
+    /// formula and mass, the Morgan invariants, AutoDock typing,
+    /// kekulisation, and the SMILES writer's bracket decision.
     pub const fn total_hydrogens(&self) -> u8 {
-        self.implicit_hydrogens + self.explicit_hydrogens
+        match self.hydrogens {
+            Some(count) => count,
+            None => 0,
+        }
     }
 
     pub fn compute_hash(&self) -> u64 {
@@ -260,6 +281,36 @@ mod tests {
         assert_eq!(Element::carbon().typical_valence(), 4);
         assert_eq!(Element::nitrogen().typical_valence(), 3);
         assert_eq!(Element::oxygen().typical_valence(), 2);
+    }
+
+    #[test]
+    fn test_hydrogens_distinguishes_saying_none_from_saying_nothing() {
+        // The distinction #244 exists for. Both answer 0 to
+        // `total_hydrogens`, and only one of them invites a reader to fill it.
+        let unsaid = Atom::new(Element::carbon());
+        assert_eq!(unsaid.hydrogens(), None);
+        assert_eq!(unsaid.total_hydrogens(), 0);
+
+        let mut stated_none = Atom::new(Element::carbon());
+        stated_none.set_hydrogens(0);
+        assert_eq!(stated_none.hydrogens(), Some(0));
+        assert_eq!(stated_none.total_hydrogens(), 0);
+
+        assert_ne!(unsaid, stated_none, "the two states are not the same atom");
+    }
+
+    #[test]
+    fn test_hydrogens_can_be_set_cleared_and_built() {
+        let mut atom = Atom::new(Element::nitrogen()).with_hydrogens(3);
+        assert_eq!(atom.hydrogens(), Some(3));
+        assert_eq!(atom.total_hydrogens(), 3);
+
+        atom.set_hydrogens(1);
+        assert_eq!(atom.hydrogens(), Some(1));
+
+        atom.clear_hydrogens();
+        assert_eq!(atom.hydrogens(), None, "back to fillable");
+        assert_eq!(atom.total_hydrogens(), 0);
     }
 
     #[test]
