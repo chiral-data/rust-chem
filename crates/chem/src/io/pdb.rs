@@ -34,7 +34,7 @@ use crate::core::atom::{Atom, Element};
 use crate::core::bond::{Bond, BondOrder};
 use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ELEMENT_SYMBOLS;
-use crate::core::geometry::Point3;
+use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
@@ -283,8 +283,13 @@ pub fn parse_pdb(text: &str) -> Result<Molecule, PdbError> {
         }
     }
 
-    mol.set_coords3(coords)
-        .map_err(|e| PdbError::ParseError(e.to_string()))?;
+    // Zeros in these columns are what a format with no room to say "unknown"
+    // writes for a molecule that has no conformer, so believing them back is
+    // how a converted molecule ended up undrawable (#270).
+    if !is_placeholder_3d(&coords) {
+        mol.set_coords3(coords)
+            .map_err(|e| PdbError::ParseError(e.to_string()))?;
+    }
     mol.set_sites(sites)
         .map_err(|e| PdbError::ParseError(e.to_string()))?;
 
@@ -616,5 +621,24 @@ END
         let text = format!("{WATER_PDB}CONECT    1   99\n");
         let err = parse_pdb(&text).unwrap_err();
         assert!(matches!(err, PdbError::ParseError(_)), "{err}");
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_conformer() {
+        // #270: the coordinate columns are mandatory, so a molecule with no
+        // conformer is written as zeros.
+        let text = "\
+ATOM      1  C   UNK     1       0.000   0.000   0.000  1.00  0.00           C
+ATOM      2  O   UNK     1       0.000   0.000   0.000  1.00  0.00           O
+END
+";
+        let mol = parse_pdb(text).expect("valid PDB");
+        assert_eq!(mol.num_atoms(), 2);
+        assert!(
+            !mol.has_coords3(),
+            "all-zero is a placeholder, not a conformer"
+        );
+        // The site data beside it is real and must survive.
+        assert_eq!(mol.site(0).unwrap().occupancy, Some(1.0));
     }
 }

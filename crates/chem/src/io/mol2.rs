@@ -55,7 +55,7 @@ use crate::core::atom::{Atom, Element, Hybridization};
 use crate::core::bond::{Bond, BondOrder};
 use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ELEMENT_SYMBOLS;
-use crate::core::geometry::Point3;
+use crate::core::geometry::{Point3, is_placeholder_2d, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
@@ -371,11 +371,17 @@ pub fn parse_mol2(text: &str) -> Result<Molecule, Mol2Error> {
     // The 2D-vs-3D distinction is exactly the one `parse_sdf` already
     // makes: an all-zero z is a flat drawing, anything else is geometry.
     // Mol2 has no dimensionality header of its own either.
+    //
+    // All-zero is neither: Mol2's coordinate columns are mandatory, so a
+    // molecule with no coordinates is written as zeros, and reading them back
+    // as a layout leaves every atom on top of every other one (#270).
     if coords.iter().all(|p: &Point3| p.z == 0.0) {
         let flat: Vec<_> = coords.iter().map(|p| p.to_2d()).collect();
-        mol.set_coords(flat)
-            .map_err(|e| Mol2Error::ParseError(e.to_string()))?;
-    } else {
+        if !is_placeholder_2d(&flat) {
+            mol.set_coords(flat)
+                .map_err(|e| Mol2Error::ParseError(e.to_string()))?;
+        }
+    } else if !is_placeholder_3d(&coords) {
         mol.set_coords3(coords)
             .map_err(|e| Mol2Error::ParseError(e.to_string()))?;
     }
@@ -726,5 +732,53 @@ NO_CHARGES
 ";
         let err = parse_mol2(text).unwrap_err();
         assert!(matches!(err, Mol2Error::InvalidAtomLine(_)), "{err}");
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_layout() {
+        // #270. This is the case that produced the reported symptom: a Mol2
+        // converted from SMILES drew as a single red dot, because every atom
+        // was at the origin and the bonds were zero-length.
+        let text = "\
+@<TRIPOS>MOLECULE
+ethanol
+ 3 2 0 0 0
+SMALL
+NO_CHARGES
+
+@<TRIPOS>ATOM
+      1 C           0.0000    0.0000    0.0000 C.3       1 UNK         0.0000
+      2 C           0.0000    0.0000    0.0000 C.3       1 UNK         0.0000
+      3 O           0.0000    0.0000    0.0000 O.3       1 UNK         0.0000
+@<TRIPOS>BOND
+     1    1    2 1
+     2    2    3 1
+";
+        let mol = parse_mol2(text).expect("valid Mol2");
+        assert_eq!(mol.num_atoms(), 3);
+        assert!(!mol.has_coords(), "all-zero is a placeholder, not a layout");
+        assert!(!mol.has_coords3());
+        assert_eq!(mol.num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_a_real_layout_still_reads() {
+        // The check that this fix is not simply discarding every layout, which
+        // is the easy wrong way to stop the dot.
+        let text = "\
+@<TRIPOS>MOLECULE
+ethanol
+ 2 1 0 0 0
+SMALL
+NO_CHARGES
+
+@<TRIPOS>ATOM
+      1 C           0.0000    0.0000    0.0000 C.3       1 UNK         0.0000
+      2 O           1.4000    0.0000    0.0000 O.3       1 UNK         0.0000
+@<TRIPOS>BOND
+     1    1    2 1
+";
+        let mol = parse_mol2(text).expect("valid Mol2");
+        assert!(mol.has_coords(), "a real layout must survive");
     }
 }

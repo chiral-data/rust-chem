@@ -86,7 +86,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::core::atom::{Atom, Element};
 use crate::core::bond::{Bond, BondOrder};
 use crate::core::elements::ELEMENT_SYMBOLS;
-use crate::core::geometry::Point3;
+use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
 use crate::core::rings::perceive_rings;
@@ -649,8 +649,13 @@ pub fn parse_pdbqt(text: &str) -> Result<Molecule, PdbqtError> {
         }
     }
 
-    mol.set_coords3(coords)
-        .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
+    // Zeros in these columns are what a format with no room to say "unknown"
+    // writes for a molecule that has no conformer, so believing them back is
+    // how a converted molecule ended up undrawable (#270).
+    if !is_placeholder_3d(&coords) {
+        mol.set_coords3(coords)
+            .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
+    }
     mol.set_sites(sites)
         .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
 
@@ -870,5 +875,26 @@ TORSDOF 1
         // The BRANCH pivot is the only connectivity a PDBQT states, so it is
         // the only bond that may come back.
         assert_eq!(mol.num_bonds(), 1);
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_conformer() {
+        // #270: the coordinate columns are mandatory, so a ligand with no
+        // conformer is written as zeros.
+        let text = "\
+ROOT
+ATOM      1 C    LIG     1       0.000   0.000   0.000  1.00  0.00     0.000 C
+ATOM      2 O    LIG     1       0.000   0.000   0.000  1.00  0.00     0.000 OA
+ENDROOT
+TORSDOF 0
+";
+        let mol = parse_pdbqt(text).expect("valid PDBQT");
+        assert_eq!(mol.num_atoms(), 2);
+        assert!(
+            !mol.has_coords3(),
+            "all-zero is a placeholder, not a conformer"
+        );
+        // The charge column beside it is real and must survive.
+        assert_eq!(mol.site(0).and_then(|s| s.partial_charge), Some(0.0));
     }
 }

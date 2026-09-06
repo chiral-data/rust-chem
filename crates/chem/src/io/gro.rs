@@ -57,7 +57,7 @@
 use crate::core::atom::{Atom, Element};
 use crate::core::cell::UnitCell;
 use crate::core::elements::ELEMENT_SYMBOLS;
-use crate::core::geometry::Point3;
+use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
 use crate::io::errors::GroError;
@@ -254,8 +254,13 @@ pub fn parse_gro(text: &str) -> Result<Molecule, GroError> {
         .collect::<Result<_, _>>()
         .map_err(|_| GroError::ParseError(format!("invalid box vector line: {box_line:?}")))?;
 
-    mol.set_coords3(coords)
-        .map_err(|e| GroError::ParseError(e.to_string()))?;
+    // Zeros in these columns are what a format with no room to say "unknown"
+    // writes for a molecule that has no conformer, so believing them back is
+    // how a converted molecule ended up undrawable (#270).
+    if !is_placeholder_3d(&coords) {
+        mol.set_coords3(coords)
+            .map_err(|e| GroError::ParseError(e.to_string()))?;
+    }
     let (chains, residues) = group_into_chain_and_residues(&keys);
     mol.set_topology(chains, residues)
         .map_err(|e| GroError::ParseError(e.to_string()))?;
@@ -467,5 +472,33 @@ with velocities
         let written = write_gro(&mol);
         let back = parse_gro(&written).expect("round trips even with no real cell");
         assert!(back.cell().is_none());
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_conformer() {
+        // #270: zeros are what this format writes when there is nothing to say,
+        // so reading them back as a conformer stacks every atom at the origin.
+        const ZEROED_GRO: &str = "\
+zeroed
+    3
+    1UNK      C    1   0.000   0.000   0.000
+    1UNK      C    2   0.000   0.000   0.000
+    1UNK      O    3   0.000   0.000   0.000
+   0.00000   0.00000   0.00000
+";
+        let mol = parse_gro(ZEROED_GRO).expect("valid GRO");
+        assert_eq!(mol.num_atoms(), 3);
+        assert!(
+            !mol.has_coords3(),
+            "all-zero is a placeholder, not a conformer"
+        );
+    }
+
+    #[test]
+    fn test_a_real_conformer_is_still_read() {
+        // The other half: WATER_GRO's first atom is at the origin and the rest
+        // are not, so it is a measurement and must survive untouched.
+        let mol = parse_gro(WATER_GRO).expect("valid GRO");
+        assert!(mol.has_coords3());
     }
 }
