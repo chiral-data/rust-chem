@@ -29,6 +29,7 @@ import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 import chem
 from oracles import Oracle, load
@@ -571,12 +572,209 @@ def check_mmcif(oracles: list[Oracle], verbose: bool) -> Report:
     return report
 
 
+PDB_CORPUS = CORPUS / "pdb"
+
+
+def check_pdb(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem`'s PDB round trip keep what gemmi reads -- values included?
+
+    Three questions, and the second is why this exists separately from
+    `check_mmcif` rather than as more fixtures for it:
+
+    1. The structural summary, as `check_mmcif` does it.
+    2. **Per-atom occupancy and B-factor values.** `Carries` is presence-based,
+       so a writer emitting a constant for every atom passes every mask
+       assertion in the crate (#257 hands this over explicitly). Only a value
+       comparison can see it.
+    3. OpenBabel through the same path -- recorded as a `note`, never a
+       mismatch. Its PDB writer zeroes the B-factor column while preserving the
+       occupancy beside it, and being *different* from that is the correct
+       behaviour (#173), so agreement here would be the bug.
+
+    Uses `oracles` unlike `check_mmcif`, which ignores it: OpenBabel is the
+    subject of question 3 rather than a judge of questions 1 and 2.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    summarize = gemmi_oracle.load_gemmi()
+    report = Report()
+    for path in sorted(PDB_CORPUS.glob("*.pdb")):
+        original = path.read_text()
+        reference = summarize(original, ".pdb")
+        reference_sites = gemmi_oracle.sites(original)
+        if reference is None or reference_sites is None:
+            report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+            continue
+
+        written = chem.convert_pdb(original, "pdb")
+        if written is None:
+            report.mismatch(f"{path.name}: chem could not round-trip this file")
+            continue
+
+        ours = summarize(written, ".pdb")
+        if ours is None:
+            report.mismatch(f"{path.name}: gemmi cannot read what chem wrote back")
+            continue
+        if ours != reference:
+            report.mismatch(
+                f"{path.name}: chem's round trip disagrees with gemmi — {reference} vs {ours}"
+            )
+            continue
+
+        our_sites = gemmi_oracle.sites(written)
+        if our_sites != reference_sites:
+            report.mismatch(
+                f"{path.name}: per-atom values moved — "
+                f"occupancy {reference_sites.occupancies} -> {our_sites.occupancies}, "
+                f"b-factor {reference_sites.b_factors} -> {our_sites.b_factors}"
+            )
+            continue
+
+        report.ok()
+        if verbose:
+            print(
+                f"    ok         {path.name:<34} "
+                f"{reference.atom_count} atoms, {len(set(reference_sites.b_factors))} distinct b"
+            )
+
+        # Question 3. Not a mismatch: this is the oracle being wrong, recorded
+        # so the divergence is visible rather than assumed.
+        for oracle in oracles:
+            theirs = getattr(oracle, "round_trip_pdb", None)
+            if theirs is None:
+                continue
+            their_text = theirs(original)
+            their_sites = gemmi_oracle.sites(their_text) if their_text else None
+            if their_sites is None:
+                report.note(f"{path.name}: {oracle.name} wrote a PDB gemmi cannot read")
+            elif their_sites.b_factors != reference_sites.b_factors:
+                kept = (
+                    "occupancy preserved"
+                    if their_sites.occupancies == reference_sites.occupancies
+                    else f"occupancy also moved to {their_sites.occupancies}"
+                )
+                report.note(
+                    f"{path.name}: {oracle.name} rewrote b-factors "
+                    f"{reference_sites.b_factors} -> {their_sites.b_factors} ({kept}); "
+                    "chem keeps them, which is the point"
+                )
+    return report
+
+
+#: AutoDock types that name an element other than themselves. Spelled out
+#: here rather than asked of `chem`, for the reason `read_corpus` exists: a
+#: check has to know what a line said independently of chem's reading of it.
+AUTODOCK_ELEMENT = {"A": "C", "OA": "O", "NA": "N", "SA": "S", "HD": "H", "HS": "H"}
+
+
+def _pdbqt_atoms(text: str) -> list[tuple[str, float]]:
+    """The element and partial charge of each atom of a PDBQT, in file order.
+
+    Fixed columns, because that is what the format is: Meeko writes `+0.034`
+    where chem writes ` 0.034`, so whitespace splitting would shift the fields
+    apart on one dialect and not the other.
+    """
+    atoms = []
+    for line in text.splitlines():
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        charge = line[70:76].strip()
+        atom_type = line[77:79].strip()
+        element = AUTODOCK_ELEMENT.get(atom_type, atom_type)
+        atoms.append((element, round(float(charge), 4) if charge else 0.0))
+    return atoms
+
+
+def _mol2_atoms(text: str) -> list[tuple[str, float]]:
+    """The same, read out of a Mol2 atom block."""
+    atoms = []
+    in_block = False
+    for line in text.splitlines():
+        if line.startswith("@<TRIPOS>"):
+            in_block = line.strip() == "@<TRIPOS>ATOM"
+            continue
+        if not in_block or not line.strip():
+            continue
+        fields = line.split()
+        element = fields[5].split(".")[0]
+        atoms.append((element, round(float(fields[8]), 4)))
+    return atoms
+
+
+def check_pdbqt(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem` read every PDBQT dialect, not just its own?
+
+    `io/pdbqt.rs` targets AutoDock's documented spec rather than obabel's or
+    Meeko's quirks -- the two disagree with each other, and #173 records that
+    downstream code parses both. That makes "read both" a promise, and until
+    Meeko joined the image (#258) only one dialect was ever exercised.
+
+    **Writes Mol2, not PDBQT.** A PDBQT round trip cannot measure the reader
+    while #259 is open: these files carry no bonds, so chem reads N one-atom
+    fragments and its writer keeps only the largest -- the first version of
+    this check reported twelve findings that were all that one defect, with
+    every atom read perfectly. Mol2 carries element and partial charge and
+    drops no components, so what is compared is the read.
+
+    Not a text comparison either: the dialects differ deliberately (`UNL` vs
+    `LIG`, an explicit `+`, the atom-name column) and none of it changes what
+    the file means.
+    """
+    from oracles import meeko as meeko_oracle
+
+    write_pdbqt = meeko_oracle.load_meeko()
+    report = Report()
+
+    writers: list[tuple[str, Callable[[str], Optional[str]]]] = [("meeko", write_pdbqt)]
+    for oracle in oracles:
+        theirs = getattr(oracle, "pdbqt_of_smiles", None)
+        if theirs is not None:
+            writers.append((oracle.name, theirs))
+
+    # `hard.smi` only: this is about dialects, not breadth, and every writer
+    # here runs a 3D embedding per molecule.
+    for record in chem.read_corpus(CORPUS / "hard.smi"):
+        name = record.name
+        if chem.is_known_gap(name):
+            continue
+        for writer_name, write in writers:
+            theirs = write(record.smiles)
+            if theirs is None:
+                continue
+            expected = _pdbqt_atoms(theirs)
+            if not expected:
+                report.note(f"{name}: {writer_name} wrote a PDBQT with no atoms")
+                continue
+
+            ours = chem.convert_pdbqt(theirs, "mol2")
+            if ours is None:
+                report.mismatch(f"{name}: chem could not read {writer_name}'s PDBQT")
+                continue
+
+            measured = _mol2_atoms(ours)
+            if measured != expected:
+                report.mismatch(
+                    f"{name}: chem's read of {writer_name}'s PDBQT disagrees — "
+                    f"{expected} vs {measured}"
+                )
+            else:
+                report.ok()
+                if verbose:
+                    print(
+                        f"    ok         {name:<26} {writer_name:<9} "
+                        f"{len(expected)} atoms"
+                    )
+    return report
+
+
 CHECKS = {
     "parse": check_parse,
     "write": check_write,
     "sdf": check_sdf,
     "fp": check_fp,
     "mmcif": check_mmcif,
+    "pdb": check_pdb,
+    "pdbqt": check_pdbqt,
     "json": check_json,
 }
 

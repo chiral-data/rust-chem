@@ -376,8 +376,6 @@ pub fn write_pdb(mol: &Molecule) -> String {
             z = p.z,
         ));
     }
-    out.push_str("END\n");
-
     let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); mol.num_atoms()];
     for bond in mol.bonds() {
         neighbors[bond.atom1()].push(bond.atom2());
@@ -397,6 +395,13 @@ pub fn write_pdb(mol: &Molecule) -> String {
             out.push('\n');
         }
     }
+
+    // Last, because `END` terminates the file: a reader that honours it never
+    // sees connectivity written after it, and every PDB this crate wrote until
+    // #263 put `CONECT` there -- OpenBabel read ethanol back as `C.C.O`. Our
+    // own parser ignores `END` outright, so a round trip through it could not
+    // have caught this.
+    out.push_str("END\n");
 
     out
 }
@@ -470,6 +475,109 @@ END
         assert!(written.contains("CONECT"), "{written}");
         let back = parse_pdb(&written).expect("round trips");
         assert_eq!(back.num_bonds(), 2);
+    }
+
+    /// Distinct per-atom occupancies and B-factors, none of them the value a
+    /// missing site would produce.
+    ///
+    /// [`WATER_PDB`] cannot serve here: its B-factors are all `0.00`, which is
+    /// exactly what `write_pdb` emits for an atom with no site at all, so a
+    /// writer that dropped the column entirely would round-trip through it
+    /// perfectly.
+    const SITES_PDB: &str = "\
+ATOM      1  N   ALA A   1      11.104  13.207  10.000  1.00 42.50           N
+ATOM      2  CA  ALA A   1      12.560  13.207  10.000  0.80 37.25           C
+ATOM      3  C   ALA A   1      13.100  14.600  10.000  0.55 55.00           C
+END
+";
+
+    #[test]
+    fn test_end_is_the_last_record_so_conect_is_not_stranded_after_it() {
+        // #263. `END` terminates the file, so connectivity written after it is
+        // invisible to any reader that honours it -- OpenBabel read ethanol
+        // back as three disconnected atoms. Asserted on the *text*, because a
+        // round trip through our own parser is precisely what hid this: it
+        // ignores `END` along with every other record it does not model.
+        let text = format!("{WATER_PDB}CONECT    1    2\nCONECT    1    3\n");
+        let mol = parse_pdb(&text).expect("valid PDB");
+        let written = write_pdb(&mol);
+
+        let records: Vec<&str> = written.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            records.last(),
+            Some(&"END"),
+            "END must terminate the file: {written}"
+        );
+
+        let end = records.iter().position(|l| *l == "END").expect("an END");
+        let last_conect = records
+            .iter()
+            .rposition(|l| l.starts_with("CONECT"))
+            .expect("this molecule has bonds");
+        assert!(
+            last_conect < end,
+            "CONECT after END is unreachable to a reader: {written}"
+        );
+    }
+
+    #[test]
+    fn test_occupancy_and_b_factor_keep_their_values_not_just_their_flags() {
+        // `Carries` is presence-based, so `held` reports B_FACTOR whether the
+        // value came back as 42.50 or as a manufactured 0.00 -- which is
+        // exactly the defect #173 records against OpenBabel, whose PDB writer
+        // zeroes this column while preserving the occupancy beside it. Only a
+        // value comparison can tell those apart (#258).
+        let mol = parse_pdb(SITES_PDB).expect("valid PDB");
+        let expected = [(1.00, 42.50), (0.80, 37.25), (0.55, 55.00)];
+
+        let read_back = |mol: &Molecule| -> Vec<(f64, f64)> {
+            (0..mol.num_atoms())
+                .map(|i| {
+                    let site = mol.site(i).expect("every atom line carries both columns");
+                    (
+                        site.occupancy.expect("an occupancy"),
+                        site.b_factor.expect("a b-factor"),
+                    )
+                })
+                .collect()
+        };
+
+        // Twice, following mmcif.rs's #260 regression: a column that survives
+        // one pass can still be misaligned enough to move on the next.
+        let mut current = mol;
+        for pass in 1..=2 {
+            let measured = read_back(&current);
+            for (i, (occupancy, b_factor)) in expected.iter().enumerate() {
+                assert!(
+                    (measured[i].0 - occupancy).abs() < 1e-9,
+                    "pass {pass}, atom {i}: occupancy {} is not {occupancy}",
+                    measured[i].0
+                );
+                assert!(
+                    (measured[i].1 - b_factor).abs() < 1e-9,
+                    "pass {pass}, atom {i}: b-factor {} is not {b_factor}",
+                    measured[i].1
+                );
+            }
+            current = parse_pdb(&write_pdb(&current)).expect("our own output reads back");
+        }
+    }
+
+    #[test]
+    fn test_an_atom_with_no_site_is_written_as_full_occupancy_and_no_b_factor() {
+        // The other half: these columns are not optional, so writing an atom
+        // that never had them manufactures 1.00 and 0.00 -- values a reader
+        // cannot tell from measured ones. Pinned because #257's `SUPPLIED`
+        // table records exactly this, and the two descriptions have to agree.
+        let mol = crate::io::smiles::parse_smiles("CC").expect("valid SMILES");
+        assert!(mol.sites().is_none(), "no site data to begin with");
+
+        let back = parse_pdb(&write_pdb(&mol)).expect("our own output reads back");
+        for i in 0..back.num_atoms() {
+            let site = back.site(i).expect("the columns are always written");
+            assert_eq!(site.occupancy, Some(1.0));
+            assert_eq!(site.b_factor, Some(0.0));
+        }
     }
 
     #[test]

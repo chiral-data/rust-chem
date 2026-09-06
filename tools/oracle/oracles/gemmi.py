@@ -11,9 +11,24 @@ list — `Oracle.parses("CCO")` means nothing to a toolkit that only reads
 structures.
 
 RDKit has no mmCIF/PDB support at all, and OpenBabel's mmCIF writer emits a
-different, incompatible small-molecule crystallography dialect (fractional
-coordinates, no chains) — neither can judge this format, which is the whole
-reason this module exists.
+file this very module reads **zero atoms** from — neither can judge this
+format, which is the whole reason this module exists.
+
+That second claim used to read "a different, incompatible small-molecule
+crystallography dialect (fractional coordinates, no chains)". Measured against
+the pinned openbabel-wheel 3.1.1.21 (#258), with and without a `CRYST1` cell,
+it writes `Cartn_x`/`Cartn_y`/`Cartn_z` both times — the fractional half was
+never true. What it actually does is drop the chain, occupancy and
+`B_iso_or_equiv` columns, and the result is not merely awkward to read:
+
+    source pdb        3 atoms, chain A, b=[42.5, 37.25, 55.0]
+    obabel -> mmcif   0 atoms, no chains, no b
+    chem   -> mmcif   3 atoms, chain A, b=[42.5, 37.25, 55.0]
+
+Its **PDB** writer is a separate defect, and the one `check_pdb` pins: it
+zeroes `B_iso_or_equiv`'s PDB equivalent on every write while preserving the
+occupancy column beside it, which destroys the per-atom confidence a predicted
+structure stores there.
 """
 
 from typing import Callable, NamedTuple, Optional
@@ -100,6 +115,52 @@ def summarize(text: str, suffix: str = ".cif") -> Optional[Summary]:
     return Summary(atom_count, cell, chain_ids, residues)
 
 
+class Sites(NamedTuple):
+    """The per-atom values [`Summary`] deliberately leaves out.
+
+    Separate from `Summary` rather than more fields on it: `check_mmcif`
+    compares whole tuples with `!=`, so widening `Summary` would silently
+    change a check this does not belong to.
+
+    Rounded to the two decimals both formats store, so the comparison is
+    about the value and not about float formatting.
+    """
+
+    occupancies: tuple[float, ...]
+    b_factors: tuple[float, ...]
+
+
+def sites(text: str, suffix: str = ".pdb") -> Optional[Sites]:
+    """Per-atom occupancy and B-factor, in file order.
+
+    The check that matters for #258: `Carries` is presence-based, so a writer
+    emitting a constant for every atom satisfies every mask assertion in the
+    crate. Only comparing values catches it -- which is exactly OpenBabel's
+    PDB defect.
+    """
+    try:
+        structure = _gemmi.read_structure_string(text, format=_FORMAT[suffix])
+    except Exception:
+        return None
+    if len(structure) == 0:
+        return None
+
+    atoms = [atom for chain in structure[0] for residue in chain for atom in residue]
+    return Sites(
+        tuple(round(atom.occ, 2) for atom in atoms),
+        tuple(round(atom.b_iso, 2) for atom in atoms),
+    )
+
+
+#: The PDB counterpart of `SANITY`, complete in the same way -- fixed columns
+#: through the element symbol, so a column-offset bug in the fixture cannot be
+#: mistaken for one in what is being tested.
+SANITY_PDB = """\
+ATOM      1  N   ALA A   1      11.104  13.207   2.428  0.80 42.50           N
+END
+"""
+
+
 def load_gemmi() -> Callable[..., Optional[Summary]]:
     """Confirms gemmi can read something, the same way `oracles.load()`
     confirms RDKit/OpenBabel can before trusting either. Returns
@@ -111,5 +172,19 @@ def load_gemmi() -> Callable[..., Optional[Summary]]:
         raise RuntimeError(
             "gemmi cannot read a trivial mmCIF fixture, so it is broken "
             "rather than strict — refusing to report its answers as findings"
+        )
+    # The PDB path was in `_FORMAT` from the start but never exercised until
+    # #258. Gated too, so a `check_pdb` failure is unambiguously about chem
+    # rather than about this reader.
+    if summarize(SANITY_PDB, ".pdb") is None:
+        raise RuntimeError(
+            "gemmi cannot read a trivial PDB fixture, so it is broken "
+            "rather than strict — refusing to report its answers as findings"
+        )
+    measured = sites(SANITY_PDB)
+    if measured != Sites((0.80,), (42.50,)):
+        raise RuntimeError(
+            f"gemmi reports {measured} for a fixture stating 0.80/42.50, so its "
+            "per-atom values cannot be trusted as a reference"
         )
     return summarize

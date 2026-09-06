@@ -27,3 +27,9 @@
 # trunk (chem_app web build output)
 /chem_app/dist/
 dist-e2e/
+
+# Python bytecode from the oracle harness. It runs in a container as root,
+# so these land in the working tree owned by root and cannot be cleaned up
+# by an ordinary `git clean`.
+__pycache__/
+*.pyc

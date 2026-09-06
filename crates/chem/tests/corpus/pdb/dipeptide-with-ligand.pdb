@@ -1,0 +1,15 @@
+HEADER    THE PDB ANALOGUE OF dipeptide-with-ligand.cif
+REMARK    Occupancies and B-factors vary per atom on purpose: a writer that
+REMARK    dropped either column would round-trip a uniform file perfectly.
+CRYST1   50.000   60.000   70.000  90.00  90.00  90.00 P 21 21 21    4
+ATOM      1  N   ALA A   1      11.104  13.207   2.428  1.00 15.00           N
+ATOM      2  CA  ALA A   1      12.560  13.207   2.428  0.80 17.25           C
+ATOM      3  C   ALA A   1      13.078  14.622   2.428  1.00 15.50           C
+ATOM      4  N   GLY A   2      14.400  14.700   2.500  0.55 16.00           N
+ATOM      5  CA  GLY A   2      15.000  16.000   2.600  1.00 21.75           C
+HETATM    6  O   HOH B   1      20.000  20.000   2.000  1.00 30.00           O
+HETATM    7  C1  LIG B   2      25.000  25.000   5.000  0.75 25.00           C
+HETATM    8  O1  LIG B   2      26.000  25.000   5.000  1.00 42.50           O
+CONECT    7    8
+CONECT    8    7
+END

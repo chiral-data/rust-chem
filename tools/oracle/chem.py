@@ -124,6 +124,23 @@ def convert_mmcif(text: str, to_format: str) -> str | None:
     return result.stdout if result.code == 0 and result.stdout.strip() else None
 
 
+def convert_pdb(text: str, to_format: str) -> str | None:
+    """Round-trips PDB text through `chem convert`, returning what it wrote.
+
+    The PDB counterpart of `convert_mmcif`, and hand-written like every other
+    helper here -- there is no generic converter, deliberately: each one names
+    the flags it passes, so a check reads as the command a user would run.
+    """
+    result = run(["convert", "-", "--from", "pdb", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
+def convert_pdbqt(text: str, to_format: str) -> str | None:
+    """Round-trips PDBQT text through `chem convert`, returning what it wrote."""
+    result = run(["convert", "-", "--from", "pdbqt", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
 def write_commonchem(smiles: str) -> str | None:
     """SMILES in, a commonchem JSON document out (#229)."""
     result = run(
