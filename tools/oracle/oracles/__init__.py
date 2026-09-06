@@ -33,6 +33,35 @@ class Oracle:
     identity_of_sdf: Callable[[str], Optional[str]]
     #: Set bits of a Morgan fingerprint, or None if unsupported.
     fingerprint: Optional[Callable[[str, int, int], Optional[list[int]]]] = None
+    #: Identity computed from a commonchem JSON document (#229), or None for a
+    #: toolkit that cannot read the format. OpenBabel cannot, so this is the
+    #: same optional-capability shape `fingerprint` already has rather than a
+    #: new kind of thing: the format is RDKit's own, and RDKit is the only
+    #: oracle that defines it.
+    identity_of_commonchem: Optional[Callable[[str], Optional[str]]] = None
+    #: `(stereo, stereo_atoms)` per double bond of a commonchem document.
+    #:
+    #: Separate from `identity_of_commonchem` because RDKit's SMILES writer
+    #: ignores the `stereoAtoms` its JSON reader faithfully preserves — a
+    #: `cis` bond anchored to two different atom pairs, which are chemically
+    #: opposite molecules, both write as the same SMILES. So bond stereo has
+    #: to be read off the bond objects rather than through any writer.
+    bond_stereo_of_commonchem: Optional[Callable[[str], Optional[list]]] = None
+    #: This toolkit's own commonchem document for a SMILES — the input to the
+    #: read direction, and the only way to exercise the `rdkitjson` dialect
+    #: this crate accepts but never writes.
+    commonchem_of_smiles: Optional[Callable[[str], Optional[str]]] = None
+    #: Molecular formula of a SMILES, and of a commonchem document.
+    #:
+    #: InChI cannot answer this one. Its `/p` layer factors out mobile
+    #: protons, so `CC(=O)[O-]` and `CC(=O)[OH2-]` — a correct carboxylate and
+    #: one carrying two impossible hydrogens — produce the *same* InChI. Since
+    #: commonchem is the first format here with a per-atom hydrogen count, an
+    #: identity that normalises hydrogens away would leave the check blind to
+    #: the one thing the format newly carries. Formula is order-independent
+    #: and counts every hydrogen, which is exactly the granularity needed.
+    formula: Optional[Callable[[str], Optional[str]]] = None
+    formula_of_commonchem: Optional[Callable[[str], Optional[str]]] = None
 
 
 #: Something every cheminformatics toolkit can read. If one cannot, it is

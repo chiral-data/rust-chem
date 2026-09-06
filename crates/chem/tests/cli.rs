@@ -1840,3 +1840,160 @@ fn test_convert_list_shows_cml_mask() {
     assert!(!r.stdout.contains("unit_cell"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("residues"), "{:?}", r.stdout);
 }
+
+const PHENOL_COMMONCHEM: &str = r#"{"commonchem":{"version":10},
+"defaults":{"atom":{"z":6,"impHs":0,"chg":0,"nRad":0,"isotope":0,"stereo":"unspecified"},"bond":{"bo":1,"stereo":"unspecified"}},
+"molecules":[{"name":"phenol",
+"atoms":[{"impHs":1},{"impHs":1},{"impHs":1},{"impHs":1},{"impHs":1},{},{"z":8,"impHs":1}],
+"bonds":[{"bo":2,"atoms":[0,1]},{"atoms":[1,2]},{"bo":2,"atoms":[2,3]},{"atoms":[3,4]},{"bo":2,"atoms":[4,5]},{"atoms":[5,6]},{"atoms":[5,0]}],
+"extensions":[{"name":"rdkitRepresentation","formatVersion":2,"aromaticAtoms":[0,1,2,3,4,5],"aromaticBonds":[0,1,2,3,4,6]}]}]}"#;
+
+#[test]
+fn test_convert_reads_a_literal_commonchem_document() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            PHENOL_COMMONCHEM,
+            "--from",
+            "commonchem",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // Lower-case ring atoms: the aromaticity came out of the extension, since
+    // the bond list this document carries is a Kekulé form.
+    assert!(r.stdout.contains("c1ccccc1"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_commonchem_from_smiles() {
+    let path = fixture("aromatic.smi", "c1ccccc1O phenol\n");
+    let r = run(
+        &["convert", path.to_str().unwrap(), "--to", "commonchem"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains(r#""commonchem":{"version":10}"#),
+        "{:?}",
+        r.stdout
+    );
+    assert!(r.stdout.contains(r#""aromaticAtoms""#), "{:?}", r.stdout);
+    // `bo: 4` is a quadruple bond in this schema, never an aromatic one.
+    assert!(!r.stdout.contains(r#""bo":4"#), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_infers_commonchem_from_a_json_extension() {
+    let path = fixture("phenol.json", PHENOL_COMMONCHEM);
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_writes_every_record_into_one_commonchem_document() {
+    // The one format here with no concatenable framing: three records must
+    // produce one document with three entries, not three documents.
+    let path = fixture("three.smi", "C a\nO b\nN c\n");
+    let r = run(
+        &["convert", path.to_str().unwrap(), "--to", "commonchem"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(
+        r.stdout.matches(r#""commonchem""#).count(),
+        1,
+        "{:?}",
+        r.stdout
+    );
+    for name in ["\"a\"", "\"b\"", "\"c\""] {
+        assert!(
+            r.stdout.contains(name),
+            "{name} missing from {:?}",
+            r.stdout
+        );
+    }
+}
+
+#[test]
+fn test_convert_rejects_an_unsupported_commonchem_version() {
+    // RDKit refuses `commonchem` 12 as well, so this is agreement with the
+    // reference implementation rather than extra strictness.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            r#"{"commonchem":{"version":12},"molecules":[]}"#,
+            "--from",
+            "commonchem",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0, "a refused document must not exit 0");
+    assert!(r.stderr.contains("commonchem"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("12"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_rejects_a_truncated_commonchem_document() {
+    // JSON has no per-record boundary, so a truncated file is one failure for
+    // the whole input rather than a partial success -- and must not be a
+    // silent `converted 0`.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            r#"{"commonchem":{"version":10},"#,
+            "--from",
+            "commonchem",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0, "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_shows_commonchem_mask() {
+    let r = run(&["convert", "-L", "commonchem"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    for flag in [
+        "coords_2d",
+        "coords_3d",
+        "formal_charge",
+        "isotope",
+        "stereo_atom",
+        "stereo_bond",
+        "aromaticity",
+        "properties",
+    ] {
+        assert!(
+            r.stdout.contains(flag),
+            "{flag} missing from {:?}",
+            r.stdout
+        );
+    }
+    // No field in the schema for any of these.
+    for flag in ["unit_cell", "residues", "b_factor", "occupancy"] {
+        assert!(!r.stdout.contains(flag), "{flag} claimed in {:?}", r.stdout);
+    }
+}
+
+#[test]
+fn test_convert_formats_lists_the_json_category() {
+    let r = run(&["convert", "-L", "formats"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("JSON formats"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("commonchem"), "{:?}", r.stdout);
+}

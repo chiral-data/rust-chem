@@ -249,6 +249,146 @@ def check_sdf(oracles: list[Oracle], verbose: bool) -> Report:
     return report
 
 
+def check_json(oracles: list[Oracle], verbose: bool) -> Report:
+    """commonchem JSON, both directions, against the toolkit that defines it (#229).
+
+    The only format in scope where the oracle is the reference implementation
+    rather than a second opinion, so both directions are worth checking:
+
+    - **write**: chem emits a document, RDKit reads it, and the InChI must
+      match RDKit's InChI for the original SMILES. This is what proves the
+      `rdkitRepresentation` extension is emitted correctly — aromaticity lives
+      only there, so a document missing it reads back kekulised and non-
+      aromatic, with a different InChI.
+    - **read**: RDKit emits a document (in its own `rdkitjson` v12 dialect,
+      which it always uses and we never write), chem reads it and writes its
+      canonical SMILES, and RDKit's InChI of *that* must match. This is what
+      proves the dialect is accepted and the extension is applied on the way
+      in.
+
+    Only RDKit takes part. OpenBabel has no reader for this format, and gemmi
+    is structural — an oracle without `identity_of_commonchem` is skipped, the
+    same way `check_fp` skips one without `fingerprint`.
+    """
+    report = Report()
+    for path in sorted(CORPUS.glob("*.smi")):
+        if path.stem == "invalid":
+            continue
+        for record in chem.read_corpus(path):
+            if chem.is_known_gap(record.name):
+                continue  # chem cannot read it yet; the parse check reports it
+
+            for oracle in oracles:
+                if oracle.identity_of_commonchem is None:
+                    continue
+                before = oracle.identity(record.smiles)
+                if before is None:
+                    continue
+
+                # --- write direction -------------------------------------
+                written = chem.write_commonchem(record.smiles)
+                if written is None:
+                    report.mismatch(
+                        f"{path.name}: chem wrote no commonchem for {record.name}"
+                    )
+                    continue
+                after = oracle.identity_of_commonchem(written)
+                if after is None:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — {oracle.name} cannot read "
+                        f"the commonchem chem wrote"
+                    )
+                elif before != after:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — commonchem write, "
+                        f"{oracle.name} says {difference(oracle, before, after)}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok  write  {record.name:<34} {record.smiles}")
+
+                # Hydrogen counts, which the InChI comparison above cannot
+                # see: its `/p` layer normalises mobile protons away, so a
+                # carboxylate carrying two impossible hydrogens has the same
+                # InChI as a correct one. commonchem is the first format here
+                # that states a per-atom hydrogen count, so this is the only
+                # check that looks at what it actually wrote.
+                if oracle.formula is not None and oracle.formula_of_commonchem is not None:
+                    want = oracle.formula(record.smiles)
+                    got = oracle.formula_of_commonchem(written)
+                    if want is not None and got is not None:
+                        if want != got:
+                            report.mismatch(
+                                f"{path.name}: {record.name} — commonchem write, "
+                                f"formula {want} -> {got}"
+                            )
+                        else:
+                            report.ok()
+
+                # --- read direction --------------------------------------
+                if oracle.commonchem_of_smiles is None:
+                    continue
+                theirs = oracle.commonchem_of_smiles(record.smiles)
+                if theirs is None:
+                    continue
+                ours = chem.read_commonchem(theirs)
+                if ours is None:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — chem cannot read the "
+                        f"commonchem {oracle.name} wrote"
+                    )
+                    continue
+                back = oracle.identity(ours)
+                if back is None:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — {oracle.name} cannot read "
+                        f"the SMILES chem wrote from their commonchem"
+                    )
+                elif before != back:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — commonchem read, "
+                        f"{oracle.name} says {difference(oracle, before, back)}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok  read   {record.name:<34} {record.smiles}")
+
+                # --- bond stereo, read off the bonds ---------------------
+                # Not through any SMILES writer: RDKit's ignores the
+                # `stereoAtoms` its JSON reader preserves, so two chemically
+                # opposite documents render identically. See the field comment
+                # in `oracles/__init__.py`.
+                if oracle.bond_stereo_of_commonchem is not None:
+                    mine = oracle.bond_stereo_of_commonchem(written)
+                    theirs_stereo = oracle.bond_stereo_of_commonchem(theirs)
+                    if mine is not None and theirs_stereo is not None:
+                        # Only bonds that actually assert a configuration.
+                        # Counting `STEREONONE` would compare how many double
+                        # bonds each side *has*, which differs legitimately
+                        # whenever aromaticity perception does -- `chem` does
+                        # not perceive outside `chem aromatic` (#192), so it
+                        # writes `C1=CC=CC=C1` with three plain double bonds
+                        # where RDKit writes an aromatic ring with none. That
+                        # is a different question, and the `write`/`read`
+                        # comparisons above already answer it.
+                        mine_kinds = sorted(
+                            s for _, _, s, _ in mine if s != "STEREONONE"
+                        )
+                        their_kinds = sorted(
+                            s for _, _, s, _ in theirs_stereo if s != "STEREONONE"
+                        )
+                        if mine_kinds != their_kinds:
+                            report.mismatch(
+                                f"{path.name}: {record.name} — bond stereo, "
+                                f"chem {mine_kinds} vs {oracle.name} {their_kinds}"
+                            )
+                        else:
+                            report.ok()
+    return report
+
+
 def tanimoto(a: set[int], b: set[int]) -> float:
     union = len(a | b)
     return len(a & b) / union if union else 1.0
@@ -380,6 +520,7 @@ CHECKS = {
     "sdf": check_sdf,
     "fp": check_fp,
     "mmcif": check_mmcif,
+    "json": check_json,
 }
 
 

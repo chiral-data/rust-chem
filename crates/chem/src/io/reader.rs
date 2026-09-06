@@ -689,6 +689,43 @@ pub fn read_cml_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
     out
 }
 
+/// [`read_commonchem_with_options`] with default options.
+pub fn read_commonchem(content: &str) -> ReadOutcome {
+    read_commonchem_with_options(content, &ReadOptions)
+}
+
+/// One molecule per entry in the document's `molecules` array (#229).
+///
+/// The only format here with no per-record framing at all: JSON has no
+/// boundary a scan could find, and a document is valid only whole. So the
+/// granularity of failure differs from every prior format -- a malformed
+/// *document* is one `Skipped` for the entire file, since nothing smaller can
+/// be salvaged, while a malformed *molecule* costs just its own record. That
+/// is still this crate's "bad input costs one record, not the run" contract,
+/// applied at the only two granularities this format has.
+pub fn read_commonchem_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+
+    match crate::io::commonchem::parse_commonchem(content) {
+        Ok(records) => {
+            for (name, molecule) in records {
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position: 1,
+            input: content.to_string(),
+            error: e.to_string(),
+        }),
+    }
+
+    out
+}
+
 /// Finds the byte offset of the next `<molecule` start tag at or after
 /// `from`, requiring the character right after `<molecule` to be a real
 /// tag boundary (whitespace, `>`, `/`, or end of input) so `<moleculeList>`

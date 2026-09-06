@@ -7,7 +7,7 @@ every identity comparison rests on. See `oracles/__init__.py`.
 from typing import Optional
 
 from rdkit import Chem, RDLogger
-from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem import rdFingerprintGenerator, rdMolDescriptors
 
 from . import Oracle
 
@@ -53,6 +53,76 @@ def fingerprint(smiles: str, radius: int, nbits: int) -> Optional[list[int]]:
     return sorted(generator.GetFingerprint(mol).GetOnBits())
 
 
+def identity_of_commonchem(text: str) -> Optional[str]:
+    """InChI of the first molecule in a commonchem/rdkitjson document.
+
+    RDKit defines this format, so unlike every other check here the comparison
+    is against the reference implementation rather than against a toolkit that
+    merely happens to support the format.
+    """
+    try:
+        mols = Chem.JSONToMols(text)
+    except Exception:
+        return None
+    for mol in mols:
+        if mol is not None:
+            return Chem.MolToInchi(mol)
+    return None
+
+
+def bond_stereo_of_commonchem(text: str) -> Optional[list]:
+    """`(begin, end, stereo, stereo_atoms)` for every double bond, in order.
+
+    Read off the bonds rather than through `MolToSmiles`, which ignores the
+    stereo atoms — see the field's comment in `oracles/__init__.py`.
+    """
+    try:
+        mols = Chem.JSONToMols(text)
+    except Exception:
+        return None
+    if not mols or mols[0] is None:
+        return None
+    out = []
+    for bond in mols[0].GetBonds():
+        if bond.GetBondType() == Chem.BondType.DOUBLE:
+            out.append(
+                (
+                    bond.GetBeginAtomIdx(),
+                    bond.GetEndAtomIdx(),
+                    str(bond.GetStereo()),
+                    sorted(bond.GetStereoAtoms()),
+                )
+            )
+    return out
+
+
+def commonchem_of_smiles(smiles: str) -> Optional[str]:
+    """RDKit's own commonchem document for a SMILES — the read direction's input."""
+    mol = _mol(smiles)
+    return Chem.MolToJSON(mol) if mol is not None else None
+
+
+def formula(smiles: str) -> Optional[str]:
+    mol = _mol(smiles)
+    return rdMolDescriptors.CalcMolFormula(mol) if mol is not None else None
+
+
+def formula_of_commonchem(text: str) -> Optional[str]:
+    """Molecular formula of the first molecule in a commonchem document.
+
+    The hydrogen-count check InChI cannot perform — see the field comment in
+    `oracles/__init__.py`.
+    """
+    try:
+        mols = Chem.JSONToMols(text)
+    except Exception:
+        return None
+    for mol in mols:
+        if mol is not None:
+            return rdMolDescriptors.CalcMolFormula(mol)
+    return None
+
+
 def oracle() -> Oracle:
     return Oracle(
         name="rdkit",
@@ -60,4 +130,9 @@ def oracle() -> Oracle:
         identity=identity,
         identity_of_sdf=identity_of_sdf,
         fingerprint=fingerprint,
+        identity_of_commonchem=identity_of_commonchem,
+        bond_stereo_of_commonchem=bond_stereo_of_commonchem,
+        commonchem_of_smiles=commonchem_of_smiles,
+        formula=formula,
+        formula_of_commonchem=formula_of_commonchem,
     )

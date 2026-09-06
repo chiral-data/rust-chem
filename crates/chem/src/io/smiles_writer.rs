@@ -272,7 +272,11 @@ fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> St
 /// One per end of the double bond, chosen deterministically so both ends agree
 /// without passing state between them: the lowest-indexed neighbour that is not
 /// the double-bond partner.
-fn reference_substituent(mol: &Molecule, anchor: usize, partner: usize) -> Option<usize> {
+pub(crate) fn reference_substituent(
+    mol: &Molecule,
+    anchor: usize,
+    partner: usize,
+) -> Option<usize> {
     mol.neighbors(anchor)
         .iter()
         .map(|n| n.atom_idx)

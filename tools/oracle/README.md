@@ -17,7 +17,7 @@ Nothing here is a workspace member, a dev-dependency, or named in `Cargo.toml`.
 It drives `target/release/chem` as a subprocess, so a developer with neither
 Python nor a toolkit installed still runs the whole `cargo` gate.
 
-## The five checks
+## The six checks
 
 | Check | Question |
 |---|---|
@@ -26,6 +26,13 @@ Python nor a toolkit installed still runs the whole `cargo` gate.
 | `sdf` | Does a molecule survive `chem coords` to SDF and back? |
 | `fp` | Do our fingerprints rank molecules the way RDKit's do? |
 | `mmcif` | Does `chem`'s mmCIF round trip agree with gemmi's independent read? |
+| `json` | Does commonchem JSON agree with RDKit, which defines the format? |
+
+`json` (#229) is the only check whose oracle is the format's *reference
+implementation* rather than a second opinion, so it runs both directions: what
+`chem` writes must read back as the same molecule, and what RDKit writes (in
+its own `rdkitjson` dialect, which `chem` accepts and never emits) must survive
+being read.
 
 ## Identity, not strings
 
@@ -41,6 +48,14 @@ work of acting on it.
 OpenBabel has no InChI here, so its key is its own canonical SMILES: canonical
 within OpenBabel, unlayered, and therefore less precise. It earns its place by
 disagreeing with RDKit rather than by being exact.
+
+`json` needs a second key alongside InChI, for a reason worth stating: InChI's
+`/p` layer normalises mobile protons away, so `CC(=O)[O-]` and the impossible
+`CC(=O)[OH2-]` have the *same* InChI. commonchem is the first format `chem`
+writes that states a per-atom hydrogen count, so an InChI-only comparison would
+be blind to the one thing it newly carries. That check therefore also compares
+molecular formula, which is order-independent and counts every hydrogen — and
+which is what caught #240.
 
 `fp` is the exception, deliberately. Morgan bit *positions* are the output of a
 particular hash, and ours differ from RDKit's (#192) — that check compares

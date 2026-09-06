@@ -578,6 +578,36 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(cml_supplier),
         writer_stream: Some(cml_writer_stream),
     },
+    FormatDescriptor {
+        name: "commonchem JSON",
+        // `json` is claimed as a bare code and as the extension because this
+        // is the only JSON format in the crate today. #230 (utility formats)
+        // may want ChemDoodle JSON, which is a different schema on the same
+        // extension -- that story reassigns these, it does not add a second
+        // claimant.
+        codes: &["commonchem", "cjson", "json"],
+        extensions: &["json"],
+        category: Category::Json,
+        // No PARTIAL_CHARGE/RESIDUES/B_FACTOR/OCCUPANCY/UNIT_CELL -- the
+        // schema has no field for any of them. No STEREO_GROUP: commonchem
+        // does have `stereoGroups`, but mapping it onto #221's `StereoGroup`
+        // is its own story. AROMATICITY rides on the `rdkitRepresentation`
+        // extension rather than on a bond order, the only channel this format
+        // has for it -- see `io/commonchem.rs`'s module doc.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_2D)
+            .or(Carries::COORDS_3D)
+            .or(Carries::FORMAL_CHARGE)
+            .or(Carries::ISOTOPE)
+            .or(Carries::STEREO_ATOM)
+            .or(Carries::STEREO_BOND)
+            .or(Carries::AROMATICITY)
+            .or(Carries::PROPERTIES),
+        reader: Some(crate::io::reader::read_commonchem_with_options),
+        writer: Some(write_commonchem_records),
+        supplier: Some(commonchem_supplier),
+        writer_stream: Some(commonchem_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -614,6 +644,12 @@ fn pdbqt_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Su
 
 fn gro_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::GroSupplier::new(reader, options))
+}
+
+fn commonchem_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::CommonchemSupplier::new(
+        reader, options,
+    ))
 }
 
 fn cml_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -654,6 +690,10 @@ fn pdbqt_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dy
 
 fn gro_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::GroWriter::new(writer, options))
+}
+
+fn commonchem_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::CommonchemWriter::new(writer, options))
 }
 
 fn cml_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -781,6 +821,14 @@ fn write_cml_records(records: &[(String, Molecule)], _options: &WriteOptions) ->
     out
 }
 
+fn write_commonchem_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // commonchem has no write options today. Unlike every other writer here
+    // this one takes all the records at once rather than looping and
+    // concatenating: the output is a single JSON document with one
+    // `molecules` array, and two documents back to back are not a document.
+    crate::io::commonchem::write_commonchem(records)
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -818,6 +866,12 @@ impl Format {
     /// behind a cargo feature — see `Cargo.toml`'s `roxmltree` dependency
     /// comment and #184.
     pub const CML: Format = Format(9);
+    /// commonchem JSON (#229) — the first structured-interchange format, and
+    /// the first where aromaticity survives a round trip in both directions,
+    /// see [`crate::io::commonchem`]. Not gated behind a cargo feature, on
+    /// the ruling #184 closed with — see `Cargo.toml`'s `serde_json`
+    /// dependency comment.
+    pub const COMMONCHEM: Format = Format(10);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1279,7 +1333,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 10);
+        assert_eq!(all().count(), 11);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

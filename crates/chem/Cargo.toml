@@ -29,6 +29,14 @@ thiserror = { workspace = true }
 # buy little while creating real registry complexity -- see
 # `io::format::Format::CML`'s doc comment and #184.
 roxmltree = "0.20"
+# commonchem JSON (#229) is the only format needing a JSON codec. Always
+# on, not gated, for the same reason as `roxmltree` above and on the
+# ruling #184 closed with: `Format` is a `u16` index into a fixed table,
+# and every registered format must both read and write, so gating one
+# buys little and costs real registry complexity -- see
+# `io::format::Format::COMMONCHEM`'s doc comment. Pure Rust, no build
+# script, no `links` key.
+serde_json = { workspace = true }
 # fp
 bitvec = "1.0.1"
 fxhash = "0.2.1"
