@@ -878,10 +878,147 @@ fn print_format_listing(query: &str) -> Result<()> {
         return Ok(());
     }
 
+    if query.eq_ignore_ascii_case("matrix") {
+        print_fidelity_matrix();
+        return Ok(());
+    }
+
     let format = Format::from_code(query)
         .ok_or_else(|| anyhow::anyhow!("unrecognized format code: {query:?}"))?;
     print_format_detail(format);
     Ok(())
+}
+
+/// One letter per attribute, for the matrix grid.
+///
+/// Single letters because a cell holds up to ten of them and eleven columns of
+/// spelled-out names would not fit a terminal. `C` is formal charge and `P`
+/// partial; `F` is the temperature factor, which is what the PDB spec calls
+/// the B-factor column.
+const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
+    (Carries::TOPOLOGY, 'T', "topology"),
+    (Carries::BONDS, 'B', "bonds"),
+    (Carries::COORDS_2D, '2', "coords_2d"),
+    (Carries::COORDS_3D, '3', "coords_3d"),
+    (Carries::FORMAL_CHARGE, 'C', "formal_charge"),
+    (Carries::PARTIAL_CHARGE, 'P', "partial_charge"),
+    (Carries::ISOTOPE, 'I', "isotope"),
+    (Carries::STEREO_ATOM, 'S', "stereo_atom"),
+    (Carries::STEREO_BOND, 'D', "stereo_bond"),
+    (Carries::STEREO_GROUP, 'G', "stereo_group"),
+    (Carries::AROMATICITY, 'A', "aromaticity"),
+    (Carries::RESIDUES, 'R', "residues"),
+    (Carries::B_FACTOR, 'F', "b_factor"),
+    (Carries::OCCUPANCY, 'O', "occupancy"),
+    (Carries::UNIT_CELL, 'U', "unit_cell"),
+    (Carries::PROPERTIES, 'X', "properties"),
+];
+
+/// `chem convert -L matrix` (#257) — what survives every registered conversion.
+///
+/// A pure query, like the rest of `-L`: the cells come from the registry, not
+/// from running conversions. What makes them true is
+/// `test_every_format_pair_delivers_what_the_matrix_says`, which measures all
+/// 121 pairs against exactly this function.
+fn print_fidelity_matrix() {
+    let formats: Vec<Format> = format::all().collect();
+    let cell = |source: Format, target: Format| -> String {
+        let delivered = format::fidelity(source, target);
+        // Lowercase for an attribute the target's writer manufactures rather
+        // than carries across. Without the distinction `smi -> pdb` reads as
+        // though a B-factor survived, when the column was filled with 0.00.
+        let mut text: String = MATRIX_LEGEND
+            .iter()
+            .filter(|(flag, _, _)| delivered.contains(*flag))
+            .map(|(flag, letter, _)| {
+                if source.carries().contains(*flag) {
+                    *letter
+                } else {
+                    letter.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if !format::pair_loss(source, target).is_empty() {
+            text.push('*');
+        }
+        if format::pair_gap(source, target).is_some() {
+            text.push('!');
+        }
+        text
+    };
+
+    // Columns sized to their own content: the widest possible cell is ten
+    // letters, but most targets are far narrower and a fixed width would push
+    // the table past a terminal for no gain.
+    let label = formats
+        .iter()
+        .map(|f| f.codes()[0].len())
+        .max()
+        .unwrap_or(0);
+    let widths: Vec<usize> = formats
+        .iter()
+        .map(|target| {
+            formats
+                .iter()
+                .map(|source| cell(*source, *target).len())
+                .chain(std::iter::once(target.codes()[0].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    println!("what survives a conversion, source row to target column\n");
+    print!("{:width$}", "", width = label + 2);
+    for (target, width) in formats.iter().zip(&widths) {
+        print!("{:<width$} ", target.codes()[0], width = width);
+    }
+    println!();
+    for source in &formats {
+        print!("{:<width$}  ", source.codes()[0], width = label);
+        for (target, width) in formats.iter().zip(&widths) {
+            print!("{:<width$} ", cell(*source, *target), width = width);
+        }
+        println!();
+    }
+
+    println!();
+    for (index, (_, letter, name)) in MATRIX_LEGEND.iter().enumerate() {
+        print!("{letter} {name:<15}");
+        if index % 4 == 3 {
+            println!();
+        }
+    }
+    println!("\n\nlowercase  supplied by the target's writer, not carried from the source");
+
+    println!("\n* an attribute both formats claim, lost anyway:");
+    for source in &formats {
+        for target in &formats {
+            let lost = format::pair_loss(*source, *target);
+            if lost.is_empty() {
+                continue;
+            }
+            println!(
+                "    {:<10} -> {:<10} {}: {}",
+                source.codes()[0],
+                target.codes()[0],
+                lost.names().collect::<Vec<_>>().join(", "),
+                format::pair_loss_reason(*source, *target).unwrap_or(""),
+            );
+        }
+    }
+
+    println!("\n! the conversion also loses atoms:");
+    for source in &formats {
+        for target in &formats {
+            if let Some(why) = format::pair_gap(*source, *target) {
+                println!(
+                    "    {:<10} -> {:<10} {why}",
+                    source.codes()[0],
+                    target.codes()[0]
+                );
+            }
+        }
+    }
 }
 
 /// `chem convert -H <code>` (#215).

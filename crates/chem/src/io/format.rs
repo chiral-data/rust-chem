@@ -38,8 +38,12 @@ use crate::io::supplier::{Supplier, Writer};
 pub struct Carries(u32);
 
 impl Carries {
-    /// Atoms, elements and the bonds between them — the one thing every
-    /// molecular format holds, and the reason an empty mask is a table typo.
+    /// Atoms and their elements — the one thing every molecular format holds,
+    /// and the reason an empty mask is a table typo.
+    ///
+    /// Bonds are [`Carries::BONDS`] and not this flag. They used to be: this
+    /// doc comment read "atoms, elements and the bonds between them" while four
+    /// formats claiming it read back none at all.
     pub const TOPOLOGY: Carries = Carries(1 << 0);
     pub const COORDS_2D: Carries = Carries(1 << 1);
     pub const COORDS_3D: Carries = Carries(1 << 2);
@@ -65,10 +69,22 @@ impl Carries {
     /// than absolute, configuration asserted across a set of stereocentres.
     /// CXSMILES is the only format that carries these today (#221).
     pub const STEREO_GROUP: Carries = Carries(1 << 15);
+    /// The bonds between atoms, separate from [`Carries::TOPOLOGY`] because
+    /// four registered formats carry atoms and no bonds at all — XYZ and GRO
+    /// have no bond block, mmCIF's `_struct_conn` is unread (#224), and PDBQT
+    /// gives only `BRANCH` pivots (#226).
+    ///
+    /// Split out in #257. Before it, a conversion into any of the four turned
+    /// benzene into six unbonded carbons and the drop report named only the
+    /// coordinates: [`held`] set `TOPOLOGY` on the atom count alone, so the
+    /// claim was never testable. Appended rather than inserted so the existing
+    /// bit numbering stays put; the report order is a separate table.
+    pub const BONDS: Carries = Carries(1 << 16);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
         (Carries::TOPOLOGY, "topology"),
+        (Carries::BONDS, "bonds"),
         (Carries::COORDS_2D, "coords_2d"),
         (Carries::COORDS_3D, "coords_3d"),
         (Carries::FORMAL_CHARGE, "formal_charge"),
@@ -174,6 +190,9 @@ pub fn held(molecule: &Molecule) -> Carries {
 
     if molecule.num_atoms() > 0 {
         carries = carries | Carries::TOPOLOGY;
+    }
+    if molecule.num_bonds() > 0 {
+        carries = carries | Carries::BONDS;
     }
     if molecule.has_coords() {
         carries = carries | Carries::COORDS_2D;
@@ -353,6 +372,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // until then, and `test_declared_masks_match_what_actually_survives`
         // is what refused to let it stay that way.
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::AROMATICITY)
             .or(Carries::FORMAL_CHARGE)
             .or(Carries::ISOTOPE)
@@ -383,6 +403,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // mask describes what a round trip *does*, not what the specification
         // permits, so it is written last and by observation.
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::COORDS_2D)
             .or(Carries::COORDS_3D)
             .or(Carries::AROMATICITY)
@@ -420,6 +441,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // slice (`Format(0)`/`Format(1)`), so a new entry has to go at the
         // end, not wherever it reads best, or it silently renumbers them.
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::AROMATICITY)
             .or(Carries::FORMAL_CHARGE)
             .or(Carries::ISOTOPE)
@@ -443,7 +465,9 @@ static FORMATS: &[FormatDescriptor] = &[
         // orientation the file's writer used, not necessarily this crate's
         // fixed orientation convention (`core/cell.rs`), and reading it
         // correctly would mean rotating every atom's coordinate to match —
-        // not attempted here (#222), see `io/xyz.rs`'s module doc.
+        // not attempted here (#222), see `io/xyz.rs`'s module doc. No BONDS:
+        // the format has no bond block, so this reads back atoms and nothing
+        // joining them.
         carries: Carries::TOPOLOGY.or(Carries::COORDS_3D),
         reader: Some(crate::io::reader::read_xyz_with_options),
         writer: Some(write_xyz_records),
@@ -463,6 +487,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // inference this crate does not implement (#223), see
         // `io/pdb.rs`'s module doc for why.
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::COORDS_3D)
             .or(Carries::RESIDUES)
             .or(Carries::OCCUPANCY)
@@ -481,7 +506,8 @@ static FORMATS: &[FormatDescriptor] = &[
         // Same mask as PDB, and for the same reasons -- see `io/pdb.rs`'s
         // module doc. Stricter on bonds: not even CONECT's rough
         // equivalent (`_struct_conn`) is read here (#224), so no bonds are
-        // claimed or produced at all.
+        // claimed or produced at all -- which is what the absent BONDS says
+        // now that #257 has split it out of TOPOLOGY.
         carries: Carries::TOPOLOGY
             .or(Carries::COORDS_3D)
             .or(Carries::RESIDUES)
@@ -507,6 +533,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // PARTIAL_CHARGE -- `AtomSite::partial_charge`'s own doc comment
         // already named Mol2 as the format this was modelled for (#225).
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::COORDS_2D)
             .or(Carries::COORDS_3D)
             .or(Carries::PARTIAL_CHARGE)
@@ -526,7 +553,8 @@ static FORMATS: &[FormatDescriptor] = &[
         // PDB's own mask plus PARTIAL_CHARGE (the new AutoDock charge
         // column) and AROMATICITY (the `A` atom type). No UNIT_CELL --
         // real ligand PDBQT carries no cell; AutoGrid's cell lives in a
-        // separate grid-parameter file, not the ligand PDBQT itself.
+        // separate grid-parameter file, not the ligand PDBQT itself. No BONDS
+        // either: reading recovers only the BRANCH pivots, not a bond graph.
         carries: Carries::TOPOLOGY
             .or(Carries::COORDS_3D)
             .or(Carries::RESIDUES)
@@ -544,9 +572,10 @@ static FORMATS: &[FormatDescriptor] = &[
         codes: &["gro"],
         extensions: &["gro"],
         category: Category::MolecularDynamicsAndDocking,
-        // No OCCUPANCY/B_FACTOR/PARTIAL_CHARGE/FORMAL_CHARGE/ISOTOPE/
+        // No BONDS/OCCUPANCY/B_FACTOR/PARTIAL_CHARGE/FORMAL_CHARGE/ISOTOPE/
         // STEREO_ATOM/STEREO_BOND/AROMATICITY/PROPERTIES -- none of those
-        // have a column in this format at all.
+        // have a column in this format at all; GROMACS keeps connectivity in
+        // the topology file, not here.
         carries: Carries::TOPOLOGY
             .or(Carries::COORDS_3D)
             .or(Carries::RESIDUES)
@@ -568,6 +597,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // bond order alone (`order="A"`), the same channel SDF's type-4
         // bonds use -- no atom-level aromaticity flag in this format.
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::COORDS_2D)
             .or(Carries::COORDS_3D)
             .or(Carries::FORMAL_CHARGE)
@@ -595,6 +625,7 @@ static FORMATS: &[FormatDescriptor] = &[
         // extension rather than on a bond order, the only channel this format
         // has for it -- see `io/commonchem.rs`'s module doc.
         carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
             .or(Carries::COORDS_2D)
             .or(Carries::COORDS_3D)
             .or(Carries::FORMAL_CHARGE)
@@ -1009,6 +1040,289 @@ pub fn all() -> impl Iterator<Item = Format> {
     (0..FORMATS.len()).map(|i| Format(i as u16))
 }
 
+/// Attributes a writer manufactures when the input has none.
+///
+/// A structural format's atom line has fixed columns, so writing one means
+/// putting *something* in them. The value is invented, and a reader cannot
+/// tell it from a measured one -- `chem convert x.smi --to pdb` produces a
+/// B-factor of 0.00 for every atom, which is the same class of defect #173
+/// records against OpenBabel, arriving from the other direction.
+///
+/// Keyed by target and attribute rather than by pair, because that is how it
+/// behaves: every source lacking the attribute gains it, and no source
+/// carrying it is affected. `test_every_format_pair_carries_the_intersection_of_its_masks`
+/// asserts this is exactly the set that appears.
+static SUPPLIED: &[(Format, Carries, &str)] = &[
+    // Coordinates. The atom line has columns for them, so an input with no
+    // conformer writes zeros and reads back with one.
+    (Format::XYZ, Carries::COORDS_3D, "no conformer writes zeros"),
+    (Format::GRO, Carries::COORDS_3D, "no conformer writes zeros"),
+    (Format::PDB, Carries::COORDS_3D, "no conformer writes zeros"),
+    (
+        Format::MMCIF,
+        Carries::COORDS_3D,
+        "no conformer writes zeros",
+    ),
+    (
+        Format::PDBQT,
+        Carries::COORDS_3D,
+        "no conformer writes zeros",
+    ),
+    // The same zeros, read back as a *drawing*: both these readers classify an
+    // all-zero z as a 2D layout rather than a flat conformer. The molfile even
+    // labels the record `3D` on write and reads it back as 2D.
+    (
+        Format::SDF,
+        Carries::COORDS_2D,
+        "no coordinates writes zeros, read back as a layout",
+    ),
+    (
+        Format::MOL2,
+        Carries::COORDS_2D,
+        "no coordinates writes zeros, read back as a layout",
+    ),
+    // Residue identity. Every atom line names one; absent input writes a
+    // placeholder, `LIG` for a docking ligand and `UNK` elsewhere.
+    (
+        Format::PDB,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
+        Format::MMCIF,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
+        Format::MOL2,
+        Carries::RESIDUES,
+        "every atom line names a substructure; absent input writes UNK",
+    ),
+    (
+        Format::GRO,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
+        Format::PDBQT,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes LIG",
+    ),
+    // The PDB family's fixed occupancy and temperature-factor columns.
+    (
+        Format::PDB,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
+        Format::MMCIF,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
+        Format::PDBQT,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
+        Format::PDB,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    (
+        Format::MMCIF,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    (
+        Format::PDBQT,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    // A per-atom charge column, written whether or not one was computed.
+    (
+        Format::MOL2,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        Format::PDBQT,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+];
+
+/// Attributes a conversion delivers that neither mask claims.
+///
+/// Pair-specific, unlike [`SUPPLIED`]: what a writer manufactures depends on
+/// what actually arrived, not only on the target's columns.
+static PAIR_EXTRAS: &[(Format, Format, Carries, &str)] = &[
+    // A molfile records a stereo field for every bond, and a double bond
+    // claiming nothing comes back `BondStereo::Unspecified` rather than
+    // `None` -- an explicit "not stated", which is #198's fix rather than a
+    // regression of it, and which `held` counts as bond stereo.
+    //
+    // Pair-specific because it needs a *double* bond to arrive, which is not a
+    // `Carries` flag: PDB carries bonds too, but writes only CONECT singles, so
+    // `pdb -> sdf` gains nothing here. Mol2 and CML are the two bond-carrying
+    // formats that state a bond order without claiming STEREO_BOND.
+    (
+        Format::MOL2,
+        Format::SDF,
+        Carries::STEREO_BOND,
+        "a molfile states, explicitly, that an arriving double bond claims nothing",
+    ),
+    (
+        Format::CML,
+        Format::SDF,
+        Carries::STEREO_BOND,
+        "a molfile states, explicitly, that an arriving double bond claims nothing",
+    ),
+];
+
+/// Attributes both masks claim but a conversion loses anyway, with the issue
+/// that owns each.
+///
+/// Pinned rather than deleted, the same discipline as the corpus's
+/// `known-gap-*` entries -- closing one fails the test that pins it, which is
+/// the prompt to remove the line.
+static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
+    // Aromaticity travels on three channels -- the atom flag, the bond flag
+    // and `BondOrder::Aromatic` -- and the readers disagree about which they
+    // set. CML sets neither flag, so the SMILES writer, which keys on the atom
+    // flag, turns benzene into cyclohexane (#261).
+    (
+        Format::CML,
+        Format::SMILES,
+        Carries::AROMATICITY,
+        "CML sets no aromatic flag (#261)",
+    ),
+    (
+        Format::CML,
+        Format::CXSMILES,
+        Carries::AROMATICITY,
+        "CML sets no aromatic flag (#261)",
+    ),
+    (
+        Format::CML,
+        Format::PDBQT,
+        Carries::AROMATICITY,
+        "CML sets no aromatic flag (#261)",
+    ),
+    // Mol2 sets the atom flag but not the bond flag, which is the one the
+    // molfile writer needs (#261).
+    (
+        Format::MOL2,
+        Format::SDF,
+        Carries::AROMATICITY,
+        "Mol2 sets no aromatic bond flag (#261)",
+    ),
+    // Not a defect: PDBQT reads no bonds at all, and a bond-based target has
+    // nothing for atom aromaticity to ride on. Attribute interference, exactly
+    // what `one_per_attribute`'s doc warns about -- here between AROMATICITY
+    // and BONDS.
+    (
+        Format::PDBQT,
+        Format::SDF,
+        Carries::AROMATICITY,
+        "no bonds survive PDBQT for aromaticity to ride on",
+    ),
+    (
+        Format::PDBQT,
+        Format::CML,
+        Carries::AROMATICITY,
+        "no bonds survive PDBQT for aromaticity to ride on",
+    ),
+];
+
+/// Conversions that lose *atoms*, each naming the issue that owns it.
+///
+/// A pair, not a format: what breaks here is a property of the conversion, so
+/// no per-format mask can express it -- and `held` sets `TOPOLOGY` on the atom
+/// count alone, so one atom of six satisfies every claim a mask makes.
+static PAIR_GAPS: &[(Format, Format, &str)] = &[
+    // PDBQT's writer keeps only the largest connected component, so a source
+    // that reads back no bonds arrives as N one-atom fragments and leaves as
+    // one atom. The four sources are exactly the four formats without
+    // `Carries::BONDS` -- PDBQT itself among them, which is why the A -> A
+    // diagonal cannot see this (#259).
+    (
+        Format::XYZ,
+        Format::PDBQT,
+        "bondless source: only the largest component is written (#259)",
+    ),
+    (
+        Format::MMCIF,
+        Format::PDBQT,
+        "bondless source: only the largest component is written (#259)",
+    ),
+    (
+        Format::PDBQT,
+        Format::PDBQT,
+        "bondless source: only the largest component is written (#259)",
+    ),
+    (
+        Format::GRO,
+        Format::PDBQT,
+        "bondless source: only the largest component is written (#259)",
+    ),
+];
+
+/// Everything `target`'s writer manufactures when the input has none.
+pub fn supplied(target: Format) -> Carries {
+    SUPPLIED
+        .iter()
+        .filter(|(format, _, _)| *format == target)
+        .fold(Carries::empty(), |acc, (_, flag, _)| acc | *flag)
+}
+
+/// Attributes `source` to `target` delivers that neither mask claims.
+pub fn pair_extra(source: Format, target: Format) -> Carries {
+    PAIR_EXTRAS
+        .iter()
+        .filter(|(from, to, _, _)| *from == source && *to == target)
+        .fold(Carries::empty(), |acc, (_, _, flag, _)| acc | *flag)
+}
+
+/// Why `source` to `target` loses what [`pair_loss`] reports.
+pub fn pair_loss_reason(source: Format, target: Format) -> Option<&'static str> {
+    PAIR_LOSSES
+        .iter()
+        .find(|(from, to, _, _)| *from == source && *to == target)
+        .map(|(_, _, _, why)| *why)
+}
+
+/// Attributes `source` to `target` loses despite both masks claiming them.
+pub fn pair_loss(source: Format, target: Format) -> Carries {
+    PAIR_LOSSES
+        .iter()
+        .filter(|(from, to, _, _)| *from == source && *to == target)
+        .fold(Carries::empty(), |acc, (_, _, flag, _)| acc | *flag)
+}
+
+/// Why converting `source` to `target` loses atoms, or `None` when it does not.
+///
+/// The drop report answers "can the target hold this?" one hop at a time. A
+/// conversion is two, and a handful of pairs lose something no mask mentions.
+pub fn pair_gap(source: Format, target: Format) -> Option<&'static str> {
+    PAIR_GAPS
+        .iter()
+        .find(|(from, to, _)| *from == source && *to == target)
+        .map(|(_, _, why)| *why)
+}
+
+/// What a conversion from `source` to `target` actually delivers.
+///
+/// The two masks intersected, less what the pair is known to lose, plus what
+/// the target's writer supplies of its own. This is one cell of the fidelity
+/// matrix, and `test_every_format_pair_carries_the_intersection_of_its_masks`
+/// is what keeps it true.
+pub fn fidelity(source: Format, target: Format) -> Carries {
+    let both = source.carries() & target.carries();
+    let manufactured = supplied(target) & target.carries();
+    (both | manufactured | pair_extra(source, target)) & !pair_loss(source, target)
+}
+
 impl fmt::Debug for Format {
     /// The name, not the whole descriptor — a `Format` inside a larger `{:?}`
     /// should not print two slices and two function pointers.
@@ -1154,6 +1468,10 @@ mod tests {
 
         vec![
             (Carries::TOPOLOGY, ethane()),
+            // Ethane holds TOPOLOGY and BONDS both, which is fine: each row
+            // asserts only its own flag. Isolating bonds from atoms is not
+            // possible anyway -- a bond needs two atoms to join.
+            (Carries::BONDS, ethane()),
             (Carries::COORDS_2D, with_2d),
             (Carries::COORDS_3D, with_3d),
             (
@@ -1226,6 +1544,137 @@ mod tests {
                     format.name()
                 );
             }
+        }
+    }
+
+    /// One conversion, exactly as `chem convert` performs it: read the source
+    /// file, write the target, read it back.
+    ///
+    /// Returns `None` when a format writes something it cannot read back,
+    /// which is a failure rather than a loss and is reported as one.
+    fn convert(source: Format, target: Format, molecule: &Molecule) -> Option<Molecule> {
+        let records = vec![("probe".to_string(), molecule.clone())];
+        let as_source = source.write(&records).expect("can_write said so");
+        let read_source = crate::io::reader::read(&as_source, source);
+        let intermediate = &read_source.records.first()?.molecule;
+
+        let records = vec![("probe".to_string(), intermediate.clone())];
+        let as_target = target.write(&records).expect("can_write said so");
+        let read_target = crate::io::reader::read(&as_target, target);
+        Some(read_target.records.first()?.molecule.clone())
+    }
+
+    #[test]
+    fn test_every_format_pair_delivers_what_the_matrix_says() {
+        // The masks are per-format; a conversion is a pair. What survives
+        // A -> B is what both masks claim, less what the pair is known to lose
+        // and plus what B's writer supplies of its own -- and until #257
+        // nothing checked it, because
+        // `test_declared_masks_match_what_actually_survives` only walks the
+        // diagonal.
+        let fixtures = one_per_attribute();
+        for source in all() {
+            for target in all() {
+                let predicted_mask = fidelity(source, target);
+                for (flag, molecule) in &fixtures {
+                    let back = convert(source, target, molecule).unwrap_or_else(|| {
+                        panic!("{source:?} -> {target:?} wrote nothing readable")
+                    });
+
+                    let predicted = predicted_mask.contains(*flag);
+                    let survived = held(&back).contains(*flag);
+
+                    assert_eq!(
+                        predicted,
+                        survived,
+                        "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                        source.name(),
+                        target.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_matrix_exception_is_stale() {
+        // Both tables are claims about behaviour, and a claim nothing exercises
+        // rots. Each row must be reachable: a supplied attribute the writer
+        // does not actually manufacture, or a loss that stopped happening,
+        // would otherwise sit in the table describing a crate that moved on.
+        let fixtures = one_per_attribute();
+
+        for (target, flag, why) in SUPPLIED {
+            let fires = all().any(|source| {
+                !source.carries().contains(*flag)
+                    && fixtures.iter().any(|(_, molecule)| {
+                        convert(source, *target, molecule)
+                            .is_some_and(|back| held(&back).contains(*flag))
+                    })
+            });
+            assert!(
+                fires,
+                "{} is pinned as supplying {flag:?} ({why:?}) but never does -- delete the line",
+                target.name()
+            );
+        }
+
+        for (source, target, flag, why) in PAIR_EXTRAS {
+            assert!(
+                !(source.carries().contains(*flag) && target.carries().contains(*flag)),
+                "{} -> {} is pinned as an extra {flag:?} ({why:?}), but both masks already claim it",
+                source.name(),
+                target.name()
+            );
+        }
+
+        for (source, target, flag, why) in PAIR_LOSSES {
+            assert!(
+                source.carries().contains(*flag) && target.carries().contains(*flag),
+                "{} -> {} is pinned as losing {flag:?} ({why:?}), but a mask never claimed it",
+                source.name(),
+                target.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_format_pair_silently_loses_atoms() {
+        // The assertion `Carries` cannot make. `held` sets TOPOLOGY on the
+        // atom count alone, so a conversion keeping one atom of six claims
+        // everything the mask promised -- which is how PDBQT's
+        // largest-component rule stayed invisible through a whole milestone,
+        // on its own diagonal included.
+        let fixtures = one_per_attribute();
+        let mut found: Vec<(Format, Format)> = Vec::new();
+
+        for source in all() {
+            for target in all() {
+                let lost = fixtures.iter().any(|(_, molecule)| {
+                    convert(source, target, molecule)
+                        .is_none_or(|back| back.num_atoms() != molecule.num_atoms())
+                });
+                if lost {
+                    found.push((source, target));
+                }
+            }
+        }
+
+        for (source, target) in &found {
+            assert!(
+                pair_gap(*source, *target).is_some(),
+                "{} -> {} loses atoms and is not pinned in PAIR_GAPS",
+                source.name(),
+                target.name()
+            );
+        }
+        for (source, target, why) in PAIR_GAPS {
+            assert!(
+                found.contains(&(*source, *target)),
+                "{} -> {} is pinned as {why:?} but no longer loses atoms -- delete the line",
+                source.name(),
+                target.name()
+            );
         }
     }
 
