@@ -394,6 +394,14 @@ def tanimoto(a: set[int], b: set[int]) -> float:
     return len(a & b) / union if union else 1.0
 
 
+#: Fold width for counting atom environments, which is deliberately not the
+#: width being tested. Collisions vanish across the whole corpus by 8192; this
+#: leaves an order of magnitude of headroom as it grows, and costs 0.2s against
+#: 8192's 0.1s. A megabit costs 1.7s and buys no further agreement, because the
+#: hex payload is 256KB per molecule.
+ENVIRONMENT_WIDTH = 65536
+
+
 def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> Report:
     """Do our fingerprints rank molecules the way RDKit's do?
 
@@ -414,8 +422,11 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
     single bit out of 2048 have told you nothing: the bit is as likely to be a
     collision as a shared environment, so the "nearest" neighbour is whichever
     collision each implementation happened to get. Bit *count* is the other
-    thing comparable across hashes — 32 of 35 corpus molecules match RDKit's
-    exactly — and it is reported as a note, since ranking cannot see it (#253).
+    thing comparable across hashes, and it is checked here too — at
+    `ENVIRONMENT_WIDTH` rather than the width under test, since only a fold
+    wide enough to avoid collisions turns a bit count into an environment
+    count. That is what would catch our enumeration drifting, which ranking
+    structurally cannot (#253).
     """
     report = Report()
     molecules: list[tuple[str, str]] = []
@@ -439,11 +450,35 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
             ours[name] = set(mine)
             theirs[name] = set(yours)
 
-            if len(mine) != len(yours):
-                report.note(
-                    f"{name}: {len(mine)} bits vs {oracle.name}'s {len(yours)} "
-                    f"— different environment counts, not just a different hash"
-                )
+            # How many atom environments did each side enumerate?
+            #
+            # Counted at a width where a count means that, and not at the width
+            # being tested. Folded into 2048 bits a smaller count means either
+            # a collision or a missing environment, and nothing distinguishes
+            # them: this comparison used to run at the requested width and
+            # report "different environment counts, not just a different hash",
+            # which was exactly backwards for the only molecule it ever fired
+            # on. RDKit puts alanine's carboxyl carbon and its hydroxyl oxygen
+            # -- a C and an O -- on bit 807, so it shows 12 bits over 13
+            # environments while chem shows 13 over 13 (#253).
+            #
+            # Worth asserting rather than noting, because a bit count is the
+            # one quantity comparable between two Morgan implementations
+            # without cloning the hash, and the ranking comparison below
+            # cannot see it: an implementation enumerating a different set of
+            # environments could still rank neighbours identically.
+            mine_envs = chem.fingerprint(smiles, radius, ENVIRONMENT_WIDTH)
+            their_envs = oracle.fingerprint(smiles, radius, ENVIRONMENT_WIDTH)
+            if mine_envs is not None and their_envs is not None:
+                if len(mine_envs) != len(their_envs):
+                    report.mismatch(
+                        f"{name} — {len(mine_envs)} atom environments vs "
+                        f"{oracle.name}'s {len(their_envs)}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok  envs   {name:<34} {len(mine_envs)}")
 
         names = sorted(ours)
         for name in names:
