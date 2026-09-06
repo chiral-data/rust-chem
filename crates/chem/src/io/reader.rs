@@ -549,6 +549,88 @@ fn push_pdbqt_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_gro_with_options`] with default options.
+pub fn read_gro(content: &str) -> ReadOutcome {
+    read_gro_with_options(content, &ReadOptions)
+}
+
+/// One molecule per frame: a title line, a count line, that many atom
+/// lines, then a box-vector line (#227). Unlike every prior format's
+/// reader, the declared count is trusted -- GRO has no structural
+/// terminator at all separating the atom block from the box-vector line
+/// that follows it, so the count is the only signal available; see
+/// `io/gro.rs`'s module doc.
+pub fn read_gro_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let all_lines: Vec<&str> = content.lines().collect();
+    let mut position = 0;
+    let mut i = 0;
+
+    while i < all_lines.len() {
+        if all_lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let count_line_idx = i + 1;
+        let Some(count_line) = all_lines.get(count_line_idx) else {
+            break;
+        };
+        let count: usize = match count_line.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                position += 1;
+                out.skipped.push(Skipped {
+                    position,
+                    input: (*count_line).to_string(),
+                    error: format!("invalid atom count: {count_line:?}"),
+                });
+                i += 1;
+                continue;
+            }
+        };
+
+        // Title line + count line + count atom lines + one box-vector line.
+        let frame_len = 3 + count;
+        if i + frame_len > all_lines.len() {
+            position += 1;
+            out.skipped.push(Skipped {
+                position,
+                input: (*count_line).to_string(),
+                error: format!(
+                    "declared {count} atoms but only {} lines remain",
+                    all_lines.len().saturating_sub(i + 2)
+                ),
+            });
+            break;
+        }
+
+        let frame = all_lines[i..i + frame_len].join("\n");
+        position += 1;
+        match crate::io::gro::parse_gro(&frame) {
+            Ok(molecule) => {
+                let name = molecule
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{position}"));
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: frame,
+                error: e.to_string(),
+            }),
+        }
+        i += frame_len;
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

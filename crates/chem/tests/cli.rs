@@ -1662,3 +1662,88 @@ fn test_convert_list_shows_pdbqt_mask() {
     assert!(r.stdout.contains("aromaticity"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("unit_cell"), "{:?}", r.stdout);
 }
+
+const WATER_GRO: &str = "\
+water
+    3
+    1SOL     OW    1   0.000   0.000   0.000
+    1SOL    HW1    2   0.076   0.000   0.050
+    1SOL    HW2    3   0.076   0.000  -0.050
+   1.00000   1.00000   1.00000
+";
+
+#[test]
+fn test_convert_reads_a_literal_gro_structure_with_nm_to_angstrom_conversion() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_GRO,
+            "--from",
+            "gro",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // 0.076 nm -> 0.760 Angstrom in the written SDF.
+    assert!(
+        r.stdout.contains("0.7600") || r.stdout.contains("0.760"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_round_trips_gro_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_GRO,
+            "--from",
+            "gro",
+            "--to",
+            "gro",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("SOL"), "{:?}", r.stdout);
+    // Round-tripped box vector line should still carry the 1.0 nm box.
+    assert!(r.stdout.contains("1.00000"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_multi_frame_gro_file_as_multiple_records() {
+    let two_frames = format!("{WATER_GRO}{WATER_GRO}");
+    let path = fixture("multiframe.gro", &two_frames);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "gro",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_gro_mask() {
+    let r = run(&["convert", "-L", "gro"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("unit_cell"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("partial_charge"), "{:?}", r.stdout);
+}
