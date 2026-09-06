@@ -408,6 +408,14 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
     a query, does the nearest neighbour agree? That property holds for any
     chemically equivalent fingerprint regardless of hash, and breaks the moment
     ours stops describing the same environments.
+
+    It holds only where the ranking is decided by more than one bit, which is
+    why a third of this corpus is skipped with a note. Two molecules sharing a
+    single bit out of 2048 have told you nothing: the bit is as likely to be a
+    collision as a shared environment, so the "nearest" neighbour is whichever
+    collision each implementation happened to get. Bit *count* is the other
+    thing comparable across hashes — 32 of 35 corpus molecules match RDKit's
+    exactly — and it is reported as a note, since ranking cannot see it (#253).
     """
     report = Report()
     molecules: list[tuple[str, str]] = []
@@ -445,16 +453,30 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
             mine = max(others, key=lambda o: tanimoto(ours[name], ours[o]))
             yours = max(others, key=lambda o: tanimoto(theirs[name], theirs[o]))
 
-            # A molecule with nothing in common with anything has no nearest
-            # neighbour, only an arbitrary one: every candidate ties at zero
-            # and `max` returns whichever it saw first. Comparing those is
-            # comparing iteration orders, and it produced findings that moved
-            # whenever the corpus grew. Skipped with a note rather than
-            # silently, so the gap in coverage stays visible.
-            if tanimoto(ours[name], ours[mine]) == 0.0 or tanimoto(theirs[name], theirs[yours]) == 0.0:
+            # A nearest neighbour reached by a single shared bit is not a
+            # neighbour, it is a coincidence. In a 2048-bit space one bit is as
+            # likely to be a hash collision as a shared environment, and
+            # tracing every deciding bit in this corpus found four of five were
+            # collisions: RDKit called hydroxide — one bit, an anionic oxygen —
+            # the nearest thing to cyclopentadiene, while `chem` answered
+            # cyclohexane on a bit carried by every saturated carbocycle here.
+            # The check reported that as *us* diverging.
+            #
+            # Zero shared bits is the same failure at its extreme: every
+            # candidate ties and `max` returns whichever it saw first, so the
+            # comparison is of iteration orders. That case was skipped before
+            # this rule generalised it, and it produced findings that moved
+            # whenever the corpus grew.
+            #
+            # Skipped with a note rather than silently, so the gap in coverage
+            # stays visible.
+            mine_shared = len(ours[name] & ours[mine])
+            their_shared = len(theirs[name] & theirs[yours])
+            if mine_shared < 2 or their_shared < 2:
                 report.note(
-                    f"{name}: shares no bits with any other corpus molecule, so "
-                    f"'nearest' is arbitrary — not compared"
+                    f"{name}: nearest neighbour rests on "
+                    f"{min(mine_shared, their_shared)} shared bit(s), too few to "
+                    f"tell chemistry from a hash collision — not compared"
                 )
                 continue
 
