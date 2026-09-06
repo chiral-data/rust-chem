@@ -1747,3 +1747,96 @@ fn test_convert_list_shows_gro_mask() {
     assert!(r.stdout.contains("unit_cell"), "{:?}", r.stdout);
     assert!(!r.stdout.contains("partial_charge"), "{:?}", r.stdout);
 }
+
+const ETHANOL_CML: &str = "\
+<molecule id=\"m1\" title=\"ethanol\">
+  <atomArray>
+    <atom id=\"a1\" elementType=\"C\" x3=\"0.000\" y3=\"0.000\" z3=\"0.000\"/>
+    <atom id=\"a2\" elementType=\"C\" x3=\"1.520\" y3=\"0.000\" z3=\"0.000\"/>
+    <atom id=\"a3\" elementType=\"O\" x3=\"2.100\" y3=\"1.300\" z3=\"0.000\"/>
+  </atomArray>
+  <bondArray>
+    <bond atomRefs2=\"a1 a2\" order=\"1\"/>
+    <bond atomRefs2=\"a2 a3\" order=\"1\"/>
+  </bondArray>
+</molecule>
+";
+
+#[test]
+fn test_convert_reads_a_literal_cml_structure() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            ETHANOL_CML,
+            "--from",
+            "cml",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("1.5200") || r.stdout.contains("1.520"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_round_trips_cml_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            ETHANOL_CML,
+            "--from",
+            "cml",
+            "--to",
+            "cml",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("<molecule"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("elementType=\"O\""), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_multi_molecule_cml_file_wrapped_in_a_container() {
+    // The trailing `</cml>` after the second molecule's own `</molecule>`
+    // is exactly the case the byte-offset framing scan has to get right:
+    // the second (last) record must stop at its own close tag, not run on
+    // to swallow the container's.
+    let wrapped = format!("<cml>\n{ETHANOL_CML}{ETHANOL_CML}</cml>\n");
+    let path = fixture("multi.cml", &wrapped);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "cml",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_cml_mask() {
+    let r = run(&["convert", "-L", "cml"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("isotope"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("unit_cell"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("residues"), "{:?}", r.stdout);
+}

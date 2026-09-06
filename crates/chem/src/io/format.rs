@@ -556,6 +556,28 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(gro_supplier),
         writer_stream: Some(gro_writer_stream),
     },
+    FormatDescriptor {
+        name: "CML",
+        codes: &["cml"],
+        extensions: &["cml"],
+        category: Category::CommonCheminformatics,
+        // No RESIDUES/UNIT_CELL/PARTIAL_CHARGE/OCCUPANCY/B_FACTOR/
+        // PROPERTIES/STEREO_ATOM/STEREO_BOND -- this crate only reads and
+        // writes the core <molecule> element (#228), see `io/cml.rs`'s
+        // module doc for the full scope cut. AROMATICITY survives through
+        // bond order alone (`order="A"`), the same channel SDF's type-4
+        // bonds use -- no atom-level aromaticity flag in this format.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_2D)
+            .or(Carries::COORDS_3D)
+            .or(Carries::FORMAL_CHARGE)
+            .or(Carries::ISOTOPE)
+            .or(Carries::AROMATICITY),
+        reader: Some(crate::io::reader::read_cml_with_options),
+        writer: Some(write_cml_records),
+        supplier: Some(cml_supplier),
+        writer_stream: Some(cml_writer_stream),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -594,6 +616,10 @@ fn gro_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
     Box::new(crate::io::supplier::GroSupplier::new(reader, options))
 }
 
+fn cml_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::CmlSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -628,6 +654,10 @@ fn pdbqt_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dy
 
 fn gro_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::GroWriter::new(writer, options))
+}
+
+fn cml_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::CmlWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -734,6 +764,23 @@ fn write_gro_records(records: &[(String, Molecule)], _options: &WriteOptions) ->
     out
 }
 
+fn write_cml_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // CML has no write options today. Always wrapped in a single `<cml>`
+    // root, regardless of record count: several sibling `<molecule>`
+    // elements with no enclosing root is not valid XML (a strict parser
+    // stops after the first) -- confirmed against OpenBabel's own CML
+    // reader during this story's verification, and matches what RDKit's
+    // own CML writer does even for a single molecule.
+    let mut out = String::from("<cml xmlns=\"http://www.xml-cml.org/schema\">\n");
+    for (name, molecule) in records {
+        let mut copy = molecule.clone();
+        copy.set_name(name.clone());
+        out.push_str(&crate::io::cml::write_cml(&copy));
+    }
+    out.push_str("</cml>\n");
+    out
+}
+
 /// A format this build supports.
 ///
 /// An index into the static table rather than a `&'static FormatDescriptor`,
@@ -766,6 +813,11 @@ impl Format {
     /// GRO (#227) — the one format needing a real nm/Å unit conversion,
     /// see [`crate::io::gro`].
     pub const GRO: Format = Format(8);
+    /// CML (#228) — the `<molecule>` element only, see [`crate::io::cml`].
+    /// The first format needing an XML parser; deliberately not gated
+    /// behind a cargo feature — see `Cargo.toml`'s `roxmltree` dependency
+    /// comment and #184.
+    pub const CML: Format = Format(9);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1227,7 +1279,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 9);
+        assert_eq!(all().count(), 10);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

@@ -1,4 +1,5 @@
 pub mod aromaticity;
+pub mod cml;
 pub mod cxsmiles;
 pub mod errors;
 pub mod format;
