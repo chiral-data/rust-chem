@@ -33,6 +33,13 @@ class Oracle:
     identity_of_sdf: Callable[[str], Optional[str]]
     #: Set bits of a Morgan fingerprint, or None if unsupported.
     fingerprint: Optional[Callable[[str, int, int], Optional[list[int]]]] = None
+    #: PDB text in, this toolkit's own PDB back out. Optional like every slot
+    #: below it: a check skips an oracle that leaves it `None`. Added for #258,
+    #: where the *point* is that the answer disagrees with ours.
+    round_trip_pdb: Optional[Callable[[str], Optional[str]]] = None
+    #: This toolkit's own PDBQT for a SMILES. Optional, and only OpenBabel
+    #: implements it -- Meeko is not an `Oracle` at all (see `oracles/meeko.py`).
+    pdbqt_of_smiles: Optional[Callable[[str], Optional[str]]] = None
     #: Identity computed from a commonchem JSON document (#229), or None for a
     #: toolkit that cannot read the format. OpenBabel cannot, so this is the
     #: same optional-capability shape `fingerprint` already has rather than a

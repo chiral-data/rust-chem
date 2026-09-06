@@ -51,6 +51,36 @@ def identity_of_sdf(text: str) -> Optional[str]:
     return _canonical(mol) if mol is not None else None
 
 
+def round_trip_pdb(text: str) -> Optional[str]:
+    """PDB in, OpenBabel's own PDB out.
+
+    Exists so `check_pdb` can record what this toolkit does to the B-factor
+    column rather than assume it -- #173 names the behaviour, and #258 measured
+    it: the column is zeroed while the occupancy beside it survives.
+    """
+    mol = _read(text, "pdb")
+    if mol is None:
+        return None
+    conversion = ob.OBConversion()
+    conversion.SetInAndOutFormats("pdb", "pdb")
+    return conversion.WriteString(mol)
+
+
+def pdbqt_of_smiles(smiles: str) -> Optional[str]:
+    """OpenBabel's own PDBQT for a molecule.
+
+    The dialect chem is already known to read; paired with Meeko's in
+    `check_pdbqt` so "read both" means both rather than whichever one was
+    installed.
+    """
+    mol = _read(smiles, "smi")
+    if mol is None:
+        return None
+    conversion = ob.OBConversion()
+    conversion.SetInAndOutFormats("smi", "pdbqt")
+    return conversion.WriteString(mol)
+
+
 def oracle() -> Oracle:
     return Oracle(
         name="openbabel",
@@ -58,4 +88,6 @@ def oracle() -> Oracle:
         identity=identity,
         identity_of_sdf=identity_of_sdf,
         fingerprint=None,
+        round_trip_pdb=round_trip_pdb,
+        pdbqt_of_smiles=pdbqt_of_smiles,
     )

@@ -4,3 +4,9 @@
 rdkit==2025.3.3
 openbabel-wheel==3.1.1.21
 gemmi==0.7.5
+# The third PDBQT dialect (#258). `io/pdbqt.rs` targets AutoDock's own spec
+# rather than any toolkit's quirks, and promises to *read* both -- meeko is
+# what holds that promise to something. scipy is meeko's own undeclared
+# runtime import: `import meeko` fails without it.
+meeko==0.8.0
+scipy==1.17.1

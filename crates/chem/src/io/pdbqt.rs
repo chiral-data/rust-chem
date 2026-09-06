@@ -793,4 +793,82 @@ mod tests {
         let err = parse_pdbqt(text).unwrap_err();
         assert!(matches!(err, PdbqtError::InvalidAtomType(_)), "{err}");
     }
+
+    /// Ethanol as OpenBabel 3.1.1 actually writes it.
+    ///
+    /// Captured from the pinned oracle rather than hand-typed. Note the
+    /// explicit `+` on the charge and the occupancy of `0.00` where both
+    /// AutoDock and this crate write `1.00` -- the module doc's "read both"
+    /// is about exactly this kind of difference.
+    const OBABEL_ETHANOL: &str = "\
+ROOT
+ATOM      1  C   UNL     1       0.000   0.000   0.000  0.00  0.00    -0.045 C
+ATOM      2  C   UNL     1       0.000   0.000   0.000  0.00  0.00    +0.117 C
+ATOM      3  O   UNL     1       0.000   0.000   0.000  0.00  0.00    -0.393 OA
+ENDROOT
+TORSDOF 0
+";
+
+    /// The same molecule as Meeko 0.8.0 writes it.
+    ///
+    /// A third dialect again: `REMARK SMILES` lines OpenBabel never emits, a
+    /// real torsion tree, computed Gasteiger charges rather than zeros, and a
+    /// polar hydrogen typed `HD`.
+    const MEEKO_ETHANOL: &str = "\
+REMARK SMILES CCO
+REMARK SMILES IDX 1 1 2 2 3 3
+REMARK H PARENT 3 4
+ROOT
+ATOM      1  C   UNL     1       0.877   0.187   0.049  1.00  0.00    +0.034 C
+ATOM      2  C   UNL     1      -0.464  -0.481  -0.045  1.00  0.00    +0.152 C
+ENDROOT
+BRANCH   2   3
+ATOM      3  O   UNL     1      -1.494   0.355  -0.418  1.00  0.00    -0.397 OA
+ATOM      4  H   UNL     1      -1.477   1.247  -0.012  1.00  0.00    +0.210 HD
+ENDBRANCH   2   3
+TORSDOF 1
+";
+
+    #[test]
+    fn test_the_openbabel_dialect_reads_with_its_signed_charges() {
+        // `io/pdbqt.rs` targets AutoDock's spec rather than any toolkit's
+        // quirks, which only works if the quirks are still readable. The
+        // signed charge column is the one that would silently misparse:
+        // ` 0.117` and `+0.117` are the same number in different spellings,
+        // and a reader that trimmed the wrong columns would get neither.
+        let mol = parse_pdbqt(OBABEL_ETHANOL).expect("obabel writes valid PDBQT");
+        assert_eq!(mol.num_atoms(), 3);
+
+        let charges: Vec<Option<f64>> = (0..3)
+            .map(|i| mol.site(i).and_then(|s| s.partial_charge))
+            .collect();
+        assert_eq!(charges, vec![Some(-0.045), Some(0.117), Some(-0.393)]);
+
+        let elements: Vec<&str> = mol.atoms().iter().map(|a| a.element().symbol()).collect();
+        assert_eq!(elements, vec!["C", "C", "O"]);
+    }
+
+    #[test]
+    fn test_the_meeko_dialect_reads_including_its_polar_hydrogen() {
+        // The dialect nothing exercised until #258, because Meeko was not in
+        // the oracle image. `HD` is the case that matters: a hydrogen typed
+        // for hydrogen bonding, which a table keyed only on `H` would reject.
+        let mol = parse_pdbqt(MEEKO_ETHANOL).expect("meeko writes valid PDBQT");
+        assert_eq!(mol.num_atoms(), 4);
+
+        let elements: Vec<&str> = mol.atoms().iter().map(|a| a.element().symbol()).collect();
+        assert_eq!(elements, vec!["C", "C", "O", "H"]);
+
+        let charges: Vec<Option<f64>> = (0..4)
+            .map(|i| mol.site(i).and_then(|s| s.partial_charge))
+            .collect();
+        assert_eq!(
+            charges,
+            vec![Some(0.034), Some(0.152), Some(-0.397), Some(0.210)]
+        );
+
+        // The BRANCH pivot is the only connectivity a PDBQT states, so it is
+        // the only bond that may come back.
+        assert_eq!(mol.num_bonds(), 1);
+    }
 }
