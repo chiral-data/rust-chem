@@ -25,10 +25,9 @@ c1cc[nH]c1 pyrrole
 #
 # Both are open-shell, and unavoidably so: an atom stating fewer hydrogens than
 # its valence implies *is* a radical (RDKit counts 2 unpaired electrons on the
-# carbene carbon and 4 on the bare one). Since #247 the radical count is
-# derived from that deficiency and written, so `parse`, `write` and `json` all
-# pass. `sdf` still records a divergence, and it is a format gap rather than a
-# model one: molfiles carry this in the atom line's valence field and an
-# `M  RAD` line, neither of which this crate reads or writes yet -- #250.
+# carbene carbon and 4 on the bare one). They cost three stories to make round
+# trip: #244 so a bracket could state zero hydrogens, #247 to derive the
+# radical count and write commonchem's `nRad`, and #250 for the molfile's
+# valence column. Every check now passes for both.
 C[C]C dimethylcarbene
 [13C] carbon-13-atom
