@@ -710,18 +710,17 @@ impl Molecule {
 
     pub fn calculate_implicit_hydrogens(&mut self) {
         for atom_idx in 0..self.atoms.len() {
-            // The input already said how many, so it is not this function's
-            // business. Note that a bracket atom written with *no* hydrogen
-            // count is indistinguishable from one that said nothing at all,
-            // so `[C]` is filled here as though it were a bare `C` -- #244.
-            if self.atoms[atom_idx].explicit_hydrogens() > 0 {
+            // The source already said how many -- including when it said
+            // none. `Some(0)` and `None` are different answers and only the
+            // second is an invitation to fill: `[C]` states no hydrogens
+            // while a bare `C` states nothing, and before #244 both arrived
+            // here as a plain 0 and left as methane.
+            if self.atoms[atom_idx].hydrogens().is_some() {
                 continue;
             }
 
-            let implicit_h = self.implied_hydrogens(atom_idx);
-            if implicit_h > 0 {
-                self.atoms[atom_idx].set_implicit_hydrogens(implicit_h);
-            }
+            let implied = self.implied_hydrogens(atom_idx);
+            self.atoms[atom_idx].set_hydrogens(implied);
         }
     }
 
@@ -865,7 +864,7 @@ mod tests {
     fn test_formula() {
         let mut mol = Molecule::new();
         mol.add_atom(Atom::new(Element::carbon()));
-        mol.atoms_mut()[0].set_implicit_hydrogens(4);
+        mol.atoms_mut()[0].set_hydrogens(4);
         assert_eq!(mol.formula(), "CH4");
     }
 
@@ -873,7 +872,7 @@ mod tests {
     fn test_molecular_weight() {
         let mut mol = Molecule::new();
         mol.add_atom(Atom::new(Element::oxygen()));
-        mol.atoms_mut()[0].set_implicit_hydrogens(2);
+        mol.atoms_mut()[0].set_hydrogens(2);
         let weight = mol.molecular_weight();
         assert!((weight - 18.016).abs() < 0.1);
     }

@@ -19,3 +19,16 @@ F/C=C\F cis-difluoroethene
 c1cc[nH]c1 pyrrole
 # Isotope. Same connectivity, same charge, different molecule.
 [13CH4] carbon-13-methane
+# A bracket says everything about its atom, so no H inside one means *none*.
+# Every other bracket above carries a charge, an isotope, chirality or a count,
+# which is why nothing here could see #244: [C] parsed as methane.
+#
+# Both are open-shell, and unavoidably so: an atom stating fewer hydrogens than
+# its valence implies *is* a radical (RDKit counts 2 unpaired electrons on the
+# carbene carbon and 4 on the bare one). `parse` and `write` pass, so the
+# hydrogen count these exist to pin is verified. `json` and `sdf` record a
+# divergence that is not about hydrogens at all: this crate has no radical
+# count to write, so InChI -- which is radical-sensitive -- reads C3H8 where
+# RDKit's own commonchem writes "nRad": 2 and gets C3H6.
+C[C]C dimethylcarbene
+[13C] carbon-13-atom

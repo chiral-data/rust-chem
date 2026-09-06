@@ -355,7 +355,9 @@ fn atom_in(jatom: &JAtom, defaults: &AtomDefaults) -> Result<Atom, CommonchemErr
         other => return Err(CommonchemError::InvalidAtomStereo(other.to_string())),
     });
 
-    atom.set_implicit_hydrogens(jatom.imp_hs.unwrap_or(defaults.imp_hs));
+    // Always stated in this schema: `impHs` is defaulted rather than
+    // optional, so it is never the "said nothing" case.
+    atom.set_hydrogens(jatom.imp_hs.unwrap_or(defaults.imp_hs));
     Ok(atom)
 }
 
@@ -896,7 +898,7 @@ mod tests {
         let mut mol = Molecule::new();
         for _ in 0..3 {
             let mut atom = Atom::new(Element::carbon());
-            atom.set_implicit_hydrogens(1);
+            atom.set_hydrogens(1);
             mol.add_atom(atom);
         }
         for (a, b) in [(0, 1), (1, 2), (2, 0)] {

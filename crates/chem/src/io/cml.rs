@@ -180,7 +180,7 @@ pub fn parse_cml(text: &str) -> Result<Molecule, CmlError> {
                 .attribute("hydrogenCount")
                 .and_then(|s| s.parse::<u8>().ok())
             {
-                atom.set_implicit_hydrogens(h);
+                atom.set_hydrogens(h);
             }
 
             let atom_idx = mol.add_atom(atom);
@@ -289,8 +289,12 @@ pub fn write_cml(mol: &Molecule) -> String {
         if let Some(isotope) = atom.isotope() {
             out.push_str(&format!(" isotopeNumber=\"{isotope}\""));
         }
-        if atom.implicit_hydrogens() > 0 {
-            out.push_str(&format!(" hydrogenCount=\"{}\"", atom.implicit_hydrogens()));
+        // `total_hydrogens`, not one half of a split: before #244 this read
+        // the implicit field only, so a molecule whose hydrogens arrived from
+        // a SMILES bracket wrote no `hydrogenCount` at all -- `[CH3][CH3]`
+        // came out with none.
+        if atom.total_hydrogens() > 0 {
+            out.push_str(&format!(" hydrogenCount=\"{}\"", atom.total_hydrogens()));
         }
         out.push_str("/>\n");
     }
@@ -314,6 +318,26 @@ pub fn write_cml(mol: &Molecule) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hydrogen_count_survives_whatever_stated_it() {
+        // The writer used to read `implicit_hydrogens()`, one half of a split
+        // that no longer exists, so a molecule whose hydrogens arrived from a
+        // SMILES bracket wrote no `hydrogenCount` at all -- `[CH3][CH3]` came
+        // out with none. #241's defect, in CML's writer; retired by #244
+        // leaving only one count to read.
+        for smiles in ["CCO", "[CH3][CH3]", "[NH4+]"] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            let written = write_cml(&mol);
+            let stated = written.matches("hydrogenCount").count();
+            let carrying = mol
+                .atoms()
+                .iter()
+                .filter(|a| a.total_hydrogens() > 0)
+                .count();
+            assert_eq!(stated, carrying, "{smiles} wrote {written}");
+        }
+    }
 
     const ETHANE_CML: &str = "\
 <molecule id=\"m1\" title=\"ethane\" xmlns=\"http://www.xml-cml.org/schema\">
