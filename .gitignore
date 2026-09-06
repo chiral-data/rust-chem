@@ -24,8 +24,9 @@
 
 .chiral/
 
-# trunk (chem_app web build output)
-/chem_app/dist/
+# trunk web build output. The path moved when the crates were reorganised;
+# the old `/chem_app/dist/` entry had stopped matching anything.
+/crates/chem-app/dist/
 dist-e2e/
 
 # Python bytecode from the oracle harness. It runs in a container as root,
