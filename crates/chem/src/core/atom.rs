@@ -42,6 +42,38 @@ impl Element {
         }
     }
 
+    /// The valence this element supports while carrying `charge`.
+    ///
+    /// Deliberately not `typical_valence() + charge`. Which way a charge moves
+    /// the valence depends on where the element sits in its period, and two
+    /// call sites disagreeing about that was #240 -- so the rule lives here,
+    /// once, rather than being re-derived wherever a hydrogen count is filled
+    /// in. Verified against RDKit 2025.3.3 for every element
+    /// [`Self::typical_valence`] covers.
+    ///
+    /// Zero for an element with no typical valence, and for a charge that
+    /// would drive the valence below it: a chloride has no bonds left to give.
+    pub const fn valence_for_charge(&self, charge: i8) -> u8 {
+        let base = self.typical_valence() as i16;
+        if base == 0 {
+            return 0;
+        }
+        let charge = charge as i16;
+        let adjusted = match self.atomic_number {
+            // A proton has no electrons and a hydride no bonds, so both carry
+            // none; carbon loses a bond to an ion of either sign, `[CH3-]` and
+            // `[CH3+]` being three apiece.
+            1 | 6 => base - charge.abs(),
+            // Boron is electron-deficient, so an extra electron buys it another
+            // bond rather than costing one: `[BH4-]` is four.
+            5 => base - charge,
+            // N, O, P, S and the halogens, the majority and the ones #240
+            // reported: `[NH4+]` is four, `[O-]` is one.
+            _ => base + charge,
+        };
+        if adjusted < 0 { 0 } else { adjusted as u8 }
+    }
+
     pub const fn hydrogen() -> Self {
         Element { atomic_number: 1 }
     }
@@ -228,6 +260,78 @@ mod tests {
         assert_eq!(Element::carbon().typical_valence(), 4);
         assert_eq!(Element::nitrogen().typical_valence(), 3);
         assert_eq!(Element::oxygen().typical_valence(), 2);
+    }
+
+    #[test]
+    fn test_valence_for_charge_matches_the_oracle() {
+        // The table as RDKit 2025.3.3 reports it: total implicit hydrogens on
+        // a bare atom at each charge, for every element `typical_valence`
+        // covers. Written out rather than computed, because a test that
+        // re-derives the implementation proves only that it equals itself.
+        //
+        //                     Z    -1   0  +1
+        let table: &[(u8, [u8; 3])] = &[
+            (1, [0, 1, 0]),  // H  -- a proton has none, a hydride none
+            (5, [4, 3, 2]),  // B  -- electron-deficient, gains with -1
+            (6, [3, 4, 3]),  // C  -- loses either way
+            (7, [2, 3, 4]),  // N
+            (8, [1, 2, 3]),  // O
+            (9, [0, 1, 2]),  // F
+            (15, [2, 3, 4]), // P
+            (16, [1, 2, 3]), // S
+            (17, [0, 1, 2]), // Cl
+            (35, [0, 1, 2]), // Br
+            (53, [0, 1, 2]), // I
+        ];
+
+        for (z, expected) in table {
+            let element = Element::new(*z).expect("real element");
+            for (i, charge) in [-1i8, 0, 1].iter().enumerate() {
+                assert_eq!(
+                    element.valence_for_charge(*charge),
+                    expected[i],
+                    "{} at charge {charge}",
+                    element.symbol()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_valence_for_charge_is_not_a_single_sign_flip() {
+        // The two rows a naive `typical_valence() + charge` gets wrong, and
+        // the reason #240 was not a one-character fix. Boron is the one the
+        // *original* code happened to get right.
+        assert_eq!(Element::new(5).unwrap().valence_for_charge(-1), 4, "[BH4-]");
+        assert_eq!(Element::carbon().valence_for_charge(1), 3, "[CH3+]");
+        assert_eq!(Element::carbon().valence_for_charge(-1), 3, "[CH3-]");
+    }
+
+    #[test]
+    fn test_valence_for_charge_floors_at_zero() {
+        // A chloride has no bonds left to give, and a doubly charged one is
+        // not a reason to underflow.
+        assert_eq!(Element::new(17).unwrap().valence_for_charge(-1), 0);
+        assert_eq!(Element::new(17).unwrap().valence_for_charge(-3), 0);
+        assert_eq!(Element::oxygen().valence_for_charge(-5), 0);
+    }
+
+    #[test]
+    fn test_valence_for_charge_is_zero_where_there_is_no_valence() {
+        // Sodium, magnesium and every metal: `typical_valence` declines to
+        // guess, and a charge must not talk it into one.
+        for z in [11u8, 12, 26, 79] {
+            let element = Element::new(z).expect("real element");
+            assert_eq!(element.typical_valence(), 0, "{}", element.symbol());
+            for charge in [-2i8, -1, 0, 1, 2] {
+                assert_eq!(
+                    element.valence_for_charge(charge),
+                    0,
+                    "{}",
+                    element.symbol()
+                );
+            }
+        }
     }
 
     #[test]

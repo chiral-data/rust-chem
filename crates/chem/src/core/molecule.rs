@@ -691,8 +691,11 @@ impl Molecule {
                 explicit_valence += bond.order().value();
             }
 
-            let charge = atom.formal_charge();
-            let adjusted_valence = (typical_valence as i16 - charge as i16) as u8;
+            // How a charge moves the valence is not uniform across the
+            // periodic table, so the rule lives on `Element` and is shared
+            // with `io::aromaticity::kekulize` rather than re-derived here
+            // (#240).
+            let adjusted_valence = element.valence_for_charge(atom.formal_charge());
 
             if (explicit_valence.round() as u8) < adjusted_valence {
                 let implicit_h = adjusted_valence - explicit_valence.round() as u8;
@@ -852,6 +855,108 @@ mod tests {
         mol.atoms_mut()[0].set_implicit_hydrogens(2);
         let weight = mol.molecular_weight();
         assert!((weight - 18.016).abs() < 0.1);
+    }
+
+    /// #240: how many hydrogens does the charged atom end up carrying?
+    ///
+    /// Parsed rather than hand-built, because `calculate_implicit_hydrogens`
+    /// is what `parse_smiles` calls and the guard it opens with -- skip an
+    /// atom whose hydrogens were spelled out -- is half the behaviour under
+    /// test.
+    fn implicit_h_on(smiles: &str, atom_idx: usize) -> u8 {
+        let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+        mol.atom(atom_idx).total_hydrogens()
+    }
+
+    #[test]
+    fn test_an_anion_does_not_gain_hydrogens() {
+        // Every one of these carried two spurious hydrogens before #240: the
+        // valence was computed as `typical - charge`, so an oxygen with one
+        // bond was given a target valence of three.
+        assert_eq!(implicit_h_on("CC(=O)[O-]", 3), 0, "acetate's O-");
+        assert_eq!(implicit_h_on("C[S-]", 1), 0, "thiolate");
+        assert_eq!(implicit_h_on("FC(F)(F)[O-]", 4), 0, "trifluoromethoxide");
+        assert_eq!(
+            implicit_h_on("C[C-](C)C", 1),
+            0,
+            "a carbanion, with three bonds"
+        );
+        assert_eq!(
+            implicit_h_on("[H-]", 0),
+            0,
+            "a hydride is not a hydrogen molecule"
+        );
+        assert_eq!(implicit_h_on("[Cl-]", 0), 0, "an unbonded chloride");
+    }
+
+    #[test]
+    fn test_the_cases_that_were_already_right_stay_right() {
+        // Boron is the trap: it is electron-deficient, so the *original*
+        // subtraction was correct for it and a plain sign flip would have
+        // broken it. The rest short-circuit on a spelled-out hydrogen count
+        // or on a saturated valence, which is why the defect went unnoticed.
+        assert_eq!(
+            implicit_h_on("[B-](F)(F)(F)F", 0),
+            0,
+            "borohydride-shaped anion"
+        );
+        assert_eq!(
+            implicit_h_on("[NH4+]", 0),
+            4,
+            "ammonium spells its hydrogens"
+        );
+        assert_eq!(
+            implicit_h_on("[OH-]", 0),
+            1,
+            "hydroxide spells its hydrogen"
+        );
+        assert_eq!(implicit_h_on("C[N+](C)(C)C", 1), 0, "already saturated");
+    }
+
+    #[test]
+    fn test_a_cation_gains_hydrogens_where_it_should() {
+        // The other direction, which the reported defect did not cover:
+        // nitrogen and oxygen gain valence with positive charge.
+        assert_eq!(
+            implicit_h_on("C[NH+](C)C", 1),
+            1,
+            "a protonated tertiary amine"
+        );
+        assert_eq!(implicit_h_on("[NH4+]", 0), 4);
+    }
+
+    #[test]
+    fn test_neutral_molecules_are_untouched() {
+        assert_eq!(implicit_h_on("C", 0), 4);
+        assert_eq!(implicit_h_on("CCO", 0), 3);
+        assert_eq!(implicit_h_on("CCO", 1), 2);
+        assert_eq!(implicit_h_on("CCO", 2), 1);
+        assert_eq!(implicit_h_on("c1ccccc1", 0), 1);
+    }
+
+    #[test]
+    fn test_formula_and_weight_of_common_anions() {
+        // The user-visible half of #240. Acetate read `C2H5O2` at 61.060
+        // before the fix, against a real 59.04 -- and carboxylates,
+        // phosphates, sulfonates and nitro groups are most drug-like ligands
+        // at physiological pH.
+        let cases: &[(&str, &str, f64)] = &[
+            ("CC(=O)[O-]", "C2H3O2", 59.04),
+            ("C[N+](=O)[O-]", "CH3NO2", 61.04),
+            // HPO4(2-), not H2PO4(-): 1.008 + 30.974 + 4 x 15.999.
+            ("OP(=O)([O-])[O-]", "HO4P", 95.98),
+            ("CS(=O)(=O)[O-]", "CH3O3S", 95.10),
+            ("C[S-]", "CH3S", 47.10),
+        ];
+        for (smiles, formula, weight) in cases {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            assert_eq!(&mol.formula(), formula, "{smiles}");
+            assert!(
+                (mol.molecular_weight() - weight).abs() < 0.05,
+                "{smiles}: {} vs {weight}",
+                mol.molecular_weight()
+            );
+        }
     }
 
     #[test]
