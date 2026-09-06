@@ -708,6 +708,44 @@ impl Molecule {
         adjusted_valence.saturating_sub(explicit_valence.round() as u8)
     }
 
+    /// Unpaired electrons on this atom: what its valence leaves room for,
+    /// less the hydrogens it actually carries.
+    ///
+    /// Derived rather than stored, because for anything this crate can assert
+    /// a valence for the answer is determined -- `[S]` has two, nitric oxide's
+    /// nitrogen one, a carbene carbon two. Storing it would re-open the
+    /// question #240, #241 and #244 spent three stories closing: which of two
+    /// places holds the truth.
+    ///
+    /// Two things it therefore cannot say, both deliberate:
+    ///
+    /// - Nothing for an element outside the eleven
+    ///   [`crate::core::atom::Element::typical_valence`] covers. RDKit gives
+    ///   `[Na]` one and `[Se]` two; this returns 0, the same declining-to-guess
+    ///   that makes [`Self::calculate_implicit_hydrogens`] skip them.
+    /// - Nothing for a count that contradicts the valence. commonchem permits
+    ///   `impHs: 4` alongside `nRad: 2`, but that is an over-full carbon rather
+    ///   than chemistry, and RDKit's own writer never emits one.
+    ///
+    /// The subtraction floors, which is what makes hypervalent sulfur and an
+    /// aromatic `[nH]` come out at zero rather than wrapping (#247).
+    ///
+    /// **Zero whenever the hydrogen count was never stated.** A deficiency is
+    /// only evidence of unpaired electrons if the hydrogens are known; an atom
+    /// that said nothing may simply have hydrogens nobody wrote down. This is
+    /// [`crate::core::atom::Atom::hydrogens`]'s `None` doing the same work it
+    /// does in [`Self::calculate_implicit_hydrogens`], and without it every
+    /// atom of every PDB and mmCIF structure -- formats that deliberately
+    /// leave hydrogens unstated -- would be reported as a multi-radical.
+    pub fn radical_electrons(&self, atom_idx: usize) -> u8 {
+        let atom = &self.atoms[atom_idx];
+        if atom.hydrogens().is_none() {
+            return 0;
+        }
+        self.implied_hydrogens(atom_idx)
+            .saturating_sub(atom.total_hydrogens())
+    }
+
     pub fn calculate_implicit_hydrogens(&mut self) {
         for atom_idx in 0..self.atoms.len() {
             // The source already said how many -- including when it said
@@ -875,6 +913,94 @@ mod tests {
         mol.atoms_mut()[0].set_hydrogens(2);
         let weight = mol.molecular_weight();
         assert!((weight - 18.016).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_radical_electrons_matches_the_oracle() {
+        // Verified against RDKit 2025.3.3 for every element `typical_valence`
+        // covers. The rows that look like they should break the derivation
+        // are the point of the test: hypervalent sulfur and the aromatic
+        // nitrogen come out at zero because the subtraction floors, and the
+        // carbanion because `valence_for_charge` already folds the charge in,
+        // so a lone pair never reads as two unpaired electrons.
+        let radicals = |smiles: &str| {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            (0..mol.num_atoms())
+                .map(|i| mol.radical_electrons(i))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(radicals("[S]"), vec![2], "a bare sulfur atom");
+        assert_eq!(radicals("[N]=O"), vec![1, 0], "nitric oxide");
+        assert_eq!(radicals("[O][O]"), vec![1, 1], "two oxygen radicals");
+        assert_eq!(radicals("O=O"), vec![0, 0], "dioxygen as written");
+        assert_eq!(
+            radicals("S(=O)(=O)(O)O"),
+            vec![0; 5],
+            "hypervalent sulfur floors"
+        );
+        assert_eq!(radicals("[CH3-]"), vec![0], "a carbanion has a lone pair");
+        assert_eq!(radicals("C[C]C"), vec![0, 2, 0], "dimethylcarbene");
+        assert_eq!(radicals("[13C]"), vec![4], "a bare carbon atom");
+        assert_eq!(
+            radicals("[nH]1cccc1"),
+            vec![0; 5],
+            "aromatic nitrogen floors"
+        );
+    }
+
+    #[test]
+    fn test_ordinary_molecules_carry_no_radicals() {
+        // The control: a derivation that leaked would put unpaired electrons
+        // on everything, and these are the molecules that would notice.
+        for smiles in [
+            "C",
+            "CCO",
+            "c1ccccc1",
+            "N[C@@H](C)C(=O)O",
+            "CC(=O)[O-]",
+            "[NH4+]",
+        ] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            let total: u32 = (0..mol.num_atoms())
+                .map(|i| u32::from(mol.radical_electrons(i)))
+                .sum();
+            assert_eq!(total, 0, "{smiles}");
+        }
+    }
+
+    #[test]
+    fn test_an_unstated_hydrogen_count_reports_no_radicals() {
+        // A deficiency only means unpaired electrons when the hydrogens are
+        // known. PDB and mmCIF deliberately leave them unstated, and without
+        // this guard every atom of every structure file reads as a
+        // multi-radical -- a protein backbone nitrogen as a 3-radical. Caught
+        // by `test_atoms_are_written_relative_to_the_defaults`, which builds
+        // exactly this shape by hand.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single))
+            .expect("valid bond");
+
+        assert_eq!(mol.atom(0).hydrogens(), None, "nothing was said");
+        assert_eq!(mol.implied_hydrogens(0), 3, "there is room for three");
+        assert_eq!(mol.radical_electrons(0), 0, "but silence is not evidence");
+
+        // Say it, and the same atom is a radical.
+        mol.atom_mut(0).set_hydrogens(0);
+        assert_eq!(mol.radical_electrons(0), 3);
+    }
+
+    #[test]
+    fn test_an_element_with_no_valence_reports_no_radicals() {
+        // Stated rather than discovered: RDKit gives `[Na]` one unpaired
+        // electron and `[Se]` two, but this crate asserts no valence for
+        // either, so it declines to assert a radical count too.
+        for smiles in ["[Na+].[Cl-]", "[Mg+2]"] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            assert_eq!(mol.radical_electrons(0), 0, "{smiles}");
+        }
     }
 
     #[test]

@@ -56,28 +56,27 @@
 //! reinterpretation — as long as the reference atoms travel with it, which is
 //! what makes this the one place in the module that can be silently wrong.
 //!
-//! **What is not modelled.** `nRad` (radical count) is read and discarded —
-//! `Atom` has no radical field. `cipRanks`, `cipCodes` and `atomRings` in the
+//! **What is not modelled.** `cipRanks`, `cipCodes` and `atomRings` in the
 //! extension are derived data this crate recomputes on demand, so they are
 //! ignored on read and never written. `stereoGroups` and query features are
 //! out of scope (they belong with #221's `StereoGroup` and the v0.12.0 query
 //! wave respectively). `Molecule` holds one 3D conformer, so the first `dim:3`
 //! conformer is kept and any others dropped; likewise the first `dim:2`.
-//! An atom's implicit/explicit hydrogen split is a SMILES-syntax distinction
-//! with no field here — both are written into `impHs` and read back as
-//! implicit, which preserves the chemistry and not the spelling.
 //!
-//! **`impHs` reports what the molecule holds, including when that is wrong.**
-//! This is the first format registered here with a per-atom hydrogen count, so
-//! it is the first one that puts that number where another toolkit can see it
-//! — and doing so immediately exposed #240, in which
-//! [`Molecule::calculate_implicit_hydrogens`] inverts the charge sign and
-//! hands every anion two extra hydrogens. `C(=O)[O-]` therefore writes
-//! `impHs: 2` and RDKit reads it back as `[OH2-]`. That is deliberate: a
-//! writer that quietly corrected the count on the way out would disagree with
-//! this crate's own `formula()` and would have hidden the defect from the
-//! oracle that found it. Fix #240, and this output becomes right with no
-//! change here.
+//! **`impHs` reports what the molecule holds, and that is how three defects
+//! were found.** This was the first format registered here with a per-atom
+//! hydrogen count, so it was the first to put that number where another
+//! toolkit could see it. The writer states what the model holds rather than
+//! correcting it on the way out, and doing so exposed #240 (every anion gained
+//! two hydrogens), #241 (bracketed atoms lost theirs on the way back to
+//! SMILES) and #244 (`[C]` parsed as methane). All three are fixed; the
+//! principle is why they were visible at all.
+//!
+//! **`nRad` is derived on write, not stored** — see
+//! [`crate::core::molecule::Molecule::radical_electrons`] (#247). It is still
+//! discarded on read, because it is recomputed from the hydrogens and bonds
+//! that *are* read, which is lossless for RDKit's own output: its `nRad`
+//! always agrees with the valence deficiency.
 
 use std::collections::HashMap;
 
@@ -559,10 +558,8 @@ fn molecule_out(name: &str, mol: &Molecule) -> JMol {
     // unlike `write_sdf` this fallback loses nothing.
     let kekulised = crate::io::aromaticity::kekulize(mol);
 
-    let atoms = mol
-        .atoms()
-        .iter()
-        .map(|a| atom_out(a, &defaults.atom))
+    let atoms = (0..mol.num_atoms())
+        .map(|ix| atom_out(mol, ix, &defaults.atom))
         .collect();
 
     let bonds = (0..mol.num_bonds())
@@ -613,14 +610,17 @@ fn molecule_out(name: &str, mol: &Molecule) -> JMol {
 
 /// Every field is omitted when it equals the document's default, which is what
 /// makes the output the same shape RDKit's is.
-fn atom_out(atom: &Atom, defaults: &AtomDefaults) -> JAtom {
+fn atom_out(mol: &Molecule, atom_idx: usize, defaults: &AtomDefaults) -> JAtom {
+    let atom = mol.atom(atom_idx);
     JAtom {
         z: Some(atom.atomic_number()).filter(|z| *z != defaults.z),
-        // Implicit and explicit both land here: commonchem has one field for
-        // "hydrogens not in the graph", and that is what they both are.
         imp_hs: Some(atom.total_hydrogens()).filter(|h| *h != defaults.imp_hs),
         chg: Some(atom.formal_charge()).filter(|c| *c != defaults.chg),
-        n_rad: None,
+        // Derived from the valence deficiency rather than stored (#247).
+        // Without it an under-valent atom is not a radical to a reader, it is
+        // an unfinished molecule -- RDKit reads a carbene carrying no `nRad`
+        // back as propane.
+        n_rad: Some(mol.radical_electrons(atom_idx)).filter(|r| *r != defaults.n_rad),
         isotope: atom.isotope().filter(|i| *i != defaults.isotope),
         stereo: match atom.chirality() {
             Chirality::Clockwise => Some("cw".to_string()),
@@ -880,6 +880,58 @@ mod tests {
                 .iter()
                 .all(|b| b.order() == BondOrder::Aromatic)
         );
+    }
+
+    #[test]
+    fn test_an_open_shell_atom_writes_its_radical_count() {
+        // Without `nRad` an under-valent atom is not a radical to a reader,
+        // it is an unfinished molecule: RDKit reads a carbene carrying none
+        // back as propane, with an InChI of C3H8 (#247).
+        let text = write_commonchem(&[("carbene".to_string(), from_smiles("C[C]C"))]);
+        assert!(
+            text.contains(r#""atoms":[{"impHs":3},{"nRad":2},{"impHs":3}]"#),
+            "{text}"
+        );
+
+        // Four unpaired electrons, which the molfile `M  RAD` line cannot
+        // encode but this schema can (#250).
+        let bare = write_commonchem(&[("atom".to_string(), from_smiles("[13C]"))]);
+        assert!(bare.contains(r#""nRad":4"#), "{bare}");
+    }
+
+    #[test]
+    fn test_a_closed_shell_molecule_writes_no_radical_count() {
+        // `nRad` is the schema default of 0, so it must be omitted rather
+        // than written as zero on every atom of every ordinary molecule.
+        for smiles in ["CCO", "c1ccccc1O", "CC(=O)[O-]", "[NH4+]"] {
+            let text = write_commonchem(&[(String::new(), from_smiles(smiles))]);
+            let molecules = text
+                .split_once(r#""molecules""#)
+                .expect("a molecules key")
+                .1;
+            assert!(!molecules.contains("nRad"), "{smiles} wrote {text}");
+        }
+    }
+
+    #[test]
+    fn test_a_radical_survives_the_round_trip_by_being_recomputed() {
+        // The reader still discards `nRad` -- it is derived again from the
+        // hydrogens and bonds that *are* read, so the count has to come back
+        // without ever having been stored.
+        for smiles in ["C[C]C", "[13C]", "[N]=O"] {
+            let mol = from_smiles(smiles);
+            let before: Vec<u8> = (0..mol.num_atoms())
+                .map(|i| mol.radical_electrons(i))
+                .collect();
+
+            let text = write_commonchem(&[("probe".to_string(), mol)]);
+            let back = &parse_commonchem(&text).expect("our own output parses")[0].1;
+            let after: Vec<u8> = (0..back.num_atoms())
+                .map(|i| back.radical_electrons(i))
+                .collect();
+
+            assert_eq!(before, after, "{smiles}");
+        }
     }
 
     #[test]
