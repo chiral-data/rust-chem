@@ -1183,6 +1183,90 @@ impl<W: Write> Writer for CmlWriter<W> {
     }
 }
 
+/// commonchem's `molecules` array, one entry at a time (#229).
+///
+/// **This format is not streamable, and this type satisfies the trait rather
+/// than exploiting it.** Every other supplier here finds a record boundary in
+/// the byte stream -- a blank line, `$$$$`, `ENDMDL`, a declared atom count --
+/// and never holds more than one record. JSON has no such boundary: a document
+/// is valid only whole. So the whole input is read and parsed in `new`, and
+/// this iterator walks the result. A caller assuming constant memory here will
+/// be wrong.
+pub struct CommonchemSupplier {
+    records: std::vec::IntoIter<Result<Record, ReadError>>,
+}
+
+impl CommonchemSupplier {
+    pub fn new<R: BufRead>(mut reader: R, _options: &ReadOptions) -> Self {
+        let mut text = String::new();
+        let records = match reader.read_to_string(&mut text) {
+            Err(source) => vec![Err(ReadError::Io {
+                position: 1,
+                source,
+            })],
+            Ok(_) => match crate::io::commonchem::parse_commonchem(&text) {
+                Ok(molecules) => molecules
+                    .into_iter()
+                    .map(|(name, molecule)| {
+                        Ok(Record {
+                            molecule,
+                            name,
+                            smiles: None,
+                        })
+                    })
+                    .collect(),
+                Err(e) => vec![Err(ReadError::Parse {
+                    position: 1,
+                    message: e.to_string(),
+                })],
+            },
+        };
+        Self {
+            records: records.into_iter(),
+        }
+    }
+}
+
+impl Iterator for CommonchemSupplier {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.next()
+    }
+}
+
+/// Buffers every molecule and emits one document in [`Writer::finish`].
+///
+/// The first real use of `finish`, whose doc comment already anticipated "a
+/// format whose file needs a footer once no more records are coming". Here it
+/// is more than a footer: the `molecules` array cannot be closed, and so
+/// nothing can be written, until the last record has arrived.
+pub struct CommonchemWriter<W> {
+    writer: W,
+    records: Vec<(String, Molecule)>,
+}
+
+impl<W: Write> CommonchemWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self {
+            writer,
+            records: Vec::new(),
+        }
+    }
+}
+
+impl<W: Write> Writer for CommonchemWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.records.push((name.to_string(), molecule.clone()));
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        let text = crate::io::commonchem::write_commonchem(&self.records);
+        self.writer.write_all(text.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

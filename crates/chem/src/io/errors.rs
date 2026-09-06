@@ -174,6 +174,50 @@ pub enum GroError {
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
+pub enum CommonchemError {
+    #[error("Invalid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("No commonchem or rdkitjson version header")]
+    MissingHeader,
+
+    #[error("Unsupported {key} version {version}")]
+    UnsupportedVersion { key: String, version: u32 },
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atomic number: {0}")]
+    InvalidElement(u8),
+
+    #[error("Invalid bond order: {0}")]
+    InvalidBondOrder(u32),
+
+    #[error("Invalid atom stereo: {0}")]
+    InvalidAtomStereo(String),
+
+    #[error("Invalid bond stereo: {0}")]
+    InvalidBondStereo(String),
+
+    #[error("Bond references atom {atom}, but the molecule has {num_atoms}")]
+    BondIndexOutOfRange { atom: usize, num_atoms: usize },
+
+    #[error("{what} references index {index}, which does not exist")]
+    ExtensionIndexOutOfRange { what: &'static str, index: usize },
+
+    #[error("A dim-{dim} conformer needs {expected} coordinates, got {got}")]
+    ConformerLengthMismatch {
+        dim: u8,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("Unsupported conformer dimensionality: {0}")]
+    UnsupportedConformerDim(u8),
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CmlError {
     #[error("Parse error: {0}")]
     ParseError(String),

@@ -124,6 +124,29 @@ def convert_mmcif(text: str, to_format: str) -> str | None:
     return result.stdout if result.code == 0 and result.stdout.strip() else None
 
 
+def write_commonchem(smiles: str) -> str | None:
+    """SMILES in, a commonchem JSON document out (#229)."""
+    result = run(
+        ["convert", "-", "--from", "smi", "--to", "commonchem"],
+        stdin=f"{smiles} probe\n",
+    )
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
+def read_commonchem(text: str) -> str | None:
+    """A commonchem document in, this crate's canonical SMILES out.
+
+    The read direction. `--to smi` rather than `--to commonchem` on purpose:
+    routing back out through our own JSON writer would let a reader bug and a
+    writer bug cancel, which is the failure mode a differential harness exists
+    to prevent.
+    """
+    result = run(["convert", "-", "--from", "commonchem", "--to", "smi"], stdin=text)
+    if result.code != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.split()[0]
+
+
 def fingerprint(smiles: str, radius: int, nbits: int) -> list[int] | None:
     """The set bits of a Morgan fingerprint.
 
