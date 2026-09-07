@@ -104,7 +104,7 @@ You need to do this at least once before you can search.
 - **What it will cost, before you run it.** Formats hold different things: XYZ has no bond block, SMILES has no coordinates, PDB has no isotopes. The section lists what this dataset would lose to the format you picked, and how many molecules lose each thing, as soon as you pick it. A conversion that keeps everything says so.
 - **⟳ Convert** — writes the dataset in the chosen format, reads it back, and adds *that* as a new dataset, then switches to it. The one you converted from stays in the Files list, so you can click between the two and see what changed. Converting benzene from a CML file to SMILES, for instance, shows `C1CCCCC1` where the original had `c1ccccc1` — cyclohexane, drawn without the aromatic ring. The report predicts that; the new dataset is it.
 - Converting again to the same format replaces the earlier result rather than adding another entry.
-- The report accounts for losses that come from the *pair* of formats rather than the target alone — a few conversions lose something both formats otherwise carry, and the reason is named when so. `chem convert` on the command line does not report those yet.
+- The report accounts for losses that come from the *pair* of formats rather than the target alone — a few conversions lose something both formats otherwise carry, and the reason is named when so. `chem convert` on the command line reports the same thing, from the same code.
 
 **Export**
 

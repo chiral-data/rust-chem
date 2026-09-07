@@ -75,7 +75,12 @@ pub fn open_writer_as(
 /// The format a bare path resolves to: a trailing `.gz` removed first, if
 /// present, so `ligand.sdf.gz` resolves as SDF rather than falling through
 /// to the unrecognised-extension default.
-fn format_for_path(path: &Path) -> Format {
+///
+/// Public because a caller that opens a supplier still has to know *which*
+/// format it got, and re-deriving it means re-implementing the `.gz` rule
+/// somewhere else -- which `chem convert` had already done once before #276
+/// needed it a third time.
+pub fn format_for_path(path: &Path) -> Format {
     let name = path.to_string_lossy();
     let format_name = name.strip_suffix(".gz").unwrap_or(&name);
     Format::from_filename(format_name)

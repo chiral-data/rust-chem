@@ -698,21 +698,20 @@ impl AppState {
     /// The command line asks one question -- can the target hold this? -- and
     /// that is not the whole of it. A conversion is a read and a write, and
     /// #257 pinned six pairs that lose an attribute *both* masks claim: CML to
-    /// SMILES drops aromaticity and hands back cyclohexane while `chem convert`
-    /// reports nothing (#261, #276). Consulting `pair_loss` as well is what
-    /// makes this report true where the command line's is not.
+    /// SMILES drops aromaticity and hands back cyclohexane, which a target-only
+    /// report cannot see (#261). `chem convert` missed them too until #276
+    /// pointed both at one function.
     ///
     /// Deliberately not `format::fidelity`, which folds in what the *target*
     /// manufactures. That answers what the output will contain; this answers
     /// what the input loses.
     ///
     /// First-seen order with a count, matching the CLI's own tracker so the two
-    /// can be read side by side -- and, once #276 lands, be the same.
+    /// can be read side by side -- and, since #276, from the same formula:
+    /// `format::kept` is what both call, so they cannot drift again.
     pub fn conversion_losses(&self, target: DatasetFormat) -> Vec<(&'static str, usize)> {
         let source = self.loaded_files.active_format();
-        let kept = target
-            .carries()
-            .difference(format::pair_loss(source, target));
+        let kept = format::kept(source, target);
 
         let mut losses: Vec<(&'static str, usize)> = Vec::new();
         for molecule in &self.loaded_files.active_dataset().molecules {

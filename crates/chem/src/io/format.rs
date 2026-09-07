@@ -1288,6 +1288,33 @@ pub fn pair_gap(source: Format, target: Format) -> Option<&'static str> {
         .map(|(_, _, why)| *why)
 }
 
+/// What a conversion from `source` to `target` keeps of what a molecule holds.
+///
+/// Subtract this from [`held`] and the remainder is the conversion's losses:
+///
+/// ```
+/// # use chem::io::format::{self, Format, held};
+/// # let molecule = chem::io::smiles::parse_smiles("c1ccccc1").unwrap();
+/// let dropped = held(&molecule).difference(format::kept(Format::CML, Format::SMILES));
+/// ```
+///
+/// `target.carries()` alone is not the answer, which is the whole of #276: a
+/// conversion is a read and a write, and #257 pinned six pairs that lose an
+/// attribute *both* masks claim. CML to SMILES hands back cyclohexane while a
+/// target-only report says nothing (#261).
+///
+/// Distinct from [`fidelity`], which folds in what the target *manufactures*
+/// and so answers what the output will contain. This answers what the input
+/// keeps -- a drop report needs the second, and using the first would under-
+/// report exactly the pairs this exists for.
+///
+/// One function because there were two: the workbench had this formula and the
+/// command line had `target.carries()`, and the two disagreeing is what #276
+/// was filed about.
+pub fn kept(source: Format, target: Format) -> Carries {
+    target.carries().difference(pair_loss(source, target))
+}
+
 /// What a conversion from `source` to `target` actually delivers.
 ///
 /// The two masks intersected, less what the pair is known to lose, plus what
