@@ -92,12 +92,21 @@ the match on every deploy and prints the id in its last step.
 
 ## Undoing one
 
+These commands resolve the project from a `.vercel/` link, which is gitignored
+and absent in a fresh clone — so give them the ids, or they will not find it:
+
 ```sh
-vercel rollback --scope chiral-b84fb3de              # back to the previous production deploy
-vercel promote <deployment-url> --scope chiral-b84fb3de   # or forward to a specific one
+export VERCEL_ORG_ID=team_SV5XJeJeURf8s8XEhKhAsH27
+export VERCEL_PROJECT_ID=prj_rT8mRl2SE04api6dn8A58OhpQGiY
+
+vercel rollback --scope chiral-b84fb3de                    # to the previous production deploy
+vercel rollback status --scope chiral-b84fb3de             # watch it land
+vercel promote <deployment-url> --scope chiral-b84fb3de    # or forward to a specific one
 ```
 
 Both re-point the alias and take effect immediately; neither rebuilds anything.
+The ids are identifiers rather than credentials, and they survive a project
+rename — only the token needs care.
 
 ## Traps
 
