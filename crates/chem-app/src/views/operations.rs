@@ -83,6 +83,7 @@ impl OperationsView {
         self.coordinates_section(ui, state);
         self.search_section(ui, state);
         self.convert_section(ui, state);
+        self.export_section(ui, state);
     }
 
     fn convert_section(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
@@ -108,7 +109,14 @@ impl OperationsView {
                     });
             });
 
-            // Before converting, not after: knowing what it costs is the point.
+            // Before converting, not after: knowing what it costs is the point,
+            // and this is the panel's most important thing -- it used to render
+            // small and grey, which is how you hide something.
+            //
+            // Amber rather than the failure red: this app already uses
+            // (220, 120, 50) for "GPU unavailable" and "not comparable", which
+            // is the right register. A conversion dropping what the format
+            // cannot hold is correct behaviour, not an error.
             if losses.is_empty() {
                 ui.label(
                     RichText::new(format!(
@@ -119,12 +127,15 @@ impl OperationsView {
                     .weak(),
                 );
             } else {
-                ui.label(RichText::new("Will lose:").small().strong());
+                ui.label(
+                    RichText::new("Will lose")
+                        .strong()
+                        .color(Color32::from_rgb(220, 120, 50)),
+                );
                 for (attribute, count) in &losses {
                     ui.label(
                         RichText::new(format!("    {attribute} — {count} molecule(s)"))
-                            .small()
-                            .weak(),
+                            .color(Color32::from_rgb(220, 120, 50)),
                     );
                 }
                 // The registry knows why, for the pairs where both formats
@@ -134,24 +145,43 @@ impl OperationsView {
                 }
             }
 
-            if ui.button("💾 Convert and Save…").clicked()
-                && let Some((name, text)) = state.convert_dataset(target)
+            if ui
+                .button("⟳ Convert")
+                .on_hover_text("Adds the result as a new dataset, leaving this one loaded")
+                .clicked()
+            {
+                state.convert_dataset(target);
+            }
+        });
+    }
+
+    fn export_section(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
+        let format = state.loaded_files.active_format();
+        // Not an `OperationOutcome`: neither save arm can report whether the
+        // file landed -- the browser's download is fire-and-forget -- so a
+        // header claiming success would be true on one platform only.
+        section(ui, "Export", false, (String::new(), false), |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Writes the active dataset as {}. Convert first to change format.",
+                    format.label()
+                ))
+                .small()
+                .weak(),
+            );
+            if ui.button("💾 Export…").clicked()
+                && let Some((name, text)) = state.export_active_dataset()
             {
                 save_text(
                     &name,
                     &text,
-                    (target.label(), target.extensions()),
+                    (format.label(), format.extensions()),
                     "text/plain",
                 );
             }
         });
     }
 
-    /// Which backend the GPU-capable operations run on.
-    ///
-    /// Here rather than only in the menu bar because it governs these
-    /// operations: it belongs where the timings it explains are read. The menu
-    /// bar chips remain, as status and a one-click toggle from anywhere.
     fn backend_section(&mut self, ui: &mut egui::Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Backend").strong());

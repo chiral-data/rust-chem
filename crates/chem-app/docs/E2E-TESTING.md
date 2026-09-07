@@ -77,8 +77,9 @@ iterating, not fine as evidence.
 - **Press Search with nothing set up.** It should name the missing prerequisite,
   not just grey out.
 - **Convert, and check the loss list against the command line (#275).** Load a
-  CML file, open Convert, pick **SMILES**. The list must name `aromaticity`.
-  Then run the same conversion in a terminal:
+  CML file, open Convert, pick **SMILES**. The list must name `aromaticity`, in
+  amber at normal size — it was small and grey once, which is how you hide the
+  most important thing on a panel. Then run the same conversion in a terminal:
 
   ```sh
   chem convert molecules.cml --to smi
@@ -87,12 +88,23 @@ iterating, not fine as evidence.
   It reports `converted 3, skipped 0` and says nothing — and the output really
   is `C1CCCCC1 benzene`, cyclohexane. The app is right and the CLI is not, until
   #276 lands. **If the two ever agree here, check which one moved.**
+- **Press ⟳ Convert and look at the result.** A new dataset appears in the Files
+  list named `<source> → SMILES`, active, with `C1CCCCC1` in the SMILES column
+  and a plain hexagon where the original drew a dashed aromatic ring. Click back
+  to the original: the two side by side are the whole feature. The predicted
+  loss has become something you can see.
+- **Convert twice to the same format.** The second replaces the first rather
+  than adding a third entry.
+- **Convert to a format you already have loaded under that name.** The loaded
+  file must survive — a converted dataset carries its provenance in the name
+  precisely so it cannot overwrite one.
 - **Pick a target that loses nothing** (SMILES to CXSMILES). It must say so
   rather than showing an empty box, which reads as a bug.
-- **Convert and Save, then open the result.** On native a dialog, in the browser
-  a download. Read the file back with `chem info`: the molecule count must match
-  the dataset. Neither save arm reports success — the browser's download cannot
-  — so the header line reports the conversion instead.
+- **Export the converted dataset.** On native a dialog, in the browser a
+  download, named from the *format* rather than the display name — `two.sdf`,
+  not `two.smi → SDF`. Read it back with `chem info`: the molecule count must
+  match. Neither save arm reports success — the browser's download cannot — so
+  Export has no outcome line, deliberately.
 - **Backend radio and the menu bar chips must agree**, in both directions.
 - **The query debounce survives a closed window.** Type a SMILES, close the
   Operations window inside 300ms, wait, reopen it. The query should have parsed.
