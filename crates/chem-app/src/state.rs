@@ -201,6 +201,7 @@ pub struct AppState {
     pub fingerprints: OperationOutcome,
     pub aromaticity: OperationOutcome,
     pub coordinates: OperationOutcome,
+    pub convert: OperationOutcome,
     pub query: OperationOutcome,
     pub search: OperationOutcome,
 
@@ -271,6 +272,26 @@ pub struct AppState {
     /// request the result waits for the user to move the mouse (#186). Cloning
     /// is cheap: `egui::Context` is a handle, not the state itself.
     repaint: egui::Context,
+}
+
+/// What separates a converted dataset's name from where it came from.
+///
+/// `add_and_activate` replaces a same-named entry *in place*, so naming a
+/// conversion `aromatics.sdf` would silently destroy a loaded file called that.
+/// Carrying the provenance instead cannot collide with a filename -- and does
+/// collide with itself, so converting twice to one target replaces rather than
+/// piling up entries (#275).
+const DERIVED_SEPARATOR: &str = " \u{2192} ";
+
+/// What a dataset converted from `source_name` to `target` is called.
+fn derived_dataset_name(source_name: &str, target: DatasetFormat) -> String {
+    // From the original rather than the chain, so converting A to B to C reads
+    // as "A -> C" instead of accumulating every step it went through.
+    let origin = source_name
+        .split(DERIVED_SEPARATOR)
+        .next()
+        .unwrap_or(source_name);
+    format!("{origin}{DERIVED_SEPARATOR}{}", target.label())
 }
 
 /// The file dialog's filters: everything readable first, then one per format.
@@ -362,6 +383,7 @@ impl AppState {
             fingerprints: OperationOutcome::default(),
             aromaticity: OperationOutcome::default(),
             coordinates: OperationOutcome::default(),
+            convert: OperationOutcome::default(),
             query: OperationOutcome::default(),
             search: OperationOutcome::default(),
             display: DisplaySettings::default(),
@@ -476,6 +498,7 @@ impl AppState {
         self.fingerprints = OperationOutcome::default();
         self.aromaticity = OperationOutcome::default();
         self.coordinates = OperationOutcome::default();
+        self.convert = OperationOutcome::default();
         self.search = OperationOutcome::default();
         // Keyed by row index too, and a row means nothing against a different
         // dataset.
@@ -667,6 +690,179 @@ impl AppState {
         // now drawing the wrong bonds.
         self.dataset_molecules_changed();
         self.aromaticity = OperationOutcome::ok(summary);
+    }
+
+    /// What converting the active dataset to `target` would discard: each
+    /// attribute, and how many molecules lose it.
+    ///
+    /// The command line asks one question -- can the target hold this? -- and
+    /// that is not the whole of it. A conversion is a read and a write, and
+    /// #257 pinned six pairs that lose an attribute *both* masks claim: CML to
+    /// SMILES drops aromaticity and hands back cyclohexane while `chem convert`
+    /// reports nothing (#261, #276). Consulting `pair_loss` as well is what
+    /// makes this report true where the command line's is not.
+    ///
+    /// Deliberately not `format::fidelity`, which folds in what the *target*
+    /// manufactures. That answers what the output will contain; this answers
+    /// what the input loses.
+    ///
+    /// First-seen order with a count, matching the CLI's own tracker so the two
+    /// can be read side by side -- and, once #276 lands, be the same.
+    pub fn conversion_losses(&self, target: DatasetFormat) -> Vec<(&'static str, usize)> {
+        let source = self.loaded_files.active_format();
+        let kept = target
+            .carries()
+            .difference(format::pair_loss(source, target));
+
+        let mut losses: Vec<(&'static str, usize)> = Vec::new();
+        for molecule in &self.loaded_files.active_dataset().molecules {
+            for attribute in format::held(molecule).difference(kept).names() {
+                match losses.iter_mut().find(|(name, _)| *name == attribute) {
+                    Some((_, count)) => *count += 1,
+                    None => losses.push((attribute, 1)),
+                }
+            }
+        }
+        losses
+    }
+
+    /// Converts the active dataset and adds the result as a dataset of its own.
+    ///
+    /// Deliberately a round trip -- written, then read back -- so what the user
+    /// looks at is what the conversion actually produced rather than the
+    /// molecules it started from. Converting CML to SMILES puts `C1CCCCC1` in
+    /// the table where the original had `c1ccccc1`: the drop report predicts
+    /// that loss, and this makes it visible (#275).
+    ///
+    /// The original stays in the file list, so the two can be compared.
+    pub fn convert_dataset(&mut self, target: DatasetFormat) -> bool {
+        let dataset = self.loaded_files.active_dataset();
+        if dataset.is_empty() {
+            self.convert = OperationOutcome::failure("No dataset loaded");
+            return false;
+        }
+
+        let records: Vec<(String, Molecule)> = dataset
+            .names
+            .iter()
+            .cloned()
+            .zip(dataset.molecules.iter().cloned())
+            .collect();
+
+        let Some(text) = target.write(&records) else {
+            // Every registered format writes today, so this is a format that
+            // grew a reader and no writer -- the picker filters on `can_write`,
+            // making this the belt to that braces.
+            self.convert =
+                OperationOutcome::failure(format!("{} cannot be written", target.label()));
+            return false;
+        };
+
+        let losses = self.conversion_losses(target);
+        let source_name = self.loaded_files.entries()[self.loaded_files.active_index()]
+            .name
+            .clone();
+        let derived = derived_dataset_name(&source_name, target);
+
+        let outcome = chem::io::reader::read(&text, target);
+        let converted = MoleculeDataset::from_outcome(&outcome, target);
+        let written = converted.len();
+
+        self.dataset_status = if outcome.skipped.is_empty() {
+            format!("Converted {written} molecules to {}", target.label())
+        } else {
+            // Our own output failing to read back is worth saying out loud
+            // rather than logging, the same as it is for a loaded file.
+            format!(
+                "Converted {written} molecules to {} — {} did not read back",
+                target.label(),
+                outcome.skipped.len()
+            )
+        };
+        for skipped in &outcome.skipped {
+            log::warn!(
+                "Conversion to {} produced record {} that did not read back: {}",
+                target.label(),
+                skipped.position,
+                skipped.error
+            );
+        }
+
+        self.loaded_files
+            .add_and_activate(derived, converted, target);
+        // Before the outcome, not after: this resets `self.convert` along with
+        // everything else the old dataset derived, so writing the summary first
+        // would leave the section's header blank after a conversion that worked.
+        self.invalidate_active_dataset();
+
+        let summary = if losses.is_empty() {
+            format!("{written} converted to {}", target.label())
+        } else {
+            let named: Vec<String> = losses
+                .iter()
+                .map(|(attribute, count)| format!("{attribute} ({count})"))
+                .collect();
+            format!(
+                "{written} converted to {} — lost {}",
+                target.label(),
+                named.join(", ")
+            )
+        };
+        self.convert = OperationOutcome::ok(summary);
+        true
+    }
+
+    /// The active dataset written in its own format, and a filename for it.
+    ///
+    /// Separate from converting: this writes whatever dataset is active, so it
+    /// works for one that was merely loaded. Changing format is what Convert is
+    /// for.
+    ///
+    /// Returns the text rather than saving it -- the dialog belongs to the
+    /// view, as it does for an SVG export, and on web there is no dialog at all,
+    /// just a download the browser takes over.
+    pub fn export_active_dataset(&self) -> Option<(String, String)> {
+        let format = self.loaded_files.active_format();
+        let dataset = self.loaded_files.active_dataset();
+        if dataset.is_empty() {
+            return None;
+        }
+
+        let records: Vec<(String, Molecule)> = dataset
+            .names
+            .iter()
+            .cloned()
+            .zip(dataset.molecules.iter().cloned())
+            .collect();
+        let text = format.write(&records)?;
+        Some((self.suggested_output_name(format), text))
+    }
+
+    /// A filename for the active dataset: its own stem with the format's
+    /// extension, and the provenance suffix a converted dataset carries
+    /// removed.
+    ///
+    /// Sanitised for the same reason `draw::svg::suggested_filename` is -- a
+    /// name comes from a file's own records and can hold anything, and a slash
+    /// would quietly redirect where the file lands.
+    fn suggested_output_name(&self, format: DatasetFormat) -> String {
+        let entry = &self.loaded_files.entries()[self.loaded_files.active_index()];
+        let displayed = entry.name.split(DERIVED_SEPARATOR).next().unwrap_or("");
+        let stem: String = displayed
+            .rsplit_once('.')
+            .map_or(displayed, |(stem, _)| stem)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = stem.trim_matches('_');
+        let stem = if stem.is_empty() { "molecules" } else { stem };
+        format!("{stem}.{}", format.extensions().first().unwrap_or(&"txt"))
     }
 
     /// Generates 2D coordinates across the dataset.
@@ -1129,6 +1325,216 @@ mod tests {
             .iter()
             .map(|p| format!("{:.4},{:.4}", p.x, p.y))
             .collect()
+    }
+
+    #[test]
+    fn test_the_loss_the_command_line_cannot_see() {
+        // The story. CML's reader sets no aromatic flag, so writing SMILES
+        // hands back cyclohexane -- and both masks claim aromaticity, so the
+        // CLI's `held(m).difference(target.carries())` reports nothing (#261,
+        // #276). Only the `pair_loss` term catches it.
+        let mut state = AppState::cpu_only();
+        let cml = DatasetFormat::CML
+            .write(&[(
+                "benzene".to_string(),
+                crate::state::parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("CML writes");
+        state.apply_loaded_file_bytes("rings.cml".to_string(), cml.into_bytes());
+        assert_eq!(state.loaded_files.active_format(), DatasetFormat::CML);
+
+        let losses = state.conversion_losses(DatasetFormat::SMILES);
+        assert!(
+            losses.iter().any(|(name, _)| *name == "aromaticity"),
+            "the pair loss is not reported: {losses:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_ordinary_loss_is_still_reported() {
+        // The other term must still work: XYZ has no bond block at all, which
+        // is what `Carries::BONDS` was added to be able to say (#257).
+        let state = AppState::cpu_only();
+        let losses = state.conversion_losses(DatasetFormat::XYZ);
+        assert!(
+            losses.iter().any(|(name, _)| *name == "bonds"),
+            "{losses:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_conversion_that_keeps_everything_reports_nothing() {
+        // So the report is not merely always non-empty. CXSMILES carries
+        // everything SMILES does and more.
+        let state = AppState::cpu_only();
+        assert_eq!(state.conversion_losses(DatasetFormat::CXSMILES), Vec::new());
+    }
+
+    #[test]
+    fn test_the_count_is_molecules_not_attributes() {
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes(
+            "two.smi".to_string(),
+            b"CCO ethanol\nCCN ethylamine\n".to_vec(),
+        );
+
+        let losses = state.conversion_losses(DatasetFormat::XYZ);
+        let bonds = losses.iter().find(|(name, _)| *name == "bonds");
+        assert_eq!(bonds, Some(&("bonds", 2)), "{losses:?}");
+    }
+
+    /// A dataset read from CML, whose benzene is aromatic on the way in.
+    fn cml_benzene(state: &mut AppState) {
+        let cml = DatasetFormat::CML
+            .write(&[(
+                "benzene".to_string(),
+                parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("CML writes");
+        state.apply_loaded_file_bytes("rings.cml".to_string(), cml.into_bytes());
+    }
+
+    #[test]
+    fn test_the_conversion_is_visible_in_what_it_produces() {
+        // The story. A report predicting a loss is weaker than a dataset that
+        // shows it: converting CML to SMILES puts `C1CCCCC1` in the table where
+        // the original had `c1ccccc1`, and the structure loses its aromatic
+        // ring (#275, #261).
+        //
+        // Asserted on the atoms rather than the flag, because the molecules are
+        // what the user is looking at.
+        let mut state = AppState::cpu_only();
+        cml_benzene(&mut state);
+        // CML's reader carries aromaticity on the bond *order* and sets neither
+        // flag -- which is #261, and the reason this conversion loses it. So the
+        // fixture is checked the way `held` sees it, which is what the drop
+        // report is computed from.
+        assert!(
+            format::held(&state.loaded_files.active_dataset().molecules[0])
+                .contains(format::Carries::AROMATICITY),
+            "the fixture must start aromatic, or this tests nothing"
+        );
+
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+
+        let converted = state.loaded_files.active_dataset();
+        assert_eq!(converted.len(), 1);
+        assert!(
+            !format::held(&converted.molecules[0]).contains(format::Carries::AROMATICITY),
+            "the loss the report predicted is not in the data"
+        );
+        // Cyclohexane, in the column the user reads.
+        assert_eq!(converted.smiles[0], "C1CCCCC1");
+    }
+
+    #[test]
+    fn test_the_original_dataset_survives_the_conversion() {
+        // The point is comparing them, so the one converted from has to still
+        // be there and switchable.
+        let mut state = AppState::cpu_only();
+        cml_benzene(&mut state);
+        let before = state.loaded_files.entries().len();
+
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+
+        assert_eq!(state.loaded_files.entries().len(), before + 1);
+        assert!(
+            state.loaded_files.names().any(|n| n == "rings.cml"),
+            "the source dataset went away"
+        );
+        assert_eq!(state.loaded_files.active_format(), DatasetFormat::SMILES);
+    }
+
+    #[test]
+    fn test_converting_twice_replaces_rather_than_piling_up() {
+        let mut state = AppState::cpu_only();
+        cml_benzene(&mut state);
+
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+        let after_one = state.loaded_files.entries().len();
+
+        // Back to the CML entry: index 0 is the example dataset every session
+        // starts on, and converting *that* would add a differently-named entry.
+        let source = state
+            .loaded_files
+            .names()
+            .position(|n| n == "rings.cml")
+            .expect("the cml entry");
+        state.activate_loaded_file(source);
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+
+        assert_eq!(state.loaded_files.entries().len(), after_one);
+    }
+
+    #[test]
+    fn test_converting_does_not_clobber_a_loaded_file_of_that_name() {
+        // `add_and_activate` replaces a same-named entry *in place*, so naming
+        // the result `two.sdf` would silently destroy a file the user loaded
+        // under that name. The derived name carries its provenance instead.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("two.smi".to_string(), b"CCO a\nCCN b\n".to_vec());
+        let sdf = DatasetFormat::SDF
+            .write(&[("mine".to_string(), parse_smiles("C").expect("valid"))])
+            .expect("SDF writes");
+        state.apply_loaded_file_bytes("two.sdf".to_string(), sdf.into_bytes());
+        let smi = state
+            .loaded_files
+            .names()
+            .position(|n| n == "two.smi")
+            .expect("the smi entry");
+        state.activate_loaded_file(smi);
+
+        assert!(state.convert_dataset(DatasetFormat::SDF));
+
+        let theirs = state
+            .loaded_files
+            .entries()
+            .iter()
+            .find(|e| e.name == "two.sdf")
+            .expect("the loaded file is still there");
+        assert_eq!(theirs.dataset.len(), 1, "their file was overwritten");
+    }
+
+    #[test]
+    fn test_the_outcome_survives_the_invalidation_that_precedes_it() {
+        // Adding a dataset invalidates what the old one derived, and that
+        // resets `convert` along with the rest. Writing the summary first would
+        // leave the section's header blank after a conversion that worked.
+        let mut state = AppState::cpu_only();
+        assert!(state.convert_dataset(DatasetFormat::XYZ));
+
+        assert!(state.convert.has_run(), "the summary was wiped");
+        assert!(!state.convert.failed());
+        assert!(
+            state.convert.summary().contains("bonds"),
+            "{}",
+            state.convert.summary()
+        );
+    }
+
+    #[test]
+    fn test_exporting_writes_the_active_dataset_named_for_its_format() {
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("two.smi".to_string(), b"CCO a\nCCN b\n".to_vec());
+
+        assert!(state.convert_dataset(DatasetFormat::SDF));
+        let (name, text) = state.export_active_dataset().expect("SDF writes");
+
+        // From the format, not from the display name the conversion gave it.
+        assert_eq!(name, "two.sdf");
+        assert_eq!(text.matches("$$$$").count(), 2, "both records written");
+    }
+
+    #[test]
+    fn test_a_filename_from_a_hostile_dataset_name_is_still_a_filename() {
+        // Names come from a file's own records; a slash would quietly redirect
+        // where the file lands.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("../../etc/passwd.smi".to_string(), b"C methane\n".to_vec());
+
+        let (name, _) = state.export_active_dataset().expect("writes");
+        assert!(!name.contains('/'), "{name}");
+        assert!(name.ends_with(".smi"), "{name}");
     }
 
     #[test]

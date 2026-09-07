@@ -161,6 +161,15 @@ impl LoadedFiles {
         self.active
     }
 
+    /// The format the active dataset was read from.
+    ///
+    /// What a conversion's losses depend on as much as the target does: a
+    /// read and a write each lose their own things, and some pairs lose
+    /// something neither mask predicts (#275).
+    pub fn active_format(&self) -> DatasetFormat {
+        self.entries()[self.active_index()].format
+    }
+
     pub fn active_dataset(&self) -> &MoleculeDataset {
         &self.entries[self.active].dataset
     }

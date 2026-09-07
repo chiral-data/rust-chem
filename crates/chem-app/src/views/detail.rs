@@ -15,9 +15,9 @@
 //! [`crate::state::MAX_OPEN_DETAILS`] of them.
 
 use crate::molecule_view::{show_atom_list, show_bond_list, show_molecule_info};
+use crate::save::save_svg;
 use crate::state::AppState;
 use crate::structure_view::structure_panel_with_options;
-use crate::svg::save_svg;
 use chem::draw::structure::StructureTheme;
 use chem::draw::svg::{structure_to_svg, suggested_filename};
 
