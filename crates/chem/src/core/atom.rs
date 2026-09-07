@@ -173,6 +173,13 @@ impl Atom {
         self
     }
 
+    /// Whether this atom is aromatic.
+    ///
+    /// One of three channels carrying the same fact, alongside
+    /// [`crate::core::bond::Bond::is_aromatic`] and `BondOrder::Aromatic` --
+    /// they must agree, and a reader reconciles them at the boundary. See
+    /// [`crate::core::bond::Bond::order`] for why none of the three is
+    /// authoritative.
     pub const fn is_aromatic(&self) -> bool {
         self.is_aromatic
     }

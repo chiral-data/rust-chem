@@ -1328,21 +1328,26 @@ mod tests {
 
     #[test]
     fn test_the_loss_the_command_line_cannot_see() {
-        // The story. CML's reader sets no aromatic flag, so writing SMILES
-        // hands back cyclohexane -- and both masks claim aromaticity, so the
-        // CLI's `held(m).difference(target.carries())` reports nothing (#261,
-        // #276). Only the `pair_loss` term catches it.
+        // The story. PDBQT and SDF both claim aromaticity, so a report asking
+        // only `held(m).difference(target.carries())` reports nothing -- the
+        // loss is structural, since PDBQT carries no bonds for atom
+        // aromaticity to ride on. Only the `pair_loss` term catches it.
+        //
+        // This used to pin `cml -> smi`, which really did hand back
+        // cyclohexane; #261 fixed that at the reader boundary, so the pair that
+        // demonstrates the mechanism is now one where the loss is correct
+        // behaviour rather than a defect.
         let mut state = AppState::cpu_only();
-        let cml = DatasetFormat::CML
+        let pdbqt = DatasetFormat::PDBQT
             .write(&[(
                 "benzene".to_string(),
-                crate::state::parse_smiles("c1ccccc1").expect("valid SMILES"),
+                parse_smiles("c1ccccc1").expect("valid SMILES"),
             )])
-            .expect("CML writes");
-        state.apply_loaded_file_bytes("rings.cml".to_string(), cml.into_bytes());
-        assert_eq!(state.loaded_files.active_format(), DatasetFormat::CML);
+            .expect("PDBQT writes");
+        state.apply_loaded_file_bytes("rings.pdbqt".to_string(), pdbqt.into_bytes());
+        assert_eq!(state.loaded_files.active_format(), DatasetFormat::PDBQT);
 
-        let losses = state.conversion_losses(DatasetFormat::SMILES);
+        let losses = state.conversion_losses(DatasetFormat::SDF);
         assert!(
             losses.iter().any(|(name, _)| *name == "aromaticity"),
             "the pair loss is not reported: {losses:?}"
@@ -1395,19 +1400,16 @@ mod tests {
 
     #[test]
     fn test_the_conversion_is_visible_in_what_it_produces() {
-        // The story. A report predicting a loss is weaker than a dataset that
-        // shows it: converting CML to SMILES puts `C1CCCCC1` in the table where
-        // the original had `c1ccccc1`, and the structure loses its aromatic
-        // ring (#275, #261).
+        // A report predicting a loss is weaker than a dataset that shows it, so
+        // this asserts on the molecules rather than the flags (#275).
         //
-        // Asserted on the atoms rather than the flag, because the molecules are
-        // what the user is looking at.
+        // It used to convert CML to SMILES and assert the *loss* was visible --
+        // `C1CCCCC1` where the original had `c1ccccc1`. Since #261 that round
+        // trip is lossless, so what is asserted is the other half of the same
+        // property: the converted dataset is what the conversion actually
+        // produced, and here that means the aromaticity survived.
         let mut state = AppState::cpu_only();
         cml_benzene(&mut state);
-        // CML's reader carries aromaticity on the bond *order* and sets neither
-        // flag -- which is #261, and the reason this conversion loses it. So the
-        // fixture is checked the way `held` sees it, which is what the drop
-        // report is computed from.
         assert!(
             format::held(&state.loaded_files.active_dataset().molecules[0])
                 .contains(format::Carries::AROMATICITY),
@@ -1419,11 +1421,12 @@ mod tests {
         let converted = state.loaded_files.active_dataset();
         assert_eq!(converted.len(), 1);
         assert!(
-            !format::held(&converted.molecules[0]).contains(format::Carries::AROMATICITY),
-            "the loss the report predicted is not in the data"
+            format::held(&converted.molecules[0]).contains(format::Carries::AROMATICITY),
+            "aromaticity was lost: CML states it in the bond order and the \
+             SMILES writer reads the atom flag, which is what #261 reconciled"
         );
-        // Cyclohexane, in the column the user reads.
-        assert_eq!(converted.smiles[0], "C1CCCCC1");
+        // The column the user reads, and the whole of #261 in one assertion.
+        assert_eq!(converted.smiles[0], "c1ccccc1");
     }
 
     #[test]

@@ -255,6 +255,11 @@ pub fn parse_cml(text: &str) -> Result<Molecule, CmlError> {
         }
     }
 
+    // CML's only aromatic channel is the bond order (`order="A"`), so the atom
+    // and bond flags need filling in -- without this, the SMILES writer, which
+    // reads only the atom flag, turned benzene into cyclohexane (#261).
+    crate::io::aromaticity::reconcile_aromaticity(&mut mol);
+
     Ok(mol)
 }
 

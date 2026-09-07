@@ -232,11 +232,13 @@ pub fn held(molecule: &Molecule) -> Carries {
         if bond.stereo() != BondStereo::None {
             carries = carries | Carries::STEREO_BOND;
         }
-        // Three channels carry the same chemical fact, and they do not travel
-        // together: an SDF round trip loses the atom flag and the bond flag but
-        // keeps `BondOrder::Aromatic`, because type 4 is how a molfile says it.
-        // Reading only the flags would report aromaticity as lost while it sat
-        // in the file.
+        // Three channels carry the same chemical fact. Since #261 a reader
+        // reconciles them at the boundary, so a molecule this crate produced
+        // sets all three -- but a mask is a claim about a *format*, and CML's
+        // only aromatic channel is the bond order (`order="A"`). Reading just
+        // the flags would report aromaticity as lost while it sat in the file,
+        // which is what this OR is for. (It used to cite SDF, whose reader has
+        // perceived since #197.)
         if bond.is_aromatic() || bond.order() == BondOrder::Aromatic {
             carries = carries | Carries::AROMATICITY;
         }
@@ -1171,37 +1173,7 @@ static PAIR_EXTRAS: &[(Format, Format, Carries, &str)] = &[
 /// `known-gap-*` entries -- closing one fails the test that pins it, which is
 /// the prompt to remove the line.
 static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
-    // Aromaticity travels on three channels -- the atom flag, the bond flag
-    // and `BondOrder::Aromatic` -- and the readers disagree about which they
-    // set. CML sets neither flag, so the SMILES writer, which keys on the atom
-    // flag, turns benzene into cyclohexane (#261).
-    (
-        Format::CML,
-        Format::SMILES,
-        Carries::AROMATICITY,
-        "CML sets no aromatic flag (#261)",
-    ),
-    (
-        Format::CML,
-        Format::CXSMILES,
-        Carries::AROMATICITY,
-        "CML sets no aromatic flag (#261)",
-    ),
-    (
-        Format::CML,
-        Format::PDBQT,
-        Carries::AROMATICITY,
-        "CML sets no aromatic flag (#261)",
-    ),
-    // Mol2 sets the atom flag but not the bond flag, which is the one the
-    // molfile writer needs (#261).
-    (
-        Format::MOL2,
-        Format::SDF,
-        Carries::AROMATICITY,
-        "Mol2 sets no aromatic bond flag (#261)",
-    ),
-    // Not a defect: PDBQT reads no bonds at all, and a bond-based target has
+    // Not a defect: PDBQT reads no bonds at all, so a bond-based target has
     // nothing for atom aromaticity to ride on. Attribute interference, exactly
     // what `one_per_attribute`'s doc warns about -- here between AROMATICITY
     // and BONDS.
@@ -1217,6 +1189,11 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
         Carries::AROMATICITY,
         "no bonds survive PDBQT for aromaticity to ride on",
     ),
+    // Four rows came out with #261. Three were CML, whose only aromatic
+    // channel is the bond order, and one was Mol2 -- whose row blamed the
+    // missing bond flag when the real cause was an unstated hydrogen count
+    // reaching `kekulize` (#281). Readers now reconcile all three channels at
+    // the boundary, so neither format loses what both masks claim.
 ];
 
 /// Conversions that lose *atoms*, each naming the issue that owns it.
@@ -1669,6 +1646,56 @@ mod tests {
                 source.name(),
                 target.name()
             );
+        }
+    }
+
+    #[test]
+    fn test_every_reader_leaves_the_aromaticity_channels_agreeing() {
+        // The invariant, as a rule rather than a CML test. Aromaticity travels
+        // on three channels and readers used to set different subsets, so a
+        // file that stated it correctly came back as a different compound --
+        // benzene through CML wrote out as cyclohexane, because the SMILES
+        // writer reads only the atom flag (#261).
+        //
+        // Nothing here suspects a particular format, which is the point: this
+        // would have caught it without anyone thinking to look at CML.
+        let outcome = crate::io::reader::read("c1ccccc1 benzene\n", Format::SMILES);
+        let records: Vec<(String, Molecule)> = outcome
+            .records
+            .iter()
+            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .collect();
+
+        for format in all() {
+            let text = format.write(&records).expect("every format writes");
+            let back = crate::io::reader::read(&text, format);
+            let molecule = &back.records[0].molecule;
+
+            let aromatic_atoms = molecule.atoms().iter().filter(|a| a.is_aromatic()).count();
+            let flagged = molecule.bonds().iter().filter(|b| b.is_aromatic()).count();
+            let ordered = molecule
+                .bonds()
+                .iter()
+                .filter(|b| b.order() == BondOrder::Aromatic)
+                .count();
+
+            assert_eq!(
+                flagged,
+                ordered,
+                "{}: {flagged} bonds flagged aromatic but {ordered} carry the aromatic order",
+                format.name()
+            );
+
+            // An aromatic bond's atoms must be aromatic too. The reverse does
+            // not hold: PDBQT carries no bonds, so its atom flags survive with
+            // nothing to ride on -- correct, and why this is one-directional.
+            if flagged > 0 {
+                assert!(
+                    aromatic_atoms > 0,
+                    "{}: aromatic bonds but no aromatic atom",
+                    format.name()
+                );
+            }
         }
     }
 
