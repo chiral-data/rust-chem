@@ -2166,9 +2166,16 @@ fn test_l_matrix_prints_a_row_per_format_and_names_its_exceptions() {
         "a pinned atom loss came back: {}",
         r.stdout
     );
+    // The CML rows came out with #261; PDBQT's remain, since it carries no
+    // bonds for aromaticity to ride on.
     assert!(
-        r.stdout.contains("lost anyway:") && r.stdout.contains("cml        -> smi"),
+        r.stdout.contains("lost anyway:") && r.stdout.contains("pdbqt      -> sdf"),
         "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("cml        -> smi"),
+        "a fixed pair is still pinned: {}",
         r.stdout
     );
 }
@@ -2185,34 +2192,55 @@ fn test_l_still_details_a_single_format() {
 
 #[test]
 fn test_convert_reports_a_loss_both_masks_say_should_not_happen() {
-    // #276. SMILES and CML both claim aromaticity, so a report asking only
-    // "can the target hold this?" says nothing — and the output really is
-    // cyclohexane, because CML's reader sets no aromatic flag (#261).
+    // #276. PDBQT and SDF both claim aromaticity, so a report asking only "can
+    // the target hold this?" says nothing — and the loss is real, because PDBQT
+    // carries no bonds for atom aromaticity to ride on.
     //
-    // The pinned pair is what makes this visible; without it the whole
-    // conversion is silent.
+    // This used to pin `cml -> smi`, whose output really was cyclohexane. #261
+    // fixed that by reconciling the three aromaticity channels at the reader
+    // boundary, so the pair the CLI misses is now one where the loss is
+    // structural rather than a defect.
+    let pdbqt = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "pdbqt"],
+        None,
+    );
+    assert_eq!(pdbqt.code, 0, "{:?}", pdbqt.stderr);
+    let path = fixture("pair-loss.pdbqt", &pdbqt.stdout);
+
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("aromaticity"), "{:?}", r.stderr);
+    // The reason, not just the attribute: it is the half a user can act on.
+    assert!(
+        r.stderr.contains("no bonds survive PDBQT"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_no_longer_turns_benzene_into_cyclohexane() {
+    // What the test above used to pin, now asserted the other way round. CML
+    // states aromaticity in its bond order and nothing else, and the SMILES
+    // writer reads only the atom flag -- so this round trip produced a
+    // different compound until the reader learned to reconcile them (#261).
     let cml = run(
         &["convert", "--literal", "c1ccccc1 benzene", "--to", "cml"],
         None,
     );
     assert_eq!(cml.code, 0, "{:?}", cml.stderr);
-    let path = fixture("pair-loss.cml", &cml.stdout);
+    let path = fixture("aromatic-round-trip.cml", &cml.stdout);
 
     let r = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
     assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("c1ccccc1"), "{:?}", r.stdout);
     assert!(
-        r.stderr.contains("SMILES cannot carry: aromaticity"),
-        "{:?}",
-        r.stderr
+        !r.stdout.contains("C1CCCCC1"),
+        "still cyclohexane: {:?}",
+        r.stdout
     );
-    // The reason, not just the attribute: it is the half a user can act on.
-    assert!(
-        r.stderr.contains("CML sets no aromatic flag"),
-        "{:?}",
-        r.stderr
-    );
-    // And the conversion really did what the report says.
-    assert!(r.stdout.contains("C1CCCCC1"), "{:?}", r.stdout);
+    // And the report no longer names a loss that is not happening.
+    assert!(!r.stderr.contains("aromaticity"), "{:?}", r.stderr);
 }
 
 #[test]

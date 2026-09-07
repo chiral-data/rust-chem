@@ -199,6 +199,48 @@ fn mark_ring_aromatic(mol: &mut Molecule, ring: &[usize]) {
     }
 }
 
+/// Makes a molecule's three aromaticity channels agree.
+///
+/// `Atom::is_aromatic`, `Bond::is_aromatic` and `BondOrder::Aromatic` carry the
+/// same chemical fact, and readers set different subsets of them: CML has only
+/// a bond-order channel (`order="A"`), Mol2 states aromaticity per atom *and*
+/// per bond but leaves `Bond::is_aromatic` unset. Writers key on different ones
+/// too -- the SMILES writer reads only the atom flag -- so a file that stated
+/// its aromaticity correctly came back as a different compound: benzene through
+/// CML wrote out as `C1CCCCC1`, cyclohexane (#261).
+///
+/// **This is not perception.** [`detect_aromaticity`] decides *whether* a ring
+/// is aromatic; this only propagates a claim the input already made, so it
+/// cannot mark anything a reader did not. Cyclohexane stays cyclohexane.
+///
+/// Deliberately one-directional, from bonds to atoms. An aromatic *atom* flag
+/// alone does not say which of its bonds are aromatic, and guessing that would
+/// be perception by the back door -- Mol2 sets the atom flag and the bond
+/// order, so the bond-driven rule reaches it anyway.
+///
+/// A no-op for SMILES, SDF and commonchem, whose readers already set all three.
+/// Called at the reader boundary so the invariant holds by construction rather
+/// than by each format remembering.
+pub fn reconcile_aromaticity(mol: &mut Molecule) {
+    let aromatic: Vec<usize> = (0..mol.num_bonds())
+        .filter(|&i| {
+            let bond = mol.bond(i);
+            bond.is_aromatic() || bond.order() == BondOrder::Aromatic
+        })
+        .collect();
+
+    for index in aromatic {
+        let (atom1, atom2) = {
+            let bond = mol.bond_mut(index);
+            bond.set_aromatic(true);
+            bond.set_order(BondOrder::Aromatic);
+            (bond.atom1(), bond.atom2())
+        };
+        mol.atom_mut(atom1).set_aromatic(true);
+        mol.atom_mut(atom2).set_aromatic(true);
+    }
+}
+
 /// Assigns a Kekulé form to a molecule's aromatic bonds, without changing it.
 ///
 /// Returns one [`BondOrder`] per bond, or `None` when no valid assignment
@@ -573,5 +615,86 @@ mod tests {
         let second = mol.atoms().iter().filter(|a| a.is_aromatic()).count();
         assert_eq!(first, 10);
         assert_eq!(first, second);
+    }
+    /// The three channels, counted: (atom flags, bond flags, `BondOrder::Aromatic`).
+    fn channels(mol: &Molecule) -> (usize, usize, usize) {
+        (
+            mol.atoms().iter().filter(|a| a.is_aromatic()).count(),
+            mol.bonds().iter().filter(|b| b.is_aromatic()).count(),
+            mol.bonds()
+                .iter()
+                .filter(|b| b.order() == BondOrder::Aromatic)
+                .count(),
+        )
+    }
+
+    #[test]
+    fn test_a_bond_order_alone_reaches_both_flags() {
+        // CML's state: `order="A"` and nothing else. The SMILES writer reads
+        // only the atom flag, so this is what turned benzene into cyclohexane
+        // (#261).
+        let mut mol = crate::io::smiles::parse_smiles("c1ccccc1").expect("valid SMILES");
+        for i in 0..mol.num_bonds() {
+            mol.bond_mut(i).set_aromatic(false);
+        }
+        for i in 0..mol.num_atoms() {
+            mol.atom_mut(i).set_aromatic(false);
+        }
+        assert_eq!(channels(&mol), (0, 0, 6), "the fixture must start partial");
+
+        reconcile_aromaticity(&mut mol);
+        assert_eq!(channels(&mol), (6, 6, 6));
+    }
+
+    #[test]
+    fn test_a_bond_flag_alone_reaches_the_order_and_the_atoms() {
+        let mut mol = crate::io::smiles::parse_smiles("c1ccccc1").expect("valid SMILES");
+        for i in 0..mol.num_bonds() {
+            mol.bond_mut(i).set_order(BondOrder::Single);
+        }
+        for i in 0..mol.num_atoms() {
+            mol.atom_mut(i).set_aromatic(false);
+        }
+        assert_eq!(channels(&mol), (0, 6, 0), "the fixture must start partial");
+
+        reconcile_aromaticity(&mut mol);
+        assert_eq!(channels(&mol), (6, 6, 6));
+    }
+
+    #[test]
+    fn test_reconciling_cannot_invent_aromaticity() {
+        // The way this could be wrong while making every other case right. It
+        // propagates a claim; it does not decide one -- that is
+        // `detect_aromaticity`'s job, and conflating them would make a
+        // saturated ring aromatic.
+        for smiles in ["C1CCCCC1", "CCO", "C1=CC=CC=C1"] {
+            let mut mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            let before = channels(&mol);
+            reconcile_aromaticity(&mut mol);
+            assert_eq!(channels(&mol), before, "{smiles} changed");
+        }
+    }
+
+    #[test]
+    fn test_an_atom_flag_alone_is_not_propagated_to_bonds() {
+        // One-directional on purpose: an aromatic atom does not say *which* of
+        // its bonds are aromatic, and guessing would be perception. Nothing
+        // reads a lone atom flag into a bond, so nothing here should either.
+        let mut mol = crate::io::smiles::parse_smiles("C1CCCCC1").expect("valid SMILES");
+        for i in 0..mol.num_atoms() {
+            mol.atom_mut(i).set_aromatic(true);
+        }
+
+        reconcile_aromaticity(&mut mol);
+        assert_eq!(channels(&mol), (6, 0, 0), "an atom flag reached the bonds");
+    }
+
+    #[test]
+    fn test_reconciling_is_idempotent() {
+        let mut mol = crate::io::smiles::parse_smiles("c1ccccc1").expect("valid SMILES");
+        reconcile_aromaticity(&mut mol);
+        let once = channels(&mol);
+        reconcile_aromaticity(&mut mol);
+        assert_eq!(channels(&mol), once);
     }
 }

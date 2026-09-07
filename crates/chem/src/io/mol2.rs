@@ -443,6 +443,21 @@ pub fn parse_mol2(text: &str) -> Result<Molecule, Mol2Error> {
         }
     }
 
+    // Mol2 has no per-atom hydrogen field, so nothing here states a count --
+    // and an unstated one is not zero. Every atom kept `hydrogens: None`, which
+    // made the SMILES writer bracket every atom of every molecule (`[C][C][O]`
+    // for ethanol) and made `kekulize` write benzene out as cyclohexane, since
+    // its valence arithmetic saw no atom needing a double bond (#281).
+    //
+    // Nothing to overwrite, unlike CML, which reads `hydrogenCount` from the
+    // file and must keep it.
+    mol.calculate_implicit_hydrogens();
+
+    // The `ar` bond type sets the order but not `Bond::is_aromatic`, and the
+    // molecule has to be internally consistent whichever channel a writer
+    // reads (#261).
+    crate::io::aromaticity::reconcile_aromaticity(&mut mol);
+
     Ok(mol)
 }
 
