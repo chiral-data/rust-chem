@@ -10,6 +10,12 @@ box-ticking: each entry exists because it is a behaviour a test could not have
 caught, and several of them are behaviours that were broken at some point during
 v0.5.0 and only found by looking.
 
+Every push to the milestone branch publishes the bundle to
+**https://chem.chiral.one**, so the list can be worked through there rather than
+locally — with one difference that matters: check the build id in the top right
+against the commit you meant to test. See [DEPLOY.md](DEPLOY.md). Use a local
+build for anything you have not pushed.
+
 ## Running it
 
 ```bash
@@ -385,7 +391,9 @@ inventing a checklist item.
 - **`index.html` is the one file with a stable name.** The js and wasm are
   content-hashed, so those can't be served stale — but a cached `index.html`
   points at a hash that no longer exists, which shows as a stuck loading
-  overlay. Hard-refresh.
+  overlay. Hard-refresh. On the deployed site the same trap is headed off by
+  serving `index.html` `no-cache` while the hashed pair is `immutable`; if you
+  meet the overlay there anyway, that header is the first thing to check.
 - **A long-lived `trunk serve` on another port** rebuilds into `crates/chem-app/dist/`
   whenever any file changes, in debug unless it was started with `--release`.
   `e2e.sh` builds into `dist-e2e/` to stay out of its way. Check for one before

@@ -1,0 +1,26 @@
+{
+  "version": 3,
+  "routes": [
+    {
+      "src": "^/chem-app-[0-9a-f]+(?:\\.js|_bg\\.wasm)$",
+      "headers": {
+        "cache-control": "public, max-age=31536000, immutable"
+      },
+      "continue": true
+    },
+    {
+      "src": "^/build-info\\.json$",
+      "headers": {
+        "cache-control": "no-store"
+      },
+      "continue": true
+    },
+    {
+      "src": "^/(?:index\\.html)?$",
+      "headers": {
+        "cache-control": "no-cache"
+      },
+      "continue": true
+    }
+  ]
+}

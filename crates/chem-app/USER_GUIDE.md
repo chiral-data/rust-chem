@@ -27,7 +27,7 @@ Then, from `crates/chem-app/`:
 trunk serve --address 0.0.0.0 --port 8080
 ```
 
-This builds, serves, and live-reloads on file changes at `http://<this-machine>:8080`. For a one-off static build instead (e.g. to check what a real deployment would look like):
+This builds, serves, and live-reloads on file changes at `http://<this-machine>:8080`. The same build is published at [chem.chiral.one](https://chem.chiral.one) on every push to the milestone branch, so a local one is for offline work or for a change you have not pushed. Note that the app remembers your settings in `localStorage`, which is per-origin: what you saved on the hosted app and what you saved against a local server are separate. For a one-off static build:
 
 ```bash
 trunk build --release

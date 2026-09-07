@@ -6,9 +6,12 @@ Cheminformatics in Rust. Two crates in this workspace:
   Published to [crates.io](https://crates.io/crates/chem); documentation at
   [docs.rs/chem](https://docs.rs/chem). See [its README](crates/chem/README.md)
   for the API and the feature flags.
-- **`chem-app`** — a desktop and browser workbench built on it. Not published;
-  see [the user guide](crates/chem-app/USER_GUIDE.md) and
-  [testing notes](crates/chem-app/docs/E2E-TESTING.md).
+- **`chem-app`** — a desktop and browser workbench built on it. Not a published
+  crate, but the browser build runs at
+  [chem.chiral.one](https://chem.chiral.one); see
+  [the user guide](crates/chem-app/USER_GUIDE.md),
+  [testing notes](crates/chem-app/docs/E2E-TESTING.md) and
+  [how it is published](crates/chem-app/docs/DEPLOY.md).
 
 ## Working on it
 
