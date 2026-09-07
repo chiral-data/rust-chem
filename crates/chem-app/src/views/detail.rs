@@ -60,6 +60,7 @@ impl DetailView {
             let dataset = state.loaded_files.active_dataset();
             let name = dataset.names.get(row).cloned();
             let smiles = dataset.smiles.get(row).cloned();
+            let generated = dataset.generated.get(row).copied().unwrap_or(false);
 
             // Laid out once per dataset and shared with the table and the
             // result rows, so all three draw the same picture (#273). `None` is
@@ -114,7 +115,7 @@ impl DetailView {
                         }
 
                         structure_panel_with_options(ui, &mol, 220.0, options);
-                        show_molecule_info(ui, &mol, &smiles, &name);
+                        show_molecule_info(ui, &mol, &smiles, generated, &name);
                         show_atom_list(ui, &mol);
                         show_bond_list(ui, &mol);
                     });
