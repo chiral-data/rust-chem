@@ -2254,3 +2254,47 @@ fn test_a_transforming_command_does_not_claim_a_pair_loss() {
         r.stderr
     );
 }
+
+#[test]
+fn test_convert_writes_multi_record_pdb_that_reads_back_as_several() {
+    // The reported symptom, through the path it came through: `chem convert`
+    // uses the *streaming* writer, which concatenated structures with no
+    // `MODEL`/`ENDMDL` between them. Three molecules read back as one with
+    // their atoms merged (#267).
+    let path = fixture("three-records.smi", "CCO a\nc1ccccc1 b\nCCN c\n");
+
+    for target in ["pdb", "pdbqt"] {
+        let out = run(&["convert", path.to_str().unwrap(), "--to", target], None);
+        assert_eq!(out.code, 0, "{:?}", out.stderr);
+        assert_eq!(
+            out.stdout.matches("\nMODEL     ").count()
+                + usize::from(out.stdout.starts_with("MODEL")),
+            3,
+            "{target}: {}",
+            out.stdout
+        );
+
+        // Read back through the library, which is the assertion that matters:
+        // the framing is only worth having if it restores the boundaries.
+        let written = fixture(&format!("three-records.{target}"), &out.stdout);
+        let back = run(&["convert", written.to_str().unwrap(), "--to", "smi"], None);
+        assert_eq!(back.code, 0, "{:?}", back.stderr);
+        assert_eq!(
+            back.stdout.lines().filter(|l| !l.trim().is_empty()).count(),
+            3,
+            "{target} read back as: {}",
+            back.stdout
+        );
+    }
+}
+
+#[test]
+fn test_convert_leaves_a_single_record_unframed() {
+    // The common case, and it must not move: a real single-structure PDB
+    // carries no `MODEL`.
+    let path = fixture("one-record.smi", "CCO ethanol\n");
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "pdb"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(!r.stdout.contains("MODEL"), "{}", r.stdout);
+    assert!(r.stdout.contains("END"), "{}", r.stdout);
+}

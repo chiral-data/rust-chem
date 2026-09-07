@@ -786,11 +786,15 @@ fn write_xyz_records(records: &[(String, Molecule)], _options: &WriteOptions) ->
 fn write_pdb_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
     // PDB has no write options today, and no per-record name to thread
     // through -- see `PdbWriter`'s own doc comment.
-    let mut out = String::new();
-    for (_, molecule) in records {
-        out.push_str(&crate::io::pdb::write_pdb(molecule));
-    }
-    out
+    //
+    // Framed rather than concatenated: `ENDMDL` is the record boundary both
+    // readers split on, and without it N structures read back as one merged
+    // molecule (#267). One structure is returned unframed, as it always was.
+    let structures: Vec<String> = records
+        .iter()
+        .map(|(_, molecule)| crate::io::pdb::write_pdb(molecule))
+        .collect();
+    crate::io::pdb::frame_models(&structures)
 }
 
 fn write_mmcif_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -817,11 +821,14 @@ fn write_mol2_records(records: &[(String, Molecule)], _options: &WriteOptions) -
 fn write_pdbqt_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
     // PDBQT has no write options today, and no per-record name to thread
     // through -- see `PdbqtWriter`'s own doc comment.
-    let mut out = String::new();
-    for (_, molecule) in records {
-        out.push_str(&crate::io::pdbqt::write_pdbqt(molecule));
-    }
-    out
+    //
+    // Framed like PDB's, which is where PDBQT takes this convention from --
+    // and where AutoDock Vina's own multi-pose output takes it too (#267).
+    let ligands: Vec<String> = records
+        .iter()
+        .map(|(_, molecule)| crate::io::pdbqt::write_pdbqt(molecule))
+        .collect();
+    crate::io::pdb::frame_models(&ligands)
 }
 
 fn write_gro_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -1678,6 +1685,38 @@ mod tests {
                 "{} -> {} is pinned as losing {flag:?} ({why:?}), but a mask never claimed it",
                 source.name(),
                 target.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_format_writes_as_many_records_as_it_was_given() {
+        // The dimension the matrix was blind to. Every fixture in
+        // `one_per_attribute` is a single molecule and `convert` reads back
+        // `.records.first()`, so a writer that merged N records into one --
+        // which PDB and PDBQT both did, for want of `MODEL`/`ENDMDL` framing --
+        // satisfied every assertion in this module (#267).
+        //
+        // Written as the general rule rather than a PDB test, because nobody
+        // thought to check PDB specifically for a whole milestone.
+        let outcome = crate::io::reader::read("CCO a\nc1ccccc1 b\nCCN c\n", Format::SMILES);
+        let records: Vec<(String, Molecule)> = outcome
+            .records
+            .iter()
+            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .collect();
+        assert_eq!(records.len(), 3, "the fixture must be multi-record");
+
+        for format in all() {
+            let text = format.write(&records).expect("every format writes");
+            let back = crate::io::reader::read(&text, format);
+            assert_eq!(
+                back.records.len(),
+                records.len(),
+                "{} wrote {} records and read back {}",
+                format.name(),
+                records.len(),
+                back.records.len()
             );
         }
     }
