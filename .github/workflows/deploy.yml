@@ -175,10 +175,19 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
-          echo "user: $(vercel whoami)"
+          # `vercel teams ls` prints its table on **stderr** and nothing on
+          # stdout, so `| grep` could never match and this check failed for
+          # every token, including a correct one -- while the log above it
+          # showed the team plainly. Capture both streams and match the text.
+          #
+          # `vercel whoami` is deliberately not called: it resolves against the
+          # personal scope by default and errors for a team-scoped token
+          # ("Not authorized: Trying to access resource under scope ..."),
+          # which reads like a broken credential and is not one.
           echo "scopes the token can reach:"
-          vercel teams ls
-          if ! vercel teams ls | grep -q "$VERCEL_TEAM"; then
+          teams=$(vercel teams ls 2>&1 || true)
+          printf '%s\n' "$teams"
+          if ! grep -q "$VERCEL_TEAM" <<<"$teams"; then
             echo "::error::the token cannot reach the $VERCEL_TEAM scope — recreate it at vercel.com/account/tokens with Scope set to the team, not a personal account (crates/chem-app/docs/DEPLOY.md)"
             exit 1
           fi
