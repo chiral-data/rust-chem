@@ -76,6 +76,11 @@
 //! the rest, out of scope and consistent with every prior format's "no
 //! bond inference."
 //!
+//! **A multi-ligand write frames every record in `MODEL`/`ENDMDL`**, reusing
+//! [`crate::io::pdb::frame_models`] — the convention PDBQT takes from PDB, and
+//! the one Vina's own multi-pose output uses. Without it, ligands written back
+//! to back read as one merged molecule (#267).
+//!
 //! A file may hold several `MODEL`/`ENDMDL`-wrapped poses (AutoDock
 //! Vina's real docked-results output shape) — reuses the exact `ENDMDL`
 //! boundary technique [`crate::io::supplier::PdbSupplier`] already

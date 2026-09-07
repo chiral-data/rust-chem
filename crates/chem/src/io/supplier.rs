@@ -713,21 +713,58 @@ impl<W: Write> Writer for XyzWriter<W> {
 /// scope, see `io/pdb.rs`'s module doc), so there is nowhere for it to go.
 pub struct PdbWriter<W> {
     writer: W,
+    /// The first structure, held until a second arrives.
+    ///
+    /// `ENDMDL` is the record boundary both readers split on, so several
+    /// structures written back to back read as one merged molecule (#267). A
+    /// single structure is written unframed, as a real one is -- and a streaming
+    /// writer cannot know a second is coming, so the first is buffered and
+    /// framed retroactively once one does. One structure of memory, not the file.
+    held: Option<String>,
+    written: usize,
 }
 
 impl<W: Write> PdbWriter<W> {
     pub fn new(writer: W, _options: &WriteOptions) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            held: None,
+            written: 0,
+        }
+    }
+
+    /// Writes one structure inside its own `MODEL`/`ENDMDL`.
+    fn write_framed(&mut self, body: &str) -> std::io::Result<()> {
+        self.written += 1;
+        self.writer
+            .write_all(crate::io::pdb::frame_model(self.written, body).as_bytes())
     }
 }
 
 impl<W: Write> Writer for PdbWriter<W> {
     fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
-        self.writer
-            .write_all(crate::io::pdb::write_pdb(molecule).as_bytes())
+        let body = crate::io::pdb::write_pdb(molecule);
+        match self.held.take() {
+            // The second arrival is what makes this a multi-record file, so the
+            // first goes out framed now rather than as it was held.
+            Some(first) => {
+                self.write_framed(&first)?;
+                self.write_framed(&body)
+            }
+            None if self.written > 0 => self.write_framed(&body),
+            None => {
+                self.held = Some(body);
+                Ok(())
+            }
+        }
     }
 
-    fn finish(self: Box<Self>) -> std::io::Result<()> {
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        // Only ever one: unframed, byte-identical to what this wrote before
+        // framing existed.
+        if let Some(only) = self.held.take() {
+            self.writer.write_all(only.as_bytes())?;
+        }
         Ok(())
     }
 }
@@ -862,21 +899,58 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
 /// name, same reasoning as [`PdbWriter`].
 pub struct PdbqtWriter<W> {
     writer: W,
+    /// The first ligand, held until a second arrives.
+    ///
+    /// `ENDMDL` is the record boundary both readers split on, so several
+    /// ligands written back to back read as one merged molecule (#267). A
+    /// single ligand is written unframed, as a real one is -- and a streaming
+    /// writer cannot know a second is coming, so the first is buffered and
+    /// framed retroactively once one does. One ligand of memory, not the file.
+    held: Option<String>,
+    written: usize,
 }
 
 impl<W: Write> PdbqtWriter<W> {
     pub fn new(writer: W, _options: &WriteOptions) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            held: None,
+            written: 0,
+        }
+    }
+
+    /// Writes one ligand inside its own `MODEL`/`ENDMDL`.
+    fn write_framed(&mut self, body: &str) -> std::io::Result<()> {
+        self.written += 1;
+        self.writer
+            .write_all(crate::io::pdb::frame_model(self.written, body).as_bytes())
     }
 }
 
 impl<W: Write> Writer for PdbqtWriter<W> {
     fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
-        self.writer
-            .write_all(crate::io::pdbqt::write_pdbqt(molecule).as_bytes())
+        let body = crate::io::pdbqt::write_pdbqt(molecule);
+        match self.held.take() {
+            // The second arrival is what makes this a multi-record file, so the
+            // first goes out framed now rather than as it was held.
+            Some(first) => {
+                self.write_framed(&first)?;
+                self.write_framed(&body)
+            }
+            None if self.written > 0 => self.write_framed(&body),
+            None => {
+                self.held = Some(body);
+                Ok(())
+            }
+        }
     }
 
-    fn finish(self: Box<Self>) -> std::io::Result<()> {
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        // Only ever one: unframed, byte-identical to what this wrote before
+        // framing existed.
+        if let Some(only) = self.held.take() {
+            self.writer.write_all(only.as_bytes())?;
+        }
         Ok(())
     }
 }
@@ -1380,5 +1454,53 @@ mod tests {
         let read_back = read_sdf_with_options(&text, &ReadOptions);
         assert_eq!(read_back.records.len(), 1);
         assert_eq!(read_back.records[0].name, "ethanol");
+    }
+    #[test]
+    fn test_the_pdb_writer_frames_only_once_a_second_molecule_arrives() {
+        // The path `chem convert` takes, and the one the symptom came through.
+        // A streaming writer cannot know a second molecule is coming, so the
+        // first is held and framed retroactively -- which keeps a one-molecule
+        // stream byte-identical to what this wrote before framing existed
+        // (#267).
+        let ethanol = crate::io::smiles::parse_smiles("CCO").expect("valid SMILES");
+
+        let mut one = Vec::new();
+        let writer: Box<dyn Writer> = Box::new(PdbWriter::new(&mut one, &WriteOptions::default()));
+        let mut writer = writer;
+        writer.write_molecule("a", &ethanol).expect("writes");
+        writer.finish().expect("finishes");
+        let one = String::from_utf8(one).expect("utf-8");
+        assert!(!one.contains("MODEL"), "one molecule is unframed: {one}");
+        assert_eq!(one, crate::io::pdb::write_pdb(&ethanol));
+
+        let mut two = Vec::new();
+        let writer: Box<dyn Writer> = Box::new(PdbWriter::new(&mut two, &WriteOptions::default()));
+        let mut writer = writer;
+        writer.write_molecule("a", &ethanol).expect("writes");
+        writer.write_molecule("b", &ethanol).expect("writes");
+        writer.finish().expect("finishes");
+        let two = String::from_utf8(two).expect("utf-8");
+
+        let back = crate::io::reader::read(&two, crate::io::format::Format::PDB);
+        assert_eq!(back.records.len(), 2, "{two}");
+    }
+
+    #[test]
+    fn test_the_pdbqt_writer_frames_the_same_way() {
+        // PDBQT borrows PDB's framing, and AutoDock Vina's own multi-pose
+        // output uses it.
+        let ethanol = crate::io::smiles::parse_smiles("CCO").expect("valid SMILES");
+        let mut out = Vec::new();
+        let writer: Box<dyn Writer> =
+            Box::new(PdbqtWriter::new(&mut out, &WriteOptions::default()));
+        let mut writer = writer;
+        writer.write_molecule("a", &ethanol).expect("writes");
+        writer.write_molecule("b", &ethanol).expect("writes");
+        writer.write_molecule("c", &ethanol).expect("writes");
+        writer.finish().expect("finishes");
+        let out = String::from_utf8(out).expect("utf-8");
+
+        let back = crate::io::reader::read(&out, crate::io::format::Format::PDBQT);
+        assert_eq!(back.records.len(), 3, "{out}");
     }
 }

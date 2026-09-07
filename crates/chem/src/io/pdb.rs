@@ -21,6 +21,14 @@
 //! per-writer orientation, deliberately not read), so `CRYST1` is read
 //! directly with no rotation step and no correctness risk.
 //!
+//! **A multi-structure write frames every record in `MODEL`/`ENDMDL`**
+//! ([`frame_models`], used by `write_pdb_records` and
+//! [`crate::io::supplier::PdbWriter`]) — `ENDMDL` is the boundary the reader
+//! splits on, and structures concatenated without it read back as one
+//! molecule with every atom merged (#267). One structure is written
+//! unframed, as a real single deposition is. OpenBabel frames the same way,
+//! and gemmi reads three models out of the result.
+//!
 //! A file may hold more than one structure via `MODEL`/`ENDMDL` (an NMR
 //! ensemble); splitting those frames is the reader's/supplier's job
 //! ([`crate::io::reader::read_pdb_with_options`],
@@ -336,6 +344,54 @@ fn format_atom_name(name: &str, element_symbol: &str) -> String {
     }
 }
 
+/// One structure inside `MODEL n`/`ENDMDL`.
+///
+/// What [`frame_models`] does per entry, exposed for the streaming writers,
+/// which frame as they go rather than over a slice they can see all of.
+pub fn frame_model(serial: usize, body: &str) -> String {
+    let mut out = format!("MODEL     {serial:>4}\n");
+    // `END` terminates a *file*; inside a model `ENDMDL` does, so the one the
+    // single-structure writer appended comes off.
+    for line in body.lines() {
+        if line.trim_end() != "END" {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str("ENDMDL\n");
+    out
+}
+
+/// Wraps each of several structures in `MODEL`/`ENDMDL`, or returns the one
+/// structure untouched.
+///
+/// Both readers here split records on `ENDMDL`, and both writers used to
+/// concatenate without it -- so `chem convert three.smi --to pdb` wrote three
+/// structures that read back as one molecule with all their atoms merged
+/// (#267). OpenBabel frames the same way and gemmi reads three models out of
+/// the result, so the convention is borrowed rather than invented.
+///
+/// **One structure is left exactly as it was**, unframed: a real
+/// single-structure PDB carries no `MODEL`, and every existing fixture and test
+/// would otherwise move. CML wraps unconditionally (#228) for a reason that
+/// does not apply here -- sibling `<molecule>` elements with no root are not
+/// valid XML, whereas an unframed PDB structure is perfectly valid.
+///
+/// **No trailing `END` after the last `ENDMDL`.** Measured: a bare `END` there
+/// reads back as an extra, empty record, the artefact visible in OpenBabel's
+/// own multi-model output.
+pub fn frame_models(structures: &[String]) -> String {
+    if structures.len() < 2 {
+        return structures.first().cloned().unwrap_or_default();
+    }
+
+    let mut out = String::new();
+    for (i, structure) in structures.iter().enumerate() {
+        out.push_str(&frame_model(i + 1, structure));
+    }
+    out
+}
+
 /// Writes one PDB structure.
 pub fn write_pdb(mol: &Molecule) -> String {
     let mut out = String::new();
@@ -522,6 +578,55 @@ END
         assert!(
             last_conect < end,
             "CONECT after END is unreachable to a reader: {written}"
+        );
+    }
+
+    #[test]
+    fn test_one_structure_is_written_unframed() {
+        // A real single-deposition PDB carries no `MODEL`, and framing one
+        // would move every fixture in the crate. CML wraps unconditionally
+        // (#228) because sibling elements with no root are not valid XML; an
+        // unframed PDB structure is perfectly valid, so the reason does not
+        // carry over (#267).
+        let mol = parse_pdb(WATER_PDB).expect("valid PDB");
+        let one = write_pdb(&mol);
+        assert_eq!(frame_models(std::slice::from_ref(&one)), one);
+        assert!(!one.contains("MODEL"), "{one}");
+    }
+
+    #[test]
+    fn test_several_structures_are_framed_and_read_back_as_several() {
+        // The defect: `ENDMDL` is the boundary the reader splits on, so
+        // concatenated structures came back as one merged molecule (#267).
+        let mol = parse_pdb(WATER_PDB).expect("valid PDB");
+        let framed = frame_models(&[write_pdb(&mol), write_pdb(&mol)]);
+
+        assert_eq!(framed.matches("MODEL     ").count(), 2, "{framed}");
+        assert_eq!(framed.matches("ENDMDL").count(), 2, "{framed}");
+
+        let back = crate::io::reader::read(&framed, crate::io::format::Format::PDB);
+        assert_eq!(back.records.len(), 2, "{framed}");
+        assert_eq!(back.records[0].molecule.num_atoms(), mol.num_atoms());
+    }
+
+    #[test]
+    fn test_a_framed_structure_ends_with_endmdl_not_end() {
+        // `END` terminates a *file*. Left inside a model it is both wrong and
+        // visible: a bare `END` after the last `ENDMDL` reads back as an extra,
+        // empty record -- measured, and the artefact OpenBabel's own multi-model
+        // output shows.
+        let mol = parse_pdb(WATER_PDB).expect("valid PDB");
+        assert!(
+            write_pdb(&mol).contains("END\n"),
+            "the single form keeps it"
+        );
+
+        let framed = frame_models(&[write_pdb(&mol), write_pdb(&mol)]);
+        let records: Vec<&str> = framed.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(records.last(), Some(&"ENDMDL"), "{framed}");
+        assert!(
+            !records.iter().any(|l| l.trim_end() == "END"),
+            "an END inside a model: {framed}"
         );
     }
 
