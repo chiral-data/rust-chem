@@ -36,7 +36,7 @@ never PR'd deploys unchecked, which is the trade.
 
 | secret | where it comes from |
 |---|---|
-| `VERCEL_TOKEN` | vercel.com/account/tokens, scoped to the `chiral` team. **The CLI cannot create one** |
+| `VERCEL_TOKEN` | vercel.com/account/tokens, **Scope set to the `chiral` team**, not a personal account. The CLI cannot create one |
 | `VERCEL_ORG_ID` | the `chiral` team id, `vercel project inspect` or `.vercel/project.json` |
 | `VERCEL_PROJECT_ID` | the same two places |
 
@@ -50,6 +50,20 @@ old one in the dashboard. Nothing else changes.
 
 **Write the token's expiry date here when you create it.** A secret that expires
 with nobody expecting it is the likeliest cause of a future mystery 403.
+
+### Reading a credential failure
+
+The three messages mean different things, and only the third is about scope:
+
+| message | cause |
+|---|---|
+| `The token provided via VERCEL_TOKEN ... is not valid` | wrong, truncated or revoked token |
+| `Project not found ({"VERCEL_PROJECT_ID":…,"VERCEL_ORG_ID":…})` | the two ids do not belong together |
+| `Could not retrieve Project Settings` | the token is valid and **cannot see this project** — nearly always scoped to a personal account instead of the team |
+
+The Scope dropdown on the token form defaults to your personal account, which
+is how the third one happens. The workflow now prints what the token can reach
+before it depends on it, and fails naming the scope if the team is missing.
 
 ## Checking a deploy actually landed
 
@@ -78,12 +92,21 @@ the match on every deploy and prints the id in its last step.
 
 ## Undoing one
 
+These commands resolve the project from a `.vercel/` link, which is gitignored
+and absent in a fresh clone — so give them the ids, or they will not find it:
+
 ```sh
-vercel rollback --scope chiral-b84fb3de              # back to the previous production deploy
-vercel promote <deployment-url> --scope chiral-b84fb3de   # or forward to a specific one
+export VERCEL_ORG_ID=team_SV5XJeJeURf8s8XEhKhAsH27
+export VERCEL_PROJECT_ID=prj_rT8mRl2SE04api6dn8A58OhpQGiY
+
+vercel rollback --scope chiral-b84fb3de                    # to the previous production deploy
+vercel rollback status --scope chiral-b84fb3de             # watch it land
+vercel promote <deployment-url> --scope chiral-b84fb3de    # or forward to a specific one
 ```
 
 Both re-point the alias and take effect immediately; neither rebuilds anything.
+The ids are identifiers rather than credentials, and they survive a project
+rename — only the token needs care.
 
 ## Traps
 
