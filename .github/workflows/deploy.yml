@@ -1,0 +1,233 @@
+name: Deploy Workbench
+
+# Its own workflow rather than a job in ci.yml. Triggers there are
+# workflow-level, and ci.yml deliberately excludes push on milestone branches:
+# "a merge into the branch would re-run the identical commit the PR just
+# checked". Adding `push` there for one job would re-run all six, reversing a
+# documented decision -- and would put VERCEL_TOKEN in the environment of every
+# pull_request job in the file.
+on:
+  push:
+    # v080 rather than main: main's HEAD is the v0.7.0 release, 34 commits
+    # behind, so a main-only deploy would publish an app with none of the
+    # v0.8.0 work. When v0.8.0 ships, *replace* v080 with main rather than
+    # listing both -- production is a single alias, so two branches deploying
+    # to it means last push wins, and a push to a stale milestone branch could
+    # overwrite the release.
+    branches: [v080]
+  # Inert until this file also exists on the default branch: GitHub dispatches
+  # only workflows found there. Here for when main takes over the trigger.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Production is one alias, so the group is global rather than keyed on the ref.
+# Not cancel-in-progress: interrupting an upload or an alias promotion is worse
+# than queueing behind it, and a deploy is about three minutes.
+concurrency:
+  group: deploy-workbench-production
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pinned because a public URL now depends on it. ci.yml's web job pinned to
+  # the same version in this commit; bump them together. A Trunk change to the
+  # dist layout or the SRI attributes would otherwise reach production without
+  # anyone choosing it.
+  TRUNK_VERSION: "0.21.14"
+  VERCEL_CLI_VERSION: "59.5.0"
+  DEPLOY_HOST: chem.chiral.one
+
+jobs:
+  deploy:
+    name: Build and publish the web bundle
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://chem.chiral.one
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the deploy is configured
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          missing=""
+          [ -n "$VERCEL_TOKEN" ]      || missing="$missing VERCEL_TOKEN"
+          [ -n "$VERCEL_ORG_ID" ]     || missing="$missing VERCEL_ORG_ID"
+          [ -n "$VERCEL_PROJECT_ID" ] || missing="$missing VERCEL_PROJECT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secrets:$missing — see crates/chem-app/docs/DEPLOY.md"
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      # This job is its own gate. ci.yml does not run on pushes to a milestone
+      # branch, so there is no CI run to depend on, and v080 is unprotected: a
+      # direct push can reach here without ever having been in a PR. These two
+      # steps are what stands between such a push and production.
+      - name: Clippy (wasm32)
+        run: cargo clippy -p chem-app --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@${{ env.TRUNK_VERSION }}
+
+      # `option_env!("CHEM_BUILD_ID")` is baked in at compile time, and the app
+      # shows nothing at all when it is unset (app.rs), so CI bundles have been
+      # anonymous until now. Short sha, matching e2e.sh's format, so the id in
+      # the corner reads the same whether the bundle came from a laptop or from
+      # here. No `-dirty` is reachable: this is a fresh checkout of a pushed
+      # commit.
+      - name: Name the build
+        run: echo "CHEM_BUILD_ID=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Build web bundle
+        working-directory: crates/chem-app
+        run: |
+          # Never reuse a dist -- e2e.sh's rule. build.rs only declares
+          # rerun-if-env-changed, so a leftover dist plus a cache hit is how
+          # the v0.5.0 stale-bundle confusion happened in the first place.
+          rm -rf dist
+          trunk build --release
+
+      - name: The bundle is what we think it is
+        working-directory: crates/chem-app/dist
+        run: |
+          set -euo pipefail
+          ls -l
+          n=$(ls -1 | wc -l)
+          [ "$n" -eq 3 ] || { echo "::error::dist holds $n files, expected 3"; exit 1; }
+          js=$(ls -1 chem-app-*.js)
+          wasm=$(ls -1 chem-app-*_bg.wasm)
+          for f in "/$js" "/$wasm"; do
+            grep -qF "$f" index.html \
+              || { echo "::error::index.html does not name $f"; exit 1; }
+          done
+          # Trunk emits subresource-integrity hashes. If a future version stops,
+          # the header rules stay right but the guarantee that no host can alter
+          # the payload is gone -- better to learn it here.
+          grep -q 'integrity="sha384-' index.html \
+            || { echo "::error::no SRI attributes in index.html"; exit 1; }
+          echo "wasm bytes: $(stat -c %s "$wasm")"
+
+      # Build Output API v3: Vercel is handed a finished directory and runs no
+      # build of its own. There is no Rust toolchain on their builder and we do
+      # not want one.
+      - name: Assemble the prebuilt output
+        run: |
+          set -euo pipefail
+          rm -rf .vercel/output
+          mkdir -p .vercel/output/static
+          cp -a crates/chem-app/dist/. .vercel/output/static/
+          cp crates/chem-app/vercel-output.json .vercel/output/config.json
+          # The in-app build id is compiled into the wasm and drawn on a canvas,
+          # so no HTTP client can read it. This is the machine-readable twin,
+          # written from the same variable in the same job -- and a new file
+          # rather than an edit to index.html, so "nothing rewrites the built
+          # bytes" stays true and SRI cannot break.
+          cat > .vercel/output/static/build-info.json <<JSON
+          {
+            "build_id": "${CHEM_BUILD_ID}",
+            "commit": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF_NAME}",
+            "run": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+          find .vercel/output -type f -printf '%P  %s\n' | sort
+
+      - name: Install the Vercel CLI
+        run: npm install --global "vercel@${VERCEL_CLI_VERSION}"
+
+      # The token goes through the environment, never as `--token`: an argument
+      # is visible in `ps` on the runner and would be echoed by any `set -x`.
+      # No `--debug` here either; it prints request payloads.
+      - name: Deploy to production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          # Writes .vercel/project.json from the two ids. Probably unnecessary
+          # for --prebuilt, but the failure mode without it is the CLI trying to
+          # resolve a project non-interactively, which is expensive to read from
+          # a log. It does not touch .vercel/output.
+          vercel pull --yes --environment=production
+          url=$(vercel deploy --prebuilt --prod --yes)
+          echo "::notice::deployed $url"
+
+      # A deploy reporting success and a site serving this build are different
+      # claims. Everything below checks the second one.
+      - name: The live site serves this build
+        run: |
+          set -euo pipefail
+          base="https://${DEPLOY_HOST}"
+          # Against the custom domain rather than the deployment URL: under
+          # Vercel's Standard Protection the *.vercel.app URL answers 401 to an
+          # anonymous client while the production domain stays public -- and the
+          # domain is what a person types.
+          code=000
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "$base/") || code=000
+            [ "$code" = "200" ] && break
+            echo "attempt $attempt: HTTP $code"
+            sleep 5
+          done
+          [ "$code" = "200" ] || { echo "::error::$base/ returned $code"; exit 1; }
+
+          live=$(curl -fsS "$base/build-info.json")
+          echo "$live"
+          echo "$live" | grep -qF "\"commit\": \"${GITHUB_SHA}\"" \
+            || { echo "::error::the live build-info does not name ${GITHUB_SHA}"; exit 1; }
+
+          # Read the asset names out of the *served* index.html and prove each
+          # resolves. This is the stuck-loading-overlay failure -- an index
+          # naming a hash that is not there -- checked at the origin.
+          html=$(curl -fsS "$base/")
+          js=$(printf '%s' "$html" | grep -oE '/chem-app-[0-9a-f]+\.js' | head -1)
+          wasm=$(printf '%s' "$html" | grep -oE '/chem-app-[0-9a-f]+_bg\.wasm' | head -1)
+          [ -n "$js" ] && [ -n "$wasm" ] \
+            || { echo "::error::the served index.html names no assets"; exit 1; }
+
+          hdr() { curl -sSI -H 'Accept-Encoding: br, gzip' "$base$1"; }
+
+          h=$(hdr "/"); printf '%s\n' "$h"
+          printf '%s' "$h" | grep -qiE '^cache-control:.*(no-cache|max-age=0)' \
+            || { echo "::error::index.html is cacheable — the stale-index trap is open"; exit 1; }
+
+          h=$(hdr "$wasm"); printf '%s\n' "$h"
+          printf '%s' "$h" | grep -qi '^HTTP/.* 200' \
+            || { echo "::error::$wasm is not served"; exit 1; }
+          printf '%s' "$h" | grep -qiE '^cache-control:.*immutable' \
+            || { echo "::error::$wasm is not immutable — every visit re-downloads 4.4 MB"; exit 1; }
+          # instantiateStreaming refuses anything else, and wasm-bindgen's glue
+          # then buffers the whole bundle instead.
+          printf '%s' "$h" | grep -qiE '^content-type:[[:space:]]*application/wasm' \
+            || { echo "::error::$wasm is not application/wasm"; exit 1; }
+          printf '%s' "$h" | grep -i '^content-encoding:' \
+            || echo "::warning::the wasm is served uncompressed — 4.4 MB rather than about 1.6 MB"
+
+          h=$(hdr "$js"); printf '%s\n' "$h"
+          printf '%s' "$h" | grep -qiE '^cache-control:.*immutable' \
+            || { echo "::error::$js is not immutable"; exit 1; }
+
+          echo "::notice::${CHEM_BUILD_ID} live at $base — the id in the app's menu bar should read the same"
