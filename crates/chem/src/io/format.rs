@@ -1225,31 +1225,14 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
 /// no per-format mask can express it -- and `held` sets `TOPOLOGY` on the atom
 /// count alone, so one atom of six satisfies every claim a mask makes.
 static PAIR_GAPS: &[(Format, Format, &str)] = &[
-    // PDBQT's writer keeps only the largest connected component, so a source
-    // that reads back no bonds arrives as N one-atom fragments and leaves as
-    // one atom. The four sources are exactly the four formats without
-    // `Carries::BONDS` -- PDBQT itself among them, which is why the A -> A
-    // diagonal cannot see this (#259).
-    (
-        Format::XYZ,
-        Format::PDBQT,
-        "bondless source: only the largest component is written (#259)",
-    ),
-    (
-        Format::MMCIF,
-        Format::PDBQT,
-        "bondless source: only the largest component is written (#259)",
-    ),
-    (
-        Format::PDBQT,
-        Format::PDBQT,
-        "bondless source: only the largest component is written (#259)",
-    ),
-    (
-        Format::GRO,
-        Format::PDBQT,
-        "bondless source: only the largest component is written (#259)",
-    ),
+    // Empty since #259. PDBQT's writer kept only the largest connected
+    // component, so a source carrying no bonds arrived as N one-atom fragments
+    // and left as one atom -- four pairs, `pdbqt -> pdbqt` among them, which is
+    // why the A -> A diagonal could not see it. The writer now writes every
+    // atom, so there is no gap to pin.
+    //
+    // The mechanism stays: this is the only way to express a loss no mask can,
+    // and it took a milestone to notice the first one.
 ];
 
 /// Everything `target`'s writer manufactures when the input has none.

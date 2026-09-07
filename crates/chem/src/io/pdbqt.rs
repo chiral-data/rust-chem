@@ -22,22 +22,37 @@
 //! Every candidate bond is a graph-theoretic bridge — a bond not in any
 //! ring is exactly a bond not in any cycle, which is the definition of a
 //! bridge. Removing every candidate bond and taking connected components
-//! therefore always yields a fragment-contraction graph that is a **tree**
-//! (the bridge/block-cut tree of a connected graph is always a tree) —
-//! `TORSDOF` is exactly `fragments - 1`, no separate counting needed, and
-//! no tree-vs-forest handling for the fragment structure itself.
+//! therefore yields a fragment-contraction graph that is a **forest**: a
+//! tree per molecular component. `TORSDOF` is `fragments - components`,
+//! which for the usual connected ligand is the `fragments - 1` this said
+//! before #259, and in both cases is simply the number of rotatable bonds.
 //!
 //! Atoms are renumbered in traversal order (the ROOT fragment's atoms
 //! first, then each branch depth-first) — real ligand PDBQT files lay
 //! fragments out contiguously this way, and `BRANCH i j`'s `i`/`j` refer
 //! to those written serials, not the input molecule's own atom indices.
 //!
-//! **Requires a single connected input molecule** — a multi-component
-//! input (a salt with a counter-ion) can't be one PDBQT ligand, the same
-//! constraint real ligand-prep tooling has. Since every registered
-//! writer's signature is infallible, this is not surfaced as an error but
-//! as an in-band `REMARK` line stating the input had N components and
-//! only the largest was written.
+//! **A disconnected input keeps every atom.** A salt with a counter-ion
+//! is not one PDBQT ligand, which is a real constraint that real
+//! ligand-prep tooling has — and what that tooling does about it is
+//! *refuse*: Meeko raises "RDKit molecule has 2 fragments. Must have 1."
+//! OpenBabel instead writes every atom. Neither discards.
+//!
+//! This module used to adopt the constraint and truncate to the largest
+//! component, announced by an in-band `REMARK` because a writer's
+//! signature is infallible. That was wrong twice over (#259). A converter
+//! discarding its input is the one thing it must not do, and the `REMARK`
+//! went into the file rather than to the loss channel, so `chem convert`
+//! reported `converted 1, skipped 0` while five atoms of six vanished.
+//! Worse, a format carrying no bonds — XYZ, mmCIF, GRO — hands over N
+//! one-atom "components", which is a fact about the reader and not the
+//! chemistry, so benzene came back as a single carbon.
+//!
+//! Every component's own root fragment therefore goes in the one `ROOT`
+//! block, with branches hanging off each. AutoDock reads the extra
+//! fragments as rigid, which is the honest consequence of being handed
+//! them — stripping solvent is an explicit operation, not a side effect of
+//! writing a file.
 //!
 //! # AutoDock atom typing
 //!
@@ -279,12 +294,43 @@ fn build_tree(
     order: &mut Vec<usize>,
     new_serial: &mut HashMap<usize, usize>,
 ) -> Node {
-    for &atom in &fragments[root_frag] {
+    place_fragment(fragments, root_frag, order, new_serial);
+    let root_atom_count = fragments[root_frag].len();
+    let children = build_children(fragments, edges, root_frag, order, new_serial);
+
+    Node::Fragment {
+        atom_count: root_atom_count,
+        pivot_in: None,
+        children,
+    }
+}
+
+/// Assigns serials to one fragment's atoms, in the order they will be written.
+fn place_fragment(
+    fragments: &[Vec<usize>],
+    frag: usize,
+    order: &mut Vec<usize>,
+    new_serial: &mut HashMap<usize, usize>,
+) {
+    for &atom in &fragments[frag] {
         new_serial.insert(atom, order.len() + 1);
         order.push(atom);
     }
-    let root_atom_count = fragments[root_frag].len();
+}
 
+/// The subtrees hanging off `root_frag` by a rotatable bond.
+///
+/// Split from [`build_tree`] so a disconnected molecule can place *every*
+/// component's root fragment in the one `ROOT` block before any branch is
+/// walked -- the block is written as a contiguous run from the head of
+/// `order`, so the roots have to be laid down together (#259).
+fn build_children(
+    fragments: &[Vec<usize>],
+    edges: &[FragmentEdge],
+    root_frag: usize,
+    order: &mut Vec<usize>,
+    new_serial: &mut HashMap<usize, usize>,
+) -> Vec<Node> {
     let mut child_edges: Vec<&FragmentEdge> = edges
         .iter()
         .filter(|e| e.frag_a == root_frag || e.frag_b == root_frag)
@@ -330,11 +376,7 @@ fn build_tree(
         });
     }
 
-    Node::Fragment {
-        atom_count: root_atom_count,
-        pivot_in: None,
-        children,
-    }
+    children
 }
 
 fn write_fragment(
@@ -395,58 +437,9 @@ fn write_atom_line(out: &mut String, mol: &Molecule, atom_idx: usize, serial: us
 /// `REMARK` line naming the loss and only its largest component is
 /// written -- see the module doc for why this isn't a `Result`.
 pub fn write_pdbqt(mol: &Molecule) -> String {
-    let mut mol = mol.clone();
-    perceive_rings(&mut mol);
-
-    let components = mol.graph().connected_components();
-    let mol_for_write;
-    let mut remark = String::new();
-    let working: &Molecule = if components.len() > 1 {
-        remark = format!(
-            "REMARK  chem: input had {} connected components; only the largest ({} atoms) was written\n",
-            components.len(),
-            components.iter().map(Vec::len).max().unwrap_or(0),
-        );
-        // Rebuild from just the largest component's atoms, in their
-        // original relative order, so indices stay simple to reason
-        // about.
-        let largest = components
-            .into_iter()
-            .max_by_key(Vec::len)
-            .unwrap_or_default();
-        let keep: HashSet<usize> = largest.into_iter().collect();
-        let mut rebuilt = Molecule::new();
-        let mut remap = HashMap::new();
-        for (old_idx, atom) in mol.atoms().iter().enumerate() {
-            if keep.contains(&old_idx) {
-                remap.insert(old_idx, rebuilt.add_atom(atom.clone()));
-            }
-        }
-        for bond in mol.bonds() {
-            if let (Some(&a), Some(&b)) = (remap.get(&bond.atom1()), remap.get(&bond.atom2())) {
-                let _ = rebuilt.add_bond(Bond::new(a, b, bond.order()));
-            }
-        }
-        if let Some(coords) = mol.coords3() {
-            let kept: Vec<Point3> = (0..mol.num_atoms())
-                .filter(|i| keep.contains(i))
-                .map(|i| coords[i])
-                .collect();
-            let _ = rebuilt.set_coords3(kept);
-        }
-        if let Some(sites) = mol.sites() {
-            let kept: Vec<AtomSite> = (0..mol.num_atoms())
-                .filter(|i| keep.contains(i))
-                .map(|i| sites[i].clone())
-                .collect();
-            let _ = rebuilt.set_sites(kept);
-        }
-        perceive_rings(&mut rebuilt);
-        mol_for_write = rebuilt;
-        &mol_for_write
-    } else {
-        &mol
-    };
+    let mut working = mol.clone();
+    perceive_rings(&mut working);
+    let working = &working;
 
     let candidate_bonds: Vec<usize> = working
         .bonds()
@@ -478,23 +471,57 @@ pub fn write_pdbqt(mol: &Molecule) -> String {
         })
         .collect();
 
-    let root_frag = fragments
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, atoms)| {
-            (
-                atoms.len(),
-                std::cmp::Reverse(atoms.first().copied().unwrap_or(usize::MAX)),
-            )
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    // One root fragment per *molecular* component, not one overall. A
+    // disconnected molecule -- a salt, or anything read from a format that
+    // carries no bonds -- has no single fragment every other is reachable
+    // from, and walking one root used to leave the rest unwritten (#259).
+    let mut roots: Vec<usize> = Vec::new();
+    for component in working.graph().connected_components() {
+        let in_component: HashSet<usize> = component.iter().copied().collect();
+        let root = fragments
+            .iter()
+            .enumerate()
+            .filter(|(_, atoms)| atoms.first().is_some_and(|a| in_component.contains(a)))
+            .max_by_key(|(_, atoms)| {
+                (
+                    atoms.len(),
+                    std::cmp::Reverse(atoms.first().copied().unwrap_or(usize::MAX)),
+                )
+            })
+            .map(|(i, _)| i);
+        if let Some(root) = root {
+            roots.push(root);
+        }
+    }
+    roots.sort_unstable_by_key(|&f| fragments[f].first().copied().unwrap_or(usize::MAX));
 
     let mut order = Vec::new();
     let mut new_serial = HashMap::new();
-    let tree = build_tree(&fragments, &edges, root_frag, &mut order, &mut new_serial);
 
-    let mut out = remark;
+    // Every root laid down first, because the ROOT block is a contiguous run
+    // from the head of `order`; only then can any branch be walked.
+    let mut root_atom_count = 0;
+    for &root in &roots {
+        place_fragment(&fragments, root, &mut order, &mut new_serial);
+        root_atom_count += fragments[root].len();
+    }
+    let mut children = Vec::new();
+    for &root in &roots {
+        children.extend(build_children(
+            &fragments,
+            &edges,
+            root,
+            &mut order,
+            &mut new_serial,
+        ));
+    }
+    let tree = Node::Fragment {
+        atom_count: root_atom_count,
+        pivot_in: None,
+        children,
+    };
+
+    let mut out = String::new();
     out.push_str("ROOT\n");
     let mut cursor = 0;
     let Node::Fragment { atom_count, .. } = &tree;
@@ -780,13 +807,85 @@ mod tests {
     }
 
     #[test]
-    fn test_a_disconnected_input_gets_a_remark_and_only_the_largest_component() {
+    fn test_a_disconnected_input_keeps_every_atom() {
+        // This used to write a REMARK and only the largest component, losing
+        // the rest in silence. Neither reference implementation does that --
+        // OpenBabel writes every atom and Meeko refuses the molecule outright
+        // -- and a converter discarding its input is the one thing it must not
+        // do (#259).
         let mut mol = parse_smiles("CCO.C").expect("valid SMILES");
         mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
             .expect("one per atom");
         let written = write_pdbqt(&mol);
-        assert!(written.starts_with("REMARK"), "{written}");
-        assert!(written.contains("2 connected components"), "{written}");
+
+        let atoms = written.lines().filter(|l| l.starts_with("ATOM")).count();
+        assert_eq!(atoms, mol.num_atoms(), "{written}");
+        assert!(
+            !written.contains("REMARK"),
+            "nothing to apologise for: {written}"
+        );
+    }
+
+    #[test]
+    fn test_a_molecule_with_no_bonds_keeps_every_atom() {
+        // The reported case. A format carrying no bonds -- XYZ, mmCIF, GRO --
+        // hands over N one-atom "components", which is a fact about the reader
+        // rather than the chemistry. Benzene came out as a single carbon.
+        // Built bondless directly: what an XYZ read hands over.
+        let benzene = parse_smiles("c1ccccc1").expect("valid SMILES");
+        let mut mol = Molecule::new();
+        for atom in benzene.atoms() {
+            mol.add_atom(atom.clone());
+        }
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+
+        let written = write_pdbqt(&mol);
+        let atoms = written.lines().filter(|l| l.starts_with("ATOM")).count();
+        assert_eq!(atoms, 6, "{written}");
+        assert!(written.contains("TORSDOF 0"), "{written}");
+    }
+
+    #[test]
+    fn test_torsdof_counts_rotatable_bonds_across_components() {
+        // The forest. `TORSDOF = fragments - 1` held only because the input was
+        // forced connected; across components it is `fragments - components`,
+        // which is just the rotatable-bond count it always meant. An ether plus
+        // a detached water has one rotatable bond, not two.
+        let mut mol = parse_smiles("CCOC.O").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+
+        assert!(written.contains("TORSDOF 1"), "{written}");
+        let atoms = written.lines().filter(|l| l.starts_with("ATOM")).count();
+        assert_eq!(atoms, mol.num_atoms(), "{written}");
+    }
+
+    #[test]
+    fn test_every_branch_names_a_serial_that_exists() {
+        // The invariant the renumbering exists for: `BRANCH i j` refers to
+        // *written* serials, not input atom indices. Placing several components
+        // in one ROOT block is exactly the change that could break it, and
+        // nothing pinned it before.
+        let mut mol = parse_smiles("CCOC.CCOC.O").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+
+        let serials: Vec<usize> = written
+            .lines()
+            .filter(|l| l.starts_with("ATOM"))
+            .filter_map(|l| l.get(6..11)?.trim().parse().ok())
+            .collect();
+        assert_eq!(serials, (1..=mol.num_atoms()).collect::<Vec<_>>());
+
+        for line in written.lines().filter(|l| l.starts_with("BRANCH")) {
+            for field in line.trim_start_matches("BRANCH").split_whitespace() {
+                let serial: usize = field.parse().expect("a serial");
+                assert!(serials.contains(&serial), "dangling {serial} in {line:?}");
+            }
+        }
     }
 
     #[test]

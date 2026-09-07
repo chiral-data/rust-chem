@@ -2153,10 +2153,17 @@ fn test_l_matrix_prints_a_row_per_format_and_names_its_exceptions() {
     assert!(r.stdout.contains("TB3rfo"), "{}", r.stdout);
 
     // Both exception classes are named, not just marked.
+    // The atom-loss section survives with nothing under it: #259 emptied
+    // `PAIR_GAPS`, and the mechanism stays because it is the only way to
+    // express a loss no mask can.
     assert!(
-        r.stdout.contains("the conversion also loses atoms:")
-            && r.stdout.contains("pdbqt      -> pdbqt"),
+        r.stdout.contains("the conversion also loses atoms:"),
         "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("pdbqt      -> pdbqt"),
+        "a pinned atom loss came back: {}",
         r.stdout
     );
     assert!(
@@ -2209,11 +2216,11 @@ fn test_convert_reports_a_loss_both_masks_say_should_not_happen() {
 }
 
 #[test]
-fn test_convert_says_when_a_conversion_loses_atoms() {
-    // The worse half of #276: six atoms in, one out, and the report used to
-    // read `converted 1, skipped 0`. Atom loss is a fact about the pair rather
-    // than an attribute of a molecule, so no `Carries` flag can carry it —
-    // `held` sets TOPOLOGY on the atom count alone (#259).
+fn test_convert_no_longer_loses_atoms_to_pdbqt() {
+    // This asserted the opposite until #259: six atoms in, one out, because
+    // PDBQT's writer kept only the largest connected component and a bondless
+    // source arrives as N one-atom fragments. #276 made the CLI *say* so; #259
+    // stopped it happening, so there is nothing left to say.
     let xyz = run(
         &["convert", "--literal", "c1ccccc1 benzene", "--to", "xyz"],
         None,
@@ -2224,11 +2231,13 @@ fn test_convert_says_when_a_conversion_loses_atoms() {
     let r = run(&["convert", path.to_str().unwrap(), "--to", "pdbqt"], None);
     assert_eq!(r.code, 0, "{:?}", r.stderr);
     assert!(
-        r.stderr.contains("PDBQT also loses atoms"),
-        "{:?}",
+        !r.stderr.contains("also loses atoms"),
+        "nothing is lost any more: {:?}",
         r.stderr
     );
-    assert!(r.stderr.contains("#259"), "{:?}", r.stderr);
+
+    let atoms = r.stdout.lines().filter(|l| l.starts_with("ATOM")).count();
+    assert_eq!(atoms, 6, "{:?}", r.stdout);
 }
 
 #[test]
