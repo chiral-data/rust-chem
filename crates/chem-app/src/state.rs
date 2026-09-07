@@ -1659,9 +1659,10 @@ mod tests {
     #[test]
     fn test_an_operation_on_an_empty_dataset_fails_in_its_own_section() {
         let mut state = AppState::cpu_only();
-        state.loaded_files.active_dataset_mut().molecules.clear();
-        state.loaded_files.active_dataset_mut().smiles.clear();
-        state.loaded_files.active_dataset_mut().names.clear();
+        // Replaced rather than cleared vector by vector: `new()` is the one
+        // constructor, so a parallel vector added later cannot be left behind
+        // here still holding rows.
+        *state.loaded_files.active_dataset_mut() = MoleculeDataset::new();
 
         state.detect_aromaticity_for_dataset();
 
@@ -1813,6 +1814,33 @@ mod tests {
     }
 
     #[test]
+    fn test_a_loaded_mol2_shows_the_molecule_where_it_used_to_show_its_format() {
+        // Through the whole load path rather than `from_outcome`, because that
+        // is where a user meets it (#283). Mol2 and CML are the two formats
+        // the issue was filed about.
+        let mut state = AppState::cpu_only();
+        let mol2 = DatasetFormat::MOL2
+            .write(&[(
+                "benzene".to_string(),
+                parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("Mol2 writes");
+        state.apply_loaded_file_bytes("rings.mol2".to_string(), mol2.into_bytes());
+
+        let dataset = state.loaded_files.active_dataset();
+        assert_eq!(dataset.smiles[0], "c1ccccc1");
+        assert!(
+            dataset.generated[0],
+            "the app wrote this string and the views say so"
+        );
+
+        cml_benzene(&mut state);
+        let dataset = state.loaded_files.active_dataset();
+        assert_eq!(dataset.smiles[0], "c1ccccc1");
+        assert!(dataset.generated[0]);
+    }
+
+    #[test]
     fn test_a_structure_file_loads_and_is_labelled_by_its_own_format() {
         // The `(SDF)` placeholder was applied to every molecule that arrived
         // without a SMILES string, so a PDB's rows claimed to be SDF records
@@ -1828,7 +1856,15 @@ END
 
         let dataset = state.loaded_files.active_dataset();
         assert_eq!(dataset.len(), 1);
+        // Still the placeholder after #283, and deliberately: the fixture has
+        // a bond, but PDB's `CONECT` is adjacency with no bond order, so a
+        // SMILES written from it would be the right topology and the wrong
+        // molecule. Asserting the bond keeps this from passing for the wrong
+        // reason -- under the `num_bonds() > 0` predicate #283 proposed, this
+        // row would read `[O][H]`.
+        assert!(dataset.molecules[0].num_bonds() > 0);
         assert_eq!(dataset.smiles[0], "(PDB)");
+        assert!(!dataset.generated[0]);
         assert!(
             !dataset.smiles[0].contains("SDF"),
             "a PDB must not describe itself as an SDF"

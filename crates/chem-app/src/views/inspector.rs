@@ -95,6 +95,7 @@ impl InspectorView {
             };
             let smiles = &active_dataset.smiles[idx];
             let name = &active_dataset.names[idx];
+            let generated = active_dataset.generated[idx];
 
             let is_selected = self.selected_result == Some(rank);
 
@@ -113,7 +114,7 @@ impl InspectorView {
                     ui.separator();
 
                     ui.vertical(|ui| {
-                        molecule_compact(ui, smiles, name, &mol.formula());
+                        molecule_compact(ui, smiles, generated, name, &mol.formula());
                         ui.label(format!(
                             "Similarity: {:.3} ({:.1}%)",
                             result.similarity,
@@ -219,7 +220,9 @@ fn query_section(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         structure_panel_with_options(ui, &mol, 200.0, state.display.structure);
-        show_molecule_info(ui, &mol, &state.query_source, "Query");
+        // Never generated: the query is the text the user typed, parsed back
+        // for display.
+        show_molecule_info(ui, &mol, &state.query_source, false, "Query");
 
         if let Some(fp) = &state.query_fingerprint {
             fingerprint_full(ui, fp);

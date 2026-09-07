@@ -77,24 +77,30 @@ iterating, not fine as evidence.
 - **Press Search with nothing set up.** It should name the missing prerequisite,
   not just grey out.
 - **Convert, and check the loss list against the command line (#275).** Load a
-  CML file, open Convert, pick **SMILES**. The list must name `aromaticity`, in
-  amber at normal size — it was small and grey once, which is how you hide the
-  most important thing on a panel. Then run the same conversion in a terminal:
+  CML file, open Convert, pick **XYZ**. The list must name `bonds` and
+  `aromaticity`, in amber at normal size — it was small and grey once, which is
+  how you hide the most important thing on a panel. Then run the same
+  conversion in a terminal:
 
   ```sh
-  chem convert molecules.cml --to smi
+  chem convert molecules.cml --to xyz -o /tmp/m.xyz
   ```
 
-  It reports `converted 3, skipped 0` and says nothing — and the output really
-  is `C1CCCCC1 benzene`, cyclohexane — and since #276 the CLI names it too,
-  from the same `format::kept` the app calls. **The two must agree; if they ever
-  diverge again, one of them has stopped using the shared formula**, which is
-  exactly how they came to disagree in the first place.
+  It reports `XYZ cannot carry: bonds (3), aromaticity (1)` — the same
+  attributes and the same per-molecule counts, from the same `format::kept` the
+  app calls (#276). **The two must agree; if they ever diverge again, one of
+  them has stopped using the shared formula**, which is exactly how they came to
+  disagree in the first place.
+
+  Pick **SMILES** instead and the panel must say the conversion keeps
+  everything. It used to name `aromaticity` here, and the output really was
+  `C1CCCCC1 benzene` — cyclohexane from a benzene file. That was #261, fixed in
+  #282; a loss reported here now would be a regression.
 - **Press ⟳ Convert and look at the result.** A new dataset appears in the Files
-  list named `<source> → SMILES`, active, with `C1CCCCC1` in the SMILES column
-  and a plain hexagon where the original drew a dashed aromatic ring. Click back
-  to the original: the two side by side are the whole feature. The predicted
-  loss has become something you can see.
+  list named `<source> → XYZ`, active, with `(XYZ)` in the SMILES column and
+  six unbonded atoms where the original drew a ring. Click back to the
+  original: the two side by side are the whole feature. The predicted loss has
+  become something you can see.
 - **Convert twice to the same format.** The second replaces the first rather
   than adding a third entry.
 - **Convert to a format you already have loaded under that name.** The loaded
@@ -169,10 +175,26 @@ done
   count must match what `chem info` reports for the same file. A file that
   half-loads looks exactly like one that fully loaded, which is why the status
   line reports skipped records.
-- **The SMILES column.** A format that carries no SMILES string shows its own name
-  in parentheses — `(PDB)`, `(mmCIF)`, `(Mol2)`. It must never say `(SDF)` for
-  anything but an SDF; that placeholder was applied to every structure format
-  before #266.
+- **The SMILES column**, three answers rather than two (#283):
+
+  | shows | formats | because |
+  |---|---|---|
+  | what the file stated | SMILES, CXSMILES | the file *is* a SMILES string |
+  | a SMILES the app wrote | SDF, Mol2, CML, commonchem | the format states a bond model |
+  | `({format})` | XYZ, PDB, mmCIF, PDBQT, GRO | it does not |
+
+  Predict it from the command line rather than from the source: `chem convert -L
+  mol2` prints the format's `carries:` line, and a format listing **both**
+  `bonds` and `aromaticity` is one that generates. PDB lists `bonds` without
+  `aromaticity` — `CONECT` is adjacency with no bond order — and PDBQT the
+  reverse, so both keep the placeholder even though a PDB may hold bonds.
+
+  A generated cell must say so on hover; a stated one must not. And it must
+  never say `(SDF)` for anything but an SDF — that placeholder was applied to
+  every structure format before #266.
+- **A molecule too big to write** keeps the placeholder: canonical ranking is
+  quadratic, so above 500 atoms the column stays `(Mol2)` rather than freezing
+  the load. A docking receptor is the file to try it with.
 
 **What each format brings, measured.** This decides what the Structure column can
 show before anything is computed:
@@ -189,9 +211,9 @@ show before anything is computed:
   picture of the real geometry. For a file with no bonds (XYZ, mmCIF, GRO) the
   atoms come out evenly spaced on a line, which is honest rather than wrong; a
   scribble or a pile at the origin would be a finding.
-- **PDB and PDBQT merge multi-record files** (#267). Three molecules written to
-  one PDB read back as a single molecule with three disconnected fragments —
-  every atom present, the record boundaries gone. Expect this until #267 lands.
+- **PDB and PDBQT frame their records** since #267 (in #280). Three molecules
+  written to one PDB read back as three rows, not one molecule with three
+  disconnected fragments. Anything else is a regression in the `MODEL` framing.
 - **Detail windows, Formula and MW** work for every format; they read the
   molecule, not the file it came from.
 - **Open something that is not a molecule at all.** A binary file is refused with

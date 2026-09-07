@@ -8,6 +8,7 @@
 //! dataset of ten thousand molecules scrolls rather than being silently cut to
 //! the first twenty.
 
+use crate::molecule_view::GENERATED_NOTE;
 use crate::state::AppState;
 use crate::structure_view::StructureView;
 use chem::draw::structure::{ShowCarbons, StructureOptions};
@@ -201,7 +202,16 @@ impl DatasetsView {
                         }
                     });
                     row.col(|ui| {
-                        ui.label(RichText::new(&dataset.smiles[i]).code().small());
+                        let cell = ui.label(RichText::new(&dataset.smiles[i]).code().small());
+                        // The column is 180px and a label clips rather than
+                        // wraps, so hovering is also how a long string is read
+                        // in full -- but the reason it is here is that this
+                        // string may be one the app wrote rather than one the
+                        // file stated, and the two are otherwise identical
+                        // (#283).
+                        if dataset.generated[i] {
+                            cell.on_hover_text(GENERATED_NOTE);
+                        }
                     });
                     row.col(|ui| {
                         ui.label(mol.formula());
