@@ -168,6 +168,7 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
     let mut sites = Vec::new();
     let mut coords = Vec::new();
     let mut keys = Vec::new();
+    let mut saw_atom_site_loop = false;
 
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -203,6 +204,7 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
             }
 
             if tags.first().is_some_and(|t| t.starts_with("_atom_site.")) {
+                saw_atom_site_loop = true;
                 read_atom_site_loop(&tags, &rows, &mut mol, &mut sites, &mut coords, &mut keys)?;
             }
             // Every other loop (e.g. `_struct_conn`) is out of scope --
@@ -250,6 +252,10 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
     }
     if let Some(symbol) = singles.get("_symmetry.space_group_name_H-M") {
         mol.set_space_group(SpaceGroup::from_symbol(symbol.as_str()));
+    }
+
+    if mol.num_atoms() == 0 && !saw_atom_site_loop {
+        return Err(MmcifError::NoAtoms);
     }
 
     Ok(mol)
@@ -620,5 +626,30 @@ ATOM 2 O O UNK A 1 A 0.000 0.000 0.000\n";
             !mol.has_coords3(),
             "all-zero is a placeholder, not a conformer"
         );
+    }
+
+    #[test]
+    fn test_garbage_text_reports_no_atoms_instead_of_an_empty_molecule() {
+        for input in [
+            "",
+            "data_x\n_cell.length_a 10.000\n",
+            "not an mmcif file at all\n",
+        ] {
+            assert!(
+                matches!(parse_mmcif(input), Err(MmcifError::NoAtoms)),
+                "{input:?} should report NoAtoms"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_atom_site_loop_with_zero_rows_is_a_legitimately_empty_structure() {
+        // Distinct from the garbage case above: this loop header genuinely
+        // says "here are atom sites" (#268) -- it just lists none, which is
+        // legal mmCIF for a deposited empty structure and must not error.
+        let text = "data_x\nloop_\n_atom_site.type_symbol\n_atom_site.Cartn_x\n\
+                    _atom_site.Cartn_y\n_atom_site.Cartn_z\n";
+        let mol = parse_mmcif(text).expect("a present-but-empty atom_site loop is legal mmCIF");
+        assert_eq!(mol.num_atoms(), 0);
     }
 }

@@ -578,20 +578,18 @@ mod tests {
     }
 
     #[test]
-    fn test_a_record_with_no_atoms_shows_its_format_rather_than_an_empty_cell() {
-        // Mol2 states a bond model and so generates, but four readers accept
-        // arbitrary text as one atomless molecule (#268) and the canonical
-        // writer returns an empty string for it. An empty cell reads as a
-        // rendering fault, so the placeholder stands -- which is also what
-        // this row showed before #283. When #268 lands and this record becomes
-        // a skip, that is why this test existed.
+    fn test_a_record_with_no_atoms_is_skipped_rather_than_shown_as_an_empty_row() {
+        // Before #268, the four lenient structure readers accepted arbitrary
+        // text as one atomless molecule, and the canonical writer's empty
+        // string for it fell back to a `(Mol2)`-style placeholder cell --
+        // indistinguishable from a real, if unusual, zero-atom read. Now the
+        // reader reports it as skipped instead, so `from_outcome` never sees
+        // a record to build a row from at all.
         let outcome = reader::read("not a molecule\n", DatasetFormat::MOL2);
-        let dataset = MoleculeDataset::from_outcome(&outcome, DatasetFormat::MOL2);
+        assert_eq!(outcome.skipped.len(), 1);
 
-        assert_eq!(dataset.len(), 1);
-        assert_eq!(dataset.molecules[0].num_atoms(), 0);
-        assert_eq!(dataset.smiles[0], "(Mol2)");
-        assert!(!dataset.generated[0]);
+        let dataset = MoleculeDataset::from_outcome(&outcome, DatasetFormat::MOL2);
+        assert_eq!(dataset.len(), 0);
     }
 
     #[test]

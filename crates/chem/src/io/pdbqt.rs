@@ -706,6 +706,10 @@ pub fn parse_pdbqt(text: &str) -> Result<Molecule, PdbqtError> {
             .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
     }
 
+    if mol.num_atoms() == 0 {
+        return Err(PdbqtError::NoAtoms);
+    }
+
     Ok(mol)
 }
 
@@ -1000,5 +1004,19 @@ TORSDOF 0
         );
         // The charge column beside it is real and must survive.
         assert_eq!(mol.site(0).and_then(|s| s.partial_charge), Some(0.0));
+    }
+
+    #[test]
+    fn test_garbage_text_reports_no_atoms_instead_of_an_empty_molecule() {
+        for input in [
+            "",
+            "REMARK  nothing here\nTORSDOF 0\n",
+            "not a pdbqt file at all\n",
+        ] {
+            assert!(
+                matches!(parse_pdbqt(input), Err(PdbqtError::NoAtoms)),
+                "{input:?} should report NoAtoms"
+            );
+        }
     }
 }
