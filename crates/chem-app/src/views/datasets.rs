@@ -176,18 +176,16 @@ impl DatasetsView {
 
                     if thumbnails {
                         row.col(|ui| {
-                            // Drawn only where coordinates already exist —
-                            // generating them needs the dataset mutably, which
-                            // the table cannot have while reading it. Run 2D
-                            // Coordinates in Operations to fill them in; SDF
-                            // files arrive with their own.
-                            if mol.has_coords() {
+                            // Laid out on demand and shared with the detail
+                            // windows and the result rows, so all three draw
+                            // the same picture. This used to be a dash and an
+                            // instruction to run 2D Coordinates, while the
+                            // detail window drew the same molecule fine (#273).
+                            if let Some(drawable) = state.drawable(i) {
                                 ui.add(
-                                    StructureView::new(mol, Vec2::new(52.0, 44.0))
+                                    StructureView::new(&drawable, Vec2::new(52.0, 44.0))
                                         .with_options(thumbnail_options),
                                 );
-                            } else {
-                                ui.label(RichText::new("\u{2014}").weak());
                             }
                         });
                     }

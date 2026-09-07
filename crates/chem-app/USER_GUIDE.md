@@ -62,7 +62,7 @@ In the **Datasets** window, or from the **File** menu:
 - **📂 Load File** — pick any format the library reads, from disk. As of v0.8.0 that is eleven: SMILES (`.smi`/`.smiles`/`.txt`), SDF (`.sdf`), CXSMILES (`.cxsmiles`), XYZ (`.xyz`), PDB (`.pdb`/`.ent`), mmCIF (`.cif`/`.mmcif`), Mol2 (`.mol2`), PDBQT (`.pdbqt`), GRO (`.gro`), CML (`.cml`) and commonchem JSON (`.json`). The dialog's list is generated from the format registry, so it stays in step with what the library supports.
   - The file's extension decides how it is read; an unrecognised one is treated as SMILES.
   - Formats that carry structures rather than SMILES strings — PDB, mmCIF, Mol2 and the rest — show their own name in the SMILES column, e.g. `(PDB)`.
-  - A structure file's 3D coordinates are not a 2D drawing: **2D Coordinates** computes a fresh layout from the connectivity rather than flattening the conformer, so the depiction shows what is bonded to what and not the real geometry.
+  - A structure file's 3D coordinates are not a 2D drawing: the depiction is laid out from the connectivity rather than flattened from the conformer, so it shows what is bonded to what and not the real geometry.
   - SMILES format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
   - Each load adds a new entry to the **Files** list rather than replacing what's already there — click any entry to switch back to it. Each is shown with its format and molecule count, so two SMILES files are told apart without switching between them. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
@@ -74,7 +74,7 @@ Each detail window has an **Export SVG** button, which saves that molecule's str
 
 Several detail windows can be open at once, so two molecules can be compared side by side rather than remembered. Eight is the limit: opening a ninth closes the oldest, since rows can be clicked much faster than windows can be closed. **View → Close all molecule windows** clears them.
 
-**Show structures in table** adds a structure column. A structure is drawn where the molecule has coordinates: SDF files bring their own, and for anything parsed from SMILES, run **2D Coordinates** in Operations to generate them. Rows without coordinates show a dash rather than a blank cell.
+**Show structures in table** adds a structure column. Every molecule is drawn: a file that brought its own layout is shown as the file drew it, and anything else is laid out on demand. That layout is shared with the detail windows and the search results, so one molecule looks the same everywhere it appears.
 
 ### 2. Run an operation
 
@@ -114,7 +114,7 @@ The **Inspector** window has two sections.
 
 **Results** — each hit drawn, with its rank, name, SMILES and similarity score. Seeing the molecule is the point: two structures can score 0.9 for reasons obvious in a drawing and invisible in a SMILES string.
 
-A structure appears where the molecule has coordinates — run **2D Coordinates** in Operations for anything parsed from SMILES, or load an SDF, which brings its own. Rows without them show a dash.
+A structure always appears, laid out on demand where the file carried no coordinates of its own.
 
 Click **▼ Why?** on a result to see how the score was arrived at. One grid holds both fingerprints, each bit coloured by which of them has it set: **blue** for bits in both, **amber** for bits only in this molecule, **violet** for bits only in your query, and background for bits in neither.
 
@@ -134,7 +134,7 @@ Open it with **Settings** in the menu bar, or from the **View** menu. It stays o
 
 - **Theme** — Light, Dark, or follow the system. Structure colours follow it: the same molecule is drawn with a light or dark palette to match.
 - **Structures** — which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure the app draws, which is why they are here rather than beside any one of them.
-- **Show structures in the dataset table** — the thumbnail column. A structure is drawn where the molecule has coordinates; run **2D Coordinates** in Operations for anything parsed from SMILES.
+- **Show structures in the dataset table** — the thumbnail column.
 
 ### Backend chips
 
