@@ -368,6 +368,10 @@ pub fn parse_mol2(text: &str) -> Result<Molecule, Mol2Error> {
         }
     }
 
+    if mol.num_atoms() == 0 {
+        return Err(Mol2Error::NoAtoms);
+    }
+
     // The 2D-vs-3D distinction is exactly the one `parse_sdf` already
     // makes: an all-zero z is a flat drawing, anything else is geometry.
     // Mol2 has no dimensionality header of its own either.
@@ -795,5 +799,15 @@ NO_CHARGES
 ";
         let mol = parse_mol2(text).expect("valid Mol2");
         assert!(mol.has_coords(), "a real layout must survive");
+    }
+
+    #[test]
+    fn test_garbage_text_reports_no_atoms_instead_of_an_empty_molecule() {
+        for input in ["", "not a mol2 file at all\n", "@<TRIPOS>MOLECULE\nempty\n"] {
+            assert!(
+                matches!(parse_mol2(input), Err(Mol2Error::NoAtoms)),
+                "{input:?} should report NoAtoms"
+            );
+        }
     }
 }

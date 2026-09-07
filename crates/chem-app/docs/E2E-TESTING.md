@@ -224,11 +224,10 @@ show before anything is computed:
   molecule, not the file it came from.
 - **Open something that is not a molecule at all.** A binary file is refused with
   "not valid UTF-8" and the current dataset is left alone. A *text* file named
-  `.pdb`/`.cif`/`.mol2`/`.pdbqt` is a known gap (#268): those four readers ignore
-  unrecognised lines by design, so they accept it as one molecule with no atoms
-  and the status line reports a successful load. One empty row is the expected
-  wrong answer until that lands; anything named `.smi`, `.sdf`, `.xyz`, `.gro`,
-  `.cml` or `.json` is correctly rejected.
+  `.pdb`/`.cif`/`.mol2`/`.pdbqt`, `.smi`, `.sdf`, `.xyz`, `.gro`, `.cml` or
+  `.json` is correctly rejected — the four structure formats used to accept it
+  as one molecule with no atoms instead (#268); the status line now reports it
+  skipped, the same as the other seven always did.
 
 ### SVG export (#109)
 

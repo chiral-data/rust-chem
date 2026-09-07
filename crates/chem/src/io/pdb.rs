@@ -328,6 +328,10 @@ pub fn parse_pdb(text: &str) -> Result<Molecule, PdbError> {
     // unknown.
     // mol.calculate_implicit_hydrogens();
 
+    if mol.num_atoms() == 0 {
+        return Err(PdbError::NoAtoms);
+    }
+
     Ok(mol)
 }
 
@@ -745,5 +749,19 @@ END
         );
         // The site data beside it is real and must survive.
         assert_eq!(mol.site(0).unwrap().occupancy, Some(1.0));
+    }
+
+    #[test]
+    fn test_garbage_text_reports_no_atoms_instead_of_an_empty_molecule() {
+        for input in [
+            "",
+            "HEADER  SOME PROTEIN\nTITLE   NOTHING HERE\n",
+            "not a pdb file at all\n",
+        ] {
+            assert!(
+                matches!(parse_pdb(input), Err(PdbError::NoAtoms)),
+                "{input:?} should report NoAtoms"
+            );
+        }
     }
 }

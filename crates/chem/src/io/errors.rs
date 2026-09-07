@@ -109,6 +109,15 @@ pub enum PdbError {
 
     #[error("Invalid element symbol: {0}")]
     InvalidElement(String),
+
+    /// No `ATOM`/`HETATM` record was ever recognized, so zero atoms were
+    /// read.
+    ///
+    /// Every other record (`HEADER`, `TITLE`, `SEQRES`, arbitrary garbage...)
+    /// falls into the parser's catch-all arm and is silently ignored, so any
+    /// text at all used to "parse" into an empty, valid molecule (#268).
+    #[error("No atoms in PDB")]
+    NoAtoms,
 }
 
 #[derive(Error, Debug)]
@@ -122,6 +131,16 @@ pub enum MmcifError {
 
     #[error("Invalid element symbol: {0}")]
     InvalidElement(String),
+
+    /// No `_atom_site.*` `loop_` was ever seen at all, so zero atoms were
+    /// read.
+    ///
+    /// A `loop_` genuinely tagged `_atom_site.*` with zero data rows is legal
+    /// mmCIF (an intentionally empty structure) and is not this — only the
+    /// absence of any `_atom_site.*` loop makes this unreadable garbage
+    /// rather than a real, empty structure (#268).
+    #[error("No atoms in mmCIF")]
+    NoAtoms,
 }
 
 #[derive(Error, Debug)]
@@ -138,6 +157,13 @@ pub enum Mol2Error {
 
     #[error("Unsupported SYBYL atom type: {0}")]
     UnsupportedAtomType(String),
+
+    /// No `@<TRIPOS>ATOM` section was ever seen, so zero atoms were read.
+    ///
+    /// Any text without recognized `@<TRIPOS>` section headers used to
+    /// "parse" into an empty, valid molecule instead of being rejected (#268).
+    #[error("No atoms in Mol2")]
+    NoAtoms,
 }
 
 #[derive(Error, Debug)]
@@ -154,6 +180,16 @@ pub enum PdbqtError {
 
     #[error("Invalid torsion tree line: {0}")]
     InvalidTorsionTree(String),
+
+    /// No `ATOM`/`HETATM` record was ever recognized, so zero atoms were
+    /// read.
+    ///
+    /// Every other record (`ROOT`, `ENDROOT`, `TORSDOF`, arbitrary
+    /// garbage...) falls into the parser's catch-all arm and is silently
+    /// ignored, so any text at all used to "parse" into an empty, valid
+    /// molecule (#268).
+    #[error("No atoms in PDBQT")]
+    NoAtoms,
 }
 
 #[derive(Error, Debug)]

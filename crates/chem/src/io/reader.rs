@@ -871,4 +871,36 @@ $$$$
         assert_eq!(out.skipped.len(), 1);
         assert_eq!(out.skipped[0].position, 1);
     }
+
+    #[test]
+    fn test_garbage_pdb_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not a pdb file at all\n", Format::PDB);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_mmcif_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not an mmcif file at all\n", Format::MMCIF);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_mol2_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not a mol2 file at all\n", Format::MOL2);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_pdbqt_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not a pdbqt file at all\n", Format::PDBQT);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
 }
