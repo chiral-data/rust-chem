@@ -21,11 +21,13 @@ use chem::io::aromaticity::detect_aromaticity;
 use chem::io::format;
 use chem::io::smiles::parse_smiles;
 use chem::search::{FingerprintSearch, SearchResult};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 #[cfg(target_arch = "wasm32")]
 use chem::gpu::{GpuMorganFingerprint, GpuTanimoto};
 #[cfg(target_arch = "wasm32")]
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
@@ -212,18 +214,36 @@ pub struct AppState {
     /// close the *oldest* window rather than an arbitrary one.
     open_details: Vec<usize>,
 
-    /// Bumped whenever the active dataset is replaced or swapped.
+    /// Bumped whenever new search results land.
     ///
-    /// Row indices, fingerprints and results all belong to whichever dataset
-    /// was active when they were made. Rather than every dataset-changing path
-    /// reaching into every view to clear what it holds — which is what the old
-    /// single struct did, in a six-line block duplicated three times — the
-    /// paths bump this, and a view holding indices notices its own state is
-    /// stale. That also means a view which isn't being drawn this frame still
-    /// finds out.
-    dataset_epoch: u64,
-    /// Bumped whenever new search results land, for the same reason.
+    /// Results, and the indices into them, belong to whichever search produced
+    /// them. Rather than every path reaching into every view to clear what it
+    /// holds — which is what the old single struct did, in a six-line block
+    /// duplicated three times — the paths bump this, and a view holding an
+    /// index notices its own state is stale. That also means a view which isn't
+    /// being drawn this frame still finds out.
+    ///
+    /// There was a `dataset_epoch` beside this until #273, for views holding
+    /// row indices. Its only reader was the detail window's own layout cache,
+    /// and that cache is now [`AppState::layouts`] — shared, and cleared
+    /// directly by the paths that invalidate it.
     results_epoch: u64,
+
+    /// Laid-out copies of the active dataset's molecules, keyed by row.
+    ///
+    /// A view cannot lay a molecule out itself: generating coordinates needs
+    /// the dataset mutably and a table is reading it. So the table and the
+    /// result rows used to show a dash for a molecule the detail window drew
+    /// perfectly well, and each ran its own cache -- which meant running
+    /// 2D Coordinates could leave two views showing two different, both valid,
+    /// layouts of one molecule (#273).
+    ///
+    /// Beside the dataset rather than in it, so `has_coords()` keeps meaning
+    /// "the file carried a layout" (#270) and this answers the separate
+    /// question of what it looks like. `RefCell` because callers hold `&self`
+    /// through a row closure; every borrow is taken and dropped inside one
+    /// method, never held across drawing.
+    layouts: RefCell<HashMap<usize, Molecule>>,
 
     // GPU-capable work, which is async on wasm32. Each is started in one place
     // and collected in `update()`; see `task::Task`.
@@ -346,8 +366,8 @@ impl AppState {
             search: OperationOutcome::default(),
             display: DisplaySettings::default(),
             open_details: Vec::new(),
-            dataset_epoch: 0,
             results_epoch: 0,
+            layouts: RefCell::new(HashMap::new()),
             dataset_fingerprint_task: Task::new(),
             query_fingerprint_task: Task::new(),
             search_task: Task::new(),
@@ -392,9 +412,48 @@ impl AppState {
         self.open_details.clear();
     }
 
-    /// Version of the active dataset. See [`AppState::dataset_epoch`] field docs.
-    pub fn dataset_epoch(&self) -> u64 {
-        self.dataset_epoch
+    /// The molecule at `row`, laid out so it can be drawn, or `None` when there
+    /// is no such row.
+    ///
+    /// Laid out once per dataset and kept, so every view that draws this
+    /// molecule draws the same picture -- `layout` is not deterministic across
+    /// runs, so two views computing their own would disagree (#273).
+    ///
+    /// A molecule whose file supplied a layout is returned untouched:
+    /// `ensure_coords` computes one only where there is none.
+    ///
+    /// Owned rather than borrowed, so no `RefCell` guard is held while the
+    /// caller paints. It costs no more than the caller is about to spend --
+    /// `StructureView` rebuilds the depiction every frame regardless.
+    pub fn drawable(&self, row: usize) -> Option<Molecule> {
+        if let Some(cached) = self.layouts.borrow().get(&row) {
+            return Some(cached.clone());
+        }
+
+        let source = self
+            .loaded_files
+            .active_dataset()
+            .molecules
+            .get(row)?
+            .clone();
+        let mut prepared = source;
+        ensure_coords(&mut prepared);
+        self.layouts.borrow_mut().insert(row, prepared.clone());
+        Some(prepared)
+    }
+
+    /// The molecules changed under their cached layouts, so drop them.
+    ///
+    /// For an operation that mutates the active dataset *in place* --
+    /// coordinates, aromaticity -- as distinct from one that replaces it, which
+    /// goes through [`AppState::invalidate_active_dataset`].
+    ///
+    /// Aromaticity is the one observable today: it changes the molecule, so a
+    /// clone cached before perception ran keeps drawing Kekulé bonds. The
+    /// coordinates call is the same rule applied consistently rather than a
+    /// bug being fixed -- see the note there.
+    fn dataset_molecules_changed(&mut self) {
+        self.layouts.get_mut().clear();
     }
 
     /// Version of [`AppState::search_results`].
@@ -418,7 +477,9 @@ impl AppState {
         self.aromaticity = OperationOutcome::default();
         self.coordinates = OperationOutcome::default();
         self.search = OperationOutcome::default();
-        self.dataset_epoch += 1;
+        // Keyed by row index too, and a row means nothing against a different
+        // dataset.
+        self.layouts.get_mut().clear();
         self.results_epoch += 1;
     }
 
@@ -601,8 +662,11 @@ impl AppState {
             .iter()
             .filter(|mol| mol.atoms().iter().any(|atom| atom.is_aromatic()))
             .count();
-        self.aromaticity =
-            OperationOutcome::ok(format!("{} of {} aromatic", aromatic, dataset.len()));
+        let summary = format!("{} of {} aromatic", aromatic, dataset.len());
+        // Perception changes the picture, so anything laid out before it ran is
+        // now drawing the wrong bonds.
+        self.dataset_molecules_changed();
+        self.aromaticity = OperationOutcome::ok(summary);
     }
 
     /// Generates 2D coordinates across the dataset.
@@ -628,6 +692,12 @@ impl AppState {
                 generated += 1;
             }
         }
+        // The dataset now holds layouts of its own. Not observable today --
+        // `layout` is deterministic, so the cached layout and the one this just
+        // computed are identical -- but the rule is that an operation mutating
+        // the dataset in place drops the cache, and #110's layout refinement
+        // would make the difference real.
+        self.dataset_molecules_changed();
         self.coordinates = OperationOutcome::ok(if kept > 0 {
             format!("{} generated, {} kept from file", generated, kept)
         } else {
@@ -935,7 +1005,6 @@ mod tests {
     fn test_loading_a_dataset_drops_what_the_old_one_derived() {
         let mut state = AppState::cpu_only();
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.load_example_dataset();
 
@@ -946,7 +1015,6 @@ mod tests {
         assert!(state.search_results.is_empty());
         assert!(state.open_details().is_empty());
         // Views hold indices too, and find out the same way.
-        assert!(state.dataset_epoch() > epoch);
     }
 
     #[test]
@@ -954,7 +1022,6 @@ mod tests {
         let mut state = AppState::cpu_only();
         state.load_example_dataset(); // a second entry to switch between
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.activate_loaded_file(0);
 
@@ -962,14 +1029,12 @@ mod tests {
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
         assert!(state.open_details().is_empty());
-        assert!(state.dataset_epoch() > epoch);
     }
 
     #[test]
     fn test_a_failed_load_leaves_the_active_dataset_alone() {
         let mut state = AppState::cpu_only();
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
         let files_before = state.loaded_files.names().count();
 
         // Not valid UTF-8, so it never reaches a parser.
@@ -978,7 +1043,6 @@ mod tests {
         assert!(state.dataset_status.contains("Failed to load"));
         // Nothing was replaced, so nothing derived from it is stale.
         assert_eq!(state.loaded_files.names().count(), files_before);
-        assert_eq!(state.dataset_epoch(), epoch);
         assert_eq!(state.open_details(), [0]);
         assert!(!state.dataset_fingerprints.is_empty());
     }
@@ -998,14 +1062,12 @@ mod tests {
         let mut state = AppState::cpu_only();
         add_second_file(&mut state); // now active
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.remove_loaded_file(state.loaded_files.active_index());
 
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
         assert!(state.open_details().is_empty());
-        assert!(state.dataset_epoch() > epoch);
         assert!(state.dataset_status.contains("Removed"));
     }
 
@@ -1015,7 +1077,6 @@ mod tests {
         add_second_file(&mut state);
         // The second entry stays active; the first is removed.
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.remove_loaded_file(0);
 
@@ -1025,19 +1086,16 @@ mod tests {
         assert!(!state.dataset_fingerprints.is_empty());
         assert!(!state.search_results.is_empty());
         assert_eq!(state.open_details(), [0]);
-        assert_eq!(state.dataset_epoch(), epoch);
     }
 
     #[test]
     fn test_removing_the_only_file_does_nothing() {
         let mut state = AppState::cpu_only();
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.remove_loaded_file(0);
 
         assert_eq!(state.loaded_files.entries().len(), 1);
-        assert_eq!(state.dataset_epoch(), epoch);
         assert!(!state.dataset_fingerprints.is_empty());
     }
 
@@ -1057,6 +1115,106 @@ mod tests {
         assert!(!state.coordinates.has_run());
         assert!(!state.fingerprints.has_run());
         assert!(!state.search.has_run());
+    }
+
+    /// The rounded positions of a drawable molecule, for comparing one layout
+    /// against another. `layout` is not deterministic across runs, so equality
+    /// here means "the same cached layout", not merely "both laid out".
+    fn positions(state: &AppState, row: usize) -> Vec<String> {
+        state
+            .drawable(row)
+            .expect("a row")
+            .coords()
+            .expect("laid out")
+            .iter()
+            .map(|p| format!("{:.4},{:.4}", p.x, p.y))
+            .collect()
+    }
+
+    #[test]
+    fn test_a_molecule_with_no_layout_is_still_drawable() {
+        // The bug: the table and the result rows showed a dash for a molecule
+        // the detail window drew perfectly well (#273). The example dataset is
+        // SMILES, so nothing in it carries a layout.
+        let state = AppState::cpu_only();
+        assert!(
+            !state.loaded_files.active_dataset().molecules[0].has_coords(),
+            "the fixture must start without a layout, or this tests nothing"
+        );
+
+        let drawable = state.drawable(0).expect("row 0 exists");
+        assert!(drawable.has_coords());
+
+        // Beside the dataset, not in it: `has_coords()` keeps meaning "the file
+        // carried a layout" (#270), so 2D Coordinates still has work to report.
+        assert!(!state.loaded_files.active_dataset().molecules[0].has_coords());
+    }
+
+    #[test]
+    fn test_the_layout_distinguishes_the_atoms() {
+        // Presence is not enough -- #270 shipped a layout that satisfied
+        // `has_coords()` with every atom stacked on one point, undrawable.
+        let state = AppState::cpu_only();
+        let drawn = positions(&state, 0);
+        let mut distinct = drawn.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), drawn.len(), "atoms share a position");
+    }
+
+    #[test]
+    fn test_every_view_asking_for_a_row_gets_the_same_layout() {
+        // The subject of #273. Two views laying out independently would each
+        // get a valid but different picture of one molecule.
+        let state = AppState::cpu_only();
+        assert_eq!(positions(&state, 0), positions(&state, 0));
+    }
+
+    #[test]
+    fn test_a_new_dataset_drops_the_cached_layouts() {
+        // A row index means nothing against a different dataset. Without the
+        // clear, row 0 would keep answering with the previous dataset's
+        // molecule.
+        let mut state = AppState::cpu_only();
+        let _ = state.drawable(0);
+
+        state.apply_loaded_file_bytes(
+            "one.smi".to_string(),
+            b"c1ccccc1 benzene
+"
+            .to_vec(),
+        );
+
+        let drawable = state.drawable(0).expect("row 0 of the new dataset");
+        assert_eq!(
+            drawable.num_atoms(),
+            state.loaded_files.active_dataset().molecules[0].num_atoms(),
+            "a stale layout from the previous dataset"
+        );
+    }
+
+    #[test]
+    fn test_detecting_aromaticity_drops_the_cached_layouts() {
+        // Perception changes the picture, so a layout cached before it ran
+        // draws the wrong bonds. Nothing else pins this, which is exactly why
+        // it is the invalidation that would be forgotten.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes(
+            "ring.smi".to_string(),
+            b"C1=CC=CC=C1 benzene
+"
+            .to_vec(),
+        );
+        let drawn = state.drawable(0).expect("a row");
+        assert!(!drawn.atoms().iter().any(|a| a.is_aromatic()));
+
+        state.detect_aromaticity_for_dataset();
+
+        let redrawn = state.drawable(0).expect("a row");
+        assert!(
+            redrawn.atoms().iter().any(|a| a.is_aromatic()),
+            "the cache is still handing out the pre-perception molecule"
+        );
     }
 
     #[test]

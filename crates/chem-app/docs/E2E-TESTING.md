@@ -107,10 +107,15 @@ iterating, not fine as evidence.
   file may still be a box in the app.
 - **Drag a column edge.** Columns are resizable now; SMILES is the one worth
   widening.
-- **Turn on "Show structures in table" with a SMILES dataset.** Cells show a dash,
-  not a structure — coordinates don't exist yet. Run **2D Coordinates** in
-  Operations and they appear. With an SDF file they should be there immediately,
-  since the file supplies them.
+- **Turn on "Show structures in table" with a SMILES dataset.** Every cell draws
+  a structure, laid out on demand — no dash, and nothing to run first (#273).
+  Click a Name: the detail window must show **the same picture** as the row, and
+  a search result row must show it too. Those three agreeing is the whole point;
+  before, the window drew and the other two showed a dash.
+- **Run Detect Aromaticity with a structure on screen**, on something like
+  `C1=CC=CC=C1`. The bonds must change to aromatic. Perception mutates the
+  molecules in place, so a layout cached before it ran would keep drawing Kekulé
+  bonds — the one staleness case with a visible symptom.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
 
@@ -144,8 +149,8 @@ show before anything is computed:
 | arrives with | formats | Structure column |
 |---|---|---|
 | a 2D layout | SDF, Mol2 | drawn immediately |
-| a 3D conformer only | XYZ, mmCIF, GRO, PDB, PDBQT | dash until **2D Coordinates** runs |
-| no coordinates | SMILES, CXSMILES, CML, commonchem | dash until **2D Coordinates** runs |
+| a 3D conformer only | XYZ, mmCIF, GRO, PDB, PDBQT | laid out from connectivity, on demand |
+| no coordinates | SMILES, CXSMILES, CML, commonchem | laid out from connectivity, on demand |
 
 - **Run 2D Coordinates on a 3D format.** It computes a *fresh graph layout* and
   ignores the conformer entirely — `ensure_coords` only asks whether a 2D layout

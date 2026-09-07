@@ -103,18 +103,12 @@ impl InspectorView {
                     ui.label(RichText::new(format!("#{}", rank + 1)).strong().size(16.0));
                     ui.separator();
 
-                    // Drawn only where coordinates already exist. Generating
-                    // them needs the dataset mutably, which this cannot have
-                    // while reading it — the same constraint the dataset table
-                    // works under. Run 2D Coordinates in Operations, or load an
-                    // SDF, which brings its own.
-                    if mol.has_coords() {
-                        ui.add(StructureView::new(mol, structure_size).with_options(options));
-                    } else {
-                        ui.add_sized(
-                            structure_size,
-                            egui::Label::new(RichText::new("\u{2014}").weak()),
-                        );
+                    // Laid out on demand and shared with the table and the
+                    // detail windows, so all three draw the same picture. This
+                    // used to be a dash for any molecule whose file carried no
+                    // layout, while a detail window drew it fine (#273).
+                    if let Some(drawable) = state.drawable(idx) {
+                        ui.add(StructureView::new(&drawable, structure_size).with_options(options));
                     }
                     ui.separator();
 
