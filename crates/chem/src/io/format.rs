@@ -1699,6 +1699,111 @@ mod tests {
         }
     }
 
+    /// The formats that can carry a *stated zero* on an atom with no bonds.
+    ///
+    /// Measured, not assumed. Each has somewhere to say it and a writer that
+    /// does: SMILES' `[C]`, a molfile's valence field, commonchem's defaulted
+    /// `impHs`. So a count there is read back rather than invented.
+    ///
+    /// CML is deliberately absent even though it reads `hydrogenCount`: our
+    /// writer omits the attribute when the count is zero, so a stated zero does
+    /// not survive the round trip. Invisible in SMILES output today, since a
+    /// bracketed atom with no `H` is how both `None` and `Some(0)` are written
+    /// -- a separate gap from this one.
+    ///
+    /// Every other format must leave a bondless atom at `None`. Implying a
+    /// count there hands it the free-atom valence, because there are no bond
+    /// orders to subtract: `[C]` comes back as methane and `[Na+].[Cl-]` as
+    /// sodium metal and hydrogen chloride, which is what #282 did to Mol2 and
+    /// #291 undid.
+    const KEEPS_A_STATED_ZERO: &[Format] = &[
+        Format::SMILES,
+        Format::CXSMILES,
+        Format::SDF,
+        Format::COMMONCHEM,
+    ];
+
+    #[test]
+    fn test_a_count_is_implied_only_where_the_bonds_are_the_whole_story() {
+        // Two opposite failures, one rule, and the matrix is blind to both:
+        // `held` never reads hydrogens and there is no `Carries` bit for them,
+        // so each was green for a whole milestone.
+        //
+        // Under-filling: PDB stated no count, so every atom kept `None`, the
+        // SMILES writer compared 0 against the implied count and bracketed the
+        // lot -- ethanol from a PDB read back as `[C][C][O]` (#285).
+        //
+        // Over-filling: #282 filled every Mol2 atom, and a bondless one has no
+        // bond orders to sum, so it took its free-atom valence -- `[C]` came
+        // back as methane (#291).
+        //
+        // Not asserted here, and deliberately: PDBQT and mmCIF are absent from
+        // both halves because neither reads back a bonded atom at all today.
+        // If either gains one it will land in the first assertion, which is the
+        // point -- but note their bond information is partial by construction
+        // (PDBQT states only rotatable pivots, `_struct_conn` only specific
+        // links), so implying a count from it would invent hydrogens rather
+        // than recover them. The fix for whoever gets there is a stated count,
+        // not this rule.
+        let bonded = crate::io::reader::read("CCO ethanol\n", Format::SMILES);
+        let bonded: Vec<(String, Molecule)> = bonded
+            .records
+            .iter()
+            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .collect();
+        // Two atoms, no bond between them, each stating it has no hydrogens.
+        let lone = crate::io::reader::read("[C].[Cl] lone\n", Format::SMILES);
+        let lone: Vec<(String, Molecule)> = lone
+            .records
+            .iter()
+            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .collect();
+
+        for format in all().filter(|f| f.can_read() && f.can_write()) {
+            let text = format.write(&bonded).expect("every format writes");
+            let back = crate::io::reader::read(&text, format);
+            let molecule = &back.records[0].molecule;
+
+            let mut bonded_atoms = 0;
+            for index in 0..molecule.num_atoms() {
+                if molecule.neighbors(index).is_empty() {
+                    continue;
+                }
+                bonded_atoms += 1;
+                assert!(
+                    molecule.atom(index).hydrogens().is_some(),
+                    "{}: a bonded atom came back with no hydrogen count, so the \
+                     writer will bracket it",
+                    format.name()
+                );
+            }
+            assert_eq!(
+                bonded_atoms > 0,
+                format.carries().contains(Carries::BONDS),
+                "{}: bonds read back disagree with the mask",
+                format.name()
+            );
+
+            let text = format.write(&lone).expect("every format writes");
+            let back = crate::io::reader::read(&text, format);
+            let molecule = &back.records[0].molecule;
+
+            for index in 0..molecule.num_atoms() {
+                assert!(
+                    molecule.neighbors(index).is_empty(),
+                    "{}: the bondless fixture came back with a bond",
+                    format.name()
+                );
+                assert_eq!(
+                    molecule.atom(index).hydrogens().is_some(),
+                    KEEPS_A_STATED_ZERO.contains(&format),
+                    "{}: a bondless atom's count was invented rather than read",
+                    format.name()
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_every_format_writes_as_many_records_as_it_was_given() {
         // The dimension the matrix was blind to. Every fixture in

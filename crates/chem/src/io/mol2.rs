@@ -455,7 +455,12 @@ pub fn parse_mol2(text: &str) -> Result<Molecule, Mol2Error> {
     //
     // Nothing to overwrite, unlike CML, which reads `hydrogenCount` from the
     // file and must keep it.
-    mol.calculate_implicit_hydrogens();
+    //
+    // Only where the BOND block says an atom is bonded. #282 filled every
+    // atom, which is right for one in the block and wrong for one outside it:
+    // the unguarded form hands a bondless atom its free-atom count, so `[C]`
+    // came back as methane and `[Na+].[Cl-]` as sodium metal and HCl (#291).
+    mol.calculate_implicit_hydrogens_where_bonded();
 
     // The `ar` bond type sets the order but not `Bond::is_aromatic`, and the
     // molecule has to be internally consistent whichever channel a writer
@@ -807,6 +812,50 @@ NO_CHARGES
             assert!(
                 matches!(parse_mol2(input), Err(Mol2Error::NoAtoms)),
                 "{input:?} should report NoAtoms"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_atom_outside_the_bond_block_keeps_an_unknown_count() {
+        // #282 filled every atom, which is right for one the BOND block
+        // describes and wrong for one it does not: with no bond orders to
+        // subtract, `implied_hydrogens` returns the free-atom valence, so a
+        // lone carbon came back as methane and `[Na+].[Cl-]` as sodium metal
+        // and hydrogen chloride (#291).
+        //
+        // Mol2 cannot state a count of its own, so `None` here is the honest
+        // answer -- unlike SDF, whose valence field carries the stated zero
+        // through and which is why the same molecules survive that round trip.
+        for smiles in ["[C]", "[Cl]", "[C].[Cl]"] {
+            let molecule = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            let text = write_mol2(&molecule);
+            let back = parse_mol2(&text).expect("reads back");
+
+            assert_eq!(back.num_bonds(), 0, "{smiles} should have no bonds");
+            for i in 0..back.num_atoms() {
+                assert_eq!(
+                    back.atom(i).hydrogens(),
+                    None,
+                    "{smiles}: atom {i} was given a count it has no bonds to imply"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_bonded_atom_still_gets_its_count() {
+        // The half #282 was for, kept: without a count the SMILES writer
+        // brackets every atom (`[C][C][O]` for ethanol) and `kekulize` writes
+        // benzene out as cyclohexane (#281).
+        for (smiles, expected) in [("CCO", "CCO"), ("c1ccccc1", "c1ccccc1")] {
+            let molecule = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            let text = write_mol2(&molecule);
+            let back = parse_mol2(&text).expect("reads back");
+
+            assert_eq!(
+                crate::io::smiles_writer::write_smiles_for_molecule_canonical(&back),
+                expected
             );
         }
     }

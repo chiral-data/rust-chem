@@ -735,8 +735,14 @@ impl Molecule {
     /// that said nothing may simply have hydrogens nobody wrote down. This is
     /// [`crate::core::atom::Atom::hydrogens`]'s `None` doing the same work it
     /// does in [`Self::calculate_implicit_hydrogens`], and without it every
-    /// atom of every PDB and mmCIF structure -- formats that deliberately
-    /// leave hydrogens unstated -- would be reported as a multi-radical.
+    /// atom of every structure whose format leaves hydrogens unstated would be
+    /// reported as a multi-radical.
+    ///
+    /// Which atoms those are narrowed in #285: PDB now implies a count for the
+    /// atoms `CONECT` describes, and they report zero here because the implied
+    /// and stated counts agree by construction. It is the atoms a structure
+    /// file says nothing about -- everything in an XYZ, mmCIF or GRO, and
+    /// whatever `CONECT` left out -- that this paragraph is still protecting.
     pub fn radical_electrons(&self, atom_idx: usize) -> u8 {
         let atom = &self.atoms[atom_idx];
         if atom.hydrogens().is_none() {
@@ -754,6 +760,40 @@ impl Molecule {
             // while a bare `C` states nothing, and before #244 both arrived
             // here as a plain 0 and left as methane.
             if self.atoms[atom_idx].hydrogens().is_some() {
+                continue;
+            }
+
+            let implied = self.implied_hydrogens(atom_idx);
+            self.atoms[atom_idx].set_hydrogens(implied);
+        }
+    }
+
+    /// Fills the count for atoms whose bonds can imply one, leaving a bondless
+    /// atom alone.
+    ///
+    /// What separates this from [`Self::calculate_implicit_hydrogens`] is what
+    /// a bondless atom *means*. In SMILES a bare `C` is bondless and a
+    /// complete statement -- methane -- so filling its four hydrogens is
+    /// right. In a structure file an atom with no bond means the connectivity
+    /// was never stated, and [`Self::implied_hydrogens`] would hand it the
+    /// free-atom valence: a protein backbone carbon reads as methane, and `[C]`
+    /// through Mol2 came back as `C` (#291).
+    ///
+    /// So a bondless atom keeps `None` and stays visibly unknown. Callers that
+    /// want the SMILES rule want the other function; this one is for the
+    /// readers of formats where connectivity is stated separately from the
+    /// atoms, and where its absence is silence rather than an assertion.
+    ///
+    /// Like its sibling it never overwrites a stated count (#244), so a format
+    /// that names one keeps it, and an explicit hydrogen *atom* -- a real graph
+    /// node, as PDB and Mol2 both allow -- is counted through the bond it
+    /// forms rather than twice.
+    pub fn calculate_implicit_hydrogens_where_bonded(&mut self) {
+        for atom_idx in 0..self.atoms.len() {
+            if self.atoms[atom_idx].hydrogens().is_some() {
+                continue;
+            }
+            if self.graph.neighbors(atom_idx).is_empty() {
                 continue;
             }
 
@@ -1879,5 +1919,62 @@ mod tests {
 
         let cloned = mol.clone();
         assert_eq!(cloned.coord(1), Some(Point2::new(1.5, 0.0)));
+    }
+    #[test]
+    fn test_a_count_is_implied_for_a_bonded_atom_and_withheld_from_a_bondless_one() {
+        // The whole difference from `calculate_implicit_hydrogens`. A bondless
+        // atom has no bond orders to subtract, so `implied_hydrogens` returns
+        // the free-atom valence -- filling it turns a lone carbon into methane
+        // (#291) and a protein backbone into a bag of small alkanes (#285).
+        let mut mol = Molecule::new();
+        let bonded_a = mol.add_atom(Atom::new(Element::carbon()));
+        let bonded_b = mol.add_atom(Atom::new(Element::carbon()));
+        let lone = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(bonded_a, bonded_b, BondOrder::Single))
+            .expect("a valid bond");
+
+        mol.calculate_implicit_hydrogens_where_bonded();
+
+        assert_eq!(mol.atom(bonded_a).hydrogens(), Some(3));
+        assert_eq!(mol.atom(bonded_b).hydrogens(), Some(3));
+        assert_eq!(
+            mol.atom(lone).hydrogens(),
+            None,
+            "a bondless atom's count is unknown, not four"
+        );
+    }
+
+    #[test]
+    fn test_a_stated_count_is_never_overwritten() {
+        // Same contract as the unguarded form (#244): `Some(0)` is an answer.
+        let mut mol = Molecule::new();
+        let a = mol.add_atom(Atom::new(Element::carbon()).with_hydrogens(0));
+        let b = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(a, b, BondOrder::Single))
+            .expect("a valid bond");
+
+        mol.calculate_implicit_hydrogens_where_bonded();
+
+        assert_eq!(mol.atom(a).hydrogens(), Some(0));
+        assert_eq!(mol.atom(b).hydrogens(), Some(3));
+    }
+
+    #[test]
+    fn test_an_element_with_no_typical_valence_gets_a_stated_zero() {
+        // Sodium has no valence this crate will assert, so `implied_hydrogens`
+        // declines to guess and returns 0. Worth pinning because the atom still
+        // moves from "unstated" to "stated none" -- which is the right answer
+        // for a bonded one, and why the bondless guard above matters more than
+        // it looks.
+        let mut mol = Molecule::new();
+        let na = mol.add_atom(Atom::new(Element::new(11).expect("sodium")));
+        let cl = mol.add_atom(Atom::new(Element::new(17).expect("chlorine")));
+        mol.add_bond(Bond::new(na, cl, BondOrder::Single))
+            .expect("a valid bond");
+
+        mol.calculate_implicit_hydrogens_where_bonded();
+
+        assert_eq!(mol.atom(na).hydrogens(), Some(0));
+        assert_eq!(mol.atom(cl).hydrogens(), Some(0));
     }
 }
