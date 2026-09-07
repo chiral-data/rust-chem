@@ -86,8 +86,10 @@ iterating, not fine as evidence.
   ```
 
   It reports `converted 3, skipped 0` and says nothing — and the output really
-  is `C1CCCCC1 benzene`, cyclohexane. The app is right and the CLI is not, until
-  #276 lands. **If the two ever agree here, check which one moved.**
+  is `C1CCCCC1 benzene`, cyclohexane — and since #276 the CLI names it too,
+  from the same `format::kept` the app calls. **The two must agree; if they ever
+  diverge again, one of them has stopped using the shared formula**, which is
+  exactly how they came to disagree in the first place.
 - **Press ⟳ Convert and look at the result.** A new dataset appears in the Files
   list named `<source> → SMILES`, active, with `C1CCCCC1` in the SMILES column
   and a plain hexagon where the original drew a dashed aromatic ring. Click back

@@ -2175,3 +2175,82 @@ fn test_l_still_details_a_single_format() {
     assert!(r.stdout.contains("carries:"), "{}", r.stdout);
     assert!(r.stdout.contains("bonds"), "{}", r.stdout);
 }
+
+#[test]
+fn test_convert_reports_a_loss_both_masks_say_should_not_happen() {
+    // #276. SMILES and CML both claim aromaticity, so a report asking only
+    // "can the target hold this?" says nothing — and the output really is
+    // cyclohexane, because CML's reader sets no aromatic flag (#261).
+    //
+    // The pinned pair is what makes this visible; without it the whole
+    // conversion is silent.
+    let cml = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "cml"],
+        None,
+    );
+    assert_eq!(cml.code, 0, "{:?}", cml.stderr);
+    let path = fixture("pair-loss.cml", &cml.stdout);
+
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("SMILES cannot carry: aromaticity"),
+        "{:?}",
+        r.stderr
+    );
+    // The reason, not just the attribute: it is the half a user can act on.
+    assert!(
+        r.stderr.contains("CML sets no aromatic flag"),
+        "{:?}",
+        r.stderr
+    );
+    // And the conversion really did what the report says.
+    assert!(r.stdout.contains("C1CCCCC1"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_says_when_a_conversion_loses_atoms() {
+    // The worse half of #276: six atoms in, one out, and the report used to
+    // read `converted 1, skipped 0`. Atom loss is a fact about the pair rather
+    // than an attribute of a molecule, so no `Carries` flag can carry it —
+    // `held` sets TOPOLOGY on the atom count alone (#259).
+    let xyz = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "xyz"],
+        None,
+    );
+    assert_eq!(xyz.code, 0, "{:?}", xyz.stderr);
+    let path = fixture("atom-loss.xyz", &xyz.stdout);
+
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("PDBQT also loses atoms"),
+        "{:?}",
+        r.stderr
+    );
+    assert!(r.stderr.contains("#259"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_a_transforming_command_does_not_claim_a_pair_loss() {
+    // #257 measured its pairs through a read and a write with nothing in
+    // between, so `chem aromatic` and `chem coords` keep the target-only
+    // report. Claiming a loss nobody measured for that path would be the same
+    // mistake as the silence #276 fixed, pointing the other way.
+    let cml = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "cml"],
+        None,
+    );
+    let path = fixture("no-pair-claim.cml", &cml.stdout);
+
+    let r = run(
+        &["aromatic", path.to_str().unwrap(), "--out-format", "smiles"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        !r.stderr.contains("CML sets no aromatic flag"),
+        "a transforming command claimed a pair loss: {:?}",
+        r.stderr
+    );
+}

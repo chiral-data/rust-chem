@@ -590,14 +590,14 @@ fn run(cli: &Cli) -> Result<i32> {
             note_cpu_only(cli);
 
             let from_format = resolve_format_code(from.as_deref())?;
-            let (mut supplier, label): (Box<dyn Supplier>, String) =
+            let (mut supplier, label, source_format): (Box<dyn Supplier>, String, Format) =
                 resolve_convert_input(input.as_deref(), literal.as_deref(), from_format)?;
 
             let to_format = resolve_format_code(to.as_deref())?;
             let format = resolve_convert_output_format(to_format, output.as_deref())?;
             let mut writer = resolve_convert_output(format, output.as_deref())?;
 
-            let mut tracker = write::DropTracker::new(format.carries());
+            let mut tracker = write::DropTracker::for_conversion(source_format, format);
             let mut written = 0usize;
             let mut skipped = 0usize;
             for (i, item) in supplier.by_ref().enumerate() {
@@ -615,6 +615,13 @@ fn run(cli: &Cli) -> Result<i32> {
             }
             writer.finish()?;
             tracker.report(format.label(), cli.explain_drops);
+            // Not part of the tracker: losing atoms is a fact about the
+            // conversion rather than an attribute of a molecule, and `Carries`
+            // has no flag for it -- `held` sets TOPOLOGY on the atom count
+            // alone, so one atom of six satisfies every mask (#259).
+            if let Some(reason) = format::pair_gap(source_format, format) {
+                eprintln!("{} also loses atoms: {reason}", format.label());
+            }
             eprintln!("converted {written}, skipped {skipped}");
 
             if written == 0 {
@@ -800,33 +807,40 @@ fn run(cli: &Cli) -> Result<i32> {
 /// standard input has no name to infer a format from, so `--from` or the
 /// SMILES fallback decides it, the same rule `stream::read_input` already
 /// uses for `-`.
+/// Also returns the format the input was read *as*.
+///
+/// It was resolved here all along and thrown away, which is why the drop report
+/// could only ever ask about the target (#276). `open_supplier` picks the
+/// format from the path, so the same rule is applied here rather than guessed
+/// at -- `chem::io::open::format_for_path` strips a trailing `.gz` first.
 fn resolve_convert_input(
     input: Option<&Path>,
     literal: Option<&str>,
     from: Option<Format>,
-) -> Result<(Box<dyn Supplier>, String)> {
+) -> Result<(Box<dyn Supplier>, String, Format)> {
     if let Some(text) = literal {
         let format = from.unwrap_or(Format::SMILES);
         let supplier = format
             .supplier(Cursor::new(text.as_bytes().to_vec()), &ReadOptions)
             .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
-        return Ok((supplier, "<literal>".to_string()));
+        return Ok((supplier, "<literal>".to_string(), format));
     }
 
     match input.filter(|p| p.as_os_str() != "-") {
         Some(path) => {
+            let format = from.unwrap_or_else(|| chem::io::open::format_for_path(path));
             let supplier = match from {
                 Some(format) => open_supplier_as(path, format, &ReadOptions)?,
                 None => chem::io::open::open_supplier(path, &ReadOptions)?,
             };
-            Ok((supplier, path.display().to_string()))
+            Ok((supplier, path.display().to_string(), format))
         }
         None => {
             let format = from.unwrap_or(Format::SMILES);
             let supplier = format
                 .supplier(std::io::stdin().lock(), &ReadOptions)
                 .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
-            Ok((supplier, "-".to_string()))
+            Ok((supplier, "-".to_string(), format))
         }
     }
 }

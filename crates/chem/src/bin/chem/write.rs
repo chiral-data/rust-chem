@@ -76,7 +76,14 @@ pub fn resolve_output_format(
 /// goes without materializing the whole file just to report what it drops.
 /// [`report_drops`] is the non-streaming convenience over the same thing.
 pub struct DropTracker {
-    target: Carries,
+    /// What survives. `target.carries()` for a command that transforms the
+    /// molecules on the way through, and `format::kept(source, target)` for a
+    /// straight conversion, which is narrower.
+    kept: Carries,
+    /// Why the pair loses what the masks say it should keep, where the registry
+    /// knows. Printed under the summary: the attribute's name says what went,
+    /// this says why, and it is the half a user can act on.
+    reason: Option<&'static str>,
     // Accumulated in a Vec in first-seen order rather than a map, so the
     // report reads the same way every run and two invocations can be diffed.
     losses: Vec<(&'static str, usize)>,
@@ -84,16 +91,38 @@ pub struct DropTracker {
 }
 
 impl DropTracker {
-    pub fn new(target: Carries) -> Self {
+    /// For a command that writes molecules it has changed -- `chem aromatic`,
+    /// `chem coords`.
+    ///
+    /// Target-only, deliberately. #257 measured its pair losses through a read
+    /// and a write with nothing in between, so the table's claim is not
+    /// established for a command that perceives aromaticity or lays out
+    /// coordinates first. Reporting a loss nobody measured would be the same
+    /// mistake as the silence #276 fixed, pointing the other way.
+    pub fn for_target(target: Format) -> Self {
         Self {
-            target,
+            kept: target.carries(),
+            reason: None,
+            losses: Vec::new(),
+            per_molecule: Vec::new(),
+        }
+    }
+
+    /// For a straight conversion, which is what #257's table describes.
+    ///
+    /// Two constructors rather than an `Option<Format>` argument so a caller
+    /// cannot get the pair logic by accident where it has not been measured.
+    pub fn for_conversion(source: Format, target: Format) -> Self {
+        Self {
+            kept: format::kept(source, target),
+            reason: format::pair_loss_reason(source, target),
             losses: Vec::new(),
             per_molecule: Vec::new(),
         }
     }
 
     pub fn record(&mut self, name: &str, molecule: &Molecule) {
-        let dropped = held(molecule).difference(self.target);
+        let dropped = held(molecule).difference(self.kept);
         if dropped.is_empty() {
             return;
         }
@@ -132,6 +161,12 @@ impl DropTracker {
             }
         );
 
+        // Under the summary, and worded without naming the flag: the
+        // explain-drops test asserts that string is absent once the flag is on.
+        if let Some(reason) = self.reason {
+            eprintln!("  {reason}");
+        }
+
         if explain {
             for (name, names) in &self.per_molecule {
                 eprintln!("  {name}: {}", names.join(", "));
@@ -143,7 +178,7 @@ impl DropTracker {
 /// [`DropTracker`] over a whole slice already in memory — what every
 /// non-streaming write command (`chem aromatic`, `chem coords`) uses.
 pub fn report_drops(format: Format, records: &[(String, Molecule)], explain: bool) {
-    let mut tracker = DropTracker::new(format.carries());
+    let mut tracker = DropTracker::for_target(format);
     for (name, molecule) in records {
         tracker.record(name, molecule);
     }
