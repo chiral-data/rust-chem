@@ -39,6 +39,9 @@ env:
   TRUNK_VERSION: "0.21.14"
   VERCEL_CLI_VERSION: "59.5.0"
   DEPLOY_HOST: chem.chiral.one
+  # The team slug that owns the project. Not a secret -- it is in the
+  # dashboard URL -- and it is the scope the token must be able to reach.
+  VERCEL_TEAM: chiral-b84fb3de
 
 jobs:
   deploy:
@@ -160,6 +163,26 @@ jobs:
       # The token goes through the environment, never as `--token`: an argument
       # is visible in `ps` on the runner and would be echoed by any `set -x`.
       # No `--debug` here either; it prints request payloads.
+      # What the token can actually see, before anything depends on it. The
+      # first run failed with "Could not retrieve Project Settings", which is
+      # neither of the two errors people expect: an invalid token says so
+      # ("the token provided via VERCEL_TOKEN ... is not valid") and mismatched
+      # ids say "Project not found" with the ids echoed. That third message
+      # means the token authenticated and has no access to this project --
+      # almost always a token scoped to a personal account rather than to the
+      # team that owns it. Both commands below print identities, never secrets.
+      - name: What the token can see
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          echo "user: $(vercel whoami)"
+          echo "scopes the token can reach:"
+          vercel teams ls
+          if ! vercel teams ls | grep -q "$VERCEL_TEAM"; then
+            echo "::error::the token cannot reach the $VERCEL_TEAM scope — recreate it at vercel.com/account/tokens with Scope set to the team, not a personal account (crates/chem-app/docs/DEPLOY.md)"
+            exit 1
+          fi
+
       - name: Deploy to production
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -167,12 +190,17 @@ jobs:
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           set -euo pipefail
-          # Writes .vercel/project.json from the two ids. Probably unnecessary
-          # for --prebuilt, but the failure mode without it is the CLI trying to
-          # resolve a project non-interactively, which is expensive to read from
-          # a log. It does not touch .vercel/output.
-          vercel pull --yes --environment=production
-          url=$(vercel deploy --prebuilt --prod --yes)
+          # --scope as well as the env ids: redundant when the token is scoped
+          # to one team, and it is what a working invocation looks like when the
+          # token can reach more than one. Verified that the two coexist rather
+          # than conflicting.
+          #
+          # `vercel pull` writes .vercel/project.json from the ids. Probably
+          # unnecessary for --prebuilt, but the failure mode without it is the
+          # CLI resolving a project non-interactively. It does not touch
+          # .vercel/output.
+          vercel pull --yes --environment=production --scope "$VERCEL_TEAM"
+          url=$(vercel deploy --prebuilt --prod --yes --scope "$VERCEL_TEAM")
           echo "::notice::deployed $url"
 
       # A deploy reporting success and a site serving this build are different
