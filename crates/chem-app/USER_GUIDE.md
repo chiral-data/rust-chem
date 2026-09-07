@@ -98,6 +98,13 @@ You need to do this at least once before you can search.
 
 - **📐 Generate Coordinates** — lays out every molecule that doesn't already have coordinates, so it can be drawn. Molecules whose coordinates came from an SDF file keep them, and the section says how many it generated against how many it kept. Structures are also laid out on demand when you open one, so this is for doing the whole dataset at once.
 
+**Convert**
+
+- **Write as** — picks the output format, from everything this build can write.
+- **What it will cost, before you run it.** Formats hold different things: XYZ has no bond block, SMILES has no coordinates, PDB has no isotopes. The section lists what this dataset would lose to the format you picked, and how many molecules lose each thing, as soon as you pick it. A conversion that keeps everything says so.
+- **💾 Convert and Save…** — writes the whole active dataset and offers it as a file, or as a download in the browser. The header line afterwards says how many molecules were written and what the conversion cost.
+- The report accounts for losses that come from the *pair* of formats rather than the target alone — a few conversions lose something both formats otherwise carry, and the reason is named when so. `chem convert` on the command line does not report those yet.
+
 **Similarity Search**
 
 - Type a SMILES string in the text box, e.g. `c1ccccc1O` (phenol) or `CC(=O)Oc1ccccc1C(=O)O` (aspirin-like).

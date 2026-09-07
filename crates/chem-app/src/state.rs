@@ -201,6 +201,7 @@ pub struct AppState {
     pub fingerprints: OperationOutcome,
     pub aromaticity: OperationOutcome,
     pub coordinates: OperationOutcome,
+    pub convert: OperationOutcome,
     pub query: OperationOutcome,
     pub search: OperationOutcome,
 
@@ -362,6 +363,7 @@ impl AppState {
             fingerprints: OperationOutcome::default(),
             aromaticity: OperationOutcome::default(),
             coordinates: OperationOutcome::default(),
+            convert: OperationOutcome::default(),
             query: OperationOutcome::default(),
             search: OperationOutcome::default(),
             display: DisplaySettings::default(),
@@ -476,6 +478,7 @@ impl AppState {
         self.fingerprints = OperationOutcome::default();
         self.aromaticity = OperationOutcome::default();
         self.coordinates = OperationOutcome::default();
+        self.convert = OperationOutcome::default();
         self.search = OperationOutcome::default();
         // Keyed by row index too, and a row means nothing against a different
         // dataset.
@@ -667,6 +670,117 @@ impl AppState {
         // now drawing the wrong bonds.
         self.dataset_molecules_changed();
         self.aromaticity = OperationOutcome::ok(summary);
+    }
+
+    /// What converting the active dataset to `target` would discard: each
+    /// attribute, and how many molecules lose it.
+    ///
+    /// The command line asks one question -- can the target hold this? -- and
+    /// that is not the whole of it. A conversion is a read and a write, and
+    /// #257 pinned six pairs that lose an attribute *both* masks claim: CML to
+    /// SMILES drops aromaticity and hands back cyclohexane while `chem convert`
+    /// reports nothing (#261, #276). Consulting `pair_loss` as well is what
+    /// makes this report true where the command line's is not.
+    ///
+    /// Deliberately not `format::fidelity`, which folds in what the *target*
+    /// manufactures. That answers what the output will contain; this answers
+    /// what the input loses.
+    ///
+    /// First-seen order with a count, matching the CLI's own tracker so the two
+    /// can be read side by side -- and, once #276 lands, be the same.
+    pub fn conversion_losses(&self, target: DatasetFormat) -> Vec<(&'static str, usize)> {
+        let source = self.loaded_files.active_format();
+        let kept = target
+            .carries()
+            .difference(format::pair_loss(source, target));
+
+        let mut losses: Vec<(&'static str, usize)> = Vec::new();
+        for molecule in &self.loaded_files.active_dataset().molecules {
+            for attribute in format::held(molecule).difference(kept).names() {
+                match losses.iter_mut().find(|(name, _)| *name == attribute) {
+                    Some((_, count)) => *count += 1,
+                    None => losses.push((attribute, 1)),
+                }
+            }
+        }
+        losses
+    }
+
+    /// The active dataset written as `target`, and a filename to offer for it.
+    ///
+    /// Returns the text rather than saving it: the dialog belongs to the view,
+    /// as it does for an SVG export, and on web there is no dialog at all --
+    /// just a download the browser takes over.
+    pub fn convert_dataset(&mut self, target: DatasetFormat) -> Option<(String, String)> {
+        let dataset = self.loaded_files.active_dataset();
+        if dataset.is_empty() {
+            self.convert = OperationOutcome::failure("No dataset loaded");
+            return None;
+        }
+
+        let records: Vec<(String, Molecule)> = dataset
+            .names
+            .iter()
+            .cloned()
+            .zip(dataset.molecules.iter().cloned())
+            .collect();
+
+        let Some(text) = target.write(&records) else {
+            // Every registered format writes today, so this is a format that
+            // grew a reader and no writer -- the picker filters on `can_write`,
+            // making this the belt to that braces.
+            self.convert =
+                OperationOutcome::failure(format!("{} cannot be written", target.label()));
+            return None;
+        };
+
+        let losses = self.conversion_losses(target);
+        let summary = if losses.is_empty() {
+            format!("{} written as {}", records.len(), target.label())
+        } else {
+            let named: Vec<String> = losses
+                .iter()
+                .map(|(attribute, count)| format!("{attribute} ({count})"))
+                .collect();
+            format!(
+                "{} written as {} — lost {}",
+                records.len(),
+                target.label(),
+                named.join(", ")
+            )
+        };
+        // Reports the conversion, not the save: the browser's download is
+        // fire-and-forget and cannot tell us whether the file landed, so
+        // claiming it did would be true on one platform only.
+        self.convert = OperationOutcome::ok(summary);
+
+        Some((self.suggested_output_name(target), text))
+    }
+
+    /// A filename for the converted dataset: the loaded file's stem with the
+    /// target's own extension.
+    ///
+    /// Sanitised for the same reason `draw::svg::suggested_filename` is -- a
+    /// name comes from a file's own records and can hold anything, and a slash
+    /// would quietly redirect where the file lands.
+    fn suggested_output_name(&self, target: DatasetFormat) -> String {
+        let entry = &self.loaded_files.entries()[self.loaded_files.active_index()];
+        let stem: String = entry
+            .name
+            .rsplit_once('.')
+            .map_or(entry.name.as_str(), |(stem, _)| stem)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = stem.trim_matches('_');
+        let stem = if stem.is_empty() { "molecules" } else { stem };
+        format!("{stem}.{}", target.extensions().first().unwrap_or(&"txt"))
     }
 
     /// Generates 2D coordinates across the dataset.
@@ -1129,6 +1243,103 @@ mod tests {
             .iter()
             .map(|p| format!("{:.4},{:.4}", p.x, p.y))
             .collect()
+    }
+
+    #[test]
+    fn test_the_loss_the_command_line_cannot_see() {
+        // The story. CML's reader sets no aromatic flag, so writing SMILES
+        // hands back cyclohexane -- and both masks claim aromaticity, so the
+        // CLI's `held(m).difference(target.carries())` reports nothing (#261,
+        // #276). Only the `pair_loss` term catches it.
+        let mut state = AppState::cpu_only();
+        let cml = DatasetFormat::CML
+            .write(&[(
+                "benzene".to_string(),
+                crate::state::parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("CML writes");
+        state.apply_loaded_file_bytes("rings.cml".to_string(), cml.into_bytes());
+        assert_eq!(state.loaded_files.active_format(), DatasetFormat::CML);
+
+        let losses = state.conversion_losses(DatasetFormat::SMILES);
+        assert!(
+            losses.iter().any(|(name, _)| *name == "aromaticity"),
+            "the pair loss is not reported: {losses:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_ordinary_loss_is_still_reported() {
+        // The other term must still work: XYZ has no bond block at all, which
+        // is what `Carries::BONDS` was added to be able to say (#257).
+        let state = AppState::cpu_only();
+        let losses = state.conversion_losses(DatasetFormat::XYZ);
+        assert!(
+            losses.iter().any(|(name, _)| *name == "bonds"),
+            "{losses:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_conversion_that_keeps_everything_reports_nothing() {
+        // So the report is not merely always non-empty. CXSMILES carries
+        // everything SMILES does and more.
+        let state = AppState::cpu_only();
+        assert_eq!(state.conversion_losses(DatasetFormat::CXSMILES), Vec::new());
+    }
+
+    #[test]
+    fn test_the_count_is_molecules_not_attributes() {
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes(
+            "two.smi".to_string(),
+            b"CCO ethanol\nCCN ethylamine\n".to_vec(),
+        );
+
+        let losses = state.conversion_losses(DatasetFormat::XYZ);
+        let bonds = losses.iter().find(|(name, _)| *name == "bonds");
+        assert_eq!(bonds, Some(&("bonds", 2)), "{losses:?}");
+    }
+
+    #[test]
+    fn test_converting_writes_every_molecule_and_names_the_file() {
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("two.smi".to_string(), b"CCO a\nCCN b\n".to_vec());
+
+        let (name, text) = state
+            .convert_dataset(DatasetFormat::SDF)
+            .expect("SDF writes");
+        assert_eq!(
+            name, "two.sdf",
+            "the stem is kept and the extension swapped"
+        );
+        assert_eq!(text.matches("$$$$").count(), 2, "both records written");
+        assert!(state.convert.has_run());
+        assert!(!state.convert.failed());
+    }
+
+    #[test]
+    fn test_the_outcome_names_what_the_conversion_cost() {
+        // The header line is what a collapsed section reports, so the loss has
+        // to reach it rather than living only in the panel.
+        let mut state = AppState::cpu_only();
+        let _ = state
+            .convert_dataset(DatasetFormat::XYZ)
+            .expect("XYZ writes");
+        let summary = state.convert.summary();
+        assert!(summary.contains("bonds"), "{summary}");
+    }
+
+    #[test]
+    fn test_a_filename_from_a_hostile_dataset_name_is_still_a_filename() {
+        // Names come from a file's own records; a slash would quietly redirect
+        // where the file lands.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("../../etc/passwd.smi".to_string(), b"C methane\n".to_vec());
+
+        let (name, _) = state.convert_dataset(DatasetFormat::SDF).expect("writes");
+        assert!(!name.contains('/'), "{name}");
+        assert!(name.ends_with(".sdf"), "{name}");
     }
 
     #[test]

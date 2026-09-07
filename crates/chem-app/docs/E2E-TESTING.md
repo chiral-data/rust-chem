@@ -76,6 +76,23 @@ iterating, not fine as evidence.
   coordinates an SDF supplied (#88).
 - **Press Search with nothing set up.** It should name the missing prerequisite,
   not just grey out.
+- **Convert, and check the loss list against the command line (#275).** Load a
+  CML file, open Convert, pick **SMILES**. The list must name `aromaticity`.
+  Then run the same conversion in a terminal:
+
+  ```sh
+  chem convert molecules.cml --to smi
+  ```
+
+  It reports `converted 3, skipped 0` and says nothing — and the output really
+  is `C1CCCCC1 benzene`, cyclohexane. The app is right and the CLI is not, until
+  #276 lands. **If the two ever agree here, check which one moved.**
+- **Pick a target that loses nothing** (SMILES to CXSMILES). It must say so
+  rather than showing an empty box, which reads as a bug.
+- **Convert and Save, then open the result.** On native a dialog, in the browser
+  a download. Read the file back with `chem info`: the molecule count must match
+  the dataset. Neither save arm reports success — the browser's download cannot
+  — so the header line reports the conversion instead.
 - **Backend radio and the menu bar chips must agree**, in both directions.
 - **The query debounce survives a closed window.** Type a SMILES, close the
   Operations window inside 300ms, wait, reopen it. The query should have parsed.
