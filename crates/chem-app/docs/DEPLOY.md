@@ -62,8 +62,18 @@ The three messages mean different things, and only the third is about scope:
 | `Could not retrieve Project Settings` | the token is valid and **cannot see this project** — nearly always scoped to a personal account instead of the team |
 
 The Scope dropdown on the token form defaults to your personal account, which
-is how the third one happens. The workflow now prints what the token can reach
+is how the third one happens. The workflow prints what the token can reach
 before it depends on it, and fails naming the scope if the team is missing.
+
+Two CLI behaviours to know before reading that step's output, both of which
+look like a bad credential and are not:
+
+- **`vercel teams ls` prints its table on stderr**, nothing on stdout. A
+  `| grep` over it matches nothing no matter what the token is — which is
+  exactly how this check once failed while the line above it showed the team.
+- **`vercel whoami` errors for a team-scoped token**, with `Not authorized:
+  Trying to access resource under scope "<personal>"`, because it resolves
+  against the personal scope by default.
 
 ## Checking a deploy actually landed
 
