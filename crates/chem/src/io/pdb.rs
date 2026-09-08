@@ -8,11 +8,19 @@
 //! rather than stating it — this crate has no such table, and building one
 //! is a materially larger, separable undertaking than this story. `CONECT`
 //! itself stays in scope: it is reading data the file states, not guessing
-//! at it. Because of this, [`Molecule::calculate_implicit_hydrogens`] is
-//! never called on a PDB-read molecule — it sums existing bond orders per
-//! atom, so a molecule with atoms but no bonds would have every atom
-//! assigned its *free-atom* hydrogen count (a backbone carbon reading as
-//! methane) rather than being left honestly blank.
+//! at it.
+//!
+//! Hydrogen counts follow from that. PDB names no count of its own, so an
+//! atom arrives with none, and
+//! [`Molecule::calculate_implicit_hydrogens`] cannot be used to fill it in:
+//! it sums the bond orders around an atom, and with most atoms bondless by
+//! construction it would hand each one its *free-atom* count — a backbone
+//! carbon reading as methane. What is called instead is
+//! [`Molecule::calculate_implicit_hydrogens_where_bonded`], which fills only
+//! the atoms `CONECT` did describe and leaves the rest honestly blank (#285).
+//! Before it, a fully-`CONECT`ed benzene wrote back as
+//! `[C]1[C][C][C][C][C]1` — six carbons stated to have no hydrogens, which is
+//! not the molecule the file described.
 //!
 //! `CRYST1`'s orientation convention already matches this crate's fixed
 //! [`crate::core::cell::UnitCell`] (its own doc comment: "the near-universal
@@ -320,17 +328,21 @@ pub fn parse_pdb(text: &str) -> Result<Molecule, PdbError> {
             .map_err(|e| PdbError::ParseError(e.to_string()))?;
     }
 
-    // Deliberately not called: this molecule's bonds are exactly what
-    // CONECT stated, nothing more, and this function computes implicit
-    // hydrogens from existing bond orders -- with most atoms bondless by
-    // construction (see the module doc), it would assign every one of them
-    // a free-atom hydrogen count instead of leaving the count honestly
-    // unknown.
-    // mol.calculate_implicit_hydrogens();
-
     if mol.num_atoms() == 0 {
         return Err(PdbError::NoAtoms);
     }
+
+    // Only where CONECT said what an atom is bonded to. The unguarded form
+    // cannot be used here -- with most atoms bondless by construction (see the
+    // module doc) it would give each one its free-atom count -- but refusing to
+    // fill any was its own wrong answer: every atom kept `hydrogens: None`, so
+    // the SMILES writer compared 0 against the implied count and bracketed the
+    // lot, and ethanol from a PDB read back as `[C][C][O]` (#285).
+    //
+    // A bondless atom still keeps `None`. That is not the same claim as
+    // `Some(0)`: the file stated no connectivity for it, so its hydrogens are
+    // unknown rather than absent.
+    mol.calculate_implicit_hydrogens_where_bonded();
 
     Ok(mol)
 }
@@ -763,5 +775,96 @@ END
                 "{input:?} should report NoAtoms"
             );
         }
+    }
+
+    #[test]
+    fn test_a_bonded_atom_gets_the_count_conect_implies() {
+        // The reported symptom (#285). Ethanol through PDB read back as
+        // `[C][C][O]` -- the right topology and the wrong molecule, since `[C]`
+        // states a carbon with no hydrogens.
+        //
+        // The answer is what the file says, not what it once meant: RDKit reads
+        // our benzene PDB as `C1CCCCC1` too. `CONECT` carries no bond order, so
+        // the aromaticity went when the PDB was written and cyclohexane is the
+        // honest reading; recovering benzene would need ring perception, which
+        // this reader deliberately does not do.
+        let molecule = crate::io::smiles::parse_smiles("CCO").expect("valid SMILES");
+        let text = write_pdb(&molecule);
+        let back = parse_pdb(&text).expect("reads back");
+
+        let counts: Vec<Option<u8>> = (0..back.num_atoms())
+            .map(|i| back.atom(i).hydrogens())
+            .collect();
+        assert_eq!(counts, vec![Some(3), Some(2), Some(1)]);
+        assert_eq!(
+            crate::io::smiles_writer::write_smiles_for_molecule_canonical(&back),
+            "CCO"
+        );
+    }
+
+    #[test]
+    fn test_an_atom_conect_never_mentioned_keeps_an_unknown_count() {
+        // The other half, and the reason the unguarded
+        // `calculate_implicit_hydrogens` cannot be used here: with no bond
+        // orders to subtract it hands an atom its free-atom valence, so every
+        // bondless atom would claim a full complement of hydrogens -- a
+        // backbone carbon reading as methane.
+        //
+        // `WATER_PDB` has explicit H atoms and no CONECT at all, so all three
+        // atoms are bondless and all three stay unknown.
+        let molecule = parse_pdb(WATER_PDB).expect("reads");
+        assert_eq!(molecule.num_atoms(), 3);
+        assert_eq!(molecule.num_bonds(), 0);
+        for i in 0..molecule.num_atoms() {
+            assert_eq!(
+                molecule.atom(i).hydrogens(),
+                None,
+                "atom {i} was given a count from no bonds at all"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_partly_connected_file_fills_only_the_atoms_it_described() {
+        // A real file rather than a fixture: eight atoms and one CONECT pair,
+        // which is what an unguarded fill would turn into a bag of small
+        // alkanes. Six atoms stay unknown; the pair becomes a methanol
+        // fragment, which is exactly what the file states about them.
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/corpus/pdb/dipeptide-with-ligand.pdb"
+        ))
+        .expect("the corpus file is there");
+        let molecule = parse_pdb(&text).expect("reads");
+
+        let stated = (0..molecule.num_atoms())
+            .filter(|&i| molecule.atom(i).hydrogens().is_some())
+            .count();
+        assert_eq!(molecule.num_atoms(), 8);
+        assert_eq!(molecule.num_bonds(), 1);
+        assert_eq!(stated, 2, "only the CONECT pair can imply a count");
+        assert_eq!(
+            crate::io::smiles_writer::write_smiles_for_molecule_canonical(&molecule),
+            "[C].[C].[C].[N].[N].[O].CO"
+        );
+    }
+
+    #[test]
+    fn test_an_explicit_hydrogen_atom_is_not_counted_twice() {
+        // Hydrogens in a PDB are ordinary atoms, so the count must come from
+        // the bonds they form rather than being added on top: this carbon's
+        // four bonds leave it needing none.
+        let text = "\
+HETATM    1  C   LIG A   1       0.000   0.000   0.000  1.00  0.00           C
+HETATM    2  H1  LIG A   1       0.629   0.629   0.629  1.00  0.00           H
+HETATM    3  H2  LIG A   1      -0.629  -0.629   0.629  1.00  0.00           H
+HETATM    4  H3  LIG A   1      -0.629   0.629  -0.629  1.00  0.00           H
+HETATM    5  H4  LIG A   1       0.629  -0.629  -0.629  1.00  0.00           H
+CONECT    1    2    3    4    5
+END
+";
+        let molecule = parse_pdb(text).expect("reads");
+        assert_eq!(molecule.atom(0).hydrogens(), Some(0));
+        assert_eq!(molecule.num_atoms(), 5);
     }
 }
