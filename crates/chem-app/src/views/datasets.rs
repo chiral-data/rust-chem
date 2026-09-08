@@ -258,3 +258,155 @@ fn remove_button(ui: &mut egui::Ui) -> egui::Response {
 
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::DatasetFormat;
+    use crate::state::AppState;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    /// A harness over the Files window, with whatever `prepare` puts in it.
+    ///
+    /// Drives the view rather than the whole app: `WorkbenchApp::new` wants an
+    /// `eframe::CreationContext` and probes for a GPU, while a view wants a
+    /// `Ui` and nothing else -- so this needs neither a window nor an adapter,
+    /// which is what lets it run in CI (#303).
+    ///
+    /// State is mutated through `AppState`'s own methods rather than by
+    /// simulating the input that would call them. The plumbing already has
+    /// tests in `state.rs`; what has none is whether the values reach the
+    /// screen, and that is all these assert. (`poll_pending_work` reads the
+    /// context `AppState` stored at construction, which is detached here, so
+    /// input injected into the harness would not reach it anyway.)
+    fn files_window(prepare: impl FnOnce(&mut AppState)) -> Harness<'static, AppState> {
+        let mut state = AppState::cpu_only();
+        prepare(&mut state);
+        let mut view = DatasetsView;
+        let mut harness = Harness::new_ui_state(move |ui, state| view.ui(ui, state), state);
+        // Not load-bearing today -- measured, the default already renders all
+        // 15 examples including the last -- but pinned so that a change to the
+        // harness default cannot clip a row and turn a real assertion into a
+        // spurious failure. `body.rows` builds only what is visible.
+        harness.set_size(egui::vec2(1400.0, 1200.0));
+        harness.run();
+        harness
+    }
+
+    /// Writes a molecule in `format` and loads it the way a file load does.
+    fn load(state: &mut AppState, name: &str, format: DatasetFormat, smiles: &str) {
+        let molecule = chem::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+        let text = format
+            .write(&[(name.to_string(), molecule)])
+            .unwrap_or_else(|| panic!("{} writes", format.label()));
+        state.apply_loaded_file_bytes(name.to_string(), text.into_bytes());
+    }
+
+    #[test]
+    fn test_the_examples_reach_the_table() {
+        // The floor: if this fails, nothing below it means anything. Fifteen
+        // built-in molecules, and the assertion is on the *last* of them --
+        // the row a clipped viewport would lose.
+        let harness = files_window(|_| {});
+
+        assert!(harness.query_by_label("Methane").is_some());
+        assert!(
+            harness.query_by_label("Neopentane").is_some(),
+            "the last example row did not render"
+        );
+        for header in ["Name", "SMILES", "Formula", "MW"] {
+            assert!(
+                harness.query_by_label(header).is_some(),
+                "the {header} header did not render"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_dropped_file_becomes_rows_on_screen() {
+        // `apply_dropped_files` has tests; that the table then shows the
+        // molecules does not (#296).
+        let harness = files_window(|state| {
+            state.apply_dropped_files(vec![(
+                "dropped.smi".to_string(),
+                b"CCO ethanol\nCC(=O)O acetic\n".to_vec(),
+            )]);
+        });
+
+        assert!(harness.query_by_label("ethanol").is_some());
+        assert!(harness.query_by_label("acetic").is_some());
+        // The list entry is `name  (FORMAT, n molecules)`, so this pins the
+        // format and the count #104 added alongside the name.
+        assert!(
+            harness
+                .query_by_label_contains("dropped.smi  (SMILES, 2 molecules)")
+                .is_some(),
+            "the Files list did not describe the dropped file"
+        );
+    }
+
+    #[test]
+    fn test_the_smiles_column_shows_the_molecule_or_the_format() {
+        // #283's rule, on screen: a format stating a bond model gets a written
+        // SMILES, one that does not keeps its own name. Both strings are
+        // pinned in `dataset.rs`; that the column displays them is not.
+        let harness = files_window(|state| {
+            load(state, "rings.mol2", DatasetFormat::MOL2, "c1ccccc1");
+        });
+        assert!(
+            harness.query_by_label("c1ccccc1").is_some(),
+            "a Mol2 should show the molecule it holds"
+        );
+
+        let harness = files_window(|state| {
+            load(state, "ethanol.pdb", DatasetFormat::PDB, "CCO");
+        });
+        assert!(
+            harness.query_by_label("(PDB)").is_some(),
+            "a PDB has no aromatic model, so the column keeps the format name"
+        );
+    }
+
+    #[test]
+    fn test_the_formula_column_counts_the_hydrogens_a_pdb_implies() {
+        // The value #294 moved. Before it, a PDB-read ethanol had no hydrogen
+        // count and this cell read C2O; the fix is only visible to a user
+        // here and in MW.
+        let harness = files_window(|state| {
+            load(state, "ethanol.pdb", DatasetFormat::PDB, "CCO");
+        });
+
+        assert!(
+            harness.query_by_label("C2H6O").is_some(),
+            "the Formula column should count the hydrogens CONECT implies"
+        );
+        assert!(
+            harness.query_by_label("C2O").is_none(),
+            "C2O is the pre-#294 answer and must not come back"
+        );
+    }
+
+    #[test]
+    fn test_a_refused_drop_names_the_file_in_the_status_line() {
+        // The status line is the only place this can appear: a refused file
+        // leaves no Files entry to notice afterwards (#296).
+        let harness = files_window(|state| {
+            state.apply_dropped_files(vec![
+                ("good.smi".to_string(), b"CCO ethanol\n".to_vec()),
+                ("logo.png".to_string(), vec![0x89, b'P', b'N', b'G']),
+            ]);
+        });
+
+        assert!(
+            harness
+                .query_by_label_contains("logo.png: not a format this build reads")
+                .is_some(),
+            "the refusal did not reach the status line"
+        );
+        assert!(
+            harness.query_by_label("ethanol").is_some(),
+            "the file beside it should still have loaded"
+        );
+    }
+}

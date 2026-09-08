@@ -47,3 +47,10 @@ features = [
     "Url",
     "Window",
 ]
+
+[dev-dependencies]
+# Drives a view headlessly and queries what it rendered, through the
+# accessibility tree egui already builds. Its own deps are egui 0.33.3,
+# eframe 0.33.3 and wgpu 27.0.1 -- exactly the versions here -- and it leaves
+# eframe and wgpu optional, so this needs no GPU and no window (#303).
+egui_kittest = "0.33.3"
