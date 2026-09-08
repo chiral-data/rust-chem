@@ -575,6 +575,29 @@ def check_mmcif(oracles: list[Oracle], verbose: bool) -> Report:
 PDB_CORPUS = CORPUS / "pdb"
 
 
+def _pdb_states_every_bond(text: str) -> bool:
+    """Whether every atom in this PDB appears in a `CONECT` record.
+
+    The question decides whether a formula comparison means anything: RDKit
+    infers the bonds a `CONECT` block leaves out, from geometry, and this crate
+    deliberately does not (`io/pdb.rs`'s module doc). So on a partly connected
+    file the two disagree about *bonds*, and comparing formulae there would
+    measure bond perception while claiming to measure hydrogen counts.
+
+    Serial numbers only -- deliberately not a PDB parser. A harness that parsed
+    the format properly could be wrong in the same way the crate is, and a
+    fixture's connectivity is a property of the text rather than of anyone's
+    reading of it.
+    """
+    atoms, connected = set(), set()
+    for line in text.splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            atoms.add(line[6:11].strip())
+        elif line.startswith("CONECT"):
+            connected.add(line[6:11].strip())
+    return bool(atoms) and atoms <= connected
+
+
 def check_pdb(oracles: list[Oracle], verbose: bool) -> Report:
     """Does `chem`'s PDB round trip keep what gemmi reads -- values included?
 
@@ -590,6 +613,11 @@ def check_pdb(oracles: list[Oracle], verbose: bool) -> Report:
        mismatch. Its PDB writer zeroes the B-factor column while preserving the
        occupancy beside it, and being *different* from that is the correct
        behaviour (#173), so agreement here would be the bug.
+    4. **The hydrogen count**, which none of the above can see. PDB states no
+       count, so a reader implies one from the bonds -- and an implicit hydrogen
+       creates no atom and fills no column, so questions 1 and 2 are identical
+       whether the count was implied or left blank. #285 was invisible here for
+       a whole milestone because of it (#293).
 
     Uses `oracles` unlike `check_mmcif`, which ignores it: OpenBabel is the
     subject of question 3 rather than a judge of questions 1 and 2.
@@ -636,6 +664,58 @@ def check_pdb(oracles: list[Oracle], verbose: bool) -> Report:
                 f"    ok         {path.name:<34} "
                 f"{reference.atom_count} atoms, {len(set(reference_sites.b_factors))} distinct b"
             )
+
+        # Question 4. The hydrogen count, via our own `pdb -> smi` output.
+        #
+        # Both formulae come from RDKit -- one read from the file, one computed
+        # from the SMILES we wrote -- so what is compared is hydrogen counting
+        # rather than canonical-string convention. OpenBabel judges nothing
+        # here: it perceives aromaticity, so it would give a third answer for
+        # the same file and disagreeing with it would mean nothing.
+        rdkit_pdb_formula = next(
+            (
+                f
+                for f in (getattr(o, "formula_of_pdb", None) for o in oracles)
+                if f is not None
+            ),
+            None,
+        )
+        rdkit_smiles_formula = next(
+            (f for f in (getattr(o, "formula", None) for o in oracles) if f is not None),
+            None,
+        )
+        if rdkit_pdb_formula is not None and rdkit_smiles_formula is not None:
+            if not _pdb_states_every_bond(original):
+                # Not a mismatch and not silence: a reader of this output should
+                # be able to tell a fixture that was skipped from one that was
+                # never looked at.
+                report.note(
+                    f"{path.name}: hydrogen counts not compared -- CONECT does not "
+                    "cover every atom, so the oracle infers bonds from geometry "
+                    "where chem does not"
+                )
+            else:
+                theirs = rdkit_pdb_formula(original)
+                as_smiles = chem.convert_pdb(original, "smi")
+                ours = (
+                    rdkit_smiles_formula(as_smiles.split()[0])
+                    if as_smiles and as_smiles.split()
+                    else None
+                )
+                if theirs is None or ours is None:
+                    report.mismatch(
+                        f"{path.name}: could not compare hydrogen counts -- "
+                        f"rdkit {theirs!r}, ours {ours!r}"
+                    )
+                elif theirs != ours:
+                    report.mismatch(
+                        f"{path.name}: hydrogen counts disagree with rdkit -- "
+                        f"{theirs} vs our {ours}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok         {path.name:<34} formula {ours}")
 
         # Question 3. Not a mismatch: this is the oracle being wrong, recorded
         # so the divergence is visible rather than assumed.
