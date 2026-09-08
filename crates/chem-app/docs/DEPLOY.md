@@ -154,6 +154,37 @@ rename — only the token needs care.
   bytes SRI covers and the browser refuses the module. Transport compression is
   fine, being decoded before the hash is checked.
 
+## What is reproducible, and what is not
+
+You cannot rebuild a commit and get the bytes that are live. Measured on `8a8329f`, three builds and
+the tools run by hand on a fixed input:
+
+| stage | deterministic? |
+|---|---|
+| rustc → `chem-app.wasm` | **yes** — identical across three builds |
+| wasm-bindgen | **no** — same 5,946,865 bytes out, 3,750 of them different every run |
+| wasm-opt `-O2` | **yes** — identical across three runs on one input |
+
+So the content hash in the filename changes on every build of the same source, and `wasm-opt` is not
+the reason: it is deterministic, and it is pinned. wasm-bindgen is the one that moves, and it is
+already pinned to the version in `Cargo.lock` — the nondeterminism is inside that version, not a
+question of which version runs. Equal output length with scattered differences is what iteration
+order looks like.
+
+What that means in practice:
+
+- **`build-info.json` and the id in the corner are the identity**, not the hash in the filename. They
+  come from `CHEM_BUILD_ID`, which is the commit.
+- **A rebuilt bundle is not comparable byte-for-byte** to a deployed one. If you need to know whether
+  production is a given commit, read `build-info.json`; do not rebuild and diff.
+- **Version pinning still matters** for a different reason: it stops an upstream release changing what
+  production serves without anyone choosing it. Trunk is pinned in both workflows, `wasm-opt` in
+  `Trunk.toml`, wasm-bindgen by `Cargo.lock`.
+
+One input is **not** pinned: the Rust toolchain. CI uses `dtolnay/rust-toolchain@stable` and there is
+no `rust-toolchain.toml`, so a Rust release changes the output. That is a deliberate decision to make
+rather than a bug, and a larger lever on the bytes than the optimiser ever was.
+
 ## Headers, and why they are not in a `vercel.json`
 
 They are in `crates/chem-app/vercel-output.json`, which the workflow copies to
