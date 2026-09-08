@@ -222,19 +222,24 @@ jobs:
           # Vercel's Standard Protection the *.vercel.app URL answers 401 to an
           # anonymous client while the production domain stays public -- and the
           # domain is what a person types.
-          code=000
-          for attempt in 1 2 3 4 5 6; do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' "$base/") || code=000
-            [ "$code" = "200" ] && break
-            echo "attempt $attempt: HTTP $code"
+          #
+          # Waiting on the *commit* rather than on a 200. The alias takes a few
+          # seconds to move, and until it does the previous deployment answers
+          # every request perfectly well -- so a loop that stops at the first
+          # 200 stops immediately and proves nothing. That is exactly how this
+          # step failed on the deploy of 54eed3f while the deploy itself was
+          # fine: it read the build-info of the release before it.
+          live=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            live=$(curl -fsS "$base/build-info.json" 2>/dev/null || echo "")
+            printf '%s' "$live" | grep -qF "\"commit\": \"${GITHUB_SHA}\"" && break
+            echo "attempt $attempt: the alias has not moved yet"
             sleep 5
           done
-          [ "$code" = "200" ] || { echo "::error::$base/ returned $code"; exit 1; }
-
-          live=$(curl -fsS "$base/build-info.json")
           echo "$live"
-          echo "$live" | grep -qF "\"commit\": \"${GITHUB_SHA}\"" \
-            || { echo "::error::the live build-info does not name ${GITHUB_SHA}"; exit 1; }
+          printf '%s' "$live" | grep -qF "\"commit\": \"${GITHUB_SHA}\"" \
+            || { echo "::error::${base} never served ${GITHUB_SHA} -- the deploy may have \
+                 succeeded while the alias did not move"; exit 1; }
 
           # Read the asset names out of the *served* index.html and prove each
           # resolves. This is the stuck-loading-overlay failure -- an index
