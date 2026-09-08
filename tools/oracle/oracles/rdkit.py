@@ -123,6 +123,36 @@ def formula_of_commonchem(text: str) -> Optional[str]:
     return None
 
 
+def formula_of_pdb(text: str) -> Optional[str]:
+    """Molecular formula of a PDB, as RDKit reads it.
+
+    The hydrogen question, asked of a format that states no count of its own. A
+    reader has to imply one from the bonds, and PDB's own columns cannot show
+    whether it did -- an implicit hydrogen creates no atom and fills no field,
+    so `check_pdb`'s structural and per-atom comparisons are blind to it. That
+    is how #285 stayed invisible here for a whole milestone.
+
+    Only meaningful where `CONECT` covers every atom. RDKit infers the missing
+    bonds from geometry and this crate deliberately does not, so on a partly
+    connected file the formulae differ by bond perception rather than by
+    hydrogen counting -- `check_pdb` notes those files rather than comparing
+    them.
+
+    `sanitize=False` because a partial CONECT block leaves valences RDKit would
+    reject outright, and a formula needs none of that analysis.
+    """
+    try:
+        mol = Chem.MolFromPDBBlock(text, removeHs=False, sanitize=False)
+    except Exception:
+        return None
+    if mol is None:
+        return None
+    try:
+        return rdMolDescriptors.CalcMolFormula(mol)
+    except Exception:
+        return None
+
+
 def oracle() -> Oracle:
     return Oracle(
         name="rdkit",
@@ -135,4 +165,5 @@ def oracle() -> Oracle:
         commonchem_of_smiles=commonchem_of_smiles,
         formula=formula,
         formula_of_commonchem=formula_of_commonchem,
+        formula_of_pdb=formula_of_pdb,
     )

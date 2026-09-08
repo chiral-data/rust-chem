@@ -27,6 +27,18 @@ they double as ordinary input. `#` comments carry the reasoning.
 | `invalid.smi` | Input that must be **rejected** |
 | `regressions/` | Promoted automatically — see below |
 
+The structure formats need whole files rather than a line of SMILES, so they sit
+in their own directories. One molecule per file, deliberately: RDKit reads only
+the first `MODEL` of a framed PDB, so a multi-record fixture would compare one
+molecule against several and pass for the wrong reason.
+
+| File | What it probes |
+|---|---|
+| `pdb/dipeptide-with-ligand.pdb` | Cells, chains, residues, and per-atom occupancy and B-factor values. `CONECT` is deliberately **partial** — two of eight atoms — which is what real PDB files look like |
+| `pdb/water-no-cell.pdb` | The contrast to the file beside it: no `CRYST1`, no `CONECT`, explicit hydrogen *atoms* |
+| `pdb/ligand-fully-connected.pdb` | The **hydrogen count**. Every atom in a `CONECT` record, which is what lets an oracle compare a count PDB never states (#293) |
+| `mmcif/` | The mmCIF analogues of the first two |
+
 ## Pinned gaps
 
 An entry **named** `known-gap-*` records a place `chem` does not behave as the

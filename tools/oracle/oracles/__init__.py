@@ -69,6 +69,13 @@ class Oracle:
     #: and counts every hydrogen, which is exactly the granularity needed.
     formula: Optional[Callable[[str], Optional[str]]] = None
     formula_of_commonchem: Optional[Callable[[str], Optional[str]]] = None
+    #: Molecular formula of a PDB, which is the only way to see whether a
+    #: reader implied a hydrogen count. PDB states none, and an implicit
+    #: hydrogen creates no atom and fills no column, so a structural
+    #: comparison is identical whether the count was implied or left blank
+    #: (#293). Only meaningful where `CONECT` covers every atom -- see
+    #: `check_pdb`'s question 4.
+    formula_of_pdb: Optional[Callable[[str], Optional[str]]] = None
 
 
 #: Something every cheminformatics toolkit can read. If one cannot, it is
