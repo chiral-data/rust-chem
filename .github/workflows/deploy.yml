@@ -244,11 +244,28 @@ jobs:
           # Read the asset names out of the *served* index.html and prove each
           # resolves. This is the stuck-loading-overlay failure -- an index
           # naming a hash that is not there -- checked at the origin.
-          html=$(curl -fsS "$base/")
-          js=$(printf '%s' "$html" | grep -oE '/chem-app-[0-9a-f]+\.js' | head -1)
-          wasm=$(printf '%s' "$html" | grep -oE '/chem-app-[0-9a-f]+_bg\.wasm' | head -1)
+          #
+          # Retried as a pair, because the index and its assets are separate
+          # requests: a deploy landing between them leaves this asking for the
+          # previous document's hashes, which 404 while production is perfectly
+          # healthy. That is how the deploy of 2aea41d went red with nothing
+          # wrong -- it wanted 1609e65f while the live index had moved on. Only
+          # a document whose own assets resolve counts as agreement.
+          for attempt in 1 2 3 4 5 6; do
+            html=$(curl -fsS "$base/" || echo "")
+            js=$(printf '%s' "$html" | grep -oE '/chem-app-[0-9a-f]+\.js' | head -1)
+            wasm=$(printf '%s' "$html" | grep -oE '/chem-app-[0-9a-f]+_bg\.wasm' | head -1)
+            if [ -n "$js" ] && [ -n "$wasm" ] \
+              && curl -fsS -o /dev/null "$base$js" \
+              && curl -fsS -o /dev/null "$base$wasm"; then
+              break
+            fi
+            echo "attempt $attempt: the index and its assets do not agree yet"
+            js=""; wasm=""
+            sleep 5
+          done
           [ -n "$js" ] && [ -n "$wasm" ] \
-            || { echo "::error::the served index.html names no assets"; exit 1; }
+            || { echo "::error::${base} never served an index.html whose own assets resolve"; exit 1; }
 
           hdr() { curl -sSI -H 'Accept-Encoding: br, gzip' "$base$1"; }
 
