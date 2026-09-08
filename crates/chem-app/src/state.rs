@@ -18,18 +18,21 @@ use chem::core::layout::ensure_coords;
 use chem::core::molecule::Molecule;
 use chem::draw::structure::StructureOptions;
 use chem::io::aromaticity::detect_aromaticity;
+use chem::io::format;
 use chem::io::smiles::parse_smiles;
 use chem::search::{FingerprintSearch, SearchResult};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 #[cfg(target_arch = "wasm32")]
 use chem::gpu::{GpuMorganFingerprint, GpuTanimoto};
 #[cfg(target_arch = "wasm32")]
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
 #[cfg(target_arch = "wasm32")]
-type PendingFileLoad = Rc<RefCell<Option<(String, Vec<u8>)>>>;
+type PendingFileLoad = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
 /// Formats a duration for display, switching to microseconds below 1ms so fast
 /// operations (a single small-molecule fingerprint, say) don't just show as
@@ -198,6 +201,7 @@ pub struct AppState {
     pub fingerprints: OperationOutcome,
     pub aromaticity: OperationOutcome,
     pub coordinates: OperationOutcome,
+    pub convert: OperationOutcome,
     pub query: OperationOutcome,
     pub search: OperationOutcome,
 
@@ -211,18 +215,36 @@ pub struct AppState {
     /// close the *oldest* window rather than an arbitrary one.
     open_details: Vec<usize>,
 
-    /// Bumped whenever the active dataset is replaced or swapped.
+    /// Bumped whenever new search results land.
     ///
-    /// Row indices, fingerprints and results all belong to whichever dataset
-    /// was active when they were made. Rather than every dataset-changing path
-    /// reaching into every view to clear what it holds — which is what the old
-    /// single struct did, in a six-line block duplicated three times — the
-    /// paths bump this, and a view holding indices notices its own state is
-    /// stale. That also means a view which isn't being drawn this frame still
-    /// finds out.
-    dataset_epoch: u64,
-    /// Bumped whenever new search results land, for the same reason.
+    /// Results, and the indices into them, belong to whichever search produced
+    /// them. Rather than every path reaching into every view to clear what it
+    /// holds — which is what the old single struct did, in a six-line block
+    /// duplicated three times — the paths bump this, and a view holding an
+    /// index notices its own state is stale. That also means a view which isn't
+    /// being drawn this frame still finds out.
+    ///
+    /// There was a `dataset_epoch` beside this until #273, for views holding
+    /// row indices. Its only reader was the detail window's own layout cache,
+    /// and that cache is now [`AppState::layouts`] — shared, and cleared
+    /// directly by the paths that invalidate it.
     results_epoch: u64,
+
+    /// Laid-out copies of the active dataset's molecules, keyed by row.
+    ///
+    /// A view cannot lay a molecule out itself: generating coordinates needs
+    /// the dataset mutably and a table is reading it. So the table and the
+    /// result rows used to show a dash for a molecule the detail window drew
+    /// perfectly well, and each ran its own cache -- which meant running
+    /// 2D Coordinates could leave two views showing two different, both valid,
+    /// layouts of one molecule (#273).
+    ///
+    /// Beside the dataset rather than in it, so `has_coords()` keeps meaning
+    /// "the file carried a layout" (#270) and this answers the separate
+    /// question of what it looks like. `RefCell` because callers hold `&self`
+    /// through a row closure; every borrow is taken and dropped inside one
+    /// method, never held across drawing.
+    layouts: RefCell<HashMap<usize, Molecule>>,
 
     // GPU-capable work, which is async on wasm32. Each is started in one place
     // and collected in `update()`; see `task::Task`.
@@ -252,6 +274,184 @@ pub struct AppState {
     repaint: egui::Context,
 }
 
+/// What separates a converted dataset's name from where it came from.
+///
+/// `add_and_activate` replaces a same-named entry *in place*, so naming a
+/// conversion `aromatics.sdf` would silently destroy a loaded file called that.
+/// Carrying the provenance instead cannot collide with a filename -- and does
+/// collide with itself, so converting twice to one target replaces rather than
+/// piling up entries (#275).
+const DERIVED_SEPARATOR: &str = " \u{2192} ";
+
+/// What a dataset converted from `source_name` to `target` is called.
+fn derived_dataset_name(source_name: &str, target: DatasetFormat) -> String {
+    // From the original rather than the chain, so converting A to B to C reads
+    // as "A -> C" instead of accumulating every step it went through.
+    let origin = source_name
+        .split(DERIVED_SEPARATOR)
+        .next()
+        .unwrap_or(source_name);
+    format!("{origin}{DERIVED_SEPARATOR}{}", target.label())
+}
+
+/// The file dialog's filters: everything readable first, then one per format.
+///
+/// Generated from the registry rather than written out. The list used to be two
+/// `add_filter` calls naming SMILES and SDF, duplicated across the two `cfg`
+/// arms of [`AppState::load_dataset_from_file`] -- so the nine formats v0.8.0
+/// added could not be picked at all, and the two copies were free to drift
+/// (#266).
+///
+/// Readable formats only: offering a file the reader would refuse is worse than
+/// not offering it. The combined entry comes first because that is the one rfd
+/// preselects, and someone opening a `.pdb` should not have to know which entry
+/// claims it.
+fn molecule_file_filters() -> Vec<(&'static str, Vec<&'static str>)> {
+    let readable = || format::all().filter(|f| f.can_read());
+
+    let mut every: Vec<&'static str> = Vec::new();
+    for extension in readable().flat_map(|f| f.extensions().iter().copied()) {
+        // Two formats may claim one extension -- the registry pins codes as
+        // unique but not extensions -- and a repeat in this list would show up
+        // in the dialog.
+        if !every.contains(&extension) {
+            every.push(extension);
+        }
+    }
+
+    let mut filters = vec![("Molecule files", every)];
+    filters.extend(readable().map(|f| (f.label(), f.extensions().to_vec())));
+    filters
+}
+
+/// A file dialog that offers every format this build can read.
+fn molecule_file_dialog() -> rfd::AsyncFileDialog {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    for (name, extensions) in molecule_file_filters() {
+        dialog = dialog.add_filter(name, &extensions);
+    }
+    dialog
+}
+
+/// The name and bytes of a dropped file, whichever half the backend filled in.
+///
+/// The two backends describe a drop differently and neither fills in the other's
+/// fields. `egui-winit` sets `path` and leaves `name` **empty**; eframe's web
+/// backend sets `name` and `bytes` and has no path to give. So on native the
+/// name has to come from the path — using `DroppedFile::name` there would hand
+/// `DatasetFormat::from_filename` an empty string, which resolves to SMILES, and
+/// a dropped `.pdb` would parse as SMILES, skip every line, and look like an
+/// empty file rather than a bug.
+fn dropped_file_contents(file: &egui::DroppedFile) -> Option<(String, Vec<u8>)> {
+    if let Some(bytes) = &file.bytes {
+        return Some((file.name.clone(), bytes.to_vec()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = &file.path {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        match std::fs::read(path) {
+            Ok(bytes) => return Some((name, bytes)),
+            Err(e) => {
+                log::error!("Could not read dropped file {name}: {e}");
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+/// One line for a whole batch, naming what did not load.
+///
+/// The counts are what the Files list already shows per entry, so the summary
+/// leads with them and then spends its length on what the list *cannot* show: a
+/// refused file has no entry, a skipped record has no entry, and a replaced name
+/// looks identical to a file that simply loaded.
+fn summarise_load(outcomes: &[FileLoad]) -> String {
+    // Deduplicated by name, keeping the last: a file that replaced an entry of
+    // the same name did not add one, and counting both would report "2 files, 3
+    // molecules" for a Files list holding one entry of two.
+    let mut surviving: Vec<(&str, usize)> = Vec::new();
+    for outcome in outcomes {
+        if let FileLoad::Loaded {
+            name, molecules, ..
+        } = outcome
+        {
+            match surviving.iter_mut().find(|(seen, _)| *seen == name) {
+                Some(entry) => entry.1 = *molecules,
+                None => surviving.push((name, *molecules)),
+            }
+        }
+    }
+    let molecules: usize = surviving.iter().map(|(_, n)| n).sum();
+
+    let mut summary = match surviving.len() {
+        0 => "Loaded nothing".to_string(),
+        1 => format!("Loaded {molecules} {}", plural(molecules, "molecule")),
+        files => format!(
+            "Loaded {files} files, {molecules} {}",
+            plural(molecules, "molecule")
+        ),
+    };
+
+    for outcome in outcomes {
+        match outcome {
+            FileLoad::Loaded {
+                name,
+                skipped,
+                replaced,
+                ..
+            } => {
+                if *skipped > 0 {
+                    summary.push_str(&format!(" \u{b7} {name}: {skipped} skipped"));
+                }
+                if *replaced {
+                    summary.push_str(&format!(" \u{b7} {name}: replaced"));
+                }
+            }
+            FileLoad::Refused { name, reason } => {
+                summary.push_str(&format!(" \u{b7} {name}: {reason}"));
+            }
+        }
+    }
+    summary
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+/// What became of one file in a load.
+///
+/// [`AppState::apply_loaded_file_bytes`] used to return `()`, which was enough
+/// while a load was one file: it wrote `dataset_status` and the caller had
+/// nothing to decide. A batch has to say what happened to *each* file, because
+/// the Files list cannot — a refused file leaves no entry in it at all, so
+/// mixed with a good one it would vanish without this (#296).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLoad {
+    Loaded {
+        name: String,
+        /// Where it landed, so a batch can activate the first one it loaded.
+        index: usize,
+        molecules: usize,
+        skipped: usize,
+        /// An entry of this name already existed and was replaced in place.
+        /// Silent until now, and much easier to hit when several files arrive
+        /// at once: two directories can each hold a `d.smi`.
+        replaced: bool,
+    },
+    Refused {
+        name: String,
+        reason: &'static str,
+    },
+}
+
 impl AppState {
     pub fn new(ctx: &egui::Context) -> Self {
         Self::with_engine(ctx, FingerprintSearch::new())
@@ -266,7 +466,7 @@ impl AppState {
     /// Its context is detached from any window, which is what a test wants: a
     /// repaint request can be observed but never has to be serviced.
     #[cfg(test)]
-    fn cpu_only() -> Self {
+    pub(crate) fn cpu_only() -> Self {
         Self::with_engine(&egui::Context::default(), FingerprintSearch::new_cpu_only())
     }
 
@@ -302,17 +502,18 @@ impl AppState {
             fingerprints: OperationOutcome::default(),
             aromaticity: OperationOutcome::default(),
             coordinates: OperationOutcome::default(),
+            convert: OperationOutcome::default(),
             query: OperationOutcome::default(),
             search: OperationOutcome::default(),
             display: DisplaySettings::default(),
             open_details: Vec::new(),
-            dataset_epoch: 0,
             results_epoch: 0,
+            layouts: RefCell::new(HashMap::new()),
             dataset_fingerprint_task: Task::new(),
             query_fingerprint_task: Task::new(),
             search_task: Task::new(),
             #[cfg(target_arch = "wasm32")]
-            pending_file_load: Rc::new(RefCell::new(None)),
+            pending_file_load: Rc::new(RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
             repaint: ctx.clone(),
@@ -352,9 +553,48 @@ impl AppState {
         self.open_details.clear();
     }
 
-    /// Version of the active dataset. See [`AppState::dataset_epoch`] field docs.
-    pub fn dataset_epoch(&self) -> u64 {
-        self.dataset_epoch
+    /// The molecule at `row`, laid out so it can be drawn, or `None` when there
+    /// is no such row.
+    ///
+    /// Laid out once per dataset and kept, so every view that draws this
+    /// molecule draws the same picture -- `layout` is not deterministic across
+    /// runs, so two views computing their own would disagree (#273).
+    ///
+    /// A molecule whose file supplied a layout is returned untouched:
+    /// `ensure_coords` computes one only where there is none.
+    ///
+    /// Owned rather than borrowed, so no `RefCell` guard is held while the
+    /// caller paints. It costs no more than the caller is about to spend --
+    /// `StructureView` rebuilds the depiction every frame regardless.
+    pub fn drawable(&self, row: usize) -> Option<Molecule> {
+        if let Some(cached) = self.layouts.borrow().get(&row) {
+            return Some(cached.clone());
+        }
+
+        let source = self
+            .loaded_files
+            .active_dataset()
+            .molecules
+            .get(row)?
+            .clone();
+        let mut prepared = source;
+        ensure_coords(&mut prepared);
+        self.layouts.borrow_mut().insert(row, prepared.clone());
+        Some(prepared)
+    }
+
+    /// The molecules changed under their cached layouts, so drop them.
+    ///
+    /// For an operation that mutates the active dataset *in place* --
+    /// coordinates, aromaticity -- as distinct from one that replaces it, which
+    /// goes through [`AppState::invalidate_active_dataset`].
+    ///
+    /// Aromaticity is the one observable today: it changes the molecule, so a
+    /// clone cached before perception ran keeps drawing Kekulé bonds. The
+    /// coordinates call is the same rule applied consistently rather than a
+    /// bug being fixed -- see the note there.
+    fn dataset_molecules_changed(&mut self) {
+        self.layouts.get_mut().clear();
     }
 
     /// Version of [`AppState::search_results`].
@@ -377,8 +617,11 @@ impl AppState {
         self.fingerprints = OperationOutcome::default();
         self.aromaticity = OperationOutcome::default();
         self.coordinates = OperationOutcome::default();
+        self.convert = OperationOutcome::default();
         self.search = OperationOutcome::default();
-        self.dataset_epoch += 1;
+        // Keyed by row index too, and a row means nothing against a different
+        // dataset.
+        self.layouts.get_mut().clear();
         self.results_epoch += 1;
     }
 
@@ -391,17 +634,17 @@ impl AppState {
         // is safe on native since blocking the calling thread doesn't stop
         // other threads from driving the future forward.
         let picked = pollster::block_on(async {
-            let file = rfd::AsyncFileDialog::new()
-                .add_filter("SMILES", &["smi", "smiles", "txt"])
-                .add_filter("SDF", &["sdf"])
-                .pick_file()
-                .await?;
-            let name = file.file_name();
-            Some((name, file.read().await))
+            let files = molecule_file_dialog().pick_files().await?;
+            let mut picked = Vec::with_capacity(files.len());
+            for file in files {
+                let name = file.file_name();
+                picked.push((name, file.read().await));
+            }
+            Some(picked)
         });
 
-        if let Some((name, bytes)) = picked {
-            self.apply_loaded_file_bytes(name, bytes);
+        if let Some(picked) = picked {
+            self.apply_loaded_files(picked);
         }
     }
 
@@ -414,15 +657,17 @@ impl AppState {
         let slot = self.pending_file_load.clone();
         let ctx = self.repaint.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let file = rfd::AsyncFileDialog::new()
-                .add_filter("SMILES", &["smi", "smiles", "txt"])
-                .add_filter("SDF", &["sdf"])
-                .pick_file()
-                .await;
-            if let Some(file) = file {
-                let name = file.file_name();
-                let bytes = file.read().await;
-                *slot.borrow_mut() = Some((name, bytes));
+            let files = molecule_file_dialog().pick_files().await;
+            if let Some(files) = files {
+                let mut picked = Vec::with_capacity(files.len());
+                for file in files {
+                    let name = file.file_name();
+                    picked.push((name, file.read().await));
+                }
+                // Extends rather than replaces: the slot used to hold one file,
+                // so a second pick before the next frame silently dropped the
+                // first (#296).
+                slot.borrow_mut().extend(picked);
                 // Closing the picker is not itself an input event the canvas
                 // sees, so without this the file stays unloaded until the user
                 // moves the mouse (#186).
@@ -431,19 +676,43 @@ impl AppState {
         });
     }
 
-    pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) {
+    /// Whether any format this build can read claims this file's extension.
+    ///
+    /// Only drops ask. A file chosen through the dialog came from a list built
+    /// from the registry (#266), so an unrecognised extension there is someone
+    /// overriding the filter on purpose and keeps the documented behaviour of
+    /// being read as SMILES. A dropped file passed no filter at all, so this is
+    /// the only place the answer can come from.
+    fn is_readable_extension(name: &str) -> bool {
+        let Some(extension) = std::path::Path::new(name).extension() else {
+            return false;
+        };
+        let Some(extension) = extension.to_str() else {
+            return false;
+        };
+        let extension = extension.to_ascii_lowercase();
+        format::all()
+            .filter(|f| f.can_read())
+            .flat_map(|f| f.extensions().iter().copied())
+            .any(|known| known.eq_ignore_ascii_case(&extension))
+    }
+
+    pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) -> FileLoad {
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(e) => {
                 self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
                 log::error!("Dataset load failed: {}", e);
-                return;
+                return FileLoad::Refused {
+                    name,
+                    reason: "not valid UTF-8",
+                };
             }
         };
 
         let format = DatasetFormat::from_filename(&name);
         let outcome = chem::io::reader::read(&content, format);
-        let dataset = MoleculeDataset::from_outcome(&outcome);
+        let dataset = MoleculeDataset::from_outcome(&outcome, format);
 
         // Records that failed used to be logged and never surfaced, so a file
         // that half-loaded looked like a file that fully loaded. Reading now
@@ -473,8 +742,94 @@ impl AppState {
             );
         }
 
-        self.loaded_files.add_and_activate(name, dataset, format);
+        let molecules = dataset.len();
+        let skipped = outcome.skipped.len();
+        let replaced = self.loaded_files.names().any(|existing| existing == name);
+        self.loaded_files
+            .add_and_activate(name.clone(), dataset, format);
         self.invalidate_active_dataset();
+        FileLoad::Loaded {
+            name,
+            index: self.loaded_files.active_index(),
+            molecules,
+            skipped,
+            replaced,
+        }
+    }
+
+    /// Loads several files as one action, from the dialog or from a drop.
+    ///
+    /// Two things it does that a loop over
+    /// [`AppState::apply_loaded_file_bytes`] would not.
+    ///
+    /// It writes **one** status for the batch. `dataset_status` is a single
+    /// string rendered by a single label, so per-file messages overwrite each
+    /// other and the last file wins — which would silently swallow a refusal,
+    /// the one outcome that leaves no Files entry to notice afterwards.
+    ///
+    /// And it activates the **first** file that loaded rather than the last.
+    /// `add_and_activate` activates whatever it just added, so without this the
+    /// batch would leave you looking at the file you happened to select last.
+    /// Going back through [`AppState::activate_loaded_file`] rather than
+    /// `LoadedFiles::activate` matters: it runs the same invalidation a click in
+    /// the list does, and fingerprints belong to whichever dataset was active
+    /// when they were computed.
+    pub fn apply_loaded_files(&mut self, files: Vec<(String, Vec<u8>)>) {
+        let outcomes: Vec<FileLoad> = files
+            .into_iter()
+            .map(|(name, bytes)| self.apply_loaded_file_bytes(name, bytes))
+            .collect();
+        self.finish_batch(outcomes);
+    }
+
+    /// Refuses a dropped file whose extension no readable format claims, and
+    /// otherwise loads it.
+    ///
+    /// The refusal is the whole difference from the dialog path. Refusals go
+    /// into the same list as the loads, in the order the files arrived, so the
+    /// summary reads as one sentence about one gesture -- building a second
+    /// summary for them and appending it produced `Loaded 2 files, 3 molecules
+    /// \u{b7} Loaded nothing \u{b7} logo.png: ...`, which is two answers to one
+    /// question.
+    pub fn apply_dropped_files(&mut self, files: Vec<(String, Vec<u8>)>) {
+        let outcomes: Vec<FileLoad> = files
+            .into_iter()
+            .map(|(name, bytes)| {
+                if Self::is_readable_extension(&name) {
+                    self.apply_loaded_file_bytes(name, bytes)
+                } else {
+                    FileLoad::Refused {
+                        name,
+                        reason: "not a format this build reads",
+                    }
+                }
+            })
+            .collect();
+        self.finish_batch(outcomes);
+    }
+
+    /// Activates the first file that loaded, then says what became of the batch.
+    ///
+    /// The first rather than the last because `add_and_activate` activates
+    /// whatever it just added, so a batch would otherwise leave you looking at
+    /// whichever file happened to be selected last. Going back through
+    /// [`AppState::activate_loaded_file`] rather than `LoadedFiles::activate`
+    /// runs the same invalidation a click in the list does -- and it writes its
+    /// own status, which is why the summary is written after it rather than
+    /// before.
+    fn finish_batch(&mut self, outcomes: Vec<FileLoad>) {
+        if outcomes.is_empty() {
+            return;
+        }
+
+        if let Some(FileLoad::Loaded { index, .. }) = outcomes
+            .iter()
+            .find(|outcome| matches!(outcome, FileLoad::Loaded { .. }))
+        {
+            self.activate_loaded_file(*index);
+        }
+
+        self.dataset_status = summarise_load(&outcomes);
     }
 
     pub fn load_example_dataset(&mut self) {
@@ -569,8 +924,183 @@ impl AppState {
             .iter()
             .filter(|mol| mol.atoms().iter().any(|atom| atom.is_aromatic()))
             .count();
-        self.aromaticity =
-            OperationOutcome::ok(format!("{} of {} aromatic", aromatic, dataset.len()));
+        let summary = format!("{} of {} aromatic", aromatic, dataset.len());
+        // Perception changes the picture, so anything laid out before it ran is
+        // now drawing the wrong bonds.
+        self.dataset_molecules_changed();
+        self.aromaticity = OperationOutcome::ok(summary);
+    }
+
+    /// What converting the active dataset to `target` would discard: each
+    /// attribute, and how many molecules lose it.
+    ///
+    /// The command line asks one question -- can the target hold this? -- and
+    /// that is not the whole of it. A conversion is a read and a write, and
+    /// #257 pinned six pairs that lose an attribute *both* masks claim: CML to
+    /// SMILES drops aromaticity and hands back cyclohexane, which a target-only
+    /// report cannot see (#261). `chem convert` missed them too until #276
+    /// pointed both at one function.
+    ///
+    /// Deliberately not `format::fidelity`, which folds in what the *target*
+    /// manufactures. That answers what the output will contain; this answers
+    /// what the input loses.
+    ///
+    /// First-seen order with a count, matching the CLI's own tracker so the two
+    /// can be read side by side -- and, since #276, from the same formula:
+    /// `format::kept` is what both call, so they cannot drift again.
+    pub fn conversion_losses(&self, target: DatasetFormat) -> Vec<(&'static str, usize)> {
+        let source = self.loaded_files.active_format();
+        let kept = format::kept(source, target);
+
+        let mut losses: Vec<(&'static str, usize)> = Vec::new();
+        for molecule in &self.loaded_files.active_dataset().molecules {
+            for attribute in format::held(molecule).difference(kept).names() {
+                match losses.iter_mut().find(|(name, _)| *name == attribute) {
+                    Some((_, count)) => *count += 1,
+                    None => losses.push((attribute, 1)),
+                }
+            }
+        }
+        losses
+    }
+
+    /// Converts the active dataset and adds the result as a dataset of its own.
+    ///
+    /// Deliberately a round trip -- written, then read back -- so what the user
+    /// looks at is what the conversion actually produced rather than the
+    /// molecules it started from. Converting CML to SMILES puts `C1CCCCC1` in
+    /// the table where the original had `c1ccccc1`: the drop report predicts
+    /// that loss, and this makes it visible (#275).
+    ///
+    /// The original stays in the file list, so the two can be compared.
+    pub fn convert_dataset(&mut self, target: DatasetFormat) -> bool {
+        let dataset = self.loaded_files.active_dataset();
+        if dataset.is_empty() {
+            self.convert = OperationOutcome::failure("No dataset loaded");
+            return false;
+        }
+
+        let records: Vec<(String, Molecule)> = dataset
+            .names
+            .iter()
+            .cloned()
+            .zip(dataset.molecules.iter().cloned())
+            .collect();
+
+        let Some(text) = target.write(&records) else {
+            // Every registered format writes today, so this is a format that
+            // grew a reader and no writer -- the picker filters on `can_write`,
+            // making this the belt to that braces.
+            self.convert =
+                OperationOutcome::failure(format!("{} cannot be written", target.label()));
+            return false;
+        };
+
+        let losses = self.conversion_losses(target);
+        let source_name = self.loaded_files.entries()[self.loaded_files.active_index()]
+            .name
+            .clone();
+        let derived = derived_dataset_name(&source_name, target);
+
+        let outcome = chem::io::reader::read(&text, target);
+        let converted = MoleculeDataset::from_outcome(&outcome, target);
+        let written = converted.len();
+
+        self.dataset_status = if outcome.skipped.is_empty() {
+            format!("Converted {written} molecules to {}", target.label())
+        } else {
+            // Our own output failing to read back is worth saying out loud
+            // rather than logging, the same as it is for a loaded file.
+            format!(
+                "Converted {written} molecules to {} — {} did not read back",
+                target.label(),
+                outcome.skipped.len()
+            )
+        };
+        for skipped in &outcome.skipped {
+            log::warn!(
+                "Conversion to {} produced record {} that did not read back: {}",
+                target.label(),
+                skipped.position,
+                skipped.error
+            );
+        }
+
+        self.loaded_files
+            .add_and_activate(derived, converted, target);
+        // Before the outcome, not after: this resets `self.convert` along with
+        // everything else the old dataset derived, so writing the summary first
+        // would leave the section's header blank after a conversion that worked.
+        self.invalidate_active_dataset();
+
+        let summary = if losses.is_empty() {
+            format!("{written} converted to {}", target.label())
+        } else {
+            let named: Vec<String> = losses
+                .iter()
+                .map(|(attribute, count)| format!("{attribute} ({count})"))
+                .collect();
+            format!(
+                "{written} converted to {} — lost {}",
+                target.label(),
+                named.join(", ")
+            )
+        };
+        self.convert = OperationOutcome::ok(summary);
+        true
+    }
+
+    /// The active dataset written in its own format, and a filename for it.
+    ///
+    /// Separate from converting: this writes whatever dataset is active, so it
+    /// works for one that was merely loaded. Changing format is what Convert is
+    /// for.
+    ///
+    /// Returns the text rather than saving it -- the dialog belongs to the
+    /// view, as it does for an SVG export, and on web there is no dialog at all,
+    /// just a download the browser takes over.
+    pub fn export_active_dataset(&self) -> Option<(String, String)> {
+        let format = self.loaded_files.active_format();
+        let dataset = self.loaded_files.active_dataset();
+        if dataset.is_empty() {
+            return None;
+        }
+
+        let records: Vec<(String, Molecule)> = dataset
+            .names
+            .iter()
+            .cloned()
+            .zip(dataset.molecules.iter().cloned())
+            .collect();
+        let text = format.write(&records)?;
+        Some((self.suggested_output_name(format), text))
+    }
+
+    /// A filename for the active dataset: its own stem with the format's
+    /// extension, and the provenance suffix a converted dataset carries
+    /// removed.
+    ///
+    /// Sanitised for the same reason `draw::svg::suggested_filename` is -- a
+    /// name comes from a file's own records and can hold anything, and a slash
+    /// would quietly redirect where the file lands.
+    fn suggested_output_name(&self, format: DatasetFormat) -> String {
+        let entry = &self.loaded_files.entries()[self.loaded_files.active_index()];
+        let displayed = entry.name.split(DERIVED_SEPARATOR).next().unwrap_or("");
+        let stem: String = displayed
+            .rsplit_once('.')
+            .map_or(displayed, |(stem, _)| stem)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let stem = stem.trim_matches('_');
+        let stem = if stem.is_empty() { "molecules" } else { stem };
+        format!("{stem}.{}", format.extensions().first().unwrap_or(&"txt"))
     }
 
     /// Generates 2D coordinates across the dataset.
@@ -596,6 +1126,12 @@ impl AppState {
                 generated += 1;
             }
         }
+        // The dataset now holds layouts of its own. Not observable today --
+        // `layout` is deterministic, so the cached layout and the one this just
+        // computed are identical -- but the rule is that an operation mutating
+        // the dataset in place drops the cache, and #110's layout refinement
+        // would make the difference real.
+        self.dataset_molecules_changed();
         self.coordinates = OperationOutcome::ok(if kept > 0 {
             format!("{} generated, {} kept from file", generated, kept)
         } else {
@@ -703,10 +1239,10 @@ impl AppState {
     pub fn poll_pending_work(&mut self) {
         #[cfg(target_arch = "wasm32")]
         {
-            let loaded = self.pending_file_load.borrow_mut().take();
-            if let Some((name, bytes)) = loaded {
-                self.apply_loaded_file_bytes(name, bytes);
-            }
+            // Drained whole, so the Files list never shows half a batch.
+            let loaded: Vec<(String, Vec<u8>)> =
+                self.pending_file_load.borrow_mut().drain(..).collect();
+            self.apply_loaded_files(loaded);
 
             let gpu_init = self.pending_gpu_init.borrow_mut().take();
             match gpu_init {
@@ -718,6 +1254,16 @@ impl AppState {
                 }
                 None => {} // still pending
             }
+        }
+
+        // Dropped files are raw input, read through the stored context rather
+        // than a parameter -- it is the same one eframe passes to `update`.
+        // egui clears them each frame, so this is the one chance to take them.
+        let dropped: Vec<egui::DroppedFile> = self.repaint.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let files: Vec<(String, Vec<u8>)> =
+                dropped.iter().filter_map(dropped_file_contents).collect();
+            self.apply_dropped_files(files);
         }
 
         // Collected on both platforms alike: the task ran on a spawned future
@@ -903,7 +1449,6 @@ mod tests {
     fn test_loading_a_dataset_drops_what_the_old_one_derived() {
         let mut state = AppState::cpu_only();
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.load_example_dataset();
 
@@ -914,7 +1459,6 @@ mod tests {
         assert!(state.search_results.is_empty());
         assert!(state.open_details().is_empty());
         // Views hold indices too, and find out the same way.
-        assert!(state.dataset_epoch() > epoch);
     }
 
     #[test]
@@ -922,7 +1466,6 @@ mod tests {
         let mut state = AppState::cpu_only();
         state.load_example_dataset(); // a second entry to switch between
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.activate_loaded_file(0);
 
@@ -930,14 +1473,12 @@ mod tests {
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
         assert!(state.open_details().is_empty());
-        assert!(state.dataset_epoch() > epoch);
     }
 
     #[test]
     fn test_a_failed_load_leaves_the_active_dataset_alone() {
         let mut state = AppState::cpu_only();
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
         let files_before = state.loaded_files.names().count();
 
         // Not valid UTF-8, so it never reaches a parser.
@@ -946,7 +1487,6 @@ mod tests {
         assert!(state.dataset_status.contains("Failed to load"));
         // Nothing was replaced, so nothing derived from it is stale.
         assert_eq!(state.loaded_files.names().count(), files_before);
-        assert_eq!(state.dataset_epoch(), epoch);
         assert_eq!(state.open_details(), [0]);
         assert!(!state.dataset_fingerprints.is_empty());
     }
@@ -966,14 +1506,12 @@ mod tests {
         let mut state = AppState::cpu_only();
         add_second_file(&mut state); // now active
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.remove_loaded_file(state.loaded_files.active_index());
 
         assert!(state.dataset_fingerprints.is_empty());
         assert!(state.search_results.is_empty());
         assert!(state.open_details().is_empty());
-        assert!(state.dataset_epoch() > epoch);
         assert!(state.dataset_status.contains("Removed"));
     }
 
@@ -983,7 +1521,6 @@ mod tests {
         add_second_file(&mut state);
         // The second entry stays active; the first is removed.
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.remove_loaded_file(0);
 
@@ -993,19 +1530,16 @@ mod tests {
         assert!(!state.dataset_fingerprints.is_empty());
         assert!(!state.search_results.is_empty());
         assert_eq!(state.open_details(), [0]);
-        assert_eq!(state.dataset_epoch(), epoch);
     }
 
     #[test]
     fn test_removing_the_only_file_does_nothing() {
         let mut state = AppState::cpu_only();
         with_derived_data(&mut state);
-        let epoch = state.dataset_epoch();
 
         state.remove_loaded_file(0);
 
         assert_eq!(state.loaded_files.entries().len(), 1);
-        assert_eq!(state.dataset_epoch(), epoch);
         assert!(!state.dataset_fingerprints.is_empty());
     }
 
@@ -1025,6 +1559,319 @@ mod tests {
         assert!(!state.coordinates.has_run());
         assert!(!state.fingerprints.has_run());
         assert!(!state.search.has_run());
+    }
+
+    /// The rounded positions of a drawable molecule, for comparing one layout
+    /// against another. `layout` is not deterministic across runs, so equality
+    /// here means "the same cached layout", not merely "both laid out".
+    fn positions(state: &AppState, row: usize) -> Vec<String> {
+        state
+            .drawable(row)
+            .expect("a row")
+            .coords()
+            .expect("laid out")
+            .iter()
+            .map(|p| format!("{:.4},{:.4}", p.x, p.y))
+            .collect()
+    }
+
+    #[test]
+    fn test_the_loss_the_command_line_cannot_see() {
+        // The story. PDBQT and SDF both claim aromaticity, so a report asking
+        // only `held(m).difference(target.carries())` reports nothing -- the
+        // loss is structural, since PDBQT carries no bonds for atom
+        // aromaticity to ride on. Only the `pair_loss` term catches it.
+        //
+        // This used to pin `cml -> smi`, which really did hand back
+        // cyclohexane; #261 fixed that at the reader boundary, so the pair that
+        // demonstrates the mechanism is now one where the loss is correct
+        // behaviour rather than a defect.
+        let mut state = AppState::cpu_only();
+        let pdbqt = DatasetFormat::PDBQT
+            .write(&[(
+                "benzene".to_string(),
+                parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("PDBQT writes");
+        state.apply_loaded_file_bytes("rings.pdbqt".to_string(), pdbqt.into_bytes());
+        assert_eq!(state.loaded_files.active_format(), DatasetFormat::PDBQT);
+
+        let losses = state.conversion_losses(DatasetFormat::SDF);
+        assert!(
+            losses.iter().any(|(name, _)| *name == "aromaticity"),
+            "the pair loss is not reported: {losses:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_ordinary_loss_is_still_reported() {
+        // The other term must still work: XYZ has no bond block at all, which
+        // is what `Carries::BONDS` was added to be able to say (#257).
+        let state = AppState::cpu_only();
+        let losses = state.conversion_losses(DatasetFormat::XYZ);
+        assert!(
+            losses.iter().any(|(name, _)| *name == "bonds"),
+            "{losses:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_conversion_that_keeps_everything_reports_nothing() {
+        // So the report is not merely always non-empty. CXSMILES carries
+        // everything SMILES does and more.
+        let state = AppState::cpu_only();
+        assert_eq!(state.conversion_losses(DatasetFormat::CXSMILES), Vec::new());
+    }
+
+    #[test]
+    fn test_the_count_is_molecules_not_attributes() {
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes(
+            "two.smi".to_string(),
+            b"CCO ethanol\nCCN ethylamine\n".to_vec(),
+        );
+
+        let losses = state.conversion_losses(DatasetFormat::XYZ);
+        let bonds = losses.iter().find(|(name, _)| *name == "bonds");
+        assert_eq!(bonds, Some(&("bonds", 2)), "{losses:?}");
+    }
+
+    /// A dataset read from CML, whose benzene is aromatic on the way in.
+    fn cml_benzene(state: &mut AppState) {
+        let cml = DatasetFormat::CML
+            .write(&[(
+                "benzene".to_string(),
+                parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("CML writes");
+        state.apply_loaded_file_bytes("rings.cml".to_string(), cml.into_bytes());
+    }
+
+    #[test]
+    fn test_the_conversion_is_visible_in_what_it_produces() {
+        // A report predicting a loss is weaker than a dataset that shows it, so
+        // this asserts on the molecules rather than the flags (#275).
+        //
+        // It used to convert CML to SMILES and assert the *loss* was visible --
+        // `C1CCCCC1` where the original had `c1ccccc1`. Since #261 that round
+        // trip is lossless, so what is asserted is the other half of the same
+        // property: the converted dataset is what the conversion actually
+        // produced, and here that means the aromaticity survived.
+        let mut state = AppState::cpu_only();
+        cml_benzene(&mut state);
+        assert!(
+            format::held(&state.loaded_files.active_dataset().molecules[0])
+                .contains(format::Carries::AROMATICITY),
+            "the fixture must start aromatic, or this tests nothing"
+        );
+
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+
+        let converted = state.loaded_files.active_dataset();
+        assert_eq!(converted.len(), 1);
+        assert!(
+            format::held(&converted.molecules[0]).contains(format::Carries::AROMATICITY),
+            "aromaticity was lost: CML states it in the bond order and the \
+             SMILES writer reads the atom flag, which is what #261 reconciled"
+        );
+        // The column the user reads, and the whole of #261 in one assertion.
+        assert_eq!(converted.smiles[0], "c1ccccc1");
+    }
+
+    #[test]
+    fn test_the_original_dataset_survives_the_conversion() {
+        // The point is comparing them, so the one converted from has to still
+        // be there and switchable.
+        let mut state = AppState::cpu_only();
+        cml_benzene(&mut state);
+        let before = state.loaded_files.entries().len();
+
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+
+        assert_eq!(state.loaded_files.entries().len(), before + 1);
+        assert!(
+            state.loaded_files.names().any(|n| n == "rings.cml"),
+            "the source dataset went away"
+        );
+        assert_eq!(state.loaded_files.active_format(), DatasetFormat::SMILES);
+    }
+
+    #[test]
+    fn test_converting_twice_replaces_rather_than_piling_up() {
+        let mut state = AppState::cpu_only();
+        cml_benzene(&mut state);
+
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+        let after_one = state.loaded_files.entries().len();
+
+        // Back to the CML entry: index 0 is the example dataset every session
+        // starts on, and converting *that* would add a differently-named entry.
+        let source = state
+            .loaded_files
+            .names()
+            .position(|n| n == "rings.cml")
+            .expect("the cml entry");
+        state.activate_loaded_file(source);
+        assert!(state.convert_dataset(DatasetFormat::SMILES));
+
+        assert_eq!(state.loaded_files.entries().len(), after_one);
+    }
+
+    #[test]
+    fn test_converting_does_not_clobber_a_loaded_file_of_that_name() {
+        // `add_and_activate` replaces a same-named entry *in place*, so naming
+        // the result `two.sdf` would silently destroy a file the user loaded
+        // under that name. The derived name carries its provenance instead.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("two.smi".to_string(), b"CCO a\nCCN b\n".to_vec());
+        let sdf = DatasetFormat::SDF
+            .write(&[("mine".to_string(), parse_smiles("C").expect("valid"))])
+            .expect("SDF writes");
+        state.apply_loaded_file_bytes("two.sdf".to_string(), sdf.into_bytes());
+        let smi = state
+            .loaded_files
+            .names()
+            .position(|n| n == "two.smi")
+            .expect("the smi entry");
+        state.activate_loaded_file(smi);
+
+        assert!(state.convert_dataset(DatasetFormat::SDF));
+
+        let theirs = state
+            .loaded_files
+            .entries()
+            .iter()
+            .find(|e| e.name == "two.sdf")
+            .expect("the loaded file is still there");
+        assert_eq!(theirs.dataset.len(), 1, "their file was overwritten");
+    }
+
+    #[test]
+    fn test_the_outcome_survives_the_invalidation_that_precedes_it() {
+        // Adding a dataset invalidates what the old one derived, and that
+        // resets `convert` along with the rest. Writing the summary first would
+        // leave the section's header blank after a conversion that worked.
+        let mut state = AppState::cpu_only();
+        assert!(state.convert_dataset(DatasetFormat::XYZ));
+
+        assert!(state.convert.has_run(), "the summary was wiped");
+        assert!(!state.convert.failed());
+        assert!(
+            state.convert.summary().contains("bonds"),
+            "{}",
+            state.convert.summary()
+        );
+    }
+
+    #[test]
+    fn test_exporting_writes_the_active_dataset_named_for_its_format() {
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("two.smi".to_string(), b"CCO a\nCCN b\n".to_vec());
+
+        assert!(state.convert_dataset(DatasetFormat::SDF));
+        let (name, text) = state.export_active_dataset().expect("SDF writes");
+
+        // From the format, not from the display name the conversion gave it.
+        assert_eq!(name, "two.sdf");
+        assert_eq!(text.matches("$$$$").count(), 2, "both records written");
+    }
+
+    #[test]
+    fn test_a_filename_from_a_hostile_dataset_name_is_still_a_filename() {
+        // Names come from a file's own records; a slash would quietly redirect
+        // where the file lands.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("../../etc/passwd.smi".to_string(), b"C methane\n".to_vec());
+
+        let (name, _) = state.export_active_dataset().expect("writes");
+        assert!(!name.contains('/'), "{name}");
+        assert!(name.ends_with(".smi"), "{name}");
+    }
+
+    #[test]
+    fn test_a_molecule_with_no_layout_is_still_drawable() {
+        // The bug: the table and the result rows showed a dash for a molecule
+        // the detail window drew perfectly well (#273). The example dataset is
+        // SMILES, so nothing in it carries a layout.
+        let state = AppState::cpu_only();
+        assert!(
+            !state.loaded_files.active_dataset().molecules[0].has_coords(),
+            "the fixture must start without a layout, or this tests nothing"
+        );
+
+        let drawable = state.drawable(0).expect("row 0 exists");
+        assert!(drawable.has_coords());
+
+        // Beside the dataset, not in it: `has_coords()` keeps meaning "the file
+        // carried a layout" (#270), so 2D Coordinates still has work to report.
+        assert!(!state.loaded_files.active_dataset().molecules[0].has_coords());
+    }
+
+    #[test]
+    fn test_the_layout_distinguishes_the_atoms() {
+        // Presence is not enough -- #270 shipped a layout that satisfied
+        // `has_coords()` with every atom stacked on one point, undrawable.
+        let state = AppState::cpu_only();
+        let drawn = positions(&state, 0);
+        let mut distinct = drawn.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), drawn.len(), "atoms share a position");
+    }
+
+    #[test]
+    fn test_every_view_asking_for_a_row_gets_the_same_layout() {
+        // The subject of #273. Two views laying out independently would each
+        // get a valid but different picture of one molecule.
+        let state = AppState::cpu_only();
+        assert_eq!(positions(&state, 0), positions(&state, 0));
+    }
+
+    #[test]
+    fn test_a_new_dataset_drops_the_cached_layouts() {
+        // A row index means nothing against a different dataset. Without the
+        // clear, row 0 would keep answering with the previous dataset's
+        // molecule.
+        let mut state = AppState::cpu_only();
+        let _ = state.drawable(0);
+
+        state.apply_loaded_file_bytes(
+            "one.smi".to_string(),
+            b"c1ccccc1 benzene
+"
+            .to_vec(),
+        );
+
+        let drawable = state.drawable(0).expect("row 0 of the new dataset");
+        assert_eq!(
+            drawable.num_atoms(),
+            state.loaded_files.active_dataset().molecules[0].num_atoms(),
+            "a stale layout from the previous dataset"
+        );
+    }
+
+    #[test]
+    fn test_detecting_aromaticity_drops_the_cached_layouts() {
+        // Perception changes the picture, so a layout cached before it ran
+        // draws the wrong bonds. Nothing else pins this, which is exactly why
+        // it is the invalidation that would be forgotten.
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes(
+            "ring.smi".to_string(),
+            b"C1=CC=CC=C1 benzene
+"
+            .to_vec(),
+        );
+        let drawn = state.drawable(0).expect("a row");
+        assert!(!drawn.atoms().iter().any(|a| a.is_aromatic()));
+
+        state.detect_aromaticity_for_dataset();
+
+        let redrawn = state.drawable(0).expect("a row");
+        assert!(
+            redrawn.atoms().iter().any(|a| a.is_aromatic()),
+            "the cache is still handing out the pre-perception molecule"
+        );
     }
 
     #[test]
@@ -1061,9 +1908,10 @@ mod tests {
     #[test]
     fn test_an_operation_on_an_empty_dataset_fails_in_its_own_section() {
         let mut state = AppState::cpu_only();
-        state.loaded_files.active_dataset_mut().molecules.clear();
-        state.loaded_files.active_dataset_mut().smiles.clear();
-        state.loaded_files.active_dataset_mut().names.clear();
+        // Replaced rather than cleared vector by vector: `new()` is the one
+        // constructor, so a parallel vector added later cannot be left behind
+        // here still holding rows.
+        *state.loaded_files.active_dataset_mut() = MoleculeDataset::new();
 
         state.detect_aromaticity_for_dataset();
 
@@ -1158,5 +2006,384 @@ mod tests {
         assert!(state.query_error.is_some());
         assert!(state.search.failed());
         assert!(state.results_epoch() > epoch);
+    }
+
+    #[test]
+    fn test_the_file_dialog_offers_every_readable_format() {
+        // Asserted against the registry rather than a count, so registering a
+        // twelfth format cannot silently go un-offered -- which is exactly what
+        // happened to the nine v0.8.0 added (#266).
+        let filters = molecule_file_filters();
+        let (combined, every) = &filters[0];
+        assert_eq!(*combined, "Molecule files");
+
+        for expected in format::all().filter(|f| f.can_read()) {
+            assert!(
+                filters.iter().any(|(name, _)| *name == expected.label()),
+                "{} has no filter entry",
+                expected.label()
+            );
+            for extension in expected.extensions() {
+                assert!(
+                    every.contains(extension),
+                    "{extension} missing from the combined filter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_dialog_offers_nothing_it_cannot_read() {
+        // Offering a file the reader would refuse is worse than not offering
+        // it: the picker would accept it and the load would fail afterwards.
+        let filters = molecule_file_filters();
+        for format in format::all().filter(|f| !f.can_read()) {
+            assert!(
+                !filters.iter().any(|(name, _)| *name == format.label()),
+                "{} cannot be read but is offered",
+                format.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_combined_filter_lists_each_extension_once() {
+        // The registry pins codes as unique but not extensions, so two formats
+        // may claim one and a repeat would reach the dialog.
+        let filters = molecule_file_filters();
+        let mut seen = filters[0].1.clone();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            before,
+            seen.len(),
+            "the combined filter repeats an extension"
+        );
+    }
+
+    #[test]
+    fn test_a_loaded_mol2_shows_the_molecule_where_it_used_to_show_its_format() {
+        // Through the whole load path rather than `from_outcome`, because that
+        // is where a user meets it (#283). Mol2 and CML are the two formats
+        // the issue was filed about.
+        let mut state = AppState::cpu_only();
+        let mol2 = DatasetFormat::MOL2
+            .write(&[(
+                "benzene".to_string(),
+                parse_smiles("c1ccccc1").expect("valid SMILES"),
+            )])
+            .expect("Mol2 writes");
+        state.apply_loaded_file_bytes("rings.mol2".to_string(), mol2.into_bytes());
+
+        let dataset = state.loaded_files.active_dataset();
+        assert_eq!(dataset.smiles[0], "c1ccccc1");
+        assert!(
+            dataset.generated[0],
+            "the app wrote this string and the views say so"
+        );
+
+        cml_benzene(&mut state);
+        let dataset = state.loaded_files.active_dataset();
+        assert_eq!(dataset.smiles[0], "c1ccccc1");
+        assert!(dataset.generated[0]);
+    }
+
+    #[test]
+    fn test_a_structure_file_loads_and_is_labelled_by_its_own_format() {
+        // The `(SDF)` placeholder was applied to every molecule that arrived
+        // without a SMILES string, so a PDB's rows claimed to be SDF records
+        // (#266). PDB is the right fixture precisely because it has no SMILES.
+        let mut state = AppState::cpu_only();
+        let pdb = "\
+ATOM      1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+ATOM      2  H1  HOH A   1       0.759   0.000   0.504  1.00 20.00           H
+CONECT    1    2
+END
+";
+        state.apply_loaded_file_bytes("water.pdb".to_string(), pdb.as_bytes().to_vec());
+
+        let dataset = state.loaded_files.active_dataset();
+        assert_eq!(dataset.len(), 1);
+        // Still the placeholder after #283, and deliberately: the fixture has
+        // a bond, but PDB's `CONECT` is adjacency with no bond order, so a
+        // SMILES written from it would be the right topology and the wrong
+        // molecule. Asserting the bond keeps this from passing for the wrong
+        // reason -- under the `num_bonds() > 0` predicate #283 proposed, this
+        // row would read `[O][H]`.
+        assert!(dataset.molecules[0].num_bonds() > 0);
+        assert_eq!(dataset.smiles[0], "(PDB)");
+        assert!(!dataset.generated[0]);
+        assert!(
+            !dataset.smiles[0].contains("SDF"),
+            "a PDB must not describe itself as an SDF"
+        );
+        assert!(
+            state.dataset_status.contains("PDB"),
+            "{}",
+            state.dataset_status
+        );
+    }
+    /// Two atoms and a CONECT, so it is a real PDB rather than something the
+    /// reader would reject for having no atoms (#292).
+    const WATER_PDB: &str = "\
+ATOM      1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+ATOM      2  H1  HOH A   1       0.759   0.000   0.504  1.00 20.00           H
+CONECT    1    2
+END
+";
+
+    #[test]
+    fn test_a_dropped_file_is_named_by_its_path_when_that_is_all_the_backend_gave() {
+        // The native half, and the one that fails silently. `egui-winit` sets
+        // `path` and leaves `name` empty, so reading `name` here would hand
+        // `from_filename` an empty string -- which resolves to SMILES, and a
+        // dropped PDB would then skip every line and look like an empty file
+        // rather than a bug.
+        let dir = std::env::temp_dir().join("chem-app-drop-native");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("water.pdb");
+        std::fs::write(&path, WATER_PDB).expect("fixture");
+
+        let dropped = egui::DroppedFile {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let (name, bytes) = dropped_file_contents(&dropped).expect("reads from the path");
+
+        assert_eq!(name, "water.pdb");
+        assert_eq!(DatasetFormat::from_filename(&name), DatasetFormat::PDB);
+        assert_eq!(bytes, WATER_PDB.as_bytes());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_a_dropped_file_uses_the_bytes_when_the_backend_gave_those_instead() {
+        // The web half: eframe reads the file itself and hands over name and
+        // bytes with no path, so nothing may touch the filesystem here.
+        let dropped = egui::DroppedFile {
+            name: "water.pdb".to_string(),
+            bytes: Some(WATER_PDB.as_bytes().to_vec().into()),
+            ..Default::default()
+        };
+        let (name, bytes) = dropped_file_contents(&dropped).expect("uses the bytes");
+
+        assert_eq!(name, "water.pdb");
+        assert_eq!(bytes, WATER_PDB.as_bytes());
+    }
+
+    #[test]
+    fn test_a_batch_activates_the_first_file_it_loaded() {
+        // `add_and_activate` activates whatever it just added, so without the
+        // batch stepping back the user would be left looking at whichever file
+        // happened to be selected last.
+        let mut state = AppState::cpu_only();
+        let before = state.loaded_files.entries().len();
+
+        state.apply_loaded_files(vec![
+            (
+                "first.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+            (
+                "second.smi".to_string(),
+                b"CC
+CCC
+"
+                .to_vec(),
+            ),
+            (
+                "third.smi".to_string(),
+                b"C
+"
+                .to_vec(),
+            ),
+        ]);
+
+        let names: Vec<&str> = state.loaded_files.names().collect();
+        assert_eq!(names.len(), before + 3);
+        assert!(names.ends_with(&["first.smi", "second.smi", "third.smi"]));
+        assert_eq!(
+            state.loaded_files.entries()[state.loaded_files.active_index()].name,
+            "first.smi"
+        );
+        assert!(
+            state.dataset_status.contains("Loaded 3 files"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_a_refused_file_is_named_and_the_ones_beside_it_still_load() {
+        // A drop passes no filter, so this is the only place a user is told
+        // that a file is not one this build reads. The status is the only
+        // place it can be said: a refused file leaves no Files entry.
+        let mut state = AppState::cpu_only();
+        let before = state.loaded_files.entries().len();
+
+        state.apply_dropped_files(vec![
+            ("logo.png".to_string(), vec![0x89, b'P', b'N', b'G']),
+            (
+                "good.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+        ]);
+
+        assert_eq!(state.loaded_files.entries().len(), before + 1);
+        assert!(
+            state.dataset_status.contains("logo.png")
+                && state
+                    .dataset_status
+                    .contains("not a format this build reads"),
+            "{}",
+            state.dataset_status
+        );
+        assert!(
+            state.dataset_status.contains("Loaded"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_a_file_that_is_not_utf8_is_still_reported_beside_one_that_loaded() {
+        // The regression the checklist rests on: "a binary file is refused with
+        // 'not valid UTF-8' and the current dataset is left alone". One status
+        // line means a naive loop would let the good file overwrite that, and
+        // the refusal leaves no entry to notice afterwards. `.smi` so it gets
+        // past the extension check and fails where it is meant to.
+        let mut state = AppState::cpu_only();
+
+        state.apply_dropped_files(vec![
+            ("broken.smi".to_string(), vec![0xff, 0xfe]),
+            (
+                "good.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+        ]);
+
+        assert!(
+            state.dataset_status.contains("broken.smi")
+                && state.dataset_status.contains("not valid UTF-8"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_two_files_of_one_name_collapse_and_the_status_says_so() {
+        // `add_and_activate` replaces a same-named entry in place, which is
+        // right for reloading a file and surprising when two directories each
+        // hold a `d.smi` -- much easier to hit now that a drop can carry both.
+        let mut state = AppState::cpu_only();
+        let before = state.loaded_files.entries().len();
+
+        state.apply_loaded_files(vec![
+            (
+                "d.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+            (
+                "d.smi".to_string(),
+                b"CC
+CCC
+"
+                .to_vec(),
+            ),
+        ]);
+
+        assert_eq!(state.loaded_files.entries().len(), before + 1);
+        assert!(
+            state.dataset_status.contains("d.smi: replaced"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_only_extensions_a_readable_format_claims_are_accepted_from_a_drop() {
+        for name in ["a.smi", "a.pdb", "a.mol2", "a.CIF", "a.json"] {
+            assert!(
+                AppState::is_readable_extension(name),
+                "{name} should be accepted"
+            );
+        }
+        for name in ["logo.png", "notes", "report.docx", "archive.tar.gz"] {
+            assert!(
+                !AppState::is_readable_extension(name),
+                "{name} should be refused"
+            );
+        }
+    }
+    #[test]
+    fn test_the_status_says_what_became_of_every_file_in_the_batch() {
+        // Exact strings, not `contains`. The first version of this feature
+        // built a second summary for the refusals and appended it, producing
+        // `Loaded 2 files, 3 molecules \u{b7} Loaded nothing \u{b7} logo.png: ...`
+        // -- two answers to one question -- and a `contains("logo.png")`
+        // assertion passed the whole way through.
+        /// A batch to drop, and the one line it should produce.
+        type Case = (Vec<(String, Vec<u8>)>, &'static str);
+
+        let cases: Vec<Case> = vec![
+            (
+                vec![("a.smi".into(), b"CCO\n".to_vec())],
+                "Loaded 1 molecule",
+            ),
+            (
+                vec![
+                    ("a.smi".into(), b"CCO\n".to_vec()),
+                    ("b.smi".into(), b"CC\nC\n".to_vec()),
+                ],
+                "Loaded 2 files, 3 molecules",
+            ),
+            (
+                vec![
+                    ("a.smi".into(), b"CCO\n".to_vec()),
+                    ("logo.png".into(), vec![0x89]),
+                ],
+                "Loaded 1 molecule \u{b7} logo.png: not a format this build reads",
+            ),
+            (
+                vec![("logo.png".into(), vec![0x89])],
+                "Loaded nothing \u{b7} logo.png: not a format this build reads",
+            ),
+            (
+                vec![
+                    ("a.smi".into(), b"CCO\n".to_vec()),
+                    ("broken.smi".into(), vec![0xff, 0xfe]),
+                ],
+                "Loaded 1 molecule \u{b7} broken.smi: not valid UTF-8",
+            ),
+            (
+                // Two entries went in and one came out, so the count is the
+                // survivor's rather than the sum -- "2 files, 3 molecules"
+                // would describe a Files list that does not exist.
+                vec![
+                    ("d.smi".into(), b"CCO\n".to_vec()),
+                    ("d.smi".into(), b"CC\nC\n".to_vec()),
+                ],
+                "Loaded 2 molecules \u{b7} d.smi: replaced",
+            ),
+            (
+                vec![("s.smi".into(), b"CCO\nnot a molecule!!\n".to_vec())],
+                "Loaded 1 molecule \u{b7} s.smi: 1 skipped",
+            ),
+        ];
+
+        for (files, expected) in cases {
+            let mut state = AppState::cpu_only();
+            state.apply_dropped_files(files);
+            assert_eq!(state.dataset_status, expected);
+        }
     }
 }

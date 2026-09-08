@@ -112,6 +112,58 @@ def write_sdf(smiles: str) -> str | None:
     return result.stdout if result.stdout.strip() else None
 
 
+def convert_mmcif(text: str, to_format: str) -> str | None:
+    """Round-trips mmCIF text through `chem convert`, returning what it wrote.
+
+    Unlike `write_smiles`/`write_sdf`, the input here is a whole structure
+    file, not a `SMILES<space>name` line — `chem convert` takes it on stdin
+    unchanged and named by `--from mmcif` rather than sniffed from an
+    extension, since stdin has none.
+    """
+    result = run(["convert", "-", "--from", "mmcif", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
+def convert_pdb(text: str, to_format: str) -> str | None:
+    """Round-trips PDB text through `chem convert`, returning what it wrote.
+
+    The PDB counterpart of `convert_mmcif`, and hand-written like every other
+    helper here -- there is no generic converter, deliberately: each one names
+    the flags it passes, so a check reads as the command a user would run.
+    """
+    result = run(["convert", "-", "--from", "pdb", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
+def convert_pdbqt(text: str, to_format: str) -> str | None:
+    """Round-trips PDBQT text through `chem convert`, returning what it wrote."""
+    result = run(["convert", "-", "--from", "pdbqt", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
+def write_commonchem(smiles: str) -> str | None:
+    """SMILES in, a commonchem JSON document out (#229)."""
+    result = run(
+        ["convert", "-", "--from", "smi", "--to", "commonchem"],
+        stdin=f"{smiles} probe\n",
+    )
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
+def read_commonchem(text: str) -> str | None:
+    """A commonchem document in, this crate's canonical SMILES out.
+
+    The read direction. `--to smi` rather than `--to commonchem` on purpose:
+    routing back out through our own JSON writer would let a reader bug and a
+    writer bug cancel, which is the failure mode a differential harness exists
+    to prevent.
+    """
+    result = run(["convert", "-", "--from", "commonchem", "--to", "smi"], stdin=text)
+    if result.code != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.split()[0]
+
+
 def fingerprint(smiles: str, radius: int, nbits: int) -> list[int] | None:
     """The set bits of a Morgan fingerprint.
 

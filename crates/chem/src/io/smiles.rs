@@ -147,7 +147,12 @@ fn parse_bracket_atom(input: &str) -> IResult<&str, AtomToken> {
                     aromatic,
                     charge: charge.unwrap_or(0),
                     isotope,
-                    h_count,
+                    // A bracket states the hydrogen count exhaustively, so no
+                    // `H` inside one means *none* rather than "unsaid" --
+                    // `[C]` is a bare carbon atom, not methane (#244). The
+                    // bare organic-subset path leaves this `None`, and that
+                    // difference is the whole distinction.
+                    h_count: Some(h_count.unwrap_or(0)),
                     chirality: chirality.unwrap_or(Chirality::None),
                 },
             ))
@@ -647,7 +652,7 @@ fn add_atom_from_token(mol: &mut Molecule, token: &AtomToken) -> Result<usize, S
     let idx = mol.add_atom(atom);
 
     if let Some(h_count) = token.h_count {
-        mol.atom_mut(idx).set_explicit_hydrogens(h_count);
+        mol.atom_mut(idx).set_hydrogens(h_count);
     }
 
     Ok(idx)
@@ -971,6 +976,89 @@ mod tests {
         let mol = parse_smiles("[NH4+]").unwrap();
         assert_eq!(mol.atom(0).formal_charge(), 1);
         assert_eq!(mol.formula(), "H4N");
+    }
+
+    #[test]
+    fn test_a_bracket_states_its_hydrogen_count_exhaustively() {
+        // #244: in SMILES a bracket says everything about its atom, so no `H`
+        // inside one means *none*. Before this, `[C]` was indistinguishable
+        // from a bare `C` and parsed as methane. Verified against RDKit
+        // 2025.3.3, which reads all of these as carrying no hydrogens.
+        for smiles in ["[C]", "[N]", "[O]", "[CH0]", "[13C]"] {
+            let mol = parse_smiles(smiles).expect("valid SMILES");
+            assert_eq!(
+                mol.atom(0).total_hydrogens(),
+                0,
+                "{smiles} should carry no hydrogens"
+            );
+            assert_eq!(mol.atom(0).hydrogens(), Some(0), "{smiles} stated none");
+        }
+
+        // `[CH0]` is the sharpest of them: the parser always read `Some(0)`
+        // here, and the old `set_explicit_hydrogens(0)` wrote the field's
+        // existing default, so the information was gone by the next line.
+        assert_eq!(parse_smiles("[CH0]").unwrap().formula(), "C");
+    }
+
+    #[test]
+    fn test_a_bare_atom_states_nothing_and_is_filled() {
+        // The other half of the distinction: the organic-subset shorthand
+        // says nothing, so the valence fill applies.
+        for (smiles, expected) in [("C", 4u8), ("N", 3), ("O", 2)] {
+            let mol = parse_smiles(smiles).expect("valid SMILES");
+            assert_eq!(mol.atom(0).total_hydrogens(), expected, "{smiles}");
+        }
+        assert_eq!(parse_smiles("C").unwrap().formula(), "CH4");
+    }
+
+    #[test]
+    fn test_a_carbene_keeps_its_missing_hydrogens() {
+        // A bracket atom with bonds, not just a lone atom: dimethylcarbene's
+        // middle carbon has two bonds and states no hydrogens, so it must not
+        // be topped up to four. RDKit reads this as C3H6.
+        let mol = parse_smiles("C[C]C").expect("valid SMILES");
+        assert_eq!(
+            mol.atoms()
+                .iter()
+                .map(|a| a.total_hydrogens())
+                .collect::<Vec<_>>(),
+            vec![3, 0, 3]
+        );
+        assert_eq!(mol.formula(), "C3H6");
+    }
+
+    #[test]
+    fn test_a_spelled_out_count_still_wins() {
+        // The cases that already worked, kept as controls: a fix that simply
+        // stopped filling brackets would pass the tests above and fail these.
+        assert_eq!(parse_smiles("[CH3]C").unwrap().formula(), "C2H6");
+        assert_eq!(parse_smiles("[13CH4]").unwrap().formula(), "CH4");
+        assert_eq!(parse_smiles("[NH4+]").unwrap().formula(), "H4N");
+        assert_eq!(parse_smiles("CCO").unwrap().formula(), "C2H6O");
+        assert_eq!(parse_smiles("c1ccccc1").unwrap().formula(), "C6H6");
+    }
+
+    #[test]
+    fn test_a_stated_zero_survives_a_round_trip() {
+        // #241's bracket predicate and #244's stated-zero compose without
+        // either needing to know about the other: the stated 0 differs from
+        // the implied 4, so the writer brackets it.
+        for smiles in ["[C]", "[13C]", "C[C]C"] {
+            let mol = parse_smiles(smiles).expect("valid SMILES");
+            let written = crate::io::smiles_writer::write_smiles_for_molecule_canonical(&mol);
+            let back = parse_smiles(&written).expect("what we write, we can read");
+            assert_eq!(
+                back.atoms()
+                    .iter()
+                    .map(|a| a.total_hydrogens())
+                    .collect::<Vec<_>>(),
+                mol.atoms()
+                    .iter()
+                    .map(|a| a.total_hydrogens())
+                    .collect::<Vec<_>>(),
+                "{smiles} wrote as {written}"
+            );
+        }
     }
 
     #[test]

@@ -15,14 +15,11 @@
 //! [`crate::state::MAX_OPEN_DETAILS`] of them.
 
 use crate::molecule_view::{show_atom_list, show_bond_list, show_molecule_info};
+use crate::save::save_svg;
 use crate::state::AppState;
 use crate::structure_view::structure_panel_with_options;
-use crate::svg::save_svg;
-use chem::core::layout::ensure_coords;
-use chem::core::molecule::Molecule;
 use chem::draw::structure::StructureTheme;
 use chem::draw::svg::{structure_to_svg, suggested_filename};
-use std::collections::HashMap;
 
 /// Size of an exported SVG, in points.
 ///
@@ -40,31 +37,15 @@ const CASCADE_STEP: f32 = 28.0;
 const CASCADE_ORIGIN: (f32, f32) = (0.28, 0.16);
 
 #[derive(Default)]
-pub struct DetailView {
-    /// Laid-out copies of the open molecules, keyed by row.
-    ///
-    /// A window rebuilds its contents every frame and a molecule from SMILES has
-    /// to be laid out before it can be drawn, so the laid-out copy is cached.
-    /// One entry per open window rather than one shared slot, which is what made
-    /// a second selection evict the first.
-    layouts: HashMap<usize, Molecule>,
-    dataset_epoch: u64,
-}
+pub struct DetailView {}
 
 impl DetailView {
     pub fn show(&mut self, ctx: &egui::Context, state: &mut AppState) {
-        self.sync(state);
-
         // Cloned so the windows can borrow `state` mutably to close themselves.
         let rows: Vec<usize> = state.open_details().to_vec();
         if rows.is_empty() {
-            self.layouts.clear();
             return;
         }
-
-        // A window closed from the table rather than by its own button leaves a
-        // layout behind; drop anything no longer open.
-        self.layouts.retain(|row, _| rows.contains(row));
 
         let options = state.display.structure;
         let workspace = ctx.available_rect();
@@ -77,28 +58,18 @@ impl DetailView {
 
         for (n, &row) in rows.iter().enumerate() {
             let dataset = state.loaded_files.active_dataset();
-            let Some(source) = dataset.molecules.get(row) else {
-                // The row went away under us; forget it rather than drawing an
-                // empty window.
+            let name = dataset.names.get(row).cloned();
+            let smiles = dataset.smiles.get(row).cloned();
+            let generated = dataset.generated.get(row).copied().unwrap_or(false);
+
+            // Laid out once per dataset and shared with the table and the
+            // result rows, so all three draw the same picture (#273). `None` is
+            // the row having gone away under us; forget it rather than drawing
+            // an empty window.
+            let (Some(mol), Some(name), Some(smiles)) = (state.drawable(row), name, smiles) else {
                 to_close.push(row);
                 continue;
             };
-            let name = dataset.names[row].clone();
-            let smiles = dataset.smiles[row].clone();
-
-            // Molecules parsed from SMILES carry no coordinates, so one is
-            // generated here; SDF-sourced molecules keep the layout their file
-            // supplied. Once per window, not once per frame — laying out a
-            // large molecule isn't free.
-            let mol = self
-                .layouts
-                .entry(row)
-                .or_insert_with(|| {
-                    let mut prepared = source.clone();
-                    ensure_coords(&mut prepared);
-                    prepared
-                })
-                .clone();
 
             let offset = CASCADE_STEP * n as f32;
             let default_pos = workspace.min
@@ -144,7 +115,7 @@ impl DetailView {
                         }
 
                         structure_panel_with_options(ui, &mol, 220.0, options);
-                        show_molecule_info(ui, &mol, &smiles, &name);
+                        show_molecule_info(ui, &mol, &smiles, generated, &name);
                         show_atom_list(ui, &mol);
                         show_bond_list(ui, &mol);
                     });
@@ -157,17 +128,6 @@ impl DetailView {
 
         for row in to_close {
             state.close_detail(row);
-            self.layouts.remove(&row);
-        }
-    }
-
-    /// Drops layouts cached against rows of a dataset that is no longer active.
-    /// `AppState` clears the open rows itself; these are the molecules that went
-    /// with them.
-    fn sync(&mut self, state: &AppState) {
-        if self.dataset_epoch != state.dataset_epoch() {
-            self.dataset_epoch = state.dataset_epoch();
-            self.layouts.clear();
         }
     }
 }

@@ -29,6 +29,7 @@ import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 import chem
 from oracles import Oracle, load
@@ -249,9 +250,157 @@ def check_sdf(oracles: list[Oracle], verbose: bool) -> Report:
     return report
 
 
+def check_json(oracles: list[Oracle], verbose: bool) -> Report:
+    """commonchem JSON, both directions, against the toolkit that defines it (#229).
+
+    The only format in scope where the oracle is the reference implementation
+    rather than a second opinion, so both directions are worth checking:
+
+    - **write**: chem emits a document, RDKit reads it, and the InChI must
+      match RDKit's InChI for the original SMILES. This is what proves the
+      `rdkitRepresentation` extension is emitted correctly — aromaticity lives
+      only there, so a document missing it reads back kekulised and non-
+      aromatic, with a different InChI.
+    - **read**: RDKit emits a document (in its own `rdkitjson` v12 dialect,
+      which it always uses and we never write), chem reads it and writes its
+      canonical SMILES, and RDKit's InChI of *that* must match. This is what
+      proves the dialect is accepted and the extension is applied on the way
+      in.
+
+    Only RDKit takes part. OpenBabel has no reader for this format, and gemmi
+    is structural — an oracle without `identity_of_commonchem` is skipped, the
+    same way `check_fp` skips one without `fingerprint`.
+    """
+    report = Report()
+    for path in sorted(CORPUS.glob("*.smi")):
+        if path.stem == "invalid":
+            continue
+        for record in chem.read_corpus(path):
+            if chem.is_known_gap(record.name):
+                continue  # chem cannot read it yet; the parse check reports it
+
+            for oracle in oracles:
+                if oracle.identity_of_commonchem is None:
+                    continue
+                before = oracle.identity(record.smiles)
+                if before is None:
+                    continue
+
+                # --- write direction -------------------------------------
+                written = chem.write_commonchem(record.smiles)
+                if written is None:
+                    report.mismatch(
+                        f"{path.name}: chem wrote no commonchem for {record.name}"
+                    )
+                    continue
+                after = oracle.identity_of_commonchem(written)
+                if after is None:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — {oracle.name} cannot read "
+                        f"the commonchem chem wrote"
+                    )
+                elif before != after:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — commonchem write, "
+                        f"{oracle.name} says {difference(oracle, before, after)}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok  write  {record.name:<34} {record.smiles}")
+
+                # Hydrogen counts, which the InChI comparison above cannot
+                # see: its `/p` layer normalises mobile protons away, so a
+                # carboxylate carrying two impossible hydrogens has the same
+                # InChI as a correct one. commonchem is the first format here
+                # that states a per-atom hydrogen count, so this is the only
+                # check that looks at what it actually wrote.
+                if oracle.formula is not None and oracle.formula_of_commonchem is not None:
+                    want = oracle.formula(record.smiles)
+                    got = oracle.formula_of_commonchem(written)
+                    if want is not None and got is not None:
+                        if want != got:
+                            report.mismatch(
+                                f"{path.name}: {record.name} — commonchem write, "
+                                f"formula {want} -> {got}"
+                            )
+                        else:
+                            report.ok()
+
+                # --- read direction --------------------------------------
+                if oracle.commonchem_of_smiles is None:
+                    continue
+                theirs = oracle.commonchem_of_smiles(record.smiles)
+                if theirs is None:
+                    continue
+                ours = chem.read_commonchem(theirs)
+                if ours is None:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — chem cannot read the "
+                        f"commonchem {oracle.name} wrote"
+                    )
+                    continue
+                back = oracle.identity(ours)
+                if back is None:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — {oracle.name} cannot read "
+                        f"the SMILES chem wrote from their commonchem"
+                    )
+                elif before != back:
+                    report.mismatch(
+                        f"{path.name}: {record.name} — commonchem read, "
+                        f"{oracle.name} says {difference(oracle, before, back)}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok  read   {record.name:<34} {record.smiles}")
+
+                # --- bond stereo, read off the bonds ---------------------
+                # Not through any SMILES writer: RDKit's ignores the
+                # `stereoAtoms` its JSON reader preserves, so two chemically
+                # opposite documents render identically. See the field comment
+                # in `oracles/__init__.py`.
+                if oracle.bond_stereo_of_commonchem is not None:
+                    mine = oracle.bond_stereo_of_commonchem(written)
+                    theirs_stereo = oracle.bond_stereo_of_commonchem(theirs)
+                    if mine is not None and theirs_stereo is not None:
+                        # Only bonds that actually assert a configuration.
+                        # Counting `STEREONONE` would compare how many double
+                        # bonds each side *has*, which differs legitimately
+                        # whenever aromaticity perception does -- `chem` does
+                        # not perceive outside `chem aromatic` (#192), so it
+                        # writes `C1=CC=CC=C1` with three plain double bonds
+                        # where RDKit writes an aromatic ring with none. That
+                        # is a different question, and the `write`/`read`
+                        # comparisons above already answer it.
+                        mine_kinds = sorted(
+                            s for _, _, s, _ in mine if s != "STEREONONE"
+                        )
+                        their_kinds = sorted(
+                            s for _, _, s, _ in theirs_stereo if s != "STEREONONE"
+                        )
+                        if mine_kinds != their_kinds:
+                            report.mismatch(
+                                f"{path.name}: {record.name} — bond stereo, "
+                                f"chem {mine_kinds} vs {oracle.name} {their_kinds}"
+                            )
+                        else:
+                            report.ok()
+    return report
+
+
 def tanimoto(a: set[int], b: set[int]) -> float:
     union = len(a | b)
     return len(a & b) / union if union else 1.0
+
+
+#: Fold width for counting atom environments, which is deliberately not the
+#: width being tested. Collisions vanish across the whole corpus by 8192; this
+#: leaves an order of magnitude of headroom as it grows, and costs 0.2s against
+#: 8192's 0.1s. A megabit costs 1.7s and buys no further agreement, because the
+#: hex payload is 256KB per molecule.
+ENVIRONMENT_WIDTH = 65536
 
 
 def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> Report:
@@ -268,6 +417,17 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
     a query, does the nearest neighbour agree? That property holds for any
     chemically equivalent fingerprint regardless of hash, and breaks the moment
     ours stops describing the same environments.
+
+    It holds only where the ranking is decided by more than one bit, which is
+    why a third of this corpus is skipped with a note. Two molecules sharing a
+    single bit out of 2048 have told you nothing: the bit is as likely to be a
+    collision as a shared environment, so the "nearest" neighbour is whichever
+    collision each implementation happened to get. Bit *count* is the other
+    thing comparable across hashes, and it is checked here too — at
+    `ENVIRONMENT_WIDTH` rather than the width under test, since only a fold
+    wide enough to avoid collisions turns a bit count into an environment
+    count. That is what would catch our enumeration drifting, which ranking
+    structurally cannot (#253).
     """
     report = Report()
     molecules: list[tuple[str, str]] = []
@@ -291,11 +451,35 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
             ours[name] = set(mine)
             theirs[name] = set(yours)
 
-            if len(mine) != len(yours):
-                report.note(
-                    f"{name}: {len(mine)} bits vs {oracle.name}'s {len(yours)} "
-                    f"— different environment counts, not just a different hash"
-                )
+            # How many atom environments did each side enumerate?
+            #
+            # Counted at a width where a count means that, and not at the width
+            # being tested. Folded into 2048 bits a smaller count means either
+            # a collision or a missing environment, and nothing distinguishes
+            # them: this comparison used to run at the requested width and
+            # report "different environment counts, not just a different hash",
+            # which was exactly backwards for the only molecule it ever fired
+            # on. RDKit puts alanine's carboxyl carbon and its hydroxyl oxygen
+            # -- a C and an O -- on bit 807, so it shows 12 bits over 13
+            # environments while chem shows 13 over 13 (#253).
+            #
+            # Worth asserting rather than noting, because a bit count is the
+            # one quantity comparable between two Morgan implementations
+            # without cloning the hash, and the ranking comparison below
+            # cannot see it: an implementation enumerating a different set of
+            # environments could still rank neighbours identically.
+            mine_envs = chem.fingerprint(smiles, radius, ENVIRONMENT_WIDTH)
+            their_envs = oracle.fingerprint(smiles, radius, ENVIRONMENT_WIDTH)
+            if mine_envs is not None and their_envs is not None:
+                if len(mine_envs) != len(their_envs):
+                    report.mismatch(
+                        f"{name} — {len(mine_envs)} atom environments vs "
+                        f"{oracle.name}'s {len(their_envs)}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok  envs   {name:<34} {len(mine_envs)}")
 
         names = sorted(ours)
         for name in names:
@@ -305,16 +489,30 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
             mine = max(others, key=lambda o: tanimoto(ours[name], ours[o]))
             yours = max(others, key=lambda o: tanimoto(theirs[name], theirs[o]))
 
-            # A molecule with nothing in common with anything has no nearest
-            # neighbour, only an arbitrary one: every candidate ties at zero
-            # and `max` returns whichever it saw first. Comparing those is
-            # comparing iteration orders, and it produced findings that moved
-            # whenever the corpus grew. Skipped with a note rather than
-            # silently, so the gap in coverage stays visible.
-            if tanimoto(ours[name], ours[mine]) == 0.0 or tanimoto(theirs[name], theirs[yours]) == 0.0:
+            # A nearest neighbour reached by a single shared bit is not a
+            # neighbour, it is a coincidence. In a 2048-bit space one bit is as
+            # likely to be a hash collision as a shared environment, and
+            # tracing every deciding bit in this corpus found four of five were
+            # collisions: RDKit called hydroxide — one bit, an anionic oxygen —
+            # the nearest thing to cyclopentadiene, while `chem` answered
+            # cyclohexane on a bit carried by every saturated carbocycle here.
+            # The check reported that as *us* diverging.
+            #
+            # Zero shared bits is the same failure at its extreme: every
+            # candidate ties and `max` returns whichever it saw first, so the
+            # comparison is of iteration orders. That case was skipped before
+            # this rule generalised it, and it produced findings that moved
+            # whenever the corpus grew.
+            #
+            # Skipped with a note rather than silently, so the gap in coverage
+            # stays visible.
+            mine_shared = len(ours[name] & ours[mine])
+            their_shared = len(theirs[name] & theirs[yours])
+            if mine_shared < 2 or their_shared < 2:
                 report.note(
-                    f"{name}: shares no bits with any other corpus molecule, so "
-                    f"'nearest' is arbitrary — not compared"
+                    f"{name}: nearest neighbour rests on "
+                    f"{min(mine_shared, their_shared)} shared bit(s), too few to "
+                    f"tell chemistry from a hash collision — not compared"
                 )
                 continue
 
@@ -331,11 +529,333 @@ def check_fp(oracles: list[Oracle], verbose: bool, radius: int, nbits: int) -> R
     return report
 
 
+MMCIF_CORPUS = CORPUS / "mmcif"
+
+
+def check_mmcif(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem`'s mmCIF round trip agree with gemmi's independent read?
+
+    Unlike every other check, this ignores `oracles` entirely (kept as a
+    parameter only so it fits `main()`'s generic dispatch) and drives
+    gemmi directly — neither RDKit nor OpenBabel can judge this format (see
+    `oracles/gemmi.py`'s module doc). Comparison is structural — atom
+    count, cell, chain ids, residue identities — computed by gemmi on both
+    the original fixture and on what `chem convert --from mmcif --to
+    mmcif` wrote back, rather than a text diff: this format has no
+    canonical spelling to hold either side to.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    summarize = gemmi_oracle.load_gemmi()
+    report = Report()
+    for path in sorted(MMCIF_CORPUS.glob("*.cif")):
+        original = path.read_text()
+        reference = summarize(original)
+        if reference is None:
+            report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+            continue
+
+        written = chem.convert_mmcif(original, "mmcif")
+        if written is None:
+            report.mismatch(f"{path.name}: chem could not round-trip this file")
+            continue
+
+        ours = summarize(written)
+        if ours is None:
+            report.mismatch(f"{path.name}: gemmi cannot read what chem wrote back")
+        elif ours != reference:
+            report.mismatch(f"{path.name}: chem's round trip disagrees with gemmi — {reference} vs {ours}")
+        else:
+            report.ok()
+            if verbose:
+                print(f"    ok         {path.name:<34} {reference.atom_count} atoms")
+    return report
+
+
+PDB_CORPUS = CORPUS / "pdb"
+
+
+def _pdb_states_every_bond(text: str) -> bool:
+    """Whether every atom in this PDB appears in a `CONECT` record.
+
+    The question decides whether a formula comparison means anything: RDKit
+    infers the bonds a `CONECT` block leaves out, from geometry, and this crate
+    deliberately does not (`io/pdb.rs`'s module doc). So on a partly connected
+    file the two disagree about *bonds*, and comparing formulae there would
+    measure bond perception while claiming to measure hydrogen counts.
+
+    Serial numbers only -- deliberately not a PDB parser. A harness that parsed
+    the format properly could be wrong in the same way the crate is, and a
+    fixture's connectivity is a property of the text rather than of anyone's
+    reading of it.
+    """
+    atoms, connected = set(), set()
+    for line in text.splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            atoms.add(line[6:11].strip())
+        elif line.startswith("CONECT"):
+            connected.add(line[6:11].strip())
+    return bool(atoms) and atoms <= connected
+
+
+def check_pdb(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem`'s PDB round trip keep what gemmi reads -- values included?
+
+    Three questions, and the second is why this exists separately from
+    `check_mmcif` rather than as more fixtures for it:
+
+    1. The structural summary, as `check_mmcif` does it.
+    2. **Per-atom occupancy and B-factor values.** `Carries` is presence-based,
+       so a writer emitting a constant for every atom passes every mask
+       assertion in the crate (#257 hands this over explicitly). Only a value
+       comparison can see it.
+    3. OpenBabel through the same path -- recorded as a `note`, never a
+       mismatch. Its PDB writer zeroes the B-factor column while preserving the
+       occupancy beside it, and being *different* from that is the correct
+       behaviour (#173), so agreement here would be the bug.
+    4. **The hydrogen count**, which none of the above can see. PDB states no
+       count, so a reader implies one from the bonds -- and an implicit hydrogen
+       creates no atom and fills no column, so questions 1 and 2 are identical
+       whether the count was implied or left blank. #285 was invisible here for
+       a whole milestone because of it (#293).
+
+    Uses `oracles` unlike `check_mmcif`, which ignores it: OpenBabel is the
+    subject of question 3 rather than a judge of questions 1 and 2.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    summarize = gemmi_oracle.load_gemmi()
+    report = Report()
+    for path in sorted(PDB_CORPUS.glob("*.pdb")):
+        original = path.read_text()
+        reference = summarize(original, ".pdb")
+        reference_sites = gemmi_oracle.sites(original)
+        if reference is None or reference_sites is None:
+            report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+            continue
+
+        written = chem.convert_pdb(original, "pdb")
+        if written is None:
+            report.mismatch(f"{path.name}: chem could not round-trip this file")
+            continue
+
+        ours = summarize(written, ".pdb")
+        if ours is None:
+            report.mismatch(f"{path.name}: gemmi cannot read what chem wrote back")
+            continue
+        if ours != reference:
+            report.mismatch(
+                f"{path.name}: chem's round trip disagrees with gemmi — {reference} vs {ours}"
+            )
+            continue
+
+        our_sites = gemmi_oracle.sites(written)
+        if our_sites != reference_sites:
+            report.mismatch(
+                f"{path.name}: per-atom values moved — "
+                f"occupancy {reference_sites.occupancies} -> {our_sites.occupancies}, "
+                f"b-factor {reference_sites.b_factors} -> {our_sites.b_factors}"
+            )
+            continue
+
+        report.ok()
+        if verbose:
+            print(
+                f"    ok         {path.name:<34} "
+                f"{reference.atom_count} atoms, {len(set(reference_sites.b_factors))} distinct b"
+            )
+
+        # Question 4. The hydrogen count, via our own `pdb -> smi` output.
+        #
+        # Both formulae come from RDKit -- one read from the file, one computed
+        # from the SMILES we wrote -- so what is compared is hydrogen counting
+        # rather than canonical-string convention. OpenBabel judges nothing
+        # here: it perceives aromaticity, so it would give a third answer for
+        # the same file and disagreeing with it would mean nothing.
+        rdkit_pdb_formula = next(
+            (
+                f
+                for f in (getattr(o, "formula_of_pdb", None) for o in oracles)
+                if f is not None
+            ),
+            None,
+        )
+        rdkit_smiles_formula = next(
+            (f for f in (getattr(o, "formula", None) for o in oracles) if f is not None),
+            None,
+        )
+        if rdkit_pdb_formula is not None and rdkit_smiles_formula is not None:
+            if not _pdb_states_every_bond(original):
+                # Not a mismatch and not silence: a reader of this output should
+                # be able to tell a fixture that was skipped from one that was
+                # never looked at.
+                report.note(
+                    f"{path.name}: hydrogen counts not compared -- CONECT does not "
+                    "cover every atom, so the oracle infers bonds from geometry "
+                    "where chem does not"
+                )
+            else:
+                theirs = rdkit_pdb_formula(original)
+                as_smiles = chem.convert_pdb(original, "smi")
+                ours = (
+                    rdkit_smiles_formula(as_smiles.split()[0])
+                    if as_smiles and as_smiles.split()
+                    else None
+                )
+                if theirs is None or ours is None:
+                    report.mismatch(
+                        f"{path.name}: could not compare hydrogen counts -- "
+                        f"rdkit {theirs!r}, ours {ours!r}"
+                    )
+                elif theirs != ours:
+                    report.mismatch(
+                        f"{path.name}: hydrogen counts disagree with rdkit -- "
+                        f"{theirs} vs our {ours}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok         {path.name:<34} formula {ours}")
+
+        # Question 3. Not a mismatch: this is the oracle being wrong, recorded
+        # so the divergence is visible rather than assumed.
+        for oracle in oracles:
+            theirs = getattr(oracle, "round_trip_pdb", None)
+            if theirs is None:
+                continue
+            their_text = theirs(original)
+            their_sites = gemmi_oracle.sites(their_text) if their_text else None
+            if their_sites is None:
+                report.note(f"{path.name}: {oracle.name} wrote a PDB gemmi cannot read")
+            elif their_sites.b_factors != reference_sites.b_factors:
+                kept = (
+                    "occupancy preserved"
+                    if their_sites.occupancies == reference_sites.occupancies
+                    else f"occupancy also moved to {their_sites.occupancies}"
+                )
+                report.note(
+                    f"{path.name}: {oracle.name} rewrote b-factors "
+                    f"{reference_sites.b_factors} -> {their_sites.b_factors} ({kept}); "
+                    "chem keeps them, which is the point"
+                )
+    return report
+
+
+#: AutoDock types that name an element other than themselves. Spelled out
+#: here rather than asked of `chem`, for the reason `read_corpus` exists: a
+#: check has to know what a line said independently of chem's reading of it.
+AUTODOCK_ELEMENT = {"A": "C", "OA": "O", "NA": "N", "SA": "S", "HD": "H", "HS": "H"}
+
+
+def _pdbqt_atoms(text: str) -> list[tuple[str, float]]:
+    """The element and partial charge of each atom of a PDBQT, in file order.
+
+    Fixed columns, because that is what the format is: Meeko writes `+0.034`
+    where chem writes ` 0.034`, so whitespace splitting would shift the fields
+    apart on one dialect and not the other.
+    """
+    atoms = []
+    for line in text.splitlines():
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        charge = line[70:76].strip()
+        atom_type = line[77:79].strip()
+        element = AUTODOCK_ELEMENT.get(atom_type, atom_type)
+        atoms.append((element, round(float(charge), 4) if charge else 0.0))
+    return atoms
+
+
+def _mol2_atoms(text: str) -> list[tuple[str, float]]:
+    """The same, read out of a Mol2 atom block."""
+    atoms = []
+    in_block = False
+    for line in text.splitlines():
+        if line.startswith("@<TRIPOS>"):
+            in_block = line.strip() == "@<TRIPOS>ATOM"
+            continue
+        if not in_block or not line.strip():
+            continue
+        fields = line.split()
+        element = fields[5].split(".")[0]
+        atoms.append((element, round(float(fields[8]), 4)))
+    return atoms
+
+
+def check_pdbqt(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem` read every PDBQT dialect, not just its own?
+
+    `io/pdbqt.rs` targets AutoDock's documented spec rather than obabel's or
+    Meeko's quirks -- the two disagree with each other, and #173 records that
+    downstream code parses both. That makes "read both" a promise, and until
+    Meeko joined the image (#258) only one dialect was ever exercised.
+
+    **Writes Mol2, not PDBQT.** A PDBQT round trip cannot measure the reader
+    while #259 is open: these files carry no bonds, so chem reads N one-atom
+    fragments and its writer keeps only the largest -- the first version of
+    this check reported twelve findings that were all that one defect, with
+    every atom read perfectly. Mol2 carries element and partial charge and
+    drops no components, so what is compared is the read.
+
+    Not a text comparison either: the dialects differ deliberately (`UNL` vs
+    `LIG`, an explicit `+`, the atom-name column) and none of it changes what
+    the file means.
+    """
+    from oracles import meeko as meeko_oracle
+
+    write_pdbqt = meeko_oracle.load_meeko()
+    report = Report()
+
+    writers: list[tuple[str, Callable[[str], Optional[str]]]] = [("meeko", write_pdbqt)]
+    for oracle in oracles:
+        theirs = getattr(oracle, "pdbqt_of_smiles", None)
+        if theirs is not None:
+            writers.append((oracle.name, theirs))
+
+    # `hard.smi` only: this is about dialects, not breadth, and every writer
+    # here runs a 3D embedding per molecule.
+    for record in chem.read_corpus(CORPUS / "hard.smi"):
+        name = record.name
+        if chem.is_known_gap(name):
+            continue
+        for writer_name, write in writers:
+            theirs = write(record.smiles)
+            if theirs is None:
+                continue
+            expected = _pdbqt_atoms(theirs)
+            if not expected:
+                report.note(f"{name}: {writer_name} wrote a PDBQT with no atoms")
+                continue
+
+            ours = chem.convert_pdbqt(theirs, "mol2")
+            if ours is None:
+                report.mismatch(f"{name}: chem could not read {writer_name}'s PDBQT")
+                continue
+
+            measured = _mol2_atoms(ours)
+            if measured != expected:
+                report.mismatch(
+                    f"{name}: chem's read of {writer_name}'s PDBQT disagrees — "
+                    f"{expected} vs {measured}"
+                )
+            else:
+                report.ok()
+                if verbose:
+                    print(
+                        f"    ok         {name:<26} {writer_name:<9} "
+                        f"{len(expected)} atoms"
+                    )
+    return report
+
+
 CHECKS = {
     "parse": check_parse,
     "write": check_write,
     "sdf": check_sdf,
     "fp": check_fp,
+    "mmcif": check_mmcif,
+    "pdb": check_pdb,
+    "pdbqt": check_pdbqt,
+    "json": check_json,
 }
 
 

@@ -27,7 +27,7 @@ Then, from `crates/chem-app/`:
 trunk serve --address 0.0.0.0 --port 8080
 ```
 
-This builds, serves, and live-reloads on file changes at `http://<this-machine>:8080`. For a one-off static build instead (e.g. to check what a real deployment would look like):
+This builds, serves, and live-reloads on file changes at `http://<this-machine>:8080`. The same build is published at [chem.chiral.one](https://chem.chiral.one) on every push to the milestone branch, so a local one is for offline work or for a change you have not pushed. Note that the app remembers your settings in `localStorage`, which is per-origin: what you saved on the hosted app and what you saved against a local server are separate. For a one-off static build:
 
 ```bash
 trunk build --release
@@ -59,7 +59,12 @@ Each is movable and resizable, and each can be closed from its own **✕** or to
 In the **Datasets** window, or from the **File** menu:
 
 - **📋 Load Examples** — loads 15 built-in molecules (methane, benzene, phenol, aniline, aspirin-adjacent structures, etc.) instantly. Good default if you just want to try things out.
-- **📂 Load File** — pick a `.smi` / `.smiles` / `.txt` file, or a `.sdf` file, from disk.
+- **📂 Load File** — pick any format the library reads, from disk, **selecting as many at once as you like**. As of v0.8.0 that is eleven: SMILES (`.smi`/`.smiles`/`.txt`), SDF (`.sdf`), CXSMILES (`.cxsmiles`), XYZ (`.xyz`), PDB (`.pdb`/`.ent`), mmCIF (`.cif`/`.mmcif`), Mol2 (`.mol2`), PDBQT (`.pdbqt`), GRO (`.gro`), CML (`.cml`) and commonchem JSON (`.json`). The dialog's list is generated from the format registry, so it stays in step with what the library supports.
+  - The file's extension decides how it is read; an unrecognised one is treated as SMILES.
+  - **Or drag files onto the window.** The app dims and says how many it will take; drop them and they load together. One difference from the dialog: a dropped file whose extension no format claims is refused by name rather than attempted as SMILES, because a drop passes no filter to steer it — the dialog's list already did that job.
+  - Loading several at once switches to the **first** of them; the rest are in the Files list, one click away. A file whose name matches one already loaded replaces that entry rather than adding a second, and the status line says which.
+  - Most formats hold coordinates and connectivity rather than a SMILES string, so the SMILES column has three answers. SDF, Mol2, CML and commonchem state bonds *and* their orders, so the app writes a SMILES from the structure and hovering the cell says it did. XYZ, PDB, mmCIF, PDBQT and GRO do not — PDB's `CONECT` is adjacency with no bond order — so those show their own name, e.g. `(PDB)`. A molecule over 500 atoms keeps the placeholder too: writing a canonical SMILES for one gets slow enough to stall the load, and a 500-character string in a table cell is not much use anyway.
+  - A structure file's 3D coordinates are not a 2D drawing: the depiction is laid out from the connectivity rather than flattened from the conformer, so it shows what is bonded to what and not the real geometry.
   - SMILES format is one molecule per line: `SMILES [optional name]`. Lines starting with `#` are comments and blank lines are skipped. If no name is given, molecules are auto-named `Molecule_<line number>`.
   - SDF files can hold multiple `$$$$`-terminated molecule records; each is parsed independently, using the record's own name field if present.
   - Each load adds a new entry to the **Files** list rather than replacing what's already there — click any entry to switch back to it. Each is shown with its format and molecule count, so two SMILES files are told apart without switching between them. Loading a file with the same name as an existing entry (e.g. reloading the same path) updates that entry in place instead of adding a duplicate.
@@ -71,7 +76,7 @@ Each detail window has an **Export SVG** button, which saves that molecule's str
 
 Several detail windows can be open at once, so two molecules can be compared side by side rather than remembered. Eight is the limit: opening a ninth closes the oldest, since rows can be clicked much faster than windows can be closed. **View → Close all molecule windows** clears them.
 
-**Show structures in table** adds a structure column. A structure is drawn where the molecule has coordinates: SDF files bring their own, and for anything parsed from SMILES, run **2D Coordinates** in Operations to generate them. Rows without coordinates show a dash rather than a blank cell.
+**Show structures in table** adds a structure column. Every molecule is drawn: a file that brought its own layout is shown as the file drew it, and anything else is laid out on demand. That layout is shared with the detail windows and the search results, so one molecule looks the same everywhere it appears.
 
 ### 2. Run an operation
 
@@ -95,13 +100,17 @@ You need to do this at least once before you can search.
 
 - **📐 Generate Coordinates** — lays out every molecule that doesn't already have coordinates, so it can be drawn. Molecules whose coordinates came from an SDF file keep them, and the section says how many it generated against how many it kept. Structures are also laid out on demand when you open one, so this is for doing the whole dataset at once.
 
-**Similarity Search**
+**Convert**
 
-- Type a SMILES string in the text box, e.g. `c1ccccc1O` (phenol) or `CC(=O)Oc1ccccc1C(=O)O` (aspirin-like).
-- Click **Parse**, or just stop typing — it auto-parses after a short idle delay (debounced so it doesn't re-parse on every keystroke).
-- On success the parsed molecule is drawn in the **Inspector** window's *Query* section, with its details and its fingerprint. Invalid SMILES shows an error here, beside the box you typed it in.
-- **Top K** — how many ranked results to return.
-- **🔍 Search** — ranked by Tanimoto similarity. It needs both a parsed query and computed dataset fingerprints; if either is missing, the section says which.
+- **Write as** — picks the output format, from everything this build can write.
+- **What it will cost, before you run it.** Formats hold different things: XYZ has no bond block, SMILES has no coordinates, PDB has no isotopes. The section lists what this dataset would lose to the format you picked, and how many molecules lose each thing, as soon as you pick it. A conversion that keeps everything says so.
+- **⟳ Convert** — writes the dataset in the chosen format, reads it back, and adds *that* as a new dataset, then switches to it. The one you converted from stays in the Files list, so you can click between the two and see what changed. Converting benzene to XYZ, for instance, gives six unbonded atoms where the original drew a ring, because XYZ has no bond block. The report predicts that; the new dataset is it.
+- Converting again to the same format replaces the earlier result rather than adding another entry.
+- The report accounts for losses that come from the *pair* of formats rather than the target alone — a few conversions lose something both formats otherwise carry, and the reason is named when so. `chem convert` on the command line reports the same thing, from the same code.
+
+**Export**
+
+- **💾 Export…** — writes the active dataset in its own format: a file on the desktop build, a download in the browser. Convert first if you want a different format.
 
 ### 3. Look at the results
 
@@ -111,7 +120,7 @@ The **Inspector** window has two sections.
 
 **Results** — each hit drawn, with its rank, name, SMILES and similarity score. Seeing the molecule is the point: two structures can score 0.9 for reasons obvious in a drawing and invisible in a SMILES string.
 
-A structure appears where the molecule has coordinates — run **2D Coordinates** in Operations for anything parsed from SMILES, or load an SDF, which brings its own. Rows without them show a dash.
+A structure always appears, laid out on demand where the file carried no coordinates of its own.
 
 Click **▼ Why?** on a result to see how the score was arrived at. One grid holds both fingerprints, each bit coloured by which of them has it set: **blue** for bits in both, **amber** for bits only in this molecule, **violet** for bits only in your query, and background for bits in neither.
 
@@ -131,7 +140,7 @@ Open it with **Settings** in the menu bar, or from the **View** menu. It stays o
 
 - **Theme** — Light, Dark, or follow the system. Structure colours follow it: the same molecule is drawn with a light or dark palette to match.
 - **Structures** — which carbons are labelled, how atoms are annotated, whether hydrogens are explicit. These apply to every structure the app draws, which is why they are here rather than beside any one of them.
-- **Show structures in the dataset table** — the thumbnail column. A structure is drawn where the molecule has coordinates; run **2D Coordinates** in Operations for anything parsed from SMILES.
+- **Show structures in the dataset table** — the thumbnail column.
 
 ### Backend chips
 

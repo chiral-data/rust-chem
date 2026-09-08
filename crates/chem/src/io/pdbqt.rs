@@ -1,0 +1,1022 @@
+//! PDBQT (AutoDock) — PDB's fixed-column layout plus AutoDock atom types,
+//! a per-atom partial charge column, and (for the flexible/ligand variant)
+//! a `ROOT`/`BRANCH i j`/`ENDBRANCH i j`/`ENDROOT`/`TORSDOF` torsion tree
+//! (#226).
+//!
+//! Targets AutoDock's own documented spec, not obabel's or Meeko's
+//! specific quirks — the two are known to disagree with each other, per
+//! this issue's own text, so oracle agreement with one of them is not the
+//! bar here.
+//!
+//! # Rotatable-bond detection and the torsion tree
+//!
+//! A bond is a *candidate* rotatable bond iff [`Bond::is_rotatable`]
+//! (single order, not in a ring) **and** both endpoints are heavy atoms
+//! **and** both endpoints have heavy-atom degree >= 2 (the number of
+//! non-hydrogen neighbours). That last rule is what excludes every
+//! terminal group (`-CH3`, `-OH`, `-NH2`, `-F`, `-Cl`) with no
+//! per-functional-group special-casing at all: a terminal heavy atom's
+//! *only* heavy neighbour is, by definition, the bond partner itself, so
+//! its heavy degree is 1.
+//!
+//! Every candidate bond is a graph-theoretic bridge — a bond not in any
+//! ring is exactly a bond not in any cycle, which is the definition of a
+//! bridge. Removing every candidate bond and taking connected components
+//! therefore yields a fragment-contraction graph that is a **forest**: a
+//! tree per molecular component. `TORSDOF` is `fragments - components`,
+//! which for the usual connected ligand is the `fragments - 1` this said
+//! before #259, and in both cases is simply the number of rotatable bonds.
+//!
+//! Atoms are renumbered in traversal order (the ROOT fragment's atoms
+//! first, then each branch depth-first) — real ligand PDBQT files lay
+//! fragments out contiguously this way, and `BRANCH i j`'s `i`/`j` refer
+//! to those written serials, not the input molecule's own atom indices.
+//!
+//! **A disconnected input keeps every atom.** A salt with a counter-ion
+//! is not one PDBQT ligand, which is a real constraint that real
+//! ligand-prep tooling has — and what that tooling does about it is
+//! *refuse*: Meeko raises "RDKit molecule has 2 fragments. Must have 1."
+//! OpenBabel instead writes every atom. Neither discards.
+//!
+//! This module used to adopt the constraint and truncate to the largest
+//! component, announced by an in-band `REMARK` because a writer's
+//! signature is infallible. That was wrong twice over (#259). A converter
+//! discarding its input is the one thing it must not do, and the `REMARK`
+//! went into the file rather than to the loss channel, so `chem convert`
+//! reported `converted 1, skipped 0` while five atoms of six vanished.
+//! Worse, a format carrying no bonds — XYZ, mmCIF, GRO — hands over N
+//! one-atom "components", which is a fact about the reader and not the
+//! chemistry, so benzene came back as a single carbon.
+//!
+//! Every component's own root fragment therefore goes in the one `ROOT`
+//! block, with branches hanging off each. AutoDock reads the extra
+//! fragments as rigid, which is the honest consequence of being handed
+//! them — stripping solvent is an explicit operation, not a side effect of
+//! writing a file.
+//!
+//! # AutoDock atom typing
+//!
+//! Simpler than Mol2's SYBYL table, not more complex: AutoDock's
+//! vocabulary for "everything else" (halogens, metals, P) *is* the plain
+//! element symbol, so the same plain-element-symbol lookup this crate's
+//! other readers already use covers that fallback — no dummy-type error
+//! path is needed. Only five elements get a special letter:
+//!
+//! - **C**: `A` if aromatic, else `C`.
+//! - **N**: `NA` if it has no attached hydrogens (a "dry" nitrogen), else `N`.
+//! - **O**: always `OA` — nearly every oxygen in an organic ligand is an
+//!   H-bond acceptor in the AutoDock4 force field; the rarely-used plain
+//!   `O` is not attempted (a documented simplification).
+//! - **S**: `SA` if no attached hydrogens, else `S` (thiol).
+//! - **H**: `HD` if any neighbour is N/O/S (polar), else `H`. **Nonpolar
+//!   hydrogens are kept explicit, never merged** into their parent heavy
+//!   atom's charge — real AutoDock4 ligand-prep merges them for correct
+//!   docking energetics; this crate does not perform that charge
+//!   redistribution, the same kind of chemistry-transformation deferral
+//!   already established for PDB's residue-template bonds and mmCIF's
+//!   `_struct_conn`.
+//!
+//! Reading reverses this via a small match on the five letters, falling
+//! through to the plain element-symbol lookup otherwise. `HD` vs `H` carries no
+//! information back onto [`Atom`] beyond "this is a hydrogen" — the
+//! donor/acceptor distinction is a write-time-only computed view.
+//!
+//! # Bonds
+//!
+//! **No `CONECT`-equivalent exists in PDBQT for intra-fragment bonds at
+//! all.** The only explicit bond data anywhere in the format is each
+//! `BRANCH i j` line's own pivot pair. Reading a PDBQT therefore produces
+//! a sparse bond graph — only the rotatable-bond pivots, nothing else —
+//! rather than attempting distance-based bond perception to reconstruct
+//! the rest, out of scope and consistent with every prior format's "no
+//! bond inference."
+//!
+//! **A multi-ligand write frames every record in `MODEL`/`ENDMDL`**, reusing
+//! [`crate::io::pdb::frame_models`] — the convention PDBQT takes from PDB, and
+//! the one Vina's own multi-pose output uses. Without it, ligands written back
+//! to back read as one merged molecule (#267).
+//!
+//! A file may hold several `MODEL`/`ENDMDL`-wrapped poses (AutoDock
+//! Vina's real docked-results output shape) — reuses the exact `ENDMDL`
+//! boundary technique [`crate::io::supplier::PdbSupplier`] already
+//! implements, not reinvented.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use crate::core::atom::{Atom, Element};
+use crate::core::bond::{Bond, BondOrder};
+use crate::core::elements::ELEMENT_SYMBOLS;
+use crate::core::geometry::{Point3, is_placeholder_3d};
+use crate::core::molecule::Molecule;
+use crate::core::residue::{Chain, Residue};
+use crate::core::rings::perceive_rings;
+use crate::core::site::AtomSite;
+use crate::io::errors::PdbqtError;
+
+fn column(line: &str, start_1based: usize, end_1based: usize) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if start_1based == 0 || start_1based > bytes.len() {
+        return None;
+    }
+    let start = start_1based - 1;
+    let end = end_1based.min(bytes.len());
+    line.get(start..end).filter(|s| !s.trim().is_empty())
+}
+
+fn parse_f64_column(line: &str, start: usize, end: usize) -> Result<f64, PdbqtError> {
+    column(line, start, end)
+        .map(str::trim)
+        .ok_or_else(|| PdbqtError::InvalidAtomLine(line.to_string()))?
+        .parse()
+        .map_err(|_| PdbqtError::InvalidAtomLine(line.to_string()))
+}
+
+fn element_from_symbol(sym: &str) -> Option<Element> {
+    let sym = sym.trim();
+    let mut chars = sym.chars();
+    let normalised = match (chars.next(), chars.next()) {
+        (Some(a), Some(b)) if chars.next().is_none() => {
+            format!("{}{}", a.to_ascii_uppercase(), b.to_ascii_lowercase())
+        }
+        (Some(a), None) => a.to_ascii_uppercase().to_string(),
+        _ => return None,
+    };
+    ELEMENT_SYMBOLS
+        .iter()
+        .position(|&s| s == normalised)
+        .and_then(|n| Element::new(n as u8))
+}
+
+/// Resolves an AutoDock atom type into `(element, is_aromatic)`. Only `A`
+/// (aromatic carbon) carries aromaticity; every other letter, and every
+/// plain element symbol, does not.
+fn resolve_autodock_type(type_str: &str) -> Result<(Element, bool), PdbqtError> {
+    match type_str {
+        "A" => Ok((Element::carbon(), true)),
+        "NA" => Ok((Element::nitrogen(), false)),
+        "OA" => Ok((Element::oxygen(), false)),
+        "SA" => element_from_symbol("S")
+            .map(|e| (e, false))
+            .ok_or_else(|| PdbqtError::InvalidAtomType(type_str.to_string())),
+        "HD" => Ok((Element::hydrogen(), false)),
+        other => element_from_symbol(other)
+            .map(|e| (e, false))
+            .ok_or_else(|| PdbqtError::InvalidAtomType(type_str.to_string())),
+    }
+}
+
+/// The number of `atom_idx`'s neighbours that are not hydrogen.
+fn heavy_degree(mol: &Molecule, atom_idx: usize) -> usize {
+    mol.neighbors(atom_idx)
+        .iter()
+        .filter(|n| mol.atom(n.atom_idx).atomic_number() != 1)
+        .count()
+}
+
+/// The reverse of [`resolve_autodock_type`]. Needs the whole molecule (not
+/// just the atom) because hydrogen's donor/acceptor status depends on its
+/// neighbour, and nitrogen/sulfur's depends on `total_hydrogens()`.
+fn autodock_type_for(mol: &Molecule, atom_idx: usize) -> String {
+    let atom = mol.atom(atom_idx);
+    let symbol = atom.element().symbol();
+    match symbol {
+        "C" => {
+            if atom.is_aromatic() {
+                "A".to_string()
+            } else {
+                "C".to_string()
+            }
+        }
+        "N" => {
+            if atom.total_hydrogens() == 0 {
+                "NA".to_string()
+            } else {
+                "N".to_string()
+            }
+        }
+        "O" => "OA".to_string(),
+        "S" => {
+            if atom.total_hydrogens() == 0 {
+                "SA".to_string()
+            } else {
+                "S".to_string()
+            }
+        }
+        "H" => {
+            let polar = mol
+                .neighbors(atom_idx)
+                .iter()
+                .any(|n| matches!(mol.atom(n.atom_idx).element().symbol(), "N" | "O" | "S"));
+            if polar {
+                "HD".to_string()
+            } else {
+                "H".to_string()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A candidate rotatable bond: not in a ring, single order, both
+/// endpoints heavy with heavy-atom degree >= 2. `mol` must already have
+/// fresh ring membership (via [`perceive_rings`]).
+fn is_candidate_rotatable(mol: &Molecule, bond: &Bond) -> bool {
+    if !bond.is_rotatable() {
+        return false;
+    }
+    let (a, b) = (bond.atom1(), bond.atom2());
+    if mol.atom(a).atomic_number() == 1 || mol.atom(b).atomic_number() == 1 {
+        return false;
+    }
+    heavy_degree(mol, a) >= 2 && heavy_degree(mol, b) >= 2
+}
+
+/// Connected components of `mol`'s atom graph, refusing to traverse any
+/// bond in `excluded`. Kept local to this module rather than added to
+/// `MoleculeGraph` -- no other format needs it.
+fn fragments_excluding(mol: &Molecule, excluded: &HashSet<usize>) -> Vec<Vec<usize>> {
+    let mut visited = vec![false; mol.num_atoms()];
+    let mut fragments = Vec::new();
+
+    for start in 0..mol.num_atoms() {
+        if visited[start] {
+            continue;
+        }
+        let mut fragment = Vec::new();
+        let mut queue = VecDeque::from([start]);
+        visited[start] = true;
+        while let Some(atom_idx) = queue.pop_front() {
+            fragment.push(atom_idx);
+            for neighbor in mol.neighbors(atom_idx) {
+                if excluded.contains(&neighbor.bond_idx) || visited[neighbor.atom_idx] {
+                    continue;
+                }
+                visited[neighbor.atom_idx] = true;
+                queue.push_back(neighbor.atom_idx);
+            }
+        }
+        fragment.sort_unstable();
+        fragments.push(fragment);
+    }
+
+    fragments
+}
+
+/// One edge of the fragment tree: `bond_idx` is the original candidate
+/// bond, `(atom_a, atom_b)` its endpoints, with `atom_a` in `frag_a` and
+/// `atom_b` in `frag_b`.
+struct FragmentEdge {
+    frag_a: usize,
+    frag_b: usize,
+    atom_a: usize,
+    atom_b: usize,
+}
+
+/// Assigns new, sequential serials to every atom by walking the fragment
+/// tree depth-first from the root fragment -- the ROOT block's atoms
+/// first, then each branch's atoms, recursively. Returns the order as a
+/// flat `Vec<usize>` of original atom indices (index into this vec + 1 is
+/// the written serial) alongside the tree structure needed to place
+/// `BRANCH`/`ENDBRANCH` markers.
+enum Node {
+    /// A run of this many atoms (from `order`), then nested children.
+    Fragment {
+        atom_count: usize,
+        pivot_in: Option<(usize, usize)>, // (i, j) for a BRANCH line, None for ROOT
+        children: Vec<Node>,
+    },
+}
+
+fn build_tree(
+    fragments: &[Vec<usize>],
+    edges: &[FragmentEdge],
+    root_frag: usize,
+    order: &mut Vec<usize>,
+    new_serial: &mut HashMap<usize, usize>,
+) -> Node {
+    place_fragment(fragments, root_frag, order, new_serial);
+    let root_atom_count = fragments[root_frag].len();
+    let children = build_children(fragments, edges, root_frag, order, new_serial);
+
+    Node::Fragment {
+        atom_count: root_atom_count,
+        pivot_in: None,
+        children,
+    }
+}
+
+/// Assigns serials to one fragment's atoms, in the order they will be written.
+fn place_fragment(
+    fragments: &[Vec<usize>],
+    frag: usize,
+    order: &mut Vec<usize>,
+    new_serial: &mut HashMap<usize, usize>,
+) {
+    for &atom in &fragments[frag] {
+        new_serial.insert(atom, order.len() + 1);
+        order.push(atom);
+    }
+}
+
+/// The subtrees hanging off `root_frag` by a rotatable bond.
+///
+/// Split from [`build_tree`] so a disconnected molecule can place *every*
+/// component's root fragment in the one `ROOT` block before any branch is
+/// walked -- the block is written as a contiguous run from the head of
+/// `order`, so the roots have to be laid down together (#259).
+fn build_children(
+    fragments: &[Vec<usize>],
+    edges: &[FragmentEdge],
+    root_frag: usize,
+    order: &mut Vec<usize>,
+    new_serial: &mut HashMap<usize, usize>,
+) -> Vec<Node> {
+    let mut child_edges: Vec<&FragmentEdge> = edges
+        .iter()
+        .filter(|e| e.frag_a == root_frag || e.frag_b == root_frag)
+        .collect();
+    child_edges.sort_by_key(|e| {
+        if e.frag_a == root_frag {
+            e.atom_a
+        } else {
+            e.atom_b
+        }
+    });
+
+    let mut children = Vec::new();
+    for edge in child_edges {
+        let (pivot_here, child_frag, pivot_child) = if edge.frag_a == root_frag {
+            (edge.atom_a, edge.frag_b, edge.atom_b)
+        } else {
+            (edge.atom_b, edge.frag_a, edge.atom_a)
+        };
+        let remaining: Vec<FragmentEdge> = edges
+            .iter()
+            .filter(|e| !(e.frag_a == root_frag && e.frag_b == child_frag))
+            .filter(|e| !(e.frag_b == root_frag && e.frag_a == child_frag))
+            .map(|e| FragmentEdge {
+                frag_a: e.frag_a,
+                frag_b: e.frag_b,
+                atom_a: e.atom_a,
+                atom_b: e.atom_b,
+            })
+            .collect();
+        let i = new_serial[&pivot_here];
+        let child_node = build_tree(fragments, &remaining, child_frag, order, new_serial);
+        let j = new_serial[&pivot_child];
+        let Node::Fragment {
+            atom_count,
+            children: grandchildren,
+            ..
+        } = child_node;
+        children.push(Node::Fragment {
+            atom_count,
+            pivot_in: Some((i, j)),
+            children: grandchildren,
+        });
+    }
+
+    children
+}
+
+fn write_fragment(
+    out: &mut String,
+    node: &Node,
+    order: &[usize],
+    cursor: &mut usize,
+    mol: &Molecule,
+) {
+    let Node::Fragment {
+        atom_count,
+        children,
+        ..
+    } = node;
+    for _ in 0..*atom_count {
+        write_atom_line(out, mol, order[*cursor], *cursor + 1);
+        *cursor += 1;
+    }
+    for child in children {
+        let Node::Fragment { pivot_in, .. } = child;
+        let (i, j) = pivot_in.expect("a child fragment always has a pivot");
+        out.push_str(&format!("BRANCH{i:>4}{j:>4}\n"));
+        write_fragment(out, child, order, cursor, mol);
+        out.push_str(&format!("ENDBRANCH{i:>4}{j:>4}\n"));
+    }
+}
+
+fn write_atom_line(out: &mut String, mol: &Molecule, atom_idx: usize, serial: usize) {
+    let atom = mol.atom(atom_idx);
+    let site = mol.site(atom_idx);
+    let residue = mol.residue_of(atom_idx);
+    let chain = mol.chain_of(atom_idx);
+    let p = mol.coord3(atom_idx).unwrap_or(Point3::new(0.0, 0.0, 0.0));
+
+    let record = "ATOM";
+    let name = site
+        .and_then(|s| s.name.as_deref())
+        .unwrap_or(atom.element().symbol());
+    let res_name = residue.map(|r| r.name.as_str()).unwrap_or("LIG");
+    let res_seq = residue.map(|r| r.sequence).unwrap_or(1);
+    let chain_id = chain.and_then(|c| c.id.chars().next()).unwrap_or(' ');
+    let occupancy = site.and_then(|s| s.occupancy).unwrap_or(1.0);
+    let b_factor = site.and_then(|s| s.b_factor).unwrap_or(0.0);
+    let charge = site.and_then(|s| s.partial_charge).unwrap_or(0.0);
+    let autodock_type = autodock_type_for(mol, atom_idx);
+
+    out.push_str(&format!(
+        "{record:<6}{serial:>5} {name:<4} {res_name:<3} {chain_id}{res_seq:>4}    {x:>8.3}{y:>8.3}{z:>8.3}{occupancy:>6.2}{b_factor:>6.2}    {charge:>6.3} {autodock_type:<2}\n",
+        x = p.x,
+        y = p.y,
+        z = p.z,
+    ));
+}
+
+/// Writes one PDBQT ligand (a `ROOT`/`BRANCH`.../`TORSDOF` block).
+///
+/// Panics never; a molecule with more than one connected component gets a
+/// `REMARK` line naming the loss and only its largest component is
+/// written -- see the module doc for why this isn't a `Result`.
+pub fn write_pdbqt(mol: &Molecule) -> String {
+    let mut working = mol.clone();
+    perceive_rings(&mut working);
+    let working = &working;
+
+    let candidate_bonds: Vec<usize> = working
+        .bonds()
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| is_candidate_rotatable(working, b))
+        .map(|(i, _)| i)
+        .collect();
+    let excluded: HashSet<usize> = candidate_bonds.iter().copied().collect();
+
+    let fragments = fragments_excluding(working, &excluded);
+    let frag_of: HashMap<usize, usize> = fragments
+        .iter()
+        .enumerate()
+        .flat_map(|(f, atoms)| atoms.iter().map(move |&a| (a, f)))
+        .collect();
+
+    let edges: Vec<FragmentEdge> = candidate_bonds
+        .iter()
+        .map(|&bond_idx| {
+            let bond = working.bond(bond_idx);
+            let (a, b) = (bond.atom1(), bond.atom2());
+            FragmentEdge {
+                frag_a: frag_of[&a],
+                frag_b: frag_of[&b],
+                atom_a: a,
+                atom_b: b,
+            }
+        })
+        .collect();
+
+    // One root fragment per *molecular* component, not one overall. A
+    // disconnected molecule -- a salt, or anything read from a format that
+    // carries no bonds -- has no single fragment every other is reachable
+    // from, and walking one root used to leave the rest unwritten (#259).
+    let mut roots: Vec<usize> = Vec::new();
+    for component in working.graph().connected_components() {
+        let in_component: HashSet<usize> = component.iter().copied().collect();
+        let root = fragments
+            .iter()
+            .enumerate()
+            .filter(|(_, atoms)| atoms.first().is_some_and(|a| in_component.contains(a)))
+            .max_by_key(|(_, atoms)| {
+                (
+                    atoms.len(),
+                    std::cmp::Reverse(atoms.first().copied().unwrap_or(usize::MAX)),
+                )
+            })
+            .map(|(i, _)| i);
+        if let Some(root) = root {
+            roots.push(root);
+        }
+    }
+    roots.sort_unstable_by_key(|&f| fragments[f].first().copied().unwrap_or(usize::MAX));
+
+    let mut order = Vec::new();
+    let mut new_serial = HashMap::new();
+
+    // Every root laid down first, because the ROOT block is a contiguous run
+    // from the head of `order`; only then can any branch be walked.
+    let mut root_atom_count = 0;
+    for &root in &roots {
+        place_fragment(&fragments, root, &mut order, &mut new_serial);
+        root_atom_count += fragments[root].len();
+    }
+    let mut children = Vec::new();
+    for &root in &roots {
+        children.extend(build_children(
+            &fragments,
+            &edges,
+            root,
+            &mut order,
+            &mut new_serial,
+        ));
+    }
+    let tree = Node::Fragment {
+        atom_count: root_atom_count,
+        pivot_in: None,
+        children,
+    };
+
+    let mut out = String::new();
+    out.push_str("ROOT\n");
+    let mut cursor = 0;
+    let Node::Fragment { atom_count, .. } = &tree;
+    for _ in 0..*atom_count {
+        write_atom_line(&mut out, working, order[cursor], cursor + 1);
+        cursor += 1;
+    }
+    out.push_str("ENDROOT\n");
+    let Node::Fragment { children, .. } = &tree;
+    for child in children {
+        let Node::Fragment { pivot_in, .. } = child;
+        let (i, j) = pivot_in.expect("a child fragment always has a pivot");
+        out.push_str(&format!("BRANCH{i:>4}{j:>4}\n"));
+        write_fragment(&mut out, child, &order, &mut cursor, working);
+        out.push_str(&format!("ENDBRANCH{i:>4}{j:>4}\n"));
+    }
+    out.push_str(&format!("TORSDOF {}\n", candidate_bonds.len()));
+
+    out
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ResidueKey {
+    chain_id: String,
+    name: String,
+    sequence: i32,
+    insertion_code: Option<char>,
+}
+
+fn group_into_chains_and_residues(keys: &[ResidueKey]) -> (Vec<Chain>, Vec<Residue>) {
+    let mut chains = Vec::new();
+    let mut residues = Vec::new();
+    let mut current_chain_id: Option<&str> = None;
+    let mut chain_start = 0;
+
+    let mut i = 0;
+    while i < keys.len() {
+        let key = &keys[i];
+        let start = i;
+        while i < keys.len() && keys[i] == *key {
+            i += 1;
+        }
+
+        if current_chain_id != Some(key.chain_id.as_str()) {
+            if let Some(id) = current_chain_id {
+                chains.push(Chain {
+                    id: id.to_string(),
+                    label_id: None,
+                    residues: chain_start..residues.len(),
+                });
+            }
+            current_chain_id = Some(&key.chain_id);
+            chain_start = residues.len();
+        }
+
+        residues.push(Residue {
+            name: key.name.clone(),
+            sequence: key.sequence,
+            insertion_code: key.insertion_code,
+            label_seq: None,
+            chain_ix: chains.len(),
+            is_hetero: false,
+            atoms: start..i,
+        });
+    }
+    if let Some(id) = current_chain_id {
+        chains.push(Chain {
+            id: id.to_string(),
+            label_id: None,
+            residues: chain_start..residues.len(),
+        });
+    }
+
+    (chains, residues)
+}
+
+/// Parses one PDBQT ligand (a single `MODEL`, or a whole file with none).
+pub fn parse_pdbqt(text: &str) -> Result<Molecule, PdbqtError> {
+    let mut mol = Molecule::new();
+    let mut coords = Vec::new();
+    let mut sites = Vec::new();
+    let mut keys = Vec::new();
+    let mut serial_to_index: HashMap<i64, usize> = HashMap::new();
+    let mut bond_pairs: Vec<(i64, i64)> = Vec::new();
+
+    for line in text.lines() {
+        if line.len() < 6 {
+            continue;
+        }
+        let record = line[0..6.min(line.len())].trim();
+        match record {
+            "ATOM" | "HETATM" => {
+                let serial: i64 = column(line, 7, 11)
+                    .map(str::trim)
+                    .ok_or_else(|| PdbqtError::InvalidAtomLine(line.to_string()))?
+                    .parse()
+                    .map_err(|_| PdbqtError::InvalidAtomLine(line.to_string()))?;
+                let name_field = column(line, 13, 16).unwrap_or("").trim().to_string();
+                let res_name = column(line, 18, 20).unwrap_or("LIG").trim().to_string();
+                let chain_id = column(line, 22, 22).unwrap_or("").trim().to_string();
+                let res_seq: i32 = column(line, 23, 26)
+                    .map(str::trim)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                let insertion_code = column(line, 27, 27).and_then(|s| s.chars().next());
+                let x = parse_f64_column(line, 31, 38)?;
+                let y = parse_f64_column(line, 39, 46)?;
+                let z = parse_f64_column(line, 47, 54)?;
+                let occupancy = column(line, 55, 60).and_then(|s| s.trim().parse().ok());
+                let b_factor = column(line, 61, 66).and_then(|s| s.trim().parse().ok());
+                let charge = column(line, 71, 76).and_then(|s| s.trim().parse().ok());
+                let autodock_type = column(line, 78, 79)
+                    .ok_or_else(|| PdbqtError::InvalidAtomLine(line.to_string()))?
+                    .trim();
+
+                let (element, is_aromatic) = resolve_autodock_type(autodock_type)?;
+                let atom = Atom::new(element).with_aromatic(is_aromatic);
+                let atom_idx = mol.add_atom(atom);
+                serial_to_index.insert(serial, atom_idx);
+                coords.push(Point3::new(x, y, z));
+                sites.push(AtomSite {
+                    name: if name_field.is_empty() {
+                        None
+                    } else {
+                        Some(name_field)
+                    },
+                    alt_loc: None,
+                    partial_charge: charge,
+                    occupancy,
+                    b_factor,
+                    radius: None,
+                });
+                keys.push(ResidueKey {
+                    chain_id,
+                    name: res_name,
+                    sequence: res_seq,
+                    insertion_code,
+                });
+            }
+            "BRANCH" => {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 3 {
+                    let i: i64 = fields[1]
+                        .parse()
+                        .map_err(|_| PdbqtError::InvalidTorsionTree(line.to_string()))?;
+                    let j: i64 = fields[2]
+                        .parse()
+                        .map_err(|_| PdbqtError::InvalidTorsionTree(line.to_string()))?;
+                    bond_pairs.push((i, j));
+                }
+            }
+            _ => {
+                // ROOT, ENDROOT, ENDBRANCH, TORSDOF, REMARK, and everything
+                // else: no further data to extract. MODEL/ENDMDL framing
+                // is the caller's job (see the module doc).
+            }
+        }
+    }
+
+    // Zeros in these columns are what a format with no room to say "unknown"
+    // writes for a molecule that has no conformer, so believing them back is
+    // how a converted molecule ended up undrawable (#270).
+    if !is_placeholder_3d(&coords) {
+        mol.set_coords3(coords)
+            .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
+    }
+    mol.set_sites(sites)
+        .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
+
+    let (chains, residues) = group_into_chains_and_residues(&keys);
+    mol.set_topology(chains, residues)
+        .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
+
+    for (i, j) in bond_pairs {
+        let a = *serial_to_index
+            .get(&i)
+            .ok_or_else(|| PdbqtError::InvalidTorsionTree(format!("unknown serial {i}")))?;
+        let b = *serial_to_index
+            .get(&j)
+            .ok_or_else(|| PdbqtError::InvalidTorsionTree(format!("unknown serial {j}")))?;
+        mol.add_bond(Bond::new(a, b, BondOrder::Single))
+            .map_err(|e| PdbqtError::ParseError(e.to_string()))?;
+    }
+
+    if mol.num_atoms() == 0 {
+        return Err(PdbqtError::NoAtoms);
+    }
+
+    Ok(mol)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::smiles::parse_smiles;
+
+    #[test]
+    fn test_deprotonation_makes_a_heteroatom_a_hydrogen_bond_acceptor() {
+        // `autodock_type_for` types nitrogen and sulfur by whether they carry
+        // a hydrogen, so #240's wrong hydrogen counts reached this column:
+        // a thiolate looked protonated and was typed `S` rather than `SA`.
+        // AutoDock reads this to decide what can accept a hydrogen bond, so
+        // it is the one place outside formula and mass where that defect
+        // changed a file rather than a number.
+        let type_of = |smiles: &str, atom_idx: usize| {
+            let mol = parse_smiles(smiles).expect("valid SMILES");
+            autodock_type_for(&mol, atom_idx)
+        };
+
+        assert_eq!(type_of("C[S-]", 1), "SA", "a thiolate accepts");
+        assert_eq!(type_of("CCS", 2), "S", "a thiol donates, and does not");
+        assert_eq!(type_of("C[N-]C", 1), "NA", "a deprotonated amine accepts");
+        assert_eq!(type_of("CNC", 1), "N", "a secondary amine still has its H");
+    }
+
+    #[test]
+    fn test_a_rigid_molecule_writes_root_only_with_torsdof_zero() {
+        let mut mol = parse_smiles("c1ccccc1").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+        assert!(written.contains("ROOT\n"), "{written}");
+        assert!(written.contains("ENDROOT\n"), "{written}");
+        assert!(!written.contains("BRANCH"), "{written}");
+        assert!(written.contains("TORSDOF 0"), "{written}");
+    }
+
+    #[test]
+    fn test_toluene_shaped_input_excludes_the_terminal_methyl_bond() {
+        // The ring-methyl bond is Single and not in a ring, so it passes
+        // Bond::is_rotatable() -- it must be excluded by the heavy-degree
+        // rule instead (the methyl carbon's only heavy neighbour is the
+        // ring carbon itself).
+        let mut mol = parse_smiles("Cc1ccccc1").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+        assert!(written.contains("TORSDOF 0"), "{written}");
+    }
+
+    #[test]
+    fn test_a_branched_ligand_with_two_rotatable_bonds_round_trips() {
+        // Two biphenyl-like rings joined through a flexible linker gives
+        // exactly two non-ring, non-terminal single bonds: ring1-CH2 and
+        // CH2-ring2 is one shape, but a cleaner >=2 case is two separate
+        // single bonds between three ring systems: ring1-ring2-ring3
+        // joined by two direct aryl-aryl single bonds (each aryl carbon
+        // has heavy degree 3, well above the threshold).
+        let mut mol = parse_smiles("c1ccc(cc1)-c1ccc(cc1)-c1ccccc1").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+        assert!(written.contains("TORSDOF 2"), "{written}");
+        let branch_count = written.matches("BRANCH").count() - written.matches("ENDBRANCH").count();
+        assert_eq!(branch_count, 2, "{written}");
+
+        let back = parse_pdbqt(&written).expect("valid PDBQT");
+        assert_eq!(back.num_bonds(), 2, "only the two BRANCH pivots are stated");
+    }
+
+    #[test]
+    fn test_autodock_type_resolution_both_directions() {
+        for (type_str, symbol, aromatic) in [
+            ("A", "C", true),
+            ("NA", "N", false),
+            ("OA", "O", false),
+            ("SA", "S", false),
+            ("HD", "H", false),
+            ("Cl", "Cl", false),
+            ("Zn", "Zn", false),
+        ] {
+            let (element, is_aromatic) = resolve_autodock_type(type_str).expect(type_str);
+            assert_eq!(element.symbol(), symbol, "{type_str}");
+            assert_eq!(is_aromatic, aromatic, "{type_str}");
+        }
+    }
+
+    #[test]
+    fn test_nitrogen_and_sulfur_type_depends_on_attached_hydrogens() {
+        let pyridine = parse_smiles("c1ccncc1").expect("valid SMILES");
+        // Atom index 3 is the ring nitrogen (no attached H).
+        assert_eq!(autodock_type_for(&pyridine, 3), "NA");
+
+        let aniline = parse_smiles("Nc1ccccc1").expect("valid SMILES");
+        // Atom index 0 is the amine nitrogen (has attached H).
+        assert_eq!(autodock_type_for(&aniline, 0), "N");
+    }
+
+    #[test]
+    fn test_a_disconnected_input_keeps_every_atom() {
+        // This used to write a REMARK and only the largest component, losing
+        // the rest in silence. Neither reference implementation does that --
+        // OpenBabel writes every atom and Meeko refuses the molecule outright
+        // -- and a converter discarding its input is the one thing it must not
+        // do (#259).
+        let mut mol = parse_smiles("CCO.C").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+
+        let atoms = written.lines().filter(|l| l.starts_with("ATOM")).count();
+        assert_eq!(atoms, mol.num_atoms(), "{written}");
+        assert!(
+            !written.contains("REMARK"),
+            "nothing to apologise for: {written}"
+        );
+    }
+
+    #[test]
+    fn test_a_molecule_with_no_bonds_keeps_every_atom() {
+        // The reported case. A format carrying no bonds -- XYZ, mmCIF, GRO --
+        // hands over N one-atom "components", which is a fact about the reader
+        // rather than the chemistry. Benzene came out as a single carbon.
+        // Built bondless directly: what an XYZ read hands over.
+        let benzene = parse_smiles("c1ccccc1").expect("valid SMILES");
+        let mut mol = Molecule::new();
+        for atom in benzene.atoms() {
+            mol.add_atom(atom.clone());
+        }
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+
+        let written = write_pdbqt(&mol);
+        let atoms = written.lines().filter(|l| l.starts_with("ATOM")).count();
+        assert_eq!(atoms, 6, "{written}");
+        assert!(written.contains("TORSDOF 0"), "{written}");
+    }
+
+    #[test]
+    fn test_torsdof_counts_rotatable_bonds_across_components() {
+        // The forest. `TORSDOF = fragments - 1` held only because the input was
+        // forced connected; across components it is `fragments - components`,
+        // which is just the rotatable-bond count it always meant. An ether plus
+        // a detached water has one rotatable bond, not two.
+        let mut mol = parse_smiles("CCOC.O").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+
+        assert!(written.contains("TORSDOF 1"), "{written}");
+        let atoms = written.lines().filter(|l| l.starts_with("ATOM")).count();
+        assert_eq!(atoms, mol.num_atoms(), "{written}");
+    }
+
+    #[test]
+    fn test_every_branch_names_a_serial_that_exists() {
+        // The invariant the renumbering exists for: `BRANCH i j` refers to
+        // *written* serials, not input atom indices. Placing several components
+        // in one ROOT block is exactly the change that could break it, and
+        // nothing pinned it before.
+        let mut mol = parse_smiles("CCOC.CCOC.O").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let written = write_pdbqt(&mol);
+
+        let serials: Vec<usize> = written
+            .lines()
+            .filter(|l| l.starts_with("ATOM"))
+            .filter_map(|l| l.get(6..11)?.trim().parse().ok())
+            .collect();
+        assert_eq!(serials, (1..=mol.num_atoms()).collect::<Vec<_>>());
+
+        for line in written.lines().filter(|l| l.starts_with("BRANCH")) {
+            for field in line.trim_start_matches("BRANCH").split_whitespace() {
+                let serial: usize = field.parse().expect("a serial");
+                assert!(serials.contains(&serial), "dangling {serial} in {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_malformed_atom_line_is_a_clear_error_not_a_panic() {
+        let text = "ATOM      1 C1   LIG A   1      not-a-number   0.000   0.000  1.00  0.00     0.000 C \n";
+        let err = parse_pdbqt(text).unwrap_err();
+        assert!(matches!(err, PdbqtError::InvalidAtomLine(_)), "{err}");
+    }
+
+    #[test]
+    fn test_an_unrecognised_atom_type_is_a_clear_error() {
+        let text =
+            "ATOM      1 C1   LIG A   1       0.000   0.000   0.000  1.00  0.00     0.000 Xx\n";
+        let err = parse_pdbqt(text).unwrap_err();
+        assert!(matches!(err, PdbqtError::InvalidAtomType(_)), "{err}");
+    }
+
+    /// Ethanol as OpenBabel 3.1.1 actually writes it.
+    ///
+    /// Captured from the pinned oracle rather than hand-typed. Note the
+    /// explicit `+` on the charge and the occupancy of `0.00` where both
+    /// AutoDock and this crate write `1.00` -- the module doc's "read both"
+    /// is about exactly this kind of difference.
+    const OBABEL_ETHANOL: &str = "\
+ROOT
+ATOM      1  C   UNL     1       0.000   0.000   0.000  0.00  0.00    -0.045 C
+ATOM      2  C   UNL     1       0.000   0.000   0.000  0.00  0.00    +0.117 C
+ATOM      3  O   UNL     1       0.000   0.000   0.000  0.00  0.00    -0.393 OA
+ENDROOT
+TORSDOF 0
+";
+
+    /// The same molecule as Meeko 0.8.0 writes it.
+    ///
+    /// A third dialect again: `REMARK SMILES` lines OpenBabel never emits, a
+    /// real torsion tree, computed Gasteiger charges rather than zeros, and a
+    /// polar hydrogen typed `HD`.
+    const MEEKO_ETHANOL: &str = "\
+REMARK SMILES CCO
+REMARK SMILES IDX 1 1 2 2 3 3
+REMARK H PARENT 3 4
+ROOT
+ATOM      1  C   UNL     1       0.877   0.187   0.049  1.00  0.00    +0.034 C
+ATOM      2  C   UNL     1      -0.464  -0.481  -0.045  1.00  0.00    +0.152 C
+ENDROOT
+BRANCH   2   3
+ATOM      3  O   UNL     1      -1.494   0.355  -0.418  1.00  0.00    -0.397 OA
+ATOM      4  H   UNL     1      -1.477   1.247  -0.012  1.00  0.00    +0.210 HD
+ENDBRANCH   2   3
+TORSDOF 1
+";
+
+    #[test]
+    fn test_the_openbabel_dialect_reads_with_its_signed_charges() {
+        // `io/pdbqt.rs` targets AutoDock's spec rather than any toolkit's
+        // quirks, which only works if the quirks are still readable. The
+        // signed charge column is the one that would silently misparse:
+        // ` 0.117` and `+0.117` are the same number in different spellings,
+        // and a reader that trimmed the wrong columns would get neither.
+        let mol = parse_pdbqt(OBABEL_ETHANOL).expect("obabel writes valid PDBQT");
+        assert_eq!(mol.num_atoms(), 3);
+
+        let charges: Vec<Option<f64>> = (0..3)
+            .map(|i| mol.site(i).and_then(|s| s.partial_charge))
+            .collect();
+        assert_eq!(charges, vec![Some(-0.045), Some(0.117), Some(-0.393)]);
+
+        let elements: Vec<&str> = mol.atoms().iter().map(|a| a.element().symbol()).collect();
+        assert_eq!(elements, vec!["C", "C", "O"]);
+    }
+
+    #[test]
+    fn test_the_meeko_dialect_reads_including_its_polar_hydrogen() {
+        // The dialect nothing exercised until #258, because Meeko was not in
+        // the oracle image. `HD` is the case that matters: a hydrogen typed
+        // for hydrogen bonding, which a table keyed only on `H` would reject.
+        let mol = parse_pdbqt(MEEKO_ETHANOL).expect("meeko writes valid PDBQT");
+        assert_eq!(mol.num_atoms(), 4);
+
+        let elements: Vec<&str> = mol.atoms().iter().map(|a| a.element().symbol()).collect();
+        assert_eq!(elements, vec!["C", "C", "O", "H"]);
+
+        let charges: Vec<Option<f64>> = (0..4)
+            .map(|i| mol.site(i).and_then(|s| s.partial_charge))
+            .collect();
+        assert_eq!(
+            charges,
+            vec![Some(0.034), Some(0.152), Some(-0.397), Some(0.210)]
+        );
+
+        // The BRANCH pivot is the only connectivity a PDBQT states, so it is
+        // the only bond that may come back.
+        assert_eq!(mol.num_bonds(), 1);
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_conformer() {
+        // #270: the coordinate columns are mandatory, so a ligand with no
+        // conformer is written as zeros.
+        let text = "\
+ROOT
+ATOM      1 C    LIG     1       0.000   0.000   0.000  1.00  0.00     0.000 C
+ATOM      2 O    LIG     1       0.000   0.000   0.000  1.00  0.00     0.000 OA
+ENDROOT
+TORSDOF 0
+";
+        let mol = parse_pdbqt(text).expect("valid PDBQT");
+        assert_eq!(mol.num_atoms(), 2);
+        assert!(
+            !mol.has_coords3(),
+            "all-zero is a placeholder, not a conformer"
+        );
+        // The charge column beside it is real and must survive.
+        assert_eq!(mol.site(0).and_then(|s| s.partial_charge), Some(0.0));
+    }
+
+    #[test]
+    fn test_garbage_text_reports_no_atoms_instead_of_an_empty_molecule() {
+        for input in [
+            "",
+            "REMARK  nothing here\nTORSDOF 0\n",
+            "not a pdbqt file at all\n",
+        ] {
+            assert!(
+                matches!(parse_pdbqt(input), Err(PdbqtError::NoAtoms)),
+                "{input:?} should report NoAtoms"
+            );
+        }
+    }
+}

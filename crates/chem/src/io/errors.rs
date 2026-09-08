@@ -81,3 +81,214 @@ pub enum SdfError {
     #[error("Missing counts line")]
     MissingCountsLine,
 }
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum XyzError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    #[error("Declared {expected} atoms but found {got}")]
+    AtomCountMismatch { expected: usize, got: usize },
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum PdbError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    /// No `ATOM`/`HETATM` record was ever recognized, so zero atoms were
+    /// read.
+    ///
+    /// Every other record (`HEADER`, `TITLE`, `SEQRES`, arbitrary garbage...)
+    /// falls into the parser's catch-all arm and is silently ignored, so any
+    /// text at all used to "parse" into an empty, valid molecule (#268).
+    #[error("No atoms in PDB")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum MmcifError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom_site row: {0}")]
+    InvalidAtomRow(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    /// No `_atom_site.*` `loop_` was ever seen at all, so zero atoms were
+    /// read.
+    ///
+    /// A `loop_` genuinely tagged `_atom_site.*` with zero data rows is legal
+    /// mmCIF (an intentionally empty structure) and is not this — only the
+    /// absence of any `_atom_site.*` loop makes this unreadable garbage
+    /// rather than a real, empty structure (#268).
+    #[error("No atoms in mmCIF")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum Mol2Error {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid bond line: {0}")]
+    InvalidBondLine(String),
+
+    #[error("Unsupported SYBYL atom type: {0}")]
+    UnsupportedAtomType(String),
+
+    /// No `@<TRIPOS>ATOM` section was ever seen, so zero atoms were read.
+    ///
+    /// Any text without recognized `@<TRIPOS>` section headers used to
+    /// "parse" into an empty, valid molecule instead of being rejected (#268).
+    #[error("No atoms in Mol2")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum PdbqtError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid AutoDock atom type: {0}")]
+    InvalidAtomType(String),
+
+    #[error("Invalid torsion tree line: {0}")]
+    InvalidTorsionTree(String),
+
+    /// No `ATOM`/`HETATM` record was ever recognized, so zero atoms were
+    /// read.
+    ///
+    /// Every other record (`ROOT`, `ENDROOT`, `TORSDOF`, arbitrary
+    /// garbage...) falls into the parser's catch-all arm and is silently
+    /// ignored, so any text at all used to "parse" into an empty, valid
+    /// molecule (#268).
+    #[error("No atoms in PDBQT")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum GroError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    #[error("Invalid element for atom name: {0}")]
+    InvalidElement(String),
+
+    #[error("Declared {expected} atoms but the file ended early")]
+    AtomCountMismatch { expected: usize },
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum CommonchemError {
+    #[error("Invalid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("No commonchem or rdkitjson version header")]
+    MissingHeader,
+
+    #[error("Unsupported {key} version {version}")]
+    UnsupportedVersion { key: String, version: u32 },
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atomic number: {0}")]
+    InvalidElement(u8),
+
+    #[error("Invalid bond order: {0}")]
+    InvalidBondOrder(u32),
+
+    #[error("Invalid atom stereo: {0}")]
+    InvalidAtomStereo(String),
+
+    #[error("Invalid bond stereo: {0}")]
+    InvalidBondStereo(String),
+
+    #[error("Bond references atom {atom}, but the molecule has {num_atoms}")]
+    BondIndexOutOfRange { atom: usize, num_atoms: usize },
+
+    #[error("{what} references index {index}, which does not exist")]
+    ExtensionIndexOutOfRange { what: &'static str, index: usize },
+
+    #[error("A dim-{dim} conformer needs {expected} coordinates, got {got}")]
+    ConformerLengthMismatch {
+        dim: u8,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("Unsupported conformer dimensionality: {0}")]
+    UnsupportedConformerDim(u8),
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum CmlError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom element: {0}")]
+    InvalidAtomElement(String),
+
+    #[error("Invalid bond element: {0}")]
+    InvalidBondElement(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    #[error("Bond references unknown atom id: {0}")]
+    UnknownAtomReference(String),
+}
+
+/// A record failed to read while streaming through a [`crate::io::supplier::Supplier`].
+///
+/// Unlike [`crate::io::reader::Skipped`] (used by the one-shot `read()`,
+/// where a bad record is data to report and move on from), a `Supplier`
+/// surfaces this as its iterator's `Err` — a genuinely new failure mode
+/// streaming introduces that one-shot reading never had: the underlying
+/// `Read` itself can fail (a broken pipe, a permissions error mid-file),
+/// not just a malformed record.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ReadError {
+    #[error("I/O error at record {position}: {source}")]
+    Io {
+        position: usize,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("record {position} failed to parse: {message}")]
+    Parse { position: usize, message: String },
+}

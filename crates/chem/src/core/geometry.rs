@@ -281,6 +281,33 @@ impl BoundingBox {
     }
 }
 
+/// Whether these positions are a format's placeholder rather than a measurement.
+///
+/// A format with mandatory coordinate columns has to write *something* for a
+/// molecule that has none, and every one of them writes zeros. Believing that
+/// back is how `chem convert x.smi --to mol2` produced a molecule whose atoms
+/// all sat on top of each other: the layout read as present, `ensure_coords`
+/// returned early, and the depiction collapsed to a single point (#270).
+///
+/// Two atoms are needed for the rule to mean anything -- one atom at the origin
+/// is genuinely at the origin, and its coordinate is real.
+///
+/// Deliberately the origin rather than "every atom at the same point". A file
+/// stacking every atom at (5, 5, 5) is equally undrawable, but nothing writes
+/// that as a convention, so it is a broken file to represent faithfully rather
+/// than a signal to interpret.
+pub fn is_placeholder_2d(points: &[Point2]) -> bool {
+    points.len() > 1 && points.iter().all(|p| p.x == 0.0 && p.y == 0.0)
+}
+
+/// The conformer counterpart of [`is_placeholder_2d`].
+pub fn is_placeholder_3d(points: &[Point3]) -> bool {
+    points.len() > 1
+        && points
+            .iter()
+            .all(|p| p.x == 0.0 && p.y == 0.0 && p.z == 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -419,5 +446,34 @@ mod tests {
         assert_eq!(bbox.min, bbox.max);
         assert_eq!(bbox.width(), 0.0);
         assert_eq!(bbox.height(), 0.0);
+    }
+
+    #[test]
+    fn test_all_atoms_at_the_origin_is_a_placeholder() {
+        assert!(is_placeholder_2d(&[Point2::ORIGIN, Point2::ORIGIN]));
+        assert!(is_placeholder_3d(&[Point3::ORIGIN; 3]));
+    }
+
+    #[test]
+    fn test_one_atom_at_the_origin_is_really_there() {
+        // The rule's only edge, and the one a later reader is most likely to
+        // simplify away: a lone atom at the origin is at the origin.
+        assert!(!is_placeholder_2d(&[Point2::ORIGIN]));
+        assert!(!is_placeholder_3d(&[Point3::ORIGIN]));
+        assert!(!is_placeholder_2d(&[]));
+    }
+
+    #[test]
+    fn test_one_atom_away_from_the_origin_makes_it_a_measurement() {
+        // Real coordinates must survive, including a molecule where all but one
+        // atom happens to sit at the origin.
+        assert!(!is_placeholder_2d(&[
+            Point2::ORIGIN,
+            Point2::new(0.0, 0.001)
+        ]));
+        assert!(!is_placeholder_3d(&[
+            Point3::ORIGIN,
+            Point3::new(0.0, 0.0, 0.001)
+        ]));
     }
 }

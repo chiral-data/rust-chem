@@ -26,14 +26,18 @@ use anyhow::{Context, Result, bail};
 use backend::Backend;
 use chem::draw::structure::{StructureOptions, StructureTheme};
 use chem::draw::svg::structure_to_svg;
-use chem::io::format::Carries;
+use chem::io::format::{self, Carries};
+use chem::io::open::{open_supplier_as, open_writer_as};
+use chem::io::options::{ReadOptions, WriteOptions};
 use chem::io::reader::Format;
+use chem::io::supplier::{Supplier, Writer};
 use clap::{Parser, Subcommand, ValueEnum};
 use emath::Vec2;
 use fpfile::FingerprintFile;
-use std::path::PathBuf;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
-use write::OutputFormat;
+use write::resolve_output_format;
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +70,16 @@ struct Cli {
     explain_drops: bool,
 }
 
+/// How `chem fp` writes its fingerprints.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FpFormat {
+    /// This crate's own format, carrying radius and size so `chem search`
+    /// can refuse a mismatched query rather than guess.
+    Chem,
+    /// chemfp's FPS format (#243).
+    Fps,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Read the input and report what is in it.
@@ -78,10 +92,11 @@ enum Command {
         /// Input file. Reads standard input when absent or `-`.
         input: Option<PathBuf>,
 
-        /// Input format. Detected from the filename otherwise; standard input
+        /// Input format code (e.g. `smi`, `sdf`; `chem convert -L formats`
+        /// lists them). Detected from the filename otherwise; standard input
         /// has no name to read, so it defaults to SMILES.
-        #[arg(long, value_enum)]
-        format: Option<FormatArg>,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write to a file instead of standard output.
         #[arg(long, short = 'o')]
@@ -93,8 +108,8 @@ enum Command {
         /// Input file. Reads standard input when absent or `-`.
         input: Option<PathBuf>,
 
-        #[arg(long, value_enum)]
-        format: Option<FormatArg>,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write to a file instead of standard output.
         #[arg(long, short = 'o')]
@@ -107,6 +122,13 @@ enum Command {
         /// Fingerprint length in bits.
         #[arg(long, default_value_t = 2048)]
         size: u32,
+
+        /// Output format. `chem` is this crate's own self-describing file,
+        /// the only one `chem search` reads. `fps` is chemfp's interchange
+        /// format, for handing the bits to another tool -- write-only here,
+        /// as it is everywhere else.
+        #[arg(long, value_enum, default_value_t = FpFormat::Chem)]
+        out_format: FpFormat,
     },
 
     /// Perceive aromatic rings and write the molecules back out.
@@ -117,16 +139,17 @@ enum Command {
         /// Input file. Reads standard input when absent or `-`.
         input: Option<PathBuf>,
 
-        #[arg(long, value_enum)]
-        format: Option<FormatArg>,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write to a file instead of standard output.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
-        /// Output format. Defaults to the output file's extension, or SMILES.
-        #[arg(long, value_enum)]
-        out_format: Option<OutputFormat>,
+        /// Output format code. Defaults to the output file's extension, or
+        /// SMILES.
+        #[arg(long)]
+        out_format: Option<String>,
 
         /// Allow writing over the input file.
         #[arg(long)]
@@ -141,17 +164,17 @@ enum Command {
         /// Input file. Reads standard input when absent or `-`.
         input: Option<PathBuf>,
 
-        #[arg(long, value_enum)]
-        format: Option<FormatArg>,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write to a file instead of standard output.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
-        /// Output format. Defaults to SDF, which is the only one that can hold
-        /// coordinates.
-        #[arg(long, value_enum)]
-        out_format: Option<OutputFormat>,
+        /// Output format code. Defaults to SDF, which is the only one that
+        /// can hold coordinates.
+        #[arg(long)]
+        out_format: Option<String>,
 
         /// Recompute coordinates for molecules that already have them, such as
         /// those read from an SDF.
@@ -163,6 +186,66 @@ enum Command {
         force: bool,
     },
 
+    /// Read format A, write format B — a general converter for the pairs
+    /// this crate registers a reader and a writer for.
+    ///
+    /// Streams rather than materializing the whole file, and reads/writes
+    /// gzip transparently when the `gzip` feature is compiled in.
+    ///
+    /// `-o`/`--output` keeps this CLI's own established meaning (the output
+    /// path, same as every other subcommand) rather than following
+    /// `obabel`'s convention, where `-o` is the output *format* and `-O` is
+    /// the path — `--from`/`--to` name the format instead, so nothing here
+    /// means something different depending on which subcommand you're
+    /// reading.
+    Convert {
+        /// Input file. Reads standard input when absent or `-`.
+        input: Option<PathBuf>,
+
+        /// Input format code (e.g. `smi`, `sdf`). Inferred from the input's
+        /// extension when omitted, or SMILES when there is no filename to
+        /// infer from (standard input, `--literal`).
+        #[arg(long, short = 'i')]
+        from: Option<String>,
+
+        /// Output format code. Inferred from `--output`'s extension when
+        /// omitted. Ambiguous, and an error, when neither is given and
+        /// output is standard output — unlike `chem aromatic`/`chem
+        /// coords`, a general converter has no format its own output
+        /// naturally needs, so guessing would just be a guess.
+        #[arg(long, short = 't')]
+        to: Option<String>,
+
+        /// Write to a file instead of standard output.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Treat this text as the input directly, in `--from`'s format,
+        /// instead of reading a file.
+        #[arg(long, conflicts_with = "input")]
+        literal: Option<String>,
+
+        /// Rejected: coordinate generation is out of scope for this crate.
+        /// `chem coords` computes a 2D layout; there is no 3D equivalent.
+        #[arg(long)]
+        gen3d: bool,
+
+        /// Allow writing over the input file.
+        #[arg(long)]
+        force: bool,
+
+        /// List every registered format (`chem convert -L formats`), or
+        /// detail one by code (`chem convert -L sdf`). A pure query — no
+        /// conversion runs.
+        #[arg(short = 'L')]
+        list: Option<String>,
+
+        /// Detail one format's options by code. A pure query — no
+        /// conversion runs.
+        #[arg(short = 'H')]
+        describe: Option<String>,
+    },
+
     /// Draw each molecule as an SVG.
     ///
     /// Coordinates are a prerequisite and SMILES carries none, so any molecule
@@ -172,8 +255,8 @@ enum Command {
         /// Input file. Reads standard input when absent or `-`.
         input: Option<PathBuf>,
 
-        #[arg(long, value_enum)]
-        format: Option<FormatArg>,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write one SVG per molecule into this directory, named after each
         /// molecule. Without it, a single structure goes to standard output.
@@ -231,27 +314,15 @@ impl Theme {
     }
 }
 
-/// `chem::io::reader::Format` is a registry handle and not ours to derive
-/// `ValueEnum` on, so this is the clap-facing mirror. Kept adjacent to its
-/// conversion so the two cannot drift.
-///
-/// The mirror stays hand-written on purpose while the CLI exposes exactly two
-/// input formats. Generating the value list from the registry is what the
-/// `-L formats` story does, and doing it here first would mean two half-built
-/// mechanisms.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FormatArg {
-    Smiles,
-    Sdf,
-}
-
-impl From<FormatArg> for Format {
-    fn from(value: FormatArg) -> Self {
-        match value {
-            FormatArg::Smiles => Format::SMILES,
-            FormatArg::Sdf => Format::SDF,
-        }
-    }
+/// Resolves a `--format`/`--from`/`--to`/etc. code against the registry
+/// (#215) — a typo'd or not-yet-registered code is a clear error rather
+/// than a guess, and every format the registry grows gains a working
+/// `--format` value automatically, with no enum to edit.
+fn resolve_format_code(code: Option<&str>) -> Result<Option<Format>> {
+    code.map(|c| {
+        Format::from_code(c).ok_or_else(|| anyhow::anyhow!("unrecognized format code: {c:?}"))
+    })
+    .transpose()
 }
 
 fn main() -> std::process::ExitCode {
@@ -277,7 +348,8 @@ fn run(cli: &Cli) -> Result<i32> {
             format,
             output,
         } => {
-            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            let read =
+                stream::read_input(input.as_deref(), resolve_format_code(format.as_deref())?)?;
             stream::report(&read);
             // Echoed rather than resolved: `info` computes nothing, and
             // probing for a device costs a device creation. A mistyped flag is
@@ -303,8 +375,10 @@ fn run(cli: &Cli) -> Result<i32> {
             output,
             radius,
             size,
+            out_format,
         } => {
-            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            let read =
+                stream::read_input(input.as_deref(), resolve_format_code(format.as_deref())?)?;
             stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
@@ -343,7 +417,11 @@ fn run(cli: &Cli) -> Result<i32> {
                     .collect(),
                 fingerprints,
             };
-            stream::write_output(output.as_ref(), &file.to_text())?;
+            let text = match out_format {
+                FpFormat::Chem => file.to_text(),
+                FpFormat::Fps => file.to_fps(),
+            };
+            stream::write_output(output.as_ref(), &text)?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -359,7 +437,8 @@ fn run(cli: &Cli) -> Result<i32> {
             force,
         } => {
             write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
-            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            let read =
+                stream::read_input(input.as_deref(), resolve_format_code(format.as_deref())?)?;
             stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
@@ -387,7 +466,8 @@ fn run(cli: &Cli) -> Result<i32> {
 
             // Perceiving aromaticity adds nothing a format has to make room
             // for, so no format is required and the default stands.
-            let format = OutputFormat::resolve(*out_format, Carries::empty(), output.as_deref());
+            let out_format = resolve_format_code(out_format.as_deref())?;
+            let format = resolve_output_format(out_format, Carries::empty(), output.as_deref());
             write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
             stream::write_output(output.as_ref(), &write::render(format, &records))?;
@@ -407,7 +487,8 @@ fn run(cli: &Cli) -> Result<i32> {
             force,
         } => {
             write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
-            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            let read =
+                stream::read_input(input.as_deref(), resolve_format_code(format.as_deref())?)?;
             stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
@@ -468,12 +549,86 @@ fn run(cli: &Cli) -> Result<i32> {
             // A layout is the thing this command produced, so the default
             // format is whichever registered one can hold it — SDF — rather
             // than SDF by name.
-            let format = OutputFormat::resolve(*out_format, Carries::COORDS_2D, output.as_deref());
+            let out_format = resolve_format_code(out_format.as_deref())?;
+            let format = resolve_output_format(out_format, Carries::COORDS_2D, output.as_deref());
             write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
             stream::write_output(output.as_ref(), &write::render(format, &records))?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
+                return Ok(exit::PARTIAL);
+            }
+            Ok(exit::OK)
+        }
+
+        Command::Convert {
+            input,
+            from,
+            to,
+            output,
+            literal,
+            gen3d,
+            force,
+            list,
+            describe,
+        } => {
+            if let Some(query) = list {
+                print_format_listing(query)?;
+                return Ok(exit::OK);
+            }
+            if let Some(code) = describe {
+                print_format_options(code)?;
+                return Ok(exit::OK);
+            }
+            if *gen3d {
+                bail!(
+                    "chem convert does not generate 3D coordinates (out of scope for this crate) \
+                     -- use `chem coords` for a 2D layout, or generate 3D externally before converting"
+                );
+            }
+            write::refuse_to_clobber_input(input.as_deref(), output.as_deref(), *force)?;
+            note_cpu_only(cli);
+
+            let from_format = resolve_format_code(from.as_deref())?;
+            let (mut supplier, label, source_format): (Box<dyn Supplier>, String, Format) =
+                resolve_convert_input(input.as_deref(), literal.as_deref(), from_format)?;
+
+            let to_format = resolve_format_code(to.as_deref())?;
+            let format = resolve_convert_output_format(to_format, output.as_deref())?;
+            let mut writer = resolve_convert_output(format, output.as_deref())?;
+
+            let mut tracker = write::DropTracker::for_conversion(source_format, format);
+            let mut written = 0usize;
+            let mut skipped = 0usize;
+            for (i, item) in supplier.by_ref().enumerate() {
+                match item {
+                    Ok(record) => {
+                        tracker.record(&record.name, &record.molecule);
+                        writer.write_molecule(&record.name, &record.molecule)?;
+                        written += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("skipping record {} of {label}: {e}", i + 1);
+                        skipped += 1;
+                    }
+                }
+            }
+            writer.finish()?;
+            tracker.report(format.label(), cli.explain_drops);
+            // Not part of the tracker: losing atoms is a fact about the
+            // conversion rather than an attribute of a molecule, and `Carries`
+            // has no flag for it -- `held` sets TOPOLOGY on the atom count
+            // alone, so one atom of six satisfies every mask (#259).
+            if let Some(reason) = format::pair_gap(source_format, format) {
+                eprintln!("{} also loses atoms: {reason}", format.label());
+            }
+            eprintln!("converted {written}, skipped {skipped}");
+
+            if written == 0 {
+                eprintln!("nothing readable in {label}");
+                return Ok(exit::NO_INPUT);
+            }
+            if cli.strict && skipped > 0 {
                 return Ok(exit::PARTIAL);
             }
             Ok(exit::OK)
@@ -488,7 +643,8 @@ fn run(cli: &Cli) -> Result<i32> {
             height,
             theme,
         } => {
-            let read = stream::read_input(input.as_deref(), format.map(Into::into))?;
+            let read =
+                stream::read_input(input.as_deref(), resolve_format_code(format.as_deref())?)?;
             stream::report(&read);
             if read.outcome.is_empty() {
                 eprintln!("nothing readable in {}", read.label);
@@ -641,6 +797,282 @@ fn run(cli: &Cli) -> Result<i32> {
             Ok(exit::OK)
         }
     }
+}
+
+/// Resolves `chem convert`'s input into a streaming [`Supplier`], and a
+/// label for its skip/error messages.
+///
+/// `--literal` bypasses the filesystem entirely; a real path streams
+/// through [`open_supplier`]/[`open_supplier_as`] (gzip-aware, per #213);
+/// standard input has no name to infer a format from, so `--from` or the
+/// SMILES fallback decides it, the same rule `stream::read_input` already
+/// uses for `-`.
+/// Also returns the format the input was read *as*.
+///
+/// It was resolved here all along and thrown away, which is why the drop report
+/// could only ever ask about the target (#276). `open_supplier` picks the
+/// format from the path, so the same rule is applied here rather than guessed
+/// at -- `chem::io::open::format_for_path` strips a trailing `.gz` first.
+fn resolve_convert_input(
+    input: Option<&Path>,
+    literal: Option<&str>,
+    from: Option<Format>,
+) -> Result<(Box<dyn Supplier>, String, Format)> {
+    if let Some(text) = literal {
+        let format = from.unwrap_or(Format::SMILES);
+        let supplier = format
+            .supplier(Cursor::new(text.as_bytes().to_vec()), &ReadOptions)
+            .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
+        return Ok((supplier, "<literal>".to_string(), format));
+    }
+
+    match input.filter(|p| p.as_os_str() != "-") {
+        Some(path) => {
+            let format = from.unwrap_or_else(|| chem::io::open::format_for_path(path));
+            let supplier = match from {
+                Some(format) => open_supplier_as(path, format, &ReadOptions)?,
+                None => chem::io::open::open_supplier(path, &ReadOptions)?,
+            };
+            Ok((supplier, path.display().to_string(), format))
+        }
+        None => {
+            let format = from.unwrap_or(Format::SMILES);
+            let supplier = format
+                .supplier(std::io::stdin().lock(), &ReadOptions)
+                .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
+            Ok((supplier, "-".to_string(), format))
+        }
+    }
+}
+
+/// Resolves `chem convert`'s output format. Unlike `chem aromatic`/`chem
+/// coords` (which fall back to whatever format can hold what they just
+/// computed), a general converter has no such fallback — guessing here
+/// would be exactly the kind of silent choice this crate's drop-report
+/// philosophy exists to avoid, so an unresolvable case is an error rather
+/// than a default.
+fn resolve_convert_output_format(to: Option<Format>, output: Option<&Path>) -> Result<Format> {
+    if let Some(format) = to {
+        return Ok(format);
+    }
+    if let Some(path) = output.filter(|p| p.as_os_str() != "-") {
+        let name = path.to_string_lossy();
+        let format_name = name.strip_suffix(".gz").unwrap_or(&name);
+        return Ok(Format::from_filename(format_name));
+    }
+    bail!(
+        "output format is ambiguous — pass --to <code>, or --output <path> with a recognized extension"
+    );
+}
+
+/// Resolves `chem convert`'s output into a streaming [`Writer`].
+fn resolve_convert_output(format: Format, output: Option<&Path>) -> Result<Box<dyn Writer>> {
+    match output.filter(|p| p.as_os_str() != "-") {
+        Some(path) => Ok(open_writer_as(path, format, &WriteOptions::default())?),
+        None => format
+            .writer_stream(std::io::stdout().lock(), &WriteOptions::default())
+            .ok_or_else(|| anyhow::anyhow!("{} cannot be written, only read", format.name())),
+    }
+}
+
+/// `chem convert -L formats` / `-L <code>` (#215).
+fn print_format_listing(query: &str) -> Result<()> {
+    if query.eq_ignore_ascii_case("formats") {
+        println!("code\tname\tcategory\tread\twrite");
+        for f in format::all() {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                f.codes().first().unwrap_or(&""),
+                f.name(),
+                f.category().label(),
+                if f.can_read() { "yes" } else { "no" },
+                if f.can_write() { "yes" } else { "no" },
+            );
+        }
+        return Ok(());
+    }
+
+    if query.eq_ignore_ascii_case("matrix") {
+        print_fidelity_matrix();
+        return Ok(());
+    }
+
+    let format = Format::from_code(query)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized format code: {query:?}"))?;
+    print_format_detail(format);
+    Ok(())
+}
+
+/// One letter per attribute, for the matrix grid.
+///
+/// Single letters because a cell holds up to ten of them and eleven columns of
+/// spelled-out names would not fit a terminal. `C` is formal charge and `P`
+/// partial; `F` is the temperature factor, which is what the PDB spec calls
+/// the B-factor column.
+const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
+    (Carries::TOPOLOGY, 'T', "topology"),
+    (Carries::BONDS, 'B', "bonds"),
+    (Carries::COORDS_2D, '2', "coords_2d"),
+    (Carries::COORDS_3D, '3', "coords_3d"),
+    (Carries::FORMAL_CHARGE, 'C', "formal_charge"),
+    (Carries::PARTIAL_CHARGE, 'P', "partial_charge"),
+    (Carries::ISOTOPE, 'I', "isotope"),
+    (Carries::STEREO_ATOM, 'S', "stereo_atom"),
+    (Carries::STEREO_BOND, 'D', "stereo_bond"),
+    (Carries::STEREO_GROUP, 'G', "stereo_group"),
+    (Carries::AROMATICITY, 'A', "aromaticity"),
+    (Carries::RESIDUES, 'R', "residues"),
+    (Carries::B_FACTOR, 'F', "b_factor"),
+    (Carries::OCCUPANCY, 'O', "occupancy"),
+    (Carries::UNIT_CELL, 'U', "unit_cell"),
+    (Carries::PROPERTIES, 'X', "properties"),
+];
+
+/// `chem convert -L matrix` (#257) — what survives every registered conversion.
+///
+/// A pure query, like the rest of `-L`: the cells come from the registry, not
+/// from running conversions. What makes them true is
+/// `test_every_format_pair_delivers_what_the_matrix_says`, which measures all
+/// 121 pairs against exactly this function.
+fn print_fidelity_matrix() {
+    let formats: Vec<Format> = format::all().collect();
+    let cell = |source: Format, target: Format| -> String {
+        let delivered = format::fidelity(source, target);
+        // Lowercase for an attribute the target's writer manufactures rather
+        // than carries across. Without the distinction `smi -> pdb` reads as
+        // though a B-factor survived, when the column was filled with 0.00.
+        let mut text: String = MATRIX_LEGEND
+            .iter()
+            .filter(|(flag, _, _)| delivered.contains(*flag))
+            .map(|(flag, letter, _)| {
+                if source.carries().contains(*flag) {
+                    *letter
+                } else {
+                    letter.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if !format::pair_loss(source, target).is_empty() {
+            text.push('*');
+        }
+        if format::pair_gap(source, target).is_some() {
+            text.push('!');
+        }
+        text
+    };
+
+    // Columns sized to their own content: the widest possible cell is ten
+    // letters, but most targets are far narrower and a fixed width would push
+    // the table past a terminal for no gain.
+    let label = formats
+        .iter()
+        .map(|f| f.codes()[0].len())
+        .max()
+        .unwrap_or(0);
+    let widths: Vec<usize> = formats
+        .iter()
+        .map(|target| {
+            formats
+                .iter()
+                .map(|source| cell(*source, *target).len())
+                .chain(std::iter::once(target.codes()[0].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    println!("what survives a conversion, source row to target column\n");
+    print!("{:width$}", "", width = label + 2);
+    for (target, width) in formats.iter().zip(&widths) {
+        print!("{:<width$} ", target.codes()[0], width = width);
+    }
+    println!();
+    for source in &formats {
+        print!("{:<width$}  ", source.codes()[0], width = label);
+        for (target, width) in formats.iter().zip(&widths) {
+            print!("{:<width$} ", cell(*source, *target), width = width);
+        }
+        println!();
+    }
+
+    println!();
+    for (index, (_, letter, name)) in MATRIX_LEGEND.iter().enumerate() {
+        print!("{letter} {name:<15}");
+        if index % 4 == 3 {
+            println!();
+        }
+    }
+    println!("\n\nlowercase  supplied by the target's writer, not carried from the source");
+
+    println!("\n* an attribute both formats claim, lost anyway:");
+    for source in &formats {
+        for target in &formats {
+            let lost = format::pair_loss(*source, *target);
+            if lost.is_empty() {
+                continue;
+            }
+            println!(
+                "    {:<10} -> {:<10} {}: {}",
+                source.codes()[0],
+                target.codes()[0],
+                lost.names().collect::<Vec<_>>().join(", "),
+                format::pair_loss_reason(*source, *target).unwrap_or(""),
+            );
+        }
+    }
+
+    println!("\n! the conversion also loses atoms:");
+    for source in &formats {
+        for target in &formats {
+            if let Some(why) = format::pair_gap(*source, *target) {
+                println!(
+                    "    {:<10} -> {:<10} {why}",
+                    source.codes()[0],
+                    target.codes()[0]
+                );
+            }
+        }
+    }
+}
+
+/// `chem convert -H <code>` (#215).
+fn print_format_options(code: &str) -> Result<()> {
+    let format = Format::from_code(code)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized format code: {code:?}"))?;
+    print_format_detail(format);
+    // #212 built the option-bag mechanism, but nothing has wired a
+    // per-format option to a CLI flag yet -- SDF's one option
+    // (MolfileVersion) isn't reachable from `chem convert` today, and
+    // SMILES has no options at all. A real "describe your options"
+    // mechanism earns its place once there's a second thing to describe;
+    // until then this says so honestly rather than inventing detail.
+    println!("no format-specific options are exposed on the command line yet");
+    Ok(())
+}
+
+fn print_format_detail(format: Format) {
+    println!(
+        "{} ({})",
+        format.name(),
+        format.codes().first().unwrap_or(&"")
+    );
+    println!("  codes: {}", format.codes().join(", "));
+    println!("  extensions: {}", format.extensions().join(", "));
+    println!("  category: {}", format.category().label());
+    let carries: Vec<&str> = format.carries().names().collect();
+    println!(
+        "  carries: {}",
+        if carries.is_empty() {
+            "(nothing)".to_string()
+        } else {
+            carries.join(", ")
+        }
+    );
+    println!(
+        "  read: {}, write: {}",
+        if format.can_read() { "yes" } else { "no" },
+        if format.can_write() { "yes" } else { "no" }
+    );
 }
 
 fn aromatic_atoms(molecule: &chem::core::molecule::Molecule) -> usize {

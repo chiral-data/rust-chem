@@ -14,9 +14,9 @@
 
 use crate::fingerprint_view::{fingerprint_comparison, fingerprint_full};
 use crate::molecule_view::{molecule_compact, show_molecule_info};
+use crate::save::save_svg;
 use crate::state::AppState;
 use crate::structure_view::{StructureView, structure_panel_with_options};
-use crate::svg::save_svg;
 use chem::draw::structure::{ShowCarbons, StructureOptions, StructureTheme};
 use chem::draw::svg::{structure_to_svg, suggested_filename};
 use egui::{Color32, RichText, Vec2};
@@ -95,6 +95,7 @@ impl InspectorView {
             };
             let smiles = &active_dataset.smiles[idx];
             let name = &active_dataset.names[idx];
+            let generated = active_dataset.generated[idx];
 
             let is_selected = self.selected_result == Some(rank);
 
@@ -103,23 +104,17 @@ impl InspectorView {
                     ui.label(RichText::new(format!("#{}", rank + 1)).strong().size(16.0));
                     ui.separator();
 
-                    // Drawn only where coordinates already exist. Generating
-                    // them needs the dataset mutably, which this cannot have
-                    // while reading it — the same constraint the dataset table
-                    // works under. Run 2D Coordinates in Operations, or load an
-                    // SDF, which brings its own.
-                    if mol.has_coords() {
-                        ui.add(StructureView::new(mol, structure_size).with_options(options));
-                    } else {
-                        ui.add_sized(
-                            structure_size,
-                            egui::Label::new(RichText::new("\u{2014}").weak()),
-                        );
+                    // Laid out on demand and shared with the table and the
+                    // detail windows, so all three draw the same picture. This
+                    // used to be a dash for any molecule whose file carried no
+                    // layout, while a detail window drew it fine (#273).
+                    if let Some(drawable) = state.drawable(idx) {
+                        ui.add(StructureView::new(&drawable, structure_size).with_options(options));
                     }
                     ui.separator();
 
                     ui.vertical(|ui| {
-                        molecule_compact(ui, smiles, name, &mol.formula());
+                        molecule_compact(ui, smiles, generated, name, &mol.formula());
                         ui.label(format!(
                             "Similarity: {:.3} ({:.1}%)",
                             result.similarity,
@@ -225,7 +220,9 @@ fn query_section(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         structure_panel_with_options(ui, &mol, 200.0, state.display.structure);
-        show_molecule_info(ui, &mol, &state.query_source, "Query");
+        // Never generated: the query is the text the user typed, parsed back
+        // for display.
+        show_molecule_info(ui, &mol, &state.query_source, false, "Query");
 
         if let Some(fp) = &state.query_fingerprint {
             fingerprint_full(ui, fp);

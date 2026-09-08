@@ -1,0 +1,6 @@
+REMARK    No CRYST1, one chain, one residue -- the contrast to the file beside
+REMARK    it, mirroring the mmCIF corpus's own deliberate pair.
+HETATM    1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+HETATM    2  H1  HOH A   1       0.759   0.000   0.504  0.90 20.00           H
+HETATM    3  H2  HOH A   1       0.759   0.000  -0.504  0.90 20.00           H
+END

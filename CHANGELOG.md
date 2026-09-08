@@ -2,6 +2,92 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.0] - 2026-09-08
+
+**Two formats became eleven, and every conversion now says what it costs.** v0.7.0 built the data
+model, the format registry and the oracle harness precisely so this release could be readers and
+writers rather than architecture. `chem convert` ships with obabel-compatible flags, and the thing
+that makes it more than a converter is the drop report: pick a target and it names — per molecule,
+by attribute — what the format cannot carry, instead of discarding it silently.
+
+The claim that this is *correct* rests on measurement rather than assertion. #257 measures all 121
+ordered format pairs against 17 attribute fixtures and pins four tables, each asserted to be exactly
+the set that deviates; the differential harness against RDKit, OpenBabel, gemmi and Meeko ends the
+release at **405 comparisons, 0 new, 0 recorded**. That machinery found eleven defects during the
+milestone that no unit test had, including two where a fix shipped a fresh regression.
+
+`chem-app` caught up in the same cycle (#265) and is now **published at
+[chem.chiral.one](https://chem.chiral.one)**, built by GitHub Actions and hosted from a prebuilt
+bundle.
+
+#184's format-gating half is **decided rather than deferred**, by #228 — the first non-core format
+story it was left open for. `Format` is a `u16` index into a fixed table and two registry tests
+permanently assert every registered format both reads and writes, so gating would force either
+feature-dependent indices or a reserved slot with a stub. roxmltree has no dependencies of its own,
+unlike the `wgpu`/`clap` that `gpu`/`cli` gate for real reasons. The finding: the machinery does not
+pay for itself.
+
+### Features
+
+- **`chem convert`**, with obabel-compatible flags, `--literal`, stdin/stdout streaming and a refusal
+  to clobber its own input (#214)
+- **Per-format read and write option bags** with typed parameter strings (#212)
+- **`Supplier` and `Writer` streaming traits**, random access and transparent decompression (#213)
+- **`-L formats`, `-L <code>` and `-H <code>`**, generated from the registry so they cannot drift from
+  what the build actually supports (#215)
+- **Nine new formats**: CXSMILES (#221), XYZ (#222), PDB (#223), mmCIF (#224), Mol2 (#225),
+  PDBQT (#226), GRO (#227), CML (#228) and commonchem JSON (#229) — joining SMILES and SDF, with a
+  canonical SMILES writer (#220) so one molecule always writes one string
+- **The utility formats resolved by survey** rather than implemented blindly: of OpenBabel's 13-entry
+  list, the ones worth having are report, fingerprint-dump and no-op text (#230, #243)
+- **The round-trip fidelity matrix** — all 121 ordered pairs, rendered by `chem convert -L matrix`,
+  with manufactured attributes shown lowercase so a cell cannot overstate what survived (#257)
+- **`Carries::BONDS`**, split from `TOPOLOGY`, which claimed "atoms, elements and the bonds between
+  them" while four formats claiming it read back none (#257)
+- **A radical electron count** derived from valence rather than stored, so open-shell species stop
+  reading as ordinary ones (#247)
+- **chem-app**: the loader learns the registry (#266), a Convert section with the drop report (#275),
+  one shared layout for the table and the detail windows (#273), a generated SMILES column where the
+  format states a bond model (#283), multi-file load and drag-and-drop (#296), and the first tests
+  above its state layer (#303)
+- **The browser build is published** — Actions builds, Vercel hosts a prebuilt bundle, and the page
+  reports the commit it was built from (#286)
+
+### Fixed
+
+- **`[C]` parsed as methane.** A bracket atom's explicit zero was indistinguishable from "unstated",
+  so `[C]`, `[CH0]` and `[13C]` all gained four hydrogens. `hydrogens` became
+  `Option<u8>` — `None` for silence, `Some(0)` for a stated none (#244)
+- **The SMILES writer printed the wrong hydrogen field**, so a molecule that arrived with implicit
+  hydrogens was written bare and read back short (#241)
+- **`calculate_implicit_hydrogens` inverted the charge sign**, making every cation and anion wrong in
+  the same direction (#240)
+- **PDB wrote `END` before `CONECT`**, so every file this crate ever emitted had connectivity an
+  external reader would discard — OpenBabel read ethanol back as `C.C.O` (#263)
+- **PDB and PDBQT wrote N molecules with no `MODEL` framing**, so a four-molecule file read back as
+  one (#267)
+- **PDBQT kept only the largest connected component**, so any disconnected molecule lost every atom
+  but one — filed about bondless sources, but `smi → pdbqt` turned a 7-atom amine salt into 4 (#259)
+- **Aromaticity travelled on three channels that disagreed**, so benzene through CML came back as
+  cyclohexane. Readers now reconcile at the boundary (#261), and Mol2's missing hydrogen count — which
+  also bracketed every atom — is established on read (#281)
+- **PDB read established no hydrogen count**, so a fully-`CONECT`ed benzene wrote as
+  `[C]1[C][C][C][C][C]1`. It now implies one where the bonds can supply it, and leaves a bondless
+  atom honestly unknown (#285, #291)
+- **Four structure readers accepted any text as an atomless molecule** (#268)
+- **SDF and Mol2 read all-zero coordinates as a real 2D layout**, so a converted molecule was
+  undrawable (#270)
+- **Molfile write dropped the valence field and `M RAD`** (#250)
+- **mmCIF write emitted an empty field where CIF requires a token**, so a second write was malformed
+  and shifted every later column (#260)
+- **The Morgan fingerprint set 13 bits where RDKit sets 12** for alanine (#253)
+- **`chem convert`'s drop report missed the six pairs #257 pinned**, under-reporting exactly where the
+  matrix had found loss (#276)
+- **The CLI test helper panicked on a broken pipe** when a command exited before reading stdin,
+  reporting the failure against whichever test happened to race (#248)
+- **The web bundle was not reproducible** — wasm-bindgen emitted a different bundle every run from
+  identical input. Fixed upstream and reached by a version bump (#288, #299)
+
 ## [0.7.0] - 2026-09-05
 
 **The data model can now represent what the next 150 formats need.** Coordinates, atom sites, residues and unit cells didn't exist a release ago — `core` could not express what PDB, mmCIF, Mol2 or PDBQT carry, regardless of how good a parser was written for them. That gap is closed. This release builds the intermediate representation, the format registry, and a differential harness against RDKit and OpenBabel to verify both — the parts nothing else in the file-conversion project could start ahead of.
@@ -14,7 +100,7 @@ All notable changes to this project are documented here.
 - **An `AtomSite` side table** for atom name, alt-loc, partial charge, occupancy and B-factor — kept off `Atom` itself, since `Atom` derives `Eq` and floats cannot satisfy that (#176)
 - **Residue and chain topology**, enough to round-trip a multi-chain structure (#177)
 - **`UnitCell`, space group, and fractional-to-Cartesian conversion** (#178)
-- **A format registry and `FormatDescriptor`**, replacing the two-variant `Format` enum. `Format` itself is deprecated rather than deleted — public API in a published crate keeps it for one release as a `#[deprecated]` shim, so 0.6 → 0.7 is a compiler warning, not a rewrite (#182)
+- **A format registry and `FormatDescriptor`**, replacing the two-variant `Format` enum. `Format` was re-exported from its new home rather than deprecated, so every `Format`-typed signature stayed as written and the migration was `Format::Smiles` → `Format::SMILES` at 17 sites. A `#[deprecated]` shim is not available in this crate: CI runs `cargo clippy -- -D warnings` three times, so a single deprecation warning fails three jobs (#182)
 - **`Carries` bitflags and a per-molecule drop report.** Every format descriptor declares what it carries — topology, coordinates, charge, isotope, stereo, aromaticity, residues, B-factor, unit cell, and so on — and every conversion reports what it's about to throw away, by name, rather than discarding it silently (#183)
 - **A CI gate that keeps the crate pure Rust.** Four rules in the existing lean-build job check that no `-sys` crate, no native `links` declaration, and no chemistry toolkit (RDKit, OpenBabel, `chemfiles`) ever reaches the dependency graph — scoped to the lean build for the tree checks, since `--all-features` legitimately pulls `wgpu`'s own platform bindings, and to every feature set for the toolkit check, since a toolkit behind an optional feature is still a toolkit (#184, the CI half — the format-gating half is deferred, see above)
 - **A fixture corpus and a differential harness** running RDKit, OpenBabel and gemmi as oracles against `chem`'s own output — living in `tools/oracle/`, never referenced from `Cargo.toml`, so the toolkits stay comparison tools rather than dependencies (#4)

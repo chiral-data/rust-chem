@@ -10,6 +10,12 @@ box-ticking: each entry exists because it is a behaviour a test could not have
 caught, and several of them are behaviours that were broken at some point during
 v0.5.0 and only found by looking.
 
+Every push to the milestone branch publishes the bundle to
+**https://chem.chiral.one**, so the list can be worked through there rather than
+locally — with one difference that matters: check the build id in the top right
+against the commit you meant to test. See [DEPLOY.md](DEPLOY.md). Use a local
+build for anything you have not pushed.
+
 ## Running it
 
 ```bash
@@ -76,6 +82,43 @@ iterating, not fine as evidence.
   coordinates an SDF supplied (#88).
 - **Press Search with nothing set up.** It should name the missing prerequisite,
   not just grey out.
+- **Convert, and check the loss list against the command line (#275).** Load a
+  CML file, open Convert, pick **XYZ**. The list must name `bonds` and
+  `aromaticity`, in amber at normal size — it was small and grey once, which is
+  how you hide the most important thing on a panel. Then run the same
+  conversion in a terminal:
+
+  ```sh
+  chem convert molecules.cml --to xyz -o /tmp/m.xyz
+  ```
+
+  It reports `XYZ cannot carry: bonds (3), aromaticity (1)` — the same
+  attributes and the same per-molecule counts, from the same `format::kept` the
+  app calls (#276). **The two must agree; if they ever diverge again, one of
+  them has stopped using the shared formula**, which is exactly how they came to
+  disagree in the first place.
+
+  Pick **SMILES** instead and the panel must say the conversion keeps
+  everything. It used to name `aromaticity` here, and the output really was
+  `C1CCCCC1 benzene` — cyclohexane from a benzene file. That was #261, fixed in
+  #282; a loss reported here now would be a regression.
+- **Press ⟳ Convert and look at the result.** A new dataset appears in the Files
+  list named `<source> → XYZ`, active, with `(XYZ)` in the SMILES column and
+  six unbonded atoms where the original drew a ring. Click back to the
+  original: the two side by side are the whole feature. The predicted loss has
+  become something you can see.
+- **Convert twice to the same format.** The second replaces the first rather
+  than adding a third entry.
+- **Convert to a format you already have loaded under that name.** The loaded
+  file must survive — a converted dataset carries its provenance in the name
+  precisely so it cannot overwrite one.
+- **Pick a target that loses nothing** (SMILES to CXSMILES). It must say so
+  rather than showing an empty box, which reads as a bug.
+- **Export the converted dataset.** On native a dialog, in the browser a
+  download, named from the *format* rather than the display name — `two.sdf`,
+  not `two.smi → SDF`. Read it back with `chem info`: the molecule count must
+  match. Neither save arm reports success — the browser's download cannot — so
+  Export has no outcome line, deliberately.
 - **Backend radio and the menu bar chips must agree**, in both directions.
 - **The query debounce survives a closed window.** Type a SMILES, close the
   Operations window inside 300ms, wait, reopen it. The query should have parsed.
@@ -90,6 +133,11 @@ iterating, not fine as evidence.
   shows as blank or repeated rows while scrolling fast.
 - **Each file in the list shows its format and molecule count.** Load a `.smi`
   and a `.sdf` and confirm both are labelled correctly.
+- **Load three files in one go** — select all three in the dialog, or drag them
+  onto the window. Three entries appear in load order and the **first** is
+  active, not the last. Loading them one at a time still works and still leaves
+  you on the one you just loaded, since with one file first and last are the
+  same.
 - **Load three files, then remove the *first* while looking at the third.** The
   third must still be the active one, with its fingerprints and results intact.
   This is the case the feature can get quietly wrong: every entry after the
@@ -107,12 +155,113 @@ iterating, not fine as evidence.
   file may still be a box in the app.
 - **Drag a column edge.** Columns are resizable now; SMILES is the one worth
   widening.
-- **Turn on "Show structures in table" with a SMILES dataset.** Cells show a dash,
-  not a structure — coordinates don't exist yet. Run **2D Coordinates** in
-  Operations and they appear. With an SDF file they should be there immediately,
-  since the file supplies them.
+- **Turn on "Show structures in table" with a SMILES dataset.** Every cell draws
+  a structure, laid out on demand — no dash, and nothing to run first (#273).
+  Click a Name: the detail window must show **the same picture** as the row, and
+  a search result row must show it too. Those three agreeing is the whole point;
+  before, the window drew and the other two showed a dash.
+- **Run Detect Aromaticity with a structure on screen**, on something like
+  `C1=CC=CC=C1`. The bonds must change to aromatic. Perception mutates the
+  molecules in place, so a layout cached before it ran would keep drawing Kekulé
+  bonds — the one staleness case with a visible symptom.
 - **Collapse the Files section.** The table takes the whole window. This is the
   escape hatch when the window is too short for both.
+
+### Every registered format (#266)
+
+The app reads whatever the library registers — eleven formats as of v0.8.0, where
+it used to offer two. `Format::from_filename` picks the reader, so what a file is
+called decides how it is read.
+
+Generate one file per format rather than hunting for samples:
+
+```sh
+printf 'CCO ethanol\nc1ccccc1 benzene\n' > /tmp/d.smi
+for f in sdf cxsmiles xyz pdb mmcif mol2 pdbqt gro cml commonchem; do
+  chem convert /tmp/d.smi --to $f -o /tmp/d.$f --force
+done
+```
+
+- **Open them all at once**, selecting every file in the dialog or dragging the
+  directory's contents in. Eleven entries, each naming the *right* format, each
+  molecule count matching what `chem info` reports for the same file. The status
+  line summarises the batch rather than reporting only the last one — that is
+  what it is for, and a file that half-loads looks exactly like one that fully
+  loaded unless it says so.
+- **The SMILES column**, three answers rather than two (#283):
+
+  | shows | formats | because |
+  |---|---|---|
+  | what the file stated | SMILES, CXSMILES | the file *is* a SMILES string |
+  | a SMILES the app wrote | SDF, Mol2, CML, commonchem | the format states a bond model |
+  | `({format})` | XYZ, PDB, mmCIF, PDBQT, GRO | it does not |
+
+  Predict it from the command line rather than from the source: `chem convert -L
+  mol2` prints the format's `carries:` line, and a format listing **both**
+  `bonds` and `aromaticity` is one that generates. PDB lists `bonds` without
+  `aromaticity` — `CONECT` is adjacency with no bond order — and PDBQT the
+  reverse, so both keep the placeholder even though a PDB may hold bonds.
+
+  A generated cell must say so on hover; a stated one must not. And it must
+  never say `(SDF)` for anything but an SDF — that placeholder was applied to
+  every structure format before #266.
+- **A molecule too big to write** keeps the placeholder: canonical ranking is
+  quadratic, so above 500 atoms the column stays `(Mol2)` rather than freezing
+  the load. A docking receptor is the file to try it with.
+
+**What each format brings, measured.** This decides what the Structure column can
+show before anything is computed:
+
+| arrives with | formats | Structure column |
+|---|---|---|
+| a 2D layout | SDF, Mol2 | drawn immediately |
+| a 3D conformer only | XYZ, mmCIF, GRO, PDB, PDBQT | laid out from connectivity, on demand |
+| no coordinates | SMILES, CXSMILES, CML, commonchem | laid out from connectivity, on demand |
+
+- **Run 2D Coordinates on a 3D format.** It computes a *fresh graph layout* and
+  ignores the conformer entirely — `ensure_coords` only asks whether a 2D layout
+  exists. The drawing is therefore a valid depiction of the connectivity and not a
+  picture of the real geometry. For a file with no bonds (XYZ, mmCIF, GRO) the
+  atoms come out evenly spaced on a line, which is honest rather than wrong; a
+  scribble or a pile at the origin would be a finding.
+- **PDB and PDBQT frame their records** since #267 (in #280). Three molecules
+  written to one PDB read back as three rows, not one molecule with three
+  disconnected fragments. Anything else is a regression in the `MODEL` framing.
+- **Detail windows, Formula and MW** work for every format; they read the
+  molecule, not the file it came from.
+- **Open something that is not a molecule at all.** A binary file is refused with
+  "not valid UTF-8" and the current dataset is left alone. A *text* file named
+  `.pdb`/`.cif`/`.mol2`/`.pdbqt`, `.smi`, `.sdf`, `.xyz`, `.gro`, `.cml` or
+  `.json` is correctly rejected — the four structure formats used to accept it
+  as one molecule with no atoms instead (#268); the status line now reports it
+  skipped, the same as the other seven always did.
+
+### Dragging files in (#296)
+
+Its own section because it is the only feature whose two halves are *different
+code on the two targets*, and because a drop target that does not say it is one
+is invisible.
+
+- **Drag a file over the window without letting go.** The screen dims and says
+  "Drop to load 1 file" — drag three and it says three. Let go outside the
+  window and the hint goes away with nothing loaded.
+- **Drop three files at once.** Three entries, load order, first one active —
+  the same result as selecting three in the dialog, which is the point.
+- **Drop a `.png` and a `.pdb` together.** The PDB loads; the status line names
+  the PNG and says it is not a format this build reads. This rule is drops only:
+  the dialog still treats an unrecognised extension as SMILES, because there the
+  filter list already steered the choice.
+- **Drop a *binary* named `.smi`.** It gets past the extension check and fails
+  where it should, and the status still names it even when a good file lands
+  beside it. That message has nowhere else to appear — a refused file leaves no
+  entry in the Files list at all.
+- **Drop two files with the same name from different directories.** One entry,
+  and the status says `replaced`. The list matches on the bare filename, so the
+  second wins; before #296 this happened silently.
+- **On the web build, drop a large SDF.** It arrives a moment *after* the drop:
+  eframe reads the bytes asynchronously and hands them over when the read
+  finishes. Native has the path immediately and reads it itself. If a web drop
+  ever appears to do nothing, wait a beat before concluding it is broken.
 
 ### SVG export (#109)
 
@@ -275,7 +424,9 @@ inventing a checklist item.
 - **`index.html` is the one file with a stable name.** The js and wasm are
   content-hashed, so those can't be served stale — but a cached `index.html`
   points at a hash that no longer exists, which shows as a stuck loading
-  overlay. Hard-refresh.
+  overlay. Hard-refresh. On the deployed site the same trap is headed off by
+  serving `index.html` `no-cache` while the hashed pair is `immutable`; if you
+  meet the overlay there anyway, that header is the first thing to check.
 - **A long-lived `trunk serve` on another port** rebuilds into `crates/chem-app/dist/`
   whenever any file changes, in debug unless it was started with `--release`.
   `e2e.sh` builds into `dist-e2e/` to stay out of its way. Check for one before

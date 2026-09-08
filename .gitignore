@@ -24,6 +24,19 @@
 
 .chiral/
 
-# trunk (chem_app web build output)
-/chem_app/dist/
+# trunk web build output. The path moved when the crates were reorganised;
+# the old `/chem_app/dist/` entry had stopped matching anything.
+/crates/chem-app/dist/
 dist-e2e/
+
+# The Vercel CLI's project link and the prebuilt output the deploy assembles.
+# Listed before anything creates it: #271 was a 4.4 MB wasm bundle committed by
+# a `git add` of a directory whose ignore path had gone stale, and the blob is
+# still in the object store.
+.vercel/
+
+# Python bytecode from the oracle harness. It runs in a container as root,
+# so these land in the working tree owned by root and cannot be cleaned up
+# by an ordinary `git clean`.
+__pycache__/
+*.pyc

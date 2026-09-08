@@ -1,7 +1,14 @@
 use chem::core::molecule::Molecule;
 use egui::Ui;
 
-pub fn show_molecule_info(ui: &mut Ui, mol: &Molecule, smiles: &str, name: &str) {
+/// Why a SMILES the file never contained is on screen.
+///
+/// One string, so the table, the detail window and the result rows cannot
+/// explain the same value three different ways (#283).
+pub const GENERATED_NOTE: &str =
+    "Written from the structure by chem — this file stated no SMILES of its own";
+
+pub fn show_molecule_info(ui: &mut Ui, mol: &Molecule, smiles: &str, generated: bool, name: &str) {
     ui.group(|ui| {
         ui.heading("Molecule Information");
 
@@ -16,7 +23,15 @@ pub fn show_molecule_info(ui: &mut Ui, mol: &Molecule, smiles: &str, name: &str)
                 ui.label(name);
                 ui.end_row();
 
-                ui.label(egui::RichText::new("SMILES:").strong());
+                let heading = if generated {
+                    "SMILES (generated):"
+                } else {
+                    "SMILES:"
+                };
+                let label = ui.label(egui::RichText::new(heading).strong());
+                if generated {
+                    label.on_hover_text(GENERATED_NOTE);
+                }
                 ui.label(egui::RichText::new(smiles).code());
                 ui.end_row();
 
@@ -101,11 +116,14 @@ pub fn show_bond_list(ui: &mut Ui, mol: &Molecule) {
     });
 }
 
-pub fn molecule_compact(ui: &mut Ui, smiles: &str, name: &str, formula: &str) {
+pub fn molecule_compact(ui: &mut Ui, smiles: &str, generated: bool, name: &str, formula: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(name).strong());
         ui.separator();
-        ui.label(egui::RichText::new(smiles).code().small());
+        let cell = ui.label(egui::RichText::new(smiles).code().small());
+        if generated {
+            cell.on_hover_text(GENERATED_NOTE);
+        }
         ui.separator();
         ui.label(formula);
     });

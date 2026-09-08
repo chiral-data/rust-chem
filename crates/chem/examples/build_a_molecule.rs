@@ -31,9 +31,9 @@ fn main() -> Result<(), MoleculeError> {
     for i in 0..mol.num_atoms() {
         let atom = mol.atom(i);
         println!(
-            "  {i}: {:<2} {} implicit hydrogens, degree {}",
+            "  {i}: {:<2} {} hydrogens, degree {}",
             ELEMENT_SYMBOLS[atom.atomic_number() as usize],
-            atom.implicit_hydrogens(),
+            atom.total_hydrogens(),
             mol.degree(i),
         );
     }

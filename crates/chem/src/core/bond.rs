@@ -94,6 +94,20 @@ impl Bond {
         (self.atom1, self.atom2)
     }
 
+    /// # Aromaticity travels on three channels
+    ///
+    /// This, [`Bond::is_aromatic`] and [`crate::core::atom::Atom::is_aromatic`]
+    /// carry the same chemical fact, and **they must agree**. A format states
+    /// aromaticity through whichever it has -- CML has only a bond order,
+    /// Mol2 has an atom type and a bond type -- and a reader reconciles them at
+    /// the boundary with
+    /// [`crate::io::aromaticity::reconcile_aromaticity`].
+    ///
+    /// Nothing designates one authoritative: writers read different ones, and a
+    /// molecule where they disagree is a different compound to whichever writer
+    /// reads the wrong channel. That is not hypothetical -- benzene read from
+    /// CML wrote out as cyclohexane until #261, because the SMILES writer reads
+    /// only the atom flag.
     pub const fn order(&self) -> BondOrder {
         self.order
     }
@@ -102,6 +116,9 @@ impl Bond {
         self.order = order;
     }
 
+    /// Whether this bond is aromatic.
+    ///
+    /// One of three channels that must agree -- see [`Bond::order`].
     pub const fn is_aromatic(&self) -> bool {
         self.is_aromatic
     }

@@ -249,8 +249,13 @@ jobs:
       - name: Clippy (wasm32)
         run: cargo clippy -p chem-app --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      # Pinned, and pinned to the same version as the deploy workflow: an
+      # unpinned Trunk means the bundle CI checks and the bundle that reaches
+      # chem.chiral.one can be built by different toolchains. Bump both.
       - name: Install trunk
-        uses: taiki-e/install-action@trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
 
       - name: Build web bundle
         working-directory: crates/chem-app

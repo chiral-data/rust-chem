@@ -21,6 +21,7 @@
 //! lets each front end decide what to do with them.
 
 use crate::core::molecule::Molecule;
+use crate::io::options::ReadOptions;
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
@@ -91,8 +92,14 @@ impl ReadOutcome {
 /// whole" contract [`ReadOutcome`] documents, rather than introducing a
 /// `Result` for a case the caller can already see in `skipped`.
 pub fn read(content: &str, format: Format) -> ReadOutcome {
+    read_with_options(content, format, &ReadOptions)
+}
+
+/// [`read`], with explicit per-format options (#212). No format has a read
+/// option yet; this exists so a future one only widens this signature once.
+pub fn read_with_options(content: &str, format: Format, options: &ReadOptions) -> ReadOutcome {
     match format.reader() {
-        Some(reader) => reader(content),
+        Some(reader) => reader(content, options),
         None => ReadOutcome {
             records: Vec::new(),
             skipped: vec![Skipped {
@@ -104,11 +111,16 @@ pub fn read(content: &str, format: Format) -> ReadOutcome {
     }
 }
 
+/// [`read_smiles_with_options`] with default options.
+pub fn read_smiles(content: &str) -> ReadOutcome {
+    read_smiles_with_options(content, &ReadOptions)
+}
+
 /// One molecule per line: the SMILES, then optionally a name.
 ///
 /// Blank lines and `#` comments are skipped silently — they are not failures,
 /// and counting them as such would make every commented file look broken.
-pub fn read_smiles(content: &str) -> ReadOutcome {
+pub fn read_smiles_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
 
     for (index, raw) in content.lines().enumerate() {
@@ -147,8 +159,60 @@ pub fn read_smiles(content: &str) -> ReadOutcome {
     out
 }
 
-/// One molecule per `$$$$`-terminated record.
+/// [`read_cxsmiles_with_options`] with default options.
+pub fn read_cxsmiles(content: &str) -> ReadOutcome {
+    read_cxsmiles_with_options(content, &ReadOptions)
+}
+
+/// One molecule per line: a SMILES, optionally followed by a `|...|`
+/// enhanced-stereo-group block, then optionally a name (#221). A strict
+/// superset of [`read_smiles_with_options`]'s own convention — a line with
+/// no block reads exactly the same way.
+pub fn read_cxsmiles_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+
+    for (index, raw) in content.lines().enumerate() {
+        let position = index + 1;
+        let line = raw.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (smiles, block, name_parts) = crate::io::cxsmiles::split_cxsmiles_line(line);
+        if smiles.is_empty() {
+            continue;
+        }
+        let name = if name_parts.is_empty() {
+            format!("Molecule_{position}")
+        } else {
+            name_parts.join(" ")
+        };
+
+        match crate::io::cxsmiles::parse_cxsmiles(smiles, block) {
+            Ok(molecule) => out.records.push(Record {
+                molecule,
+                name,
+                smiles: Some(smiles.to_owned()),
+            }),
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: smiles.to_owned(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    out
+}
+
+/// [`read_sdf_with_options`] with default options.
 pub fn read_sdf(content: &str) -> ReadOutcome {
+    read_sdf_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `$$$$`-terminated record.
+pub fn read_sdf_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let mut lines: Vec<&str> = Vec::new();
     let mut position = 0;
@@ -190,6 +254,493 @@ fn push_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
             input: String::new(),
             error: e.to_string(),
         }),
+    }
+}
+
+/// [`read_xyz_with_options`] with default options.
+pub fn read_xyz(content: &str) -> ReadOutcome {
+    read_xyz_with_options(content, &ReadOptions)
+}
+
+/// One molecule per frame: a count line, a comment line, then that many
+/// atom lines (#222). A frame's own declared count is its record boundary,
+/// the role SDF's `$$$$` terminator plays -- so a trajectory (many frames
+/// back to back) reads as many records, not one.
+pub fn read_xyz_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let all_lines: Vec<&str> = content.lines().collect();
+    let mut position = 0;
+    let mut i = 0;
+
+    while i < all_lines.len() {
+        if all_lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let count_line = all_lines[i];
+        let count: usize = match count_line.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                position += 1;
+                out.skipped.push(Skipped {
+                    position,
+                    input: count_line.to_string(),
+                    error: format!("invalid atom count: {count_line:?}"),
+                });
+                i += 1;
+                continue;
+            }
+        };
+
+        let frame_len = 2 + count;
+        if i + frame_len > all_lines.len() {
+            position += 1;
+            out.skipped.push(Skipped {
+                position,
+                input: count_line.to_string(),
+                error: format!(
+                    "declared {count} atoms but only {} lines remain",
+                    all_lines.len().saturating_sub(i + 2)
+                ),
+            });
+            break;
+        }
+
+        let frame = all_lines[i..i + frame_len].join("\n");
+        position += 1;
+        match crate::io::xyz::parse_xyz(&frame) {
+            Ok(molecule) => {
+                let name = molecule
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{position}"));
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: frame,
+                error: e.to_string(),
+            }),
+        }
+        i += frame_len;
+    }
+
+    out
+}
+
+/// [`read_pdb_with_options`] with default options.
+pub fn read_pdb(content: &str) -> ReadOutcome {
+    read_pdb_with_options(content, &ReadOptions)
+}
+
+/// One molecule per structure. A file may hold several back to back via
+/// `MODEL`/`ENDMDL` (an NMR ensemble) -- `ENDMDL` is the record boundary,
+/// the same role SDF's `$$$$` and XYZ's atom count play; a file with
+/// neither `MODEL` nor `ENDMDL` at all (today's common case, a single
+/// deposited structure) is one implicit record, the whole file.
+pub fn read_pdb_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        lines.push(line);
+        if line.trim() == "ENDMDL" {
+            position += 1;
+            push_pdb_record(&mut out, &lines, position);
+            lines.clear();
+        }
+    }
+
+    // A trailing structure with no `ENDMDL` -- which a single-model file
+    // always is.
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_pdb_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_pdb_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::pdb::parse_pdb(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// [`read_mmcif_with_options`] with default options.
+pub fn read_mmcif(content: &str) -> ReadOutcome {
+    read_mmcif_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `data_` block (#224). A block boundary is a line
+/// starting with `data_`; a file with only one is one implicit record,
+/// today's common case for a single deposited structure. Within a block, a
+/// varying `pdbx_PDB_model_num` is [`crate::io::mmcif::parse_mmcif`]'s own
+/// job (its own doc explains why), not this splitter's.
+pub fn read_mmcif_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        let starts_new_block = line.trim_start().to_ascii_lowercase().starts_with("data_");
+        if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
+            position += 1;
+            push_mmcif_record(&mut out, &lines, position);
+            lines.clear();
+        }
+        lines.push(line);
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_mmcif_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_mmcif_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::mmcif::parse_mmcif(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// [`read_mol2_with_options`] with default options.
+pub fn read_mol2(content: &str) -> ReadOutcome {
+    read_mol2_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `@<TRIPOS>MOLECULE` block (#225) -- a ligand library's
+/// normal batch shape. The marker is a *start*, not an end, so a block
+/// boundary is only recognised once a previous one has already begun
+/// collecting content, the same reasoning `read_mmcif_with_options` uses
+/// for `data_`.
+pub fn read_mol2_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        let starts_new_block = line.trim() == "@<TRIPOS>MOLECULE";
+        if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
+            position += 1;
+            push_mol2_record(&mut out, &lines, position);
+            lines.clear();
+        }
+        lines.push(line);
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_mol2_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_mol2_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::mol2::parse_mol2(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// [`read_pdbqt_with_options`] with default options.
+pub fn read_pdbqt(content: &str) -> ReadOutcome {
+    read_pdbqt_with_options(content, &ReadOptions)
+}
+
+/// One molecule per structure. `ENDMDL` is the record boundary for a
+/// `MODEL`/`ENDMDL`-wrapped multi-pose file (AutoDock Vina's real docked-
+/// results output shape) (#226) -- mirrors [`read_pdb_with_options`]
+/// exactly, since PDBQT borrows this framing directly from PDB.
+pub fn read_pdbqt_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        lines.push(line);
+        if line.trim() == "ENDMDL" {
+            position += 1;
+            push_pdbqt_record(&mut out, &lines, position);
+            lines.clear();
+        }
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_pdbqt_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_pdbqt_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::pdbqt::parse_pdbqt(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                molecule,
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// [`read_gro_with_options`] with default options.
+pub fn read_gro(content: &str) -> ReadOutcome {
+    read_gro_with_options(content, &ReadOptions)
+}
+
+/// One molecule per frame: a title line, a count line, that many atom
+/// lines, then a box-vector line (#227). Unlike every prior format's
+/// reader, the declared count is trusted -- GRO has no structural
+/// terminator at all separating the atom block from the box-vector line
+/// that follows it, so the count is the only signal available; see
+/// `io/gro.rs`'s module doc.
+pub fn read_gro_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let all_lines: Vec<&str> = content.lines().collect();
+    let mut position = 0;
+    let mut i = 0;
+
+    while i < all_lines.len() {
+        if all_lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let count_line_idx = i + 1;
+        let Some(count_line) = all_lines.get(count_line_idx) else {
+            break;
+        };
+        let count: usize = match count_line.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                position += 1;
+                out.skipped.push(Skipped {
+                    position,
+                    input: (*count_line).to_string(),
+                    error: format!("invalid atom count: {count_line:?}"),
+                });
+                i += 1;
+                continue;
+            }
+        };
+
+        // Title line + count line + count atom lines + one box-vector line.
+        let frame_len = 3 + count;
+        if i + frame_len > all_lines.len() {
+            position += 1;
+            out.skipped.push(Skipped {
+                position,
+                input: (*count_line).to_string(),
+                error: format!(
+                    "declared {count} atoms but only {} lines remain",
+                    all_lines.len().saturating_sub(i + 2)
+                ),
+            });
+            break;
+        }
+
+        let frame = all_lines[i..i + frame_len].join("\n");
+        position += 1;
+        match crate::io::gro::parse_gro(&frame) {
+            Ok(molecule) => {
+                let name = molecule
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{position}"));
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: frame,
+                error: e.to_string(),
+            }),
+        }
+        i += frame_len;
+    }
+
+    out
+}
+
+/// [`read_cml_with_options`] with default options.
+pub fn read_cml(content: &str) -> ReadOutcome {
+    read_cml_with_options(content, &ReadOptions)
+}
+
+/// One molecule per `<molecule>` element (#228). A byte-offset scan over
+/// the raw text, not a per-line scan like every prior format's framing
+/// (mmCIF's `data_`, Mol2's `@<TRIPOS>MOLECULE`, PDB/PDBQT's `ENDMDL`) --
+/// XML is not line-oriented, and a `<molecule>` start or `</molecule>` end
+/// can fall anywhere on a line, including both on the same line for
+/// compact output. Nested `<molecule>` elements are out of scope: each
+/// record is assumed to run from its own `<molecule` start to the very
+/// next `</molecule>` close, not a depth-balanced match -- see
+/// `io/cml.rs`'s module doc.
+pub fn read_cml_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut position = 0;
+    let mut search_from = 0;
+
+    while let Some(start) = find_molecule_start(content, search_from) {
+        let close_tag = "</molecule>";
+        let (record, next_search_from) = match content[start..].find(close_tag) {
+            Some(rel_end) => {
+                let end = start + rel_end + close_tag.len();
+                (&content[start..end], end)
+            }
+            None => (&content[start..], content.len()),
+        };
+
+        position += 1;
+        match crate::io::cml::parse_cml(record) {
+            Ok(molecule) => {
+                let name = molecule
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Molecule_{position}"));
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+            Err(e) => out.skipped.push(Skipped {
+                position,
+                input: record.to_string(),
+                error: e.to_string(),
+            }),
+        }
+
+        if next_search_from >= content.len() {
+            break;
+        }
+        search_from = next_search_from;
+    }
+
+    out
+}
+
+/// [`read_commonchem_with_options`] with default options.
+pub fn read_commonchem(content: &str) -> ReadOutcome {
+    read_commonchem_with_options(content, &ReadOptions)
+}
+
+/// One molecule per entry in the document's `molecules` array (#229).
+///
+/// The only format here with no per-record framing at all: JSON has no
+/// boundary a scan could find, and a document is valid only whole. So the
+/// granularity of failure differs from every prior format -- a malformed
+/// *document* is one `Skipped` for the entire file, since nothing smaller can
+/// be salvaged, while a malformed *molecule* costs just its own record. That
+/// is still this crate's "bad input costs one record, not the run" contract,
+/// applied at the only two granularities this format has.
+pub fn read_commonchem_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+
+    match crate::io::commonchem::parse_commonchem(content) {
+        Ok(records) => {
+            for (name, molecule) in records {
+                out.records.push(Record {
+                    molecule,
+                    name,
+                    smiles: None,
+                });
+            }
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position: 1,
+            input: content.to_string(),
+            error: e.to_string(),
+        }),
+    }
+
+    out
+}
+
+/// Finds the byte offset of the next `<molecule` start tag at or after
+/// `from`, requiring the character right after `<molecule` to be a real
+/// tag boundary (whitespace, `>`, `/`, or end of input) so `<moleculeList>`
+/// and similar tags are never mistaken for a record start.
+fn find_molecule_start(content: &str, from: usize) -> Option<usize> {
+    let mut search_from = from;
+    loop {
+        let rel = content[search_from..].find("<molecule")?;
+        let idx = search_from + rel;
+        let after = &content[idx + "<molecule".len()..];
+        match after.chars().next() {
+            Some(c) if c.is_whitespace() || c == '>' || c == '/' => return Some(idx),
+            None => return Some(idx),
+            _ => search_from = idx + "<molecule".len(),
+        }
     }
 }
 
@@ -316,6 +867,38 @@ $$$$
         // one molecule per record, and a caller asking "did anything parse?"
         // was told yes.
         let out = read_smiles("$$$$\n");
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_pdb_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not a pdb file at all\n", Format::PDB);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_mmcif_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not an mmcif file at all\n", Format::MMCIF);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_mol2_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not a mol2 file at all\n", Format::MOL2);
+        assert!(out.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_garbage_pdbqt_text_is_skipped_rather_than_read_as_an_empty_molecule() {
+        let out = read("not a pdbqt file at all\n", Format::PDBQT);
         assert!(out.is_empty());
         assert_eq!(out.skipped.len(), 1);
         assert_eq!(out.skipped[0].position, 1);

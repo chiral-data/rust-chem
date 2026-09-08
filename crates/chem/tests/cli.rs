@@ -32,12 +32,28 @@ fn run(args: &[&str], stdin: Option<&str>) -> Run {
         .expect("spawn chem");
 
     if let Some(text) = stdin {
-        child
-            .stdin
-            .as_mut()
-            .expect("piped stdin")
-            .write_all(text.as_bytes())
-            .expect("write stdin");
+        // A command that rejects its arguments exits without reading standard
+        // input, which closes the read end of this pipe -- so this write fails
+        // with EPIPE, and unwrapping it panicked *here*, reporting the failure
+        // against whichever test happened to race (#248). One run aborted at
+        // "644 passed, 1 failed" without even naming one.
+        //
+        // Whether it happens at all is scheduling. EPIPE needs the read end
+        // *closed*, not merely unread, so a payload smaller than the pipe
+        // buffer lands there and succeeds although nobody will ever read it --
+        // which is why this was green until the machine was busy.
+        //
+        // Tolerated rather than ignored: the child having exited early is the
+        // outcome the error-path tests assert, and every assertion below still
+        // runs, so an early exit on a path that *should* consume stdin still
+        // fails -- at its own assertion. A write failing for any other reason
+        // is still a bug and still panics.
+        let pipe = child.stdin.as_mut().expect("piped stdin");
+        match pipe.write_all(text.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("write stdin: {e}"),
+        }
     }
 
     let out = child.wait_with_output().expect("wait");
@@ -949,4 +965,1417 @@ fn test_drawing_an_unusable_file_exits_before_writing_anything() {
     );
     assert_eq!(r.code, 2);
     assert!(!dir.exists(), "no directory should be created for nothing");
+}
+
+#[test]
+fn test_convert_round_trips_smiles_to_sdf_and_back() {
+    let path = fixture("convert-in.smi", GOOD);
+    let sdf = std::env::temp_dir().join("chem-cli-test-convert-out.sdf");
+    let _ = std::fs::remove_file(&sdf);
+
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "-o",
+            sdf.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 3, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+    let written = std::fs::read_to_string(&sdf).expect("output file");
+    assert!(written.contains("ethanol"));
+    assert!(written.contains("$$$$"));
+
+    // And back, to stdout as SMILES via --to.
+    let r = run(&["convert", sdf.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ethanol"));
+    assert!(r.stdout.contains("benzene"));
+}
+
+#[test]
+fn test_convert_from_and_to_override_the_extension() {
+    // Named .txt, so the extension alone would resolve to neither format.
+    let path = fixture("convert-wrong-ext.txt", GOOD);
+    let dest = std::env::temp_dir().join("chem-cli-test-convert-wrong-ext-out.txt");
+    let _ = std::fs::remove_file(&dest);
+
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "smi",
+            "--to",
+            "sdf",
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    let written = std::fs::read_to_string(&dest).expect("output file");
+    assert!(written.contains("$$$$"));
+}
+
+#[test]
+fn test_convert_literal_reads_the_string_directly() {
+    let r = run(&["convert", "--literal", "c1ccccc1O", "--to", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"));
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_gen3d_is_rejected_with_a_clear_message() {
+    let r = run(
+        &["convert", "--literal", "CCO", "--to", "sdf", "--gen3d"],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("does not generate 3D coordinates"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_output_format_is_ambiguous_without_to_or_a_named_extension() {
+    let r = run(&["convert", "--literal", "CCO"], None);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("ambiguous"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_unrecognized_format_code_is_an_error() {
+    // Not "pdbqt": that used to be an unrecognized-code example, but #226
+    // registered it -- pinning a code this crate might register later
+    // would make this test flip again for the same reason, so a code with
+    // no chemistry meaning at all is used instead.
+    let r = run(
+        &["convert", "--literal", "CCO", "--to", "not-a-format"],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_strict_exits_partial_on_a_skipped_record() {
+    let path = fixture("convert-mixed.smi", MIXED);
+    let r = run(
+        &["--strict", "convert", path.to_str().unwrap(), "--to", "sdf"],
+        None,
+    );
+    assert_eq!(r.code, 4);
+}
+
+#[test]
+fn test_convert_refuses_to_clobber_its_own_input() {
+    let path = fixture("convert-clobber.sdf", SDF);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--to",
+            "smi",
+            "-o",
+            path.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("pass --force"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_format_bogus_is_an_error_not_a_clap_panic() {
+    // #215: --format used to be a clap ValueEnum, so an unknown value was
+    // rejected by clap itself. Now it's a registry lookup -- same outcome,
+    // different mechanism, and the message should say so plainly.
+    let r = run(&["info", "--format", "bogus"], Some(GOOD));
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_writing_stdin_survives_a_command_that_exits_before_reading_it() {
+    // The helper's own regression (#248), and deterministic where the flake was
+    // not. `--format bogus` fails in `resolve_format_code`, which runs as an
+    // argument to `stream::read_input` and therefore *before* a byte of stdin
+    // is consumed -- so the child exits with the pipe unread.
+    //
+    // The payload is what makes this reliable. Over the pipe buffer (64 KiB on
+    // Linux) the write cannot fit, so it blocks until the child exits and then
+    // fails with EPIPE -- measured 20 times out of 20. A small payload usually
+    // lands in the buffer and succeeds instead, which is exactly why the flake
+    // needed a loaded machine to appear.
+    let big = "CCO ethanol\n".repeat(100_000);
+    assert!(
+        big.len() > 64 * 1024,
+        "the payload must exceed the pipe buffer"
+    );
+
+    let r = run(&["info", "--format", "bogus"], Some(&big));
+
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_formats_lists_every_registered_code() {
+    let r = run(&["convert", "-L", "formats"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("smi"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("sdf"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_one_format_shows_its_detail() {
+    let r = run(&["convert", "-L", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("sdf"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("codes:"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("extensions:"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("category:"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("carries:"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_unrecognized_code_is_an_error() {
+    let r = run(&["convert", "-L", "bogus"], None);
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_describe_reports_no_options_exposed_yet() {
+    let r = run(&["convert", "-H", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("no format-specific options are exposed"),
+        "{:?}",
+        r.stdout
+    );
+
+    let r = run(&["convert", "-H", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("no format-specific options are exposed"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_list_and_describe_are_pure_queries_that_run_no_conversion() {
+    // Neither flag should require --literal/input/--to -- they're pure
+    // queries against the registry, resolved before any of that is checked.
+    let r = run(&["convert", "-L", "formats"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    let r = run(&["convert", "-H", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_writes_an_enhanced_stereo_group_as_cxsmiles() {
+    // #221: --to cxsmiles needed no main.rs changes at all, since #215
+    // already made every format-code flag a registry lookup.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "N[C@@H](C)C(=O)O",
+            "--from",
+            "smi",
+            "--to",
+            "cxsmiles",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // Plain SMILES has no stereo groups, so nothing to write -- confirms
+    // the block is genuinely omitted rather than always present.
+    assert!(!r.stdout.contains('|'), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_round_trips_an_enhanced_stereo_group_through_cxsmiles() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "N[C@@H](C)C(=O)O |&1:1|",
+            "--from",
+            "cxsmiles",
+            "--to",
+            "cxsmiles",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("|&1:1|"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reports_dropping_a_stereo_group_when_writing_plain_smiles() {
+    // Plain SMILES's carries mask does not include STEREO_GROUP, so the
+    // drop report (#214's DropTracker) should fire rather than silently
+    // discard the group.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "N[C@@H](C)C(=O)O |&1:1|",
+            "--from",
+            "cxsmiles",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("stereo_group"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_list_shows_cxsmiles_is_registered() {
+    let r = run(&["convert", "-L", "cxsmiles"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("stereo_group"), "{:?}", r.stdout);
+}
+
+const WATER_XYZ: &str = "3\nwater\nO 0.000000 0.000000 0.000000\nH 0.758602 0.000000 0.504284\nH 0.758602 0.000000 -0.504284\n";
+
+#[test]
+fn test_convert_reads_a_literal_xyz_frame() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_XYZ,
+            "--from",
+            "xyz",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("water"), "{:?}", r.stdout);
+    // A real 3D conformer, not a flat drawing -- the y column is nonzero
+    // nowhere in this molecule, but z is, and 0.504284 is one atom's.
+    assert!(
+        r.stdout.contains("0.5043") || r.stdout.contains("0.5042"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_writes_xyz_and_it_reads_back_the_same_atom_count() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_XYZ,
+            "--from",
+            "xyz",
+            "--to",
+            "xyz",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.starts_with("3\n"), "{:?}", r.stdout);
+
+    let back = run(
+        &[
+            "convert",
+            "--literal",
+            &r.stdout,
+            "--from",
+            "xyz",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+}
+
+#[test]
+fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
+    let path = fixture(
+        "trajectory.xyz",
+        &format!("{WATER_XYZ}{WATER_XYZ}{WATER_XYZ}"),
+    );
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "xyz",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 3, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_xyz_has_the_smallest_mask() {
+    let r = run(&["convert", "-L", "xyz"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
+}
+
+const WATER_PDB: &str = "\
+HETATM    1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+HETATM    2  H1  HOH A   1       0.759   0.000   0.504  1.00 20.00           H
+HETATM    3  H2  HOH A   1       0.759   0.000  -0.504  1.00 20.00           H
+CONECT    1    2
+CONECT    1    3
+END
+";
+
+#[test]
+fn test_convert_reads_a_literal_pdb_structure() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_PDB,
+            "--from",
+            "pdb",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // Occupancy/B-factor aren't SDF columns, but the atoms/bonds/coords
+    // from CONECT should have made it through.
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_pdb_with_occupancy_and_b_factor() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_PDB,
+            "--from",
+            "pdb",
+            "--to",
+            "pdb",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("HETATM"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("20.00"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("CONECT"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_multi_model_pdb_as_multiple_records() {
+    let two_models =
+        format!("MODEL        1\n{WATER_PDB}ENDMDL\nMODEL        2\n{WATER_PDB}ENDMDL\n");
+    let path = fixture("multimodel.pdb", &two_models);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "pdb",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_pdb_has_no_stereo_or_charge() {
+    let r = run(&["convert", "-L", "pdb"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}
+
+const WATER_MMCIF: &str = "\
+data_water
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.auth_comp_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.pdbx_PDB_model_num
+HETATM 1 O O . HOH A 1 A HOH . 0.000 0.000 0.000 1.00 20.00 1
+HETATM 2 H H1 . HOH A 1 A HOH . 0.759 0.000 0.504 1.00 20.00 1
+HETATM 3 H H2 . HOH A 1 A HOH . 0.759 0.000 -0.504 1.00 20.00 1
+";
+
+#[test]
+fn test_convert_reads_a_literal_mmcif_structure() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_MMCIF,
+            "--from",
+            "mmcif",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_round_trips_mmcif_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_MMCIF,
+            "--from",
+            "mmcif",
+            "--to",
+            "mmcif",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("HETATM"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("20.00"), "{:?}", r.stdout);
+
+    let back = run(
+        &[
+            "convert",
+            "--literal",
+            &r.stdout,
+            "--from",
+            "mmcif",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+}
+
+#[test]
+fn test_convert_reads_a_multi_block_mmcif_file_as_multiple_records() {
+    let two_blocks = format!("{WATER_MMCIF}{WATER_MMCIF}");
+    let path = fixture("multiblock.cif", &two_blocks);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "mmcif",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_mmcif_has_no_bonds_claimed() {
+    let r = run(&["convert", "-L", "mmcif"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("stereo_atom"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}
+
+const BENZENE_MOL2: &str = "\
+@<TRIPOS>MOLECULE
+benzene
+6 6 1 0 0
+SMALL
+USER_CHARGES
+@<TRIPOS>ATOM
+1 C1 0.000 1.396 0.000 C.ar 1 BNZ -0.1000
+2 C2 1.209 0.698 0.000 C.ar 1 BNZ -0.1000
+3 C3 1.209 -0.698 0.000 C.ar 1 BNZ -0.1000
+4 C4 0.000 -1.396 0.000 C.ar 1 BNZ -0.1000
+5 C5 -1.209 -0.698 0.000 C.ar 1 BNZ -0.1000
+6 C6 -1.209 0.698 0.000 C.ar 1 BNZ -0.1000
+@<TRIPOS>BOND
+1 1 2 ar
+2 2 3 ar
+3 3 4 ar
+4 4 5 ar
+5 5 6 ar
+6 6 1 ar
+@<TRIPOS>SUBSTRUCTURE
+1 BNZ 1 RESIDUE 1 A
+";
+
+#[test]
+fn test_convert_reads_a_literal_mol2_molecule() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            BENZENE_MOL2,
+            "--from",
+            "mol2",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_round_trips_mol2_with_charge_and_aromaticity() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            BENZENE_MOL2,
+            "--from",
+            "mol2",
+            "--to",
+            "mol2",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("C.ar"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("-0.1000"), "{:?}", r.stdout);
+    assert!(r.stdout.contains(" ar\n"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reports_dropping_partial_charge_when_writing_plain_sdf() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            BENZENE_MOL2,
+            "--from",
+            "mol2",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("partial_charge"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_list_shows_mol2_is_the_first_format_with_partial_charge() {
+    let r = run(&["convert", "-L", "mol2"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("partial_charge"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("aromaticity"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_a_rigid_molecule_as_pdbqt_with_torsdof_zero() {
+    let r = run(&["convert", "--literal", "c1ccccc1", "--to", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ROOT"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("TORSDOF 0"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("BRANCH"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_a_branched_ligand_as_pdbqt_with_torsion_tree() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "c1ccc(cc1)-c1ccc(cc1)-c1ccccc1",
+            "--to",
+            "pdbqt",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("TORSDOF 2"), "{:?}", r.stdout);
+    let branch_lines = r.stdout.lines().filter(|l| l.starts_with("BRANCH")).count();
+    assert_eq!(branch_lines, 2, "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_literal_pdbqt_structure() {
+    let text = "\
+ROOT
+ATOM      1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00     0.000 C \n\
+ATOM      2  C2  LIG A   1       1.500   0.000   0.000  1.00  0.00     0.000 C \n\
+ENDROOT
+TORSDOF 0
+";
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            text,
+            "--from",
+            "pdbqt",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("$$$$"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_shows_pdbqt_mask() {
+    let r = run(&["convert", "-L", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("partial_charge"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("aromaticity"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("unit_cell"), "{:?}", r.stdout);
+}
+
+const WATER_GRO: &str = "\
+water
+    3
+    1SOL     OW    1   0.000   0.000   0.000
+    1SOL    HW1    2   0.076   0.000   0.050
+    1SOL    HW2    3   0.076   0.000  -0.050
+   1.00000   1.00000   1.00000
+";
+
+#[test]
+fn test_convert_reads_a_literal_gro_structure_with_nm_to_angstrom_conversion() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_GRO,
+            "--from",
+            "gro",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // 0.076 nm -> 0.760 Angstrom in the written SDF.
+    assert!(
+        r.stdout.contains("0.7600") || r.stdout.contains("0.760"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_round_trips_gro_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            WATER_GRO,
+            "--from",
+            "gro",
+            "--to",
+            "gro",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("SOL"), "{:?}", r.stdout);
+    // Round-tripped box vector line should still carry the 1.0 nm box.
+    assert!(r.stdout.contains("1.00000"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_multi_frame_gro_file_as_multiple_records() {
+    let two_frames = format!("{WATER_GRO}{WATER_GRO}");
+    let path = fixture("multiframe.gro", &two_frames);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "gro",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_gro_mask() {
+    let r = run(&["convert", "-L", "gro"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("unit_cell"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("partial_charge"), "{:?}", r.stdout);
+}
+
+const ETHANOL_CML: &str = "\
+<molecule id=\"m1\" title=\"ethanol\">
+  <atomArray>
+    <atom id=\"a1\" elementType=\"C\" x3=\"0.000\" y3=\"0.000\" z3=\"0.000\"/>
+    <atom id=\"a2\" elementType=\"C\" x3=\"1.520\" y3=\"0.000\" z3=\"0.000\"/>
+    <atom id=\"a3\" elementType=\"O\" x3=\"2.100\" y3=\"1.300\" z3=\"0.000\"/>
+  </atomArray>
+  <bondArray>
+    <bond atomRefs2=\"a1 a2\" order=\"1\"/>
+    <bond atomRefs2=\"a2 a3\" order=\"1\"/>
+  </bondArray>
+</molecule>
+";
+
+#[test]
+fn test_convert_reads_a_literal_cml_structure() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            ETHANOL_CML,
+            "--from",
+            "cml",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("1.5200") || r.stdout.contains("1.520"),
+        "{:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_convert_round_trips_cml_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            ETHANOL_CML,
+            "--from",
+            "cml",
+            "--to",
+            "cml",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("<molecule"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("elementType=\"O\""), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_reads_a_multi_molecule_cml_file_wrapped_in_a_container() {
+    // The trailing `</cml>` after the second molecule's own `</molecule>`
+    // is exactly the case the byte-offset framing scan has to get right:
+    // the second (last) record must stop at its own close tag, not run on
+    // to swallow the container's.
+    let wrapped = format!("<cml>\n{ETHANOL_CML}{ETHANOL_CML}</cml>\n");
+    let path = fixture("multi.cml", &wrapped);
+    let r = run(
+        &[
+            "convert",
+            path.to_str().unwrap(),
+            "--from",
+            "cml",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 2, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_list_shows_cml_mask() {
+    let r = run(&["convert", "-L", "cml"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("formal_charge"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("isotope"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("unit_cell"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("residues"), "{:?}", r.stdout);
+}
+
+const PHENOL_COMMONCHEM: &str = r#"{"commonchem":{"version":10},
+"defaults":{"atom":{"z":6,"impHs":0,"chg":0,"nRad":0,"isotope":0,"stereo":"unspecified"},"bond":{"bo":1,"stereo":"unspecified"}},
+"molecules":[{"name":"phenol",
+"atoms":[{"impHs":1},{"impHs":1},{"impHs":1},{"impHs":1},{"impHs":1},{},{"z":8,"impHs":1}],
+"bonds":[{"bo":2,"atoms":[0,1]},{"atoms":[1,2]},{"bo":2,"atoms":[2,3]},{"atoms":[3,4]},{"bo":2,"atoms":[4,5]},{"atoms":[5,6]},{"atoms":[5,0]}],
+"extensions":[{"name":"rdkitRepresentation","formatVersion":2,"aromaticAtoms":[0,1,2,3,4,5],"aromaticBonds":[0,1,2,3,4,6]}]}]}"#;
+
+#[test]
+fn test_convert_reads_a_literal_commonchem_document() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            PHENOL_COMMONCHEM,
+            "--from",
+            "commonchem",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    // Lower-case ring atoms: the aromaticity came out of the extension, since
+    // the bond list this document carries is a Kekulé form.
+    assert!(r.stdout.contains("c1ccccc1"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_writes_commonchem_from_smiles() {
+    let path = fixture("aromatic.smi", "c1ccccc1O phenol\n");
+    let r = run(
+        &["convert", path.to_str().unwrap(), "--to", "commonchem"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains(r#""commonchem":{"version":10}"#),
+        "{:?}",
+        r.stdout
+    );
+    assert!(r.stdout.contains(r#""aromaticAtoms""#), "{:?}", r.stdout);
+    // `bo: 4` is a quadruple bond in this schema, never an aromatic one.
+    assert!(!r.stdout.contains(r#""bo":4"#), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_infers_commonchem_from_a_json_extension() {
+    let path = fixture("phenol.json", PHENOL_COMMONCHEM);
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_writes_every_record_into_one_commonchem_document() {
+    // The one format here with no concatenable framing: three records must
+    // produce one document with three entries, not three documents.
+    let path = fixture("three.smi", "C a\nO b\nN c\n");
+    let r = run(
+        &["convert", path.to_str().unwrap(), "--to", "commonchem"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(
+        r.stdout.matches(r#""commonchem""#).count(),
+        1,
+        "{:?}",
+        r.stdout
+    );
+    for name in ["\"a\"", "\"b\"", "\"c\""] {
+        assert!(
+            r.stdout.contains(name),
+            "{name} missing from {:?}",
+            r.stdout
+        );
+    }
+}
+
+#[test]
+fn test_convert_rejects_an_unsupported_commonchem_version() {
+    // RDKit refuses `commonchem` 12 as well, so this is agreement with the
+    // reference implementation rather than extra strictness.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            r#"{"commonchem":{"version":12},"molecules":[]}"#,
+            "--from",
+            "commonchem",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0, "a refused document must not exit 0");
+    assert!(r.stderr.contains("commonchem"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("12"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_rejects_a_truncated_commonchem_document() {
+    // JSON has no per-record boundary, so a truncated file is one failure for
+    // the whole input rather than a partial success -- and must not be a
+    // silent `converted 0`.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            r#"{"commonchem":{"version":10},"#,
+            "--from",
+            "commonchem",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0, "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_shows_commonchem_mask() {
+    let r = run(&["convert", "-L", "commonchem"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    for flag in [
+        "coords_2d",
+        "coords_3d",
+        "formal_charge",
+        "isotope",
+        "stereo_atom",
+        "stereo_bond",
+        "aromaticity",
+        "properties",
+    ] {
+        assert!(
+            r.stdout.contains(flag),
+            "{flag} missing from {:?}",
+            r.stdout
+        );
+    }
+    // No field in the schema for any of these.
+    for flag in ["unit_cell", "residues", "b_factor", "occupancy"] {
+        assert!(!r.stdout.contains(flag), "{flag} claimed in {:?}", r.stdout);
+    }
+}
+
+#[test]
+fn test_convert_formats_lists_the_json_category() {
+    let r = run(&["convert", "-L", "formats"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("JSON formats"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("commonchem"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_sdf_to_smiles_keeps_an_aromatic_nitrogen_hydrogen() {
+    // The user-visible shape of #241: a molecule goes out to a format that
+    // stores hydrogens implicitly and comes back as `c1ccnc1`, an aromatic
+    // ring with no valid Kekule form that no other toolkit will read.
+    let sdf = run(
+        &[
+            "convert",
+            "--literal",
+            "c1cc[nH]c1",
+            "--from",
+            "smi",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_eq!(sdf.code, 0, "{:?}", sdf.stderr);
+
+    let path = fixture("pyrrole-241.sdf", &sdf.stdout);
+    let smi = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(smi.code, 0, "{:?}", smi.stderr);
+    assert!(smi.stdout.contains("[nH]"), "{:?}", smi.stdout);
+
+    // And what came back is readable again, which `c1ccnc1` was not.
+    let again = run(
+        &[
+            "convert",
+            "--literal",
+            smi.stdout.split_whitespace().next().expect("a SMILES"),
+            "--from",
+            "smi",
+            "--to",
+            "smi",
+        ],
+        None,
+    );
+    assert_eq!(again.code, 0, "{:?}", again.stderr);
+}
+
+#[test]
+fn test_fp_writes_chemfp_fps_on_request() {
+    // FPS is a published interchange format (#243), so the header is what a
+    // foreign reader keys on -- and `#type` is what tells it these are this
+    // crate's Morgan bits and not RDKit's, which differ by design (#192).
+    let path = fixture("fps-out.smi", "CCO ethanol\nc1ccccc1 benzene\n");
+    let r = run(&["fp", path.to_str().unwrap(), "--out-format", "fps"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines[0], "#FPS1", "{:?}", r.stdout);
+    assert!(r.stdout.contains("#num_bits=2048"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("#type=chem-Morgan/1"), "{:?}", r.stdout);
+
+    // Hex first, name second -- reversed from this crate's own file.
+    let row = lines.iter().find(|l| l.contains("ethanol")).expect("a row");
+    let (hex, name) = row.split_once('\t').expect("two fields");
+    assert_eq!(name, "ethanol");
+    assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{row}");
+}
+
+#[test]
+fn test_fp_still_writes_its_own_format_by_default() {
+    // The regression that would matter: `chem search` reads only this form,
+    // and its parser refuses anything else outright.
+    let path = fixture("fps-default.smi", "CCO ethanol\nc1ccccc1 benzene\n");
+    let fp = run(&["fp", path.to_str().unwrap()], None);
+    assert_eq!(fp.code, 0, "{:?}", fp.stderr);
+    assert!(
+        fp.stdout.starts_with("# chem-fingerprints 1"),
+        "{:?}",
+        fp.stdout
+    );
+
+    let fp_path = fixture("fps-default.fp", &fp.stdout);
+    let search = run(
+        &["search", fp_path.to_str().unwrap(), "--query", "CCO"],
+        None,
+    );
+    assert_eq!(search.code, 0, "{:?}", search.stderr);
+    assert!(search.stdout.contains("ethanol"), "{:?}", search.stdout);
+}
+
+#[test]
+fn test_search_refuses_an_fps_file() {
+    // FPS is write-only here, as it is in OpenBabel. Pointing `search` at one
+    // must name the problem rather than rank nothing.
+    let path = fixture("fps-refused.smi", "CCO ethanol\n");
+    let fps = run(&["fp", path.to_str().unwrap(), "--out-format", "fps"], None);
+    assert_eq!(fps.code, 0, "{:?}", fps.stderr);
+
+    let fps_path = fixture("fps-refused.fps", &fps.stdout);
+    let search = run(
+        &["search", fps_path.to_str().unwrap(), "--query", "CCO"],
+        None,
+    );
+    assert_ne!(search.code, 0, "an FPS file is not a chem fingerprint file");
+    assert!(
+        search.stderr.contains("chem-fingerprints"),
+        "{:?}",
+        search.stderr
+    );
+}
+
+#[test]
+fn test_the_drop_report_names_bonds_when_the_target_has_none() {
+    // The defect that made `Carries::BONDS` necessary (#257): XYZ, mmCIF,
+    // PDBQT and GRO all read back zero bonds while declaring TOPOLOGY, so a
+    // conversion into one turned benzene into six unbonded carbons and the
+    // loss report named only the coordinates.
+    let path = fixture("bonds-drop.smi", "c1ccccc1 benzene\n");
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "xyz"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("XYZ cannot carry: bonds"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_the_drop_report_stays_quiet_about_bonds_a_molecule_never_had() {
+    // `held` keys on the molecule, not the format. A salt has two atoms and no
+    // bonds, so there is nothing to drop -- a warning here would mean the flag
+    // was being read off the source format instead.
+    let path = fixture("bonds-none.smi", "[Na+].[Cl-] salt\n");
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "xyz"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(!r.stderr.contains("bonds"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_l_matrix_prints_a_row_per_format_and_names_its_exceptions() {
+    // #257. The table is derived from the registry, so what makes it true is
+    // the pair test in `io/format.rs` -- this pins that the CLI renders it,
+    // marks the cells that deviate, and explains them rather than leaving a
+    // bare symbol in a grid.
+    let r = run(&["convert", "-L", "matrix"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+
+    for code in [
+        "smi", "sdf", "xyz", "pdb", "mmcif", "mol2", "pdbqt", "gro", "cml",
+    ] {
+        assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
+    }
+
+    // XYZ carries atoms and a conformer and nothing else, so its own diagonal
+    // cell is the shortest in the table.
+    assert!(r.stdout.contains("\nxyz "), "{}", r.stdout);
+
+    // Supplied attributes are lowercase: `smi -> pdb` invents the residue,
+    // B-factor and occupancy columns rather than carrying them across.
+    assert!(r.stdout.contains("TB3rfo"), "{}", r.stdout);
+
+    // Both exception classes are named, not just marked.
+    // The atom-loss section survives with nothing under it: #259 emptied
+    // `PAIR_GAPS`, and the mechanism stays because it is the only way to
+    // express a loss no mask can.
+    assert!(
+        r.stdout.contains("the conversion also loses atoms:"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("pdbqt      -> pdbqt"),
+        "a pinned atom loss came back: {}",
+        r.stdout
+    );
+    // The CML rows came out with #261; PDBQT's remain, since it carries no
+    // bonds for aromaticity to ride on.
+    assert!(
+        r.stdout.contains("lost anyway:") && r.stdout.contains("pdbqt      -> sdf"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("cml        -> smi"),
+        "a fixed pair is still pinned: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_l_still_details_a_single_format() {
+    // `matrix` is special-cased before the code lookup, the same shape as
+    // `formats`. A format code must not be shadowed by it.
+    let r = run(&["convert", "-L", "pdb"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("carries:"), "{}", r.stdout);
+    assert!(r.stdout.contains("bonds"), "{}", r.stdout);
+}
+
+#[test]
+fn test_convert_reports_a_loss_both_masks_say_should_not_happen() {
+    // #276. PDBQT and SDF both claim aromaticity, so a report asking only "can
+    // the target hold this?" says nothing — and the loss is real, because PDBQT
+    // carries no bonds for atom aromaticity to ride on.
+    //
+    // This used to pin `cml -> smi`, whose output really was cyclohexane. #261
+    // fixed that by reconciling the three aromaticity channels at the reader
+    // boundary, so the pair the CLI misses is now one where the loss is
+    // structural rather than a defect.
+    let pdbqt = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "pdbqt"],
+        None,
+    );
+    assert_eq!(pdbqt.code, 0, "{:?}", pdbqt.stderr);
+    let path = fixture("pair-loss.pdbqt", &pdbqt.stdout);
+
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "sdf"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("aromaticity"), "{:?}", r.stderr);
+    // The reason, not just the attribute: it is the half a user can act on.
+    assert!(
+        r.stderr.contains("no bonds survive PDBQT"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_no_longer_turns_benzene_into_cyclohexane() {
+    // What the test above used to pin, now asserted the other way round. CML
+    // states aromaticity in its bond order and nothing else, and the SMILES
+    // writer reads only the atom flag -- so this round trip produced a
+    // different compound until the reader learned to reconcile them (#261).
+    let cml = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "cml"],
+        None,
+    );
+    assert_eq!(cml.code, 0, "{:?}", cml.stderr);
+    let path = fixture("aromatic-round-trip.cml", &cml.stdout);
+
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "smi"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("c1ccccc1"), "{:?}", r.stdout);
+    assert!(
+        !r.stdout.contains("C1CCCCC1"),
+        "still cyclohexane: {:?}",
+        r.stdout
+    );
+    // And the report no longer names a loss that is not happening.
+    assert!(!r.stderr.contains("aromaticity"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_no_longer_loses_atoms_to_pdbqt() {
+    // This asserted the opposite until #259: six atoms in, one out, because
+    // PDBQT's writer kept only the largest connected component and a bondless
+    // source arrives as N one-atom fragments. #276 made the CLI *say* so; #259
+    // stopped it happening, so there is nothing left to say.
+    let xyz = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "xyz"],
+        None,
+    );
+    assert_eq!(xyz.code, 0, "{:?}", xyz.stderr);
+    let path = fixture("atom-loss.xyz", &xyz.stdout);
+
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        !r.stderr.contains("also loses atoms"),
+        "nothing is lost any more: {:?}",
+        r.stderr
+    );
+
+    let atoms = r.stdout.lines().filter(|l| l.starts_with("ATOM")).count();
+    assert_eq!(atoms, 6, "{:?}", r.stdout);
+}
+
+#[test]
+fn test_a_transforming_command_does_not_claim_a_pair_loss() {
+    // #257 measured its pairs through a read and a write with nothing in
+    // between, so `chem aromatic` and `chem coords` keep the target-only
+    // report. Claiming a loss nobody measured for that path would be the same
+    // mistake as the silence #276 fixed, pointing the other way.
+    let cml = run(
+        &["convert", "--literal", "c1ccccc1 benzene", "--to", "cml"],
+        None,
+    );
+    let path = fixture("no-pair-claim.cml", &cml.stdout);
+
+    let r = run(
+        &["aromatic", path.to_str().unwrap(), "--out-format", "smiles"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        !r.stderr.contains("CML sets no aromatic flag"),
+        "a transforming command claimed a pair loss: {:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_writes_multi_record_pdb_that_reads_back_as_several() {
+    // The reported symptom, through the path it came through: `chem convert`
+    // uses the *streaming* writer, which concatenated structures with no
+    // `MODEL`/`ENDMDL` between them. Three molecules read back as one with
+    // their atoms merged (#267).
+    let path = fixture("three-records.smi", "CCO a\nc1ccccc1 b\nCCN c\n");
+
+    for target in ["pdb", "pdbqt"] {
+        let out = run(&["convert", path.to_str().unwrap(), "--to", target], None);
+        assert_eq!(out.code, 0, "{:?}", out.stderr);
+        assert_eq!(
+            out.stdout.matches("\nMODEL     ").count()
+                + usize::from(out.stdout.starts_with("MODEL")),
+            3,
+            "{target}: {}",
+            out.stdout
+        );
+
+        // Read back through the library, which is the assertion that matters:
+        // the framing is only worth having if it restores the boundaries.
+        let written = fixture(&format!("three-records.{target}"), &out.stdout);
+        let back = run(&["convert", written.to_str().unwrap(), "--to", "smi"], None);
+        assert_eq!(back.code, 0, "{:?}", back.stderr);
+        assert_eq!(
+            back.stdout.lines().filter(|l| !l.trim().is_empty()).count(),
+            3,
+            "{target} read back as: {}",
+            back.stdout
+        );
+    }
+}
+
+#[test]
+fn test_convert_leaves_a_single_record_unframed() {
+    // The common case, and it must not move: a real single-structure PDB
+    // carries no `MODEL`.
+    let path = fixture("one-record.smi", "CCO ethanol\n");
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "pdb"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(!r.stdout.contains("MODEL"), "{}", r.stdout);
+    assert!(r.stdout.contains("END"), "{}", r.stdout);
 }

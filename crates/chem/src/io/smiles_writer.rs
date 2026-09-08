@@ -27,9 +27,10 @@
 //! assert_eq!(write_smiles(atom_symbols, atom_neighbours, atom_rankings, bond_symbols), "c1ccccc1=O".to_string());
 //! ```
 
-use crate::core::atom::Chirality;
+use crate::core::atom::{Chirality, Element};
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
+use crate::core::rings::find_sssr;
 
 /// Manager of ring digit
 struct DigitHeap {
@@ -202,10 +203,27 @@ fn bond_order_symbol(order: BondOrder) -> &'static str {
     }
 }
 
+/// Whether this element may be written as a bare symbol, with no brackets.
+///
+/// The exact set [`crate::io::smiles`]'s `parse_organic_two_char` and
+/// `parse_organic_one_char` accept outside brackets, and the two are a pair:
+/// a symbol written bare here that the parser will not read bare is an
+/// unreadable file. Silicon is the demonstration -- `CSi` was written happily
+/// and then failed to parse, because `S` matched sulfur and `i` was left over
+/// (#241).
+///
+/// The aromatic set is smaller than the aliphatic one: no halogens.
+fn writes_bare(element: Element, aromatic: bool) -> bool {
+    match element.symbol() {
+        "B" | "C" | "N" | "O" | "P" | "S" => true,
+        "F" | "Cl" | "Br" | "I" => !aromatic,
+        _ => false,
+    }
+}
+
 // Writes an atom's SMILES token. Plain element symbol (lowercase if
-// aromatic) for the common case; bracket notation only when charge or
-// isotope need representing, since those can't be expressed in the
-// organic-subset shorthand.
+// aromatic) for the common case; bracket notation whenever the bare form
+// would not read back as this same atom.
 fn atom_symbol(mol: &Molecule, atom_idx: usize) -> String {
     atom_symbol_with(mol, atom_idx, mol.atom(atom_idx).chirality())
 }
@@ -223,10 +241,21 @@ fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> St
         symbol.to_string()
     };
 
-    let needs_brackets = atom.formal_charge() != 0
+    // One question: would the bare organic-subset form read back as this exact
+    // atom? Anything the shorthand cannot say has to be spelled out.
+    //
+    // The hydrogen term compares against what the reader would fill in rather
+    // than against zero, which is what makes `[nH]` fall out of the general
+    // rule: a pyrrole nitrogen's two aromatic bonds imply no hydrogen, so the
+    // one it has must be written. Before #241 this asked
+    // `explicit_hydrogens() > 0` -- whether the *input* had spelled a count --
+    // so a molecule that arrived from SDF, CML or commonchem with its
+    // hydrogens implicit was written bare and read back short.
+    let needs_brackets = !writes_bare(atom.element(), atom.is_aromatic())
+        || atom.formal_charge() != 0
         || atom.isotope().is_some()
-        || atom.explicit_hydrogens() > 0
-        || chirality != Chirality::None;
+        || chirality != Chirality::None
+        || atom.total_hydrogens() != mol.implied_hydrogens(atom_idx);
     if !needs_brackets {
         return symbol;
     }
@@ -250,7 +279,12 @@ fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> St
         Chirality::Clockwise => "@@",
         Chirality::None | Chirality::Unspecified => "",
     };
-    match atom.explicit_hydrogens() {
+    // `total_hydrogens`, not `explicit_hydrogens`: a bracket states the atom's
+    // whole hydrogen count, and which half of the model it is stored in is a
+    // record of how the input was spelled (#241). `atom_symbol_in_order` has
+    // always used `total_hydrogens` for the stereo neighbour slot -- the
+    // chirality machinery treated it as the truth while the printing did not.
+    match atom.total_hydrogens() {
         0 => {}
         1 => bracket += "H",
         h => bracket += &format!("H{}", h),
@@ -271,7 +305,11 @@ fn atom_symbol_with(mol: &Molecule, atom_idx: usize, chirality: Chirality) -> St
 /// One per end of the double bond, chosen deterministically so both ends agree
 /// without passing state between them: the lowest-indexed neighbour that is not
 /// the double-bond partner.
-fn reference_substituent(mol: &Molecule, anchor: usize, partner: usize) -> Option<usize> {
+pub(crate) fn reference_substituent(
+    mol: &Molecule,
+    anchor: usize,
+    partner: usize,
+) -> Option<usize> {
     mol.neighbors(anchor)
         .iter()
         .map(|n| n.atom_idx)
@@ -585,16 +623,272 @@ pub fn write_smiles(
 /// Writes a SMILES string for a [`crate::core::molecule::Molecule`], using
 /// atom index as the traversal ranking. Not canonical — the same molecule
 /// built in a different atom order can write a different (but equally
-/// valid) SMILES string.
+/// valid) SMILES string. See [`write_smiles_for_molecule_canonical`] for the
+/// version that is.
 pub fn write_smiles_for_molecule(mol: &Molecule) -> String {
     let rankings: Vec<usize> = (0..mol.num_atoms()).collect();
     write_smiles_for_mol(mol, &rankings)
 }
 
+/// An atom's structural fingerprint for canonical ranking (#220) — every
+/// field participates in `Ord`, so two atoms compare equal only when truly
+/// indistinguishable by these properties.
+///
+/// Deliberately not [`crate::core::atom::Atom::compute_hash`] or
+/// [`crate::fp::morgan::invariants::MorganAtomInvGenerator`]'s invariant:
+/// both fold their inputs into a single hash via wrapping multiplication,
+/// which risks collisions. A collision is harmless for a fingerprint's bit
+/// count (the accepted lossy tradeoff there) and wrong here — it would
+/// silently merge two atoms that are actually distinguishable, corrupting
+/// the traversal order rather than merely losing information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AtomInvariant {
+    degree: usize,
+    atomic_number: u8,
+    total_hydrogens: u8,
+    formal_charge: i8,
+    isotope: Option<u16>,
+    is_aromatic: bool,
+    in_ring: bool,
+}
+
+fn atom_invariant(mol: &Molecule, atom_idx: usize, in_ring: &[bool]) -> AtomInvariant {
+    let atom = mol.atom(atom_idx);
+    AtomInvariant {
+        degree: mol.degree(atom_idx),
+        atomic_number: atom.atomic_number(),
+        total_hydrogens: atom.total_hydrogens(),
+        formal_charge: atom.formal_charge(),
+        isotope: atom.isotope(),
+        is_aromatic: atom.is_aromatic(),
+        in_ring: in_ring[atom_idx],
+    }
+}
+
+fn ring_membership(mol: &Molecule) -> Vec<bool> {
+    let mut in_ring = vec![false; mol.num_atoms()];
+    for ring in find_sssr(mol) {
+        for &atom_idx in ring.atoms() {
+            in_ring[atom_idx] = true;
+        }
+    }
+    in_ring
+}
+
+/// Assigns each element of `keys` a dense rank (`0..`distinct count), by
+/// `Ord`. Two elements get the same rank exactly when they compare equal.
+fn dense_ranks<T: Ord + Clone>(keys: &[T]) -> Vec<usize> {
+    let mut sorted: Vec<T> = keys.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    keys.iter()
+        .map(|k| {
+            sorted
+                .binary_search(k)
+                .expect("key present in its own sorted, deduped source")
+        })
+        .collect()
+}
+
+fn num_classes(classes: &[usize]) -> usize {
+    classes.iter().max().map_or(0, |m| m + 1)
+}
+
+/// Refines `classes` by iterated neighbour comparison (colour refinement,
+/// a.k.a. 1-WL) until the number of distinct classes stops growing. That
+/// point is a fixed point: refinement is monotonic (a round can only split
+/// classes further, never merge two that already differ), so once a round
+/// fails to grow the count, no later round can either.
+fn refine(mol: &Molecule, mut classes: Vec<usize>) -> Vec<usize> {
+    loop {
+        let before = num_classes(&classes);
+        let keys: Vec<(usize, Vec<usize>)> = (0..classes.len())
+            .map(|i| {
+                let mut neighbour_classes: Vec<usize> = mol
+                    .neighbors(i)
+                    .iter()
+                    .map(|n| classes[n.atom_idx])
+                    .collect();
+                neighbour_classes.sort_unstable();
+                (classes[i], neighbour_classes)
+            })
+            .collect();
+        classes = dense_ranks(&keys);
+        if num_classes(&classes) == before {
+            return classes;
+        }
+    }
+}
+
+/// Splits `target` out of its current class into a new one strictly below
+/// it, leaving every other class's relative order unchanged.
+fn individualize(classes: &[usize], target: usize) -> Vec<usize> {
+    let keys: Vec<(usize, u8)> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, if i == target { 0 } else { 1 }))
+        .collect();
+    dense_ranks(&keys)
+}
+
+/// The lowest atom index still sharing a class with another atom, or `None`
+/// once every class is a singleton (a total order).
+fn find_tied_atom(classes: &[usize]) -> Option<usize> {
+    let mut sizes = vec![0usize; num_classes(classes)];
+    for &c in classes {
+        sizes[c] += 1;
+    }
+    (0..classes.len()).find(|&i| sizes[classes[i]] > 1)
+}
+
+/// Canonical atom ranking (#220): colour refinement from a lossless
+/// structural invariant, then individualise-and-refine through any
+/// remaining ties (genuine topological symmetry — e.g. benzene's six
+/// equivalent ring atoms) until every atom has a distinct rank.
+///
+/// "Canonical" means stable and unique for *this* algorithm: the same
+/// molecule, built with atoms in any order, always ranks the same way and
+/// so always writes the same SMILES. It does not mean the same ranking
+/// RDKit or OpenBabel would produce — canonicalisation algorithms differ by
+/// design across toolkits, which is exactly why InChI exists as the
+/// toolkit-independent answer (deferred past v1.0.0, see #173's Goal
+/// section).
+///
+/// When ties remain after colour refinement, which atom is individualised
+/// first is chosen by original atom index — an arbitrary but deterministic
+/// rule. This does not undermine stability across a relabelling: colour
+/// refinement can only put two atoms in the same class when they are
+/// structurally interchangeable, so the same molecule built with a
+/// different atom order still presents the same interchangeable classes,
+/// and individualising whichever member bears the lowest index this time
+/// yields the same written text either way — interchangeable atoms are, by
+/// definition, textually indistinguishable from one another. This is
+/// standard practice (Morgan's original 1965 algorithm has the same shape),
+/// with the standard caveat: colour refinement alone cannot distinguish
+/// every non-isomorphic graph in the adversarial case, though none of those
+/// cases arise in valence-bonded molecular graphs at any practical size.
+pub fn canonical_rankings(mol: &Molecule) -> Vec<usize> {
+    let n = mol.num_atoms();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let in_ring = ring_membership(mol);
+    let initial: Vec<AtomInvariant> = (0..n).map(|i| atom_invariant(mol, i, &in_ring)).collect();
+    let mut classes = refine(mol, dense_ranks(&initial));
+
+    while let Some(target) = find_tied_atom(&classes) {
+        classes = refine(mol, individualize(&classes, target));
+    }
+
+    classes
+}
+
+/// [`write_smiles_for_molecule`], with atoms visited in canonical order
+/// (#220) rather than insertion order — the same molecule, built with atoms
+/// in any order, always writes the same string. See [`canonical_rankings`]
+/// for what "canonical" does and does not promise.
+pub fn write_smiles_for_molecule_canonical(mol: &Molecule) -> String {
+    write_smiles_for_mol(mol, &canonical_rankings(mol))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::atom::Atom;
+    use crate::core::bond::Bond;
     use crate::io::smiles::parse_smiles;
+
+    /// A molecule written out, then read back, then written again -- through
+    /// SDF, which stores hydrogen counts implicitly.
+    ///
+    /// SMILES-to-SMILES cannot see #241: `parse_smiles` fills
+    /// `explicit_hydrogens` from the input's own brackets, so the writer's old
+    /// `explicit_hydrogens() > 0` test happened to be right for exactly the
+    /// atoms that arrived bracketed. Every other format stores the count
+    /// implicitly, which is where a bracket came out empty.
+    fn through_sdf(smiles: &str) -> String {
+        let mol = parse_smiles(smiles).expect("valid SMILES");
+        let sdf = crate::io::sdf::write_sdf(&mol);
+        let outcome = crate::io::reader::read_sdf(&sdf);
+        let back = &outcome.records.first().expect("one record").molecule;
+        write_smiles_for_molecule_canonical(back)
+    }
+
+    #[test]
+    fn test_an_aromatic_nitrogen_keeps_its_hydrogen() {
+        // The headline case. `c1ccnc1` is not merely a different spelling --
+        // it is an aromatic ring with no valid Kekule form, which RDKit
+        // refuses outright, so this was a file no other toolkit could read.
+        for smiles in ["c1cc[nH]c1", "c1cnc[nH]1"] {
+            let written = through_sdf(smiles);
+            assert!(
+                written.contains("[nH]"),
+                "{smiles} lost its aromatic N-H: {written}"
+            );
+            parse_smiles(&written).expect("what we write, we can read");
+        }
+    }
+
+    #[test]
+    fn test_a_bracketed_atom_states_its_whole_hydrogen_count() {
+        // Charge, isotope: the two that force brackets for their own reason
+        // and then have to print the count they actually hold.
+        assert_eq!(through_sdf("[NH4+]"), "[NH4+]");
+        assert_eq!(through_sdf("[13CH4]"), "[13CH4]");
+        assert_eq!(through_sdf("[OH-]"), "[OH-]");
+    }
+
+    #[test]
+    fn test_brackets_are_compared_against_the_implied_count_not_assumed() {
+        // `[CH2]` holds two where a bare carbon with one bond implies three,
+        // so it must stay bracketed; `[CH3]` holds exactly the implied three,
+        // so it may shed them. A predicate that always bracketed, or never
+        // did, would get one of these wrong.
+        let write = |s: &str| write_smiles_for_molecule_canonical(&parse_smiles(s).expect("valid"));
+        assert_eq!(
+            write("[CH2]C"),
+            "[CH2]C",
+            "differs from implied, keeps brackets"
+        );
+        assert_eq!(write("[CH3]C"), "CC", "matches implied, sheds them");
+    }
+
+    #[test]
+    fn test_an_element_outside_the_bare_subset_is_bracketed() {
+        // Written bare, `CSi` fails this crate's own parser: `S` matches
+        // sulfur and `i` is left over. The writer never consulted the element
+        // before #241.
+        for (z, symbol) in [(14u8, "[Si]"), (34, "[Se]"), (33, "[As]"), (11, "[Na]")] {
+            let mut mol = Molecule::new();
+            mol.add_atom(Atom::new(Element::new(z).expect("real element")));
+            mol.add_atom(Atom::new(Element::carbon()));
+            mol.add_bond(Bond::new(0, 1, BondOrder::Single))
+                .expect("valid bond");
+            mol.calculate_implicit_hydrogens();
+
+            let written = write_smiles_for_molecule_canonical(&mol);
+            assert!(written.contains(symbol), "z={z} wrote {written}");
+            parse_smiles(&written).expect("what we write, we can read");
+        }
+    }
+
+    #[test]
+    fn test_the_bare_forms_stay_bare() {
+        // The regression guard: every atom whose implied count already
+        // matches must not acquire brackets, or ordinary output turns into
+        // [CH3][CH2][OH].
+        for smiles in [
+            "CCO",
+            "c1ccccc1",
+            "c1ccncc1",
+            "c1ccoc1",
+            "Cc1ccccc1",
+            "CC(=O)O",
+        ] {
+            assert_eq!(through_sdf(smiles), smiles, "{smiles} should be unchanged");
+        }
+    }
 
     /// The configuration of the one double bond, after a full round trip.
     ///
@@ -763,6 +1057,104 @@ mod tests {
             });
             let written = write_smiles_for_molecule(&mol);
             assert_eq!(&written, smiles, "round-trip mismatch for {smiles}");
+        }
+    }
+
+    /// Rebuilds `mol` with atom `i` relabelled to `perm[i]` — a different
+    /// atom order describing the identical molecule when `perm` is any
+    /// permutation, or a genuine automorphism's image when `perm` happens
+    /// to map the graph onto itself.
+    fn permuted(mol: &Molecule, perm: &[usize]) -> Molecule {
+        let n = mol.num_atoms();
+        let mut relabelled: Vec<Option<crate::core::atom::Atom>> = vec![None; n];
+        for old in 0..n {
+            relabelled[perm[old]] = Some(mol.atom(old).clone());
+        }
+        let mut out = Molecule::new();
+        for atom in relabelled.into_iter() {
+            out.add_atom(atom.expect("perm is a bijection over 0..n"));
+        }
+        for bond in mol.bonds() {
+            out.add_bond(crate::core::bond::Bond::new(
+                perm[bond.atom1()],
+                perm[bond.atom2()],
+                bond.order(),
+            ))
+            .expect("permuted bond stays valid");
+        }
+        out
+    }
+
+    #[test]
+    fn test_canonical_output_does_not_depend_on_where_parsing_started() {
+        // Chlorobenzene has no nontrivial automorphism (the substituted ring
+        // atom is distinguishable from the other five), so this exercises
+        // colour refinement alone, with no individualisation needed: two
+        // spellings that assign the ring atoms in a genuinely different
+        // order must still canonicalise to the same string.
+        let from_the_chlorine_end = parse_smiles("Clc1ccccc1").expect("valid SMILES");
+        let from_the_ring_end = parse_smiles("c1ccc(Cl)cc1").expect("valid SMILES");
+        assert_eq!(
+            write_smiles_for_molecule_canonical(&from_the_chlorine_end),
+            write_smiles_for_molecule_canonical(&from_the_ring_end),
+        );
+    }
+
+    #[test]
+    fn test_canonical_output_is_stable_under_a_real_automorphism() {
+        // Malonic acid, HOOC-CH2-COOH: swapping its two -C(=O)OH branches
+        // wholesale, while fixing the central CH2, maps the molecule onto
+        // itself -- a genuine automorphism, not just a different spelling.
+        // Colour refinement alone cannot separate the two branches (they
+        // really are interchangeable); individualise-and-refine has to pick
+        // one arbitrarily and still land on the same text either way.
+        let mol = parse_smiles("OC(=O)CC(=O)O").expect("valid SMILES");
+        // atom0=OH(branch1) atom1=C(branch1) atom2==O(branch1) atom3=central
+        // CH2 atom4=C(branch2) atom5==O(branch2) atom6=OH(branch2) -- swap
+        // branch1 <-> branch2, fix the centre.
+        let swapped = permuted(&mol, &[6, 4, 5, 3, 1, 2, 0]);
+        assert_eq!(
+            write_smiles_for_molecule_canonical(&mol),
+            write_smiles_for_molecule_canonical(&swapped),
+        );
+    }
+
+    #[test]
+    fn test_canonical_writing_is_idempotent() {
+        for smiles in [
+            "Clc1ccccc1",
+            "OC(=O)CC(=O)O",
+            "CC(C)(CCCOc1cc(Cl)c(OCCCC(C)(C)C(=O)O)cc1Cl)C(=O)O",
+            "N[C@@H](C)C(=O)O",
+        ] {
+            let mol = parse_smiles(smiles).expect(smiles);
+            let once = write_smiles_for_molecule_canonical(&mol);
+            let twice = write_smiles_for_molecule_canonical(
+                &parse_smiles(&once).unwrap_or_else(|e| panic!("{once} will not parse: {e}")),
+            );
+            assert_eq!(
+                once, twice,
+                "{smiles} is not stable under recanonicalisation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_output_still_parses_back_to_an_equivalent_molecule() {
+        for smiles in [
+            "Oc1ccccc1",
+            "CC(C)(CCCOc1cc(Cl)c(OCCCC(C)(C)C(=O)O)cc1Cl)C(=O)O",
+            "OCCCCCNCc1c2ccccc2c(CNCCCCCO)c2ccccc12",
+            "F/C=C/F",
+            "N[C@@H](C)C(=O)O",
+            "[Na+].[Cl-]",
+        ] {
+            let mol = parse_smiles(smiles).expect(smiles);
+            let written = write_smiles_for_molecule_canonical(&mol);
+            let back = parse_smiles(&written)
+                .unwrap_or_else(|e| panic!("{smiles} wrote {written}, which will not parse: {e}"));
+            assert_eq!(back.num_atoms(), mol.num_atoms(), "{smiles} -> {written}");
+            assert_eq!(back.num_bonds(), mol.num_bonds(), "{smiles} -> {written}");
         }
     }
 }

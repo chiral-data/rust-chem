@@ -1,5 +1,7 @@
+use crate::core::geometry::is_placeholder_2d;
 use crate::core::prelude::*;
 use crate::io::errors::SdfError;
+use crate::io::options::{MolfileVersion, SdfWriteOptions};
 
 const SDF_ENTRY_END: &str = "$$$$";
 const SDF_STRUCTURE_END: &str = "M END";
@@ -48,12 +50,18 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
     // Parse atom block (starts at line 4)
     let mut coords: Vec<Point3> = Vec::with_capacity(num_atoms);
     let mut all_coords_parsed = true;
+    // The `vvv` column, kept until the bond block has been read: a stated
+    // valence only becomes a hydrogen count once the bonds it counts are
+    // known (#250).
+    let mut valences: Vec<Option<u8>> = Vec::with_capacity(num_atoms);
     for i in 0..num_atoms {
         let line_idx = SDF_ATOM_BLOCK_START + i;
         if line_idx >= lines.len() {
             return Err(SdfError::ParseError("Not enough atom lines".to_string()));
         }
-        match parse_atom_line(&mut mol, lines[line_idx])? {
+        let parsed = parse_atom_line(&mut mol, lines[line_idx])?;
+        valences.push(parsed.valence);
+        match parsed.point {
             Some(point) => coords.push(point),
             // An unparseable coordinate isn't fatal — the atom itself is
             // still valid, so the molecule parses as it always did, just
@@ -76,10 +84,17 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
         // storing a 3D record's x/y as a layout is the projection that
         // superimposes atoms differing only in depth — which is what this
         // parser did until now, silently.
+        //
+        // All-zero is a third case, and neither: a molfile has no way to say
+        // "no coordinates", so a molecule that has none is written as zeros.
+        // Reading those back as a layout is how a converted molecule came out
+        // with every atom stacked at the origin, undrawable (#270).
         if coords.iter().all(|point| point.z == 0.0) {
             let flat: Vec<Point2> = coords.iter().map(|point| point.to_2d()).collect();
-            mol.set_coords(flat)
-                .map_err(|e| SdfError::ParseError(e.to_string()))?;
+            if !is_placeholder_2d(&flat) {
+                mol.set_coords(flat)
+                    .map_err(|e| SdfError::ParseError(e.to_string()))?;
+            }
         } else {
             mol.set_coords3(coords)
                 .map_err(|e| SdfError::ParseError(e.to_string()))?;
@@ -107,6 +122,25 @@ pub fn parse_sdf(sdf: &str) -> Result<Molecule, SdfError> {
 
     // Parse optional properties block (follows bond block)
     parse_properties(&mut mol, &lines[prop_start..])?;
+
+    // A stated valence is the file saying how many bonds and hydrogens this
+    // atom has in total, so the hydrogens are what remains after the bonds.
+    // Done here rather than in `parse_atom_line` because the bond block comes
+    // after the atom block, and after `M  CHG` so a charge is already known.
+    //
+    // `set_hydrogens` marks the count as stated (#244), so the fill below then
+    // skips these atoms -- which is the whole point: without it `C[C]C` reads
+    // back as propane and `[13C]` as methane (#250).
+    for (index, stated) in valences.iter().enumerate() {
+        let Some(valence) = stated else { continue };
+        let bonds: f64 = mol
+            .neighbors(index)
+            .iter()
+            .map(|n| mol.bond(n.bond_idx).order().value())
+            .sum();
+        mol.atom_mut(index)
+            .set_hydrogens(valence.saturating_sub(bonds.round() as u8));
+    }
 
     // Calculate implicit hydrogens for each atom based on valence rules
     mol.calculate_implicit_hydrogens();
@@ -254,7 +288,16 @@ fn parse_counts_line(line: &str) -> Result<(usize, usize), SdfError> {
 ///     ^^^^^^    ^^^^^^    ^^^^^^ ^
 ///        x         y         z   element
 /// ```
-fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, SdfError> {
+/// What one atom line said, beyond the atom it added to the molecule.
+struct ParsedAtomLine {
+    /// The coordinate, or `None` when the columns did not parse as floats.
+    point: Option<Point3>,
+    /// The `vvv` valence column, when the file stated one. `None` for the `0`
+    /// that means "not specified", which is the overwhelming majority.
+    valence: Option<u8>,
+}
+
+fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<ParsedAtomLine, SdfError> {
     let fixed_width = (|| {
         let x = fixed_field(line, 0, 10)?;
         let y = fixed_field(line, 10, 10)?;
@@ -266,6 +309,7 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, Sdf
         fields.extend(line.get(30..).unwrap_or("").split_whitespace());
         Some(fields)
     })();
+    let was_fixed_width = fixed_width.is_some();
     let parts: Vec<&str> = fixed_width.unwrap_or_else(|| line.split_whitespace().collect());
 
     // Real-world SDF files typically have at least 4 fields: x, y, z, symbol
@@ -321,7 +365,23 @@ fn parse_atom_line(mol: &mut Molecule, line: &str) -> Result<Option<Point3>, Sdf
         _ => None,
     };
 
-    Ok(point)
+    // `vvv`, the valence, at 0-based columns 48-50 -- the sixth field after
+    // the symbol, `dd ccc sss hhh bbb` preceding it. Read from fixed columns
+    // when the line was fixed-width, because two full-width `%3d` fields side
+    // by side merge under `split_whitespace` and that is exactly what #202
+    // cost. On the lenient path there are no columns to trust, so index the
+    // split instead: the symbol is `parts[3]`, so `vvv` is `parts[9]`.
+    let valence = if was_fixed_width {
+        fixed_field(line, 48, 3)
+    } else {
+        parts.get(9).copied()
+    }
+    .and_then(|field| field.parse::<u8>().ok())
+    // `0` is "not specified", not a valence of zero -- that is what 15 means.
+    .filter(|valence| *valence != 0)
+    .map(|valence| if valence == 15 { 0 } else { valence });
+
+    Ok(ParsedAtomLine { point, valence })
 }
 
 /// Parses a single bond line from the SDF bond block.
@@ -490,6 +550,12 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
 /// written with zeros, and [`molecule_has_coords_for_sdf`] lets a caller check
 /// first rather than discovering it in the file.
 pub fn write_sdf(mol: &Molecule) -> String {
+    write_sdf_with_options(mol, &SdfWriteOptions::default())
+}
+
+/// [`write_sdf`], with explicit per-format options (#212) — currently just
+/// which molfile dialect to write.
+pub fn write_sdf_with_options(mol: &Molecule, options: &SdfWriteOptions) -> String {
     // A molecule that states double-bond geometry but carries no drawing is
     // laid out first, because geometry is the *only* channel V2000 has for it:
     // there is no field to write, so a record with no coordinates cannot
@@ -533,10 +599,13 @@ pub fn write_sdf(mol: &Molecule) -> String {
     // Line 2 is a free-text comment; blank is more honest than inventing one.
     out.push('\n');
 
-    // Line 3: counts. The trailing fields are the spec's defaults —
-    // `0999 V2000` is the version marker every V2000 file carries.
+    // Line 3: counts. The trailing fields are the spec's defaults, followed
+    // by the version marker (#212) — only V2000 is implemented today.
+    let version_marker = match options.version {
+        MolfileVersion::V2000 => "0999 V2000",
+    };
     out.push_str(&format!(
-        "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000\n",
+        "{:>3}{:>3}  0  0  0  0  0  0  0  {version_marker}\n",
         mol.num_atoms(),
         mol.num_bonds()
     ));
@@ -557,13 +626,16 @@ pub fn write_sdf(mol: &Molecule) -> String {
             .get(mol.atom(index).atomic_number() as usize)
             .copied()
             .unwrap_or("*");
-        // Columns after the symbol are `dd ccc sss ...`: mass difference,
-        // old-style charge, atom stereo parity. `dd` and `ccc` stay zero — the
+        // Columns after the symbol are `dd ccc sss hhh bbb vvv ...`: mass
+        // difference, old-style charge, atom stereo parity, query hydrogen
+        // count, stereo care box, valence. `dd` and `ccc` stay zero — the
         // `M  CHG` and `M  ISO` lines above supersede them, and a reader seeing
-        // both forms is entitled to believe either.
+        // both forms is entitled to believe either. `hhh` is a substructure
+        // query feature with nothing to say about a concrete atom.
         let parity = atom_parity(mol, index);
+        let valence = atom_valence_field(mol, index);
         out.push_str(&format!(
-            "{x:>10.4}{y:>10.4}{z:>10.4} {symbol:<3} 0  0{parity:>3}  0  0  0  0  0  0  0  0  0\n"
+            "{x:>10.4}{y:>10.4}{z:>10.4} {symbol:<3} 0  0{parity:>3}  0  0{valence:>3}  0  0  0  0  0  0\n"
         ));
     }
 
@@ -734,9 +806,17 @@ fn data_block(mol: &Molecule) -> String {
 
 /// Writes several molecules as one SDF file.
 pub fn write_sdf_all<'a>(molecules: impl IntoIterator<Item = &'a Molecule>) -> String {
+    write_sdf_all_with_options(molecules, &SdfWriteOptions::default())
+}
+
+/// [`write_sdf_all`], with explicit per-format options (#212).
+pub fn write_sdf_all_with_options<'a>(
+    molecules: impl IntoIterator<Item = &'a Molecule>,
+    options: &SdfWriteOptions,
+) -> String {
     let mut out = String::new();
     for mol in molecules {
-        out.push_str(&write_sdf(mol));
+        out.push_str(&write_sdf_with_options(mol, options));
     }
     out
 }
@@ -762,6 +842,37 @@ pub fn molecule_has_coords_for_sdf(mol: &Molecule) -> bool {
 /// the specification: both alanine enantiomers must keep their distinct `/m0`
 /// and `/m1` InChI layers through an SDF trip, and a centre carrying a
 /// ring-closure digit must survive too.
+/// The `vvv` valence column, at 0-based columns 48-50 of the atom line.
+///
+/// `0` means "not specified", so a reader applies its own default valence and
+/// tops the atom up with hydrogens. That is right for almost every atom and
+/// wrong for the ones that carry fewer bonds and hydrogens than their valence
+/// allows: without this column `C[C]C` reads back as propane and `[13C]` as
+/// methane, in RDKit and OpenBabel alike (#250).
+///
+/// Marked exactly when [`Molecule::radical_electrons`] is non-zero, which is
+/// the same question "does this differ from the charge-adjusted default?"
+/// asked once rather than twice (#247) — and it reproduces RDKit's own
+/// choices, including leaving hypervalent sulfur unmarked and leaving
+/// `[NH4+]` unmarked because its charge already tells the reader.
+///
+/// It also inherits that function's guard: an atom whose hydrogen count was
+/// never stated reports no radicals, so PDB and mmCIF structures gain no
+/// valence claims. Asserting one there would be worse than saying nothing.
+fn atom_valence_field(mol: &Molecule, index: usize) -> u8 {
+    if mol.radical_electrons(index) == 0 {
+        return 0;
+    }
+    let bonds: f64 = mol
+        .neighbors(index)
+        .iter()
+        .map(|n| mol.bond(n.bond_idx).order().value())
+        .sum();
+    let valence = bonds.round() as u8 + mol.atom(index).total_hydrogens();
+    // 0 is "not specified", so a genuine zero valence has its own code.
+    if valence == 0 { 15 } else { valence }
+}
+
 fn atom_parity(mol: &Molecule, atom_idx: usize) -> u8 {
     let base = match mol.atom(atom_idx).chirality() {
         Chirality::Clockwise => 1,
@@ -1189,6 +1300,93 @@ mod tests {
         assert_eq!(back.name(), Some("ethanol"));
     }
 
+    /// The `vvv` column of every atom line, in file order.
+    fn valence_columns(sdf: &str) -> Vec<u8> {
+        sdf.lines()
+            .filter(|l| l.len() > 50 && l.as_bytes()[30] == b' ' && l[31..34].trim().len() <= 2)
+            .filter(|l| l[..10].trim().parse::<f64>().is_ok())
+            .map(|l| l[48..51].trim().parse::<u8>().unwrap_or(0))
+            .collect()
+    }
+
+    #[test]
+    fn test_an_under_valent_atom_states_its_valence() {
+        // Without this column a molfile says nothing about an atom carrying
+        // fewer bonds and hydrogens than its valence allows, so a reader tops
+        // it up: `C[C]C` comes back propane and `[13C]` methane, in RDKit and
+        // OpenBabel alike (#250). 15 is the code for a genuine zero valence,
+        // since 0 already means "not specified".
+        let carbene = write_sdf(&parse_smiles("C[C]C").expect("valid SMILES"));
+        assert_eq!(valence_columns(&carbene), vec![0, 2, 0], "{carbene}");
+
+        let bare = write_sdf(&parse_smiles("[13C]").expect("valid SMILES"));
+        assert_eq!(valence_columns(&bare), vec![15], "{bare}");
+
+        let methyl = write_sdf(&parse_smiles("[CH3]").expect("valid SMILES"));
+        assert_eq!(valence_columns(&methyl), vec![3], "{methyl}");
+    }
+
+    #[test]
+    fn test_an_ordinary_atom_states_nothing() {
+        // The controls. `[NH4+]` and `CC(=O)[O-]` are the ones that would fail
+        // if the rule compared against an uncharged default: their charge
+        // already tells a reader what valence to expect, and RDKit leaves them
+        // unmarked too.
+        for smiles in ["CCO", "c1ccccc1", "[NH4+]", "CC(=O)[O-]", "S(=O)(=O)(O)O"] {
+            let text = write_sdf(&parse_smiles(smiles).expect("valid SMILES"));
+            let columns = valence_columns(&text);
+            assert!(
+                columns.iter().all(|v| *v == 0),
+                "{smiles} marked a valence: {columns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_structure_with_unstated_hydrogens_states_no_valence() {
+        // mmCIF and PDB leave hydrogens unstated, so their deficiency is
+        // unknown rather than zero. Asserting a valence there would be worse
+        // than saying nothing -- every backbone atom would claim to be a
+        // radical. This is #247's guard doing its work one layer down.
+        let cif = include_str!("../../tests/corpus/mmcif/dipeptide-with-ligand.cif");
+        let outcome = crate::io::reader::read_mmcif(cif);
+        let mol = &outcome.records.first().expect("one record").molecule;
+        let text = write_sdf(mol);
+        let columns = valence_columns(&text);
+        assert!(!columns.is_empty(), "the fixture should have atoms");
+        assert!(columns.iter().all(|v| *v == 0), "{columns:?}");
+    }
+
+    #[test]
+    fn test_a_stated_valence_is_read_back() {
+        // The other direction: a spec-correct molfile from another toolkit
+        // lost this on the way in too.
+        for smiles in ["C[C]C", "[13C]", "[CH3]"] {
+            let mol = parse_smiles(smiles).expect("valid SMILES");
+            let before: Vec<u8> = mol.atoms().iter().map(|a| a.total_hydrogens()).collect();
+
+            let back = parse_sdf(&write_sdf(&mol)).expect("our own output parses");
+            let after: Vec<u8> = back.atoms().iter().map(|a| a.total_hydrogens()).collect();
+
+            assert_eq!(before, after, "{smiles}");
+        }
+    }
+
+    #[test]
+    fn test_a_zero_valence_column_still_fills_by_valence() {
+        // 0 means "not specified", so the fill has to keep applying -- every
+        // ordinary molfile in the world relies on it.
+        let mol =
+            parse_sdf(&write_sdf(&parse_smiles("CCO").expect("valid SMILES"))).expect("parses");
+        assert_eq!(
+            mol.atoms()
+                .iter()
+                .map(|a| a.total_hydrogens())
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+
     #[test]
     fn test_a_molecule_with_no_layout_writes_zeros_and_says_so() {
         // Not an error: a caller may legitimately want connectivity only. But
@@ -1457,6 +1655,23 @@ $$$$";
     }
 
     #[test]
+    fn test_write_sdf_defaults_to_v2000_and_matches_explicit_options() {
+        // #212: write_sdf is a convenience over write_sdf_with_options with
+        // default options -- the two must agree, and the only implemented
+        // dialect is V2000.
+        let mol = laid_out("CCO");
+        let default = write_sdf(&mol);
+        let explicit = write_sdf_with_options(
+            &mol,
+            &SdfWriteOptions {
+                version: MolfileVersion::V2000,
+            },
+        );
+        assert_eq!(default, explicit);
+        assert!(default.lines().nth(3).unwrap().ends_with("999 V2000"));
+    }
+
+    #[test]
     fn test_writer_declares_the_dimensional_code() {
         // Columns 21-22 of the program line. A reader that trusts the header
         // instead of sniffing z gets the right answer only if we write it.
@@ -1512,5 +1727,31 @@ $$$$";
         assert_eq!(mol.num_atoms(), 2);
         assert_eq!(mol.num_bonds(), 1);
         assert!(!mol.has_coords());
+    }
+
+    #[test]
+    fn test_all_zero_coordinates_are_not_read_as_a_layout() {
+        // A molfile has no way to say "no coordinates", so a molecule that has
+        // none is written as zeros. Reading those back as a layout left every
+        // atom stacked at the origin, and the depiction collapsed to one point
+        // (#270).
+        let text = "\
+ethanol
+     RDKit          2D
+
+  3  2  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0
+    0.0000    0.0000    0.0000 C   0  0
+    0.0000    0.0000    0.0000 O   0  0
+  1  2  1  0
+  2  3  1  0
+M  END
+";
+        let mol = parse_sdf(text).expect("valid molfile");
+        assert_eq!(mol.num_atoms(), 3);
+        assert!(!mol.has_coords(), "all-zero is a placeholder, not a layout");
+        assert!(!mol.has_coords3());
+        // The topology is real and must survive.
+        assert_eq!(mol.num_bonds(), 2);
     }
 }

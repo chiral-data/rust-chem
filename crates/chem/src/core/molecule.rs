@@ -6,6 +6,7 @@ use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
+use crate::core::stereo_group::StereoGroup;
 
 use std::{collections::HashMap, fmt};
 
@@ -51,6 +52,10 @@ pub enum MoleculeError {
     /// has several unrelated ways to be wrong and the message names which.
     #[error("Invalid unit cell: {0}")]
     InvalidCell(String),
+
+    /// Stringly-typed for the same reason as [`Self::InvalidTopology`].
+    #[error("Invalid stereo groups: {0}")]
+    InvalidStereoGroups(String),
 }
 
 /// Represents a complete molecule with atoms, bonds, and connectivity.
@@ -123,6 +128,14 @@ pub struct Molecule {
     /// The space group, as the source stated it. Survives `add_atom` for the
     /// same reason the cell does.
     space_group: Option<SpaceGroup>,
+    /// Enhanced stereochemistry groups (CXSMILES `&n:`/`on:`/`a:`), in file
+    /// order. Empty for every molecule that carries no such assertion, which
+    /// is most of them.
+    ///
+    /// A plain `Vec`, same reasoning as `chains`: not indexed in parallel
+    /// with `atoms`, so there is no natural absent value to distinguish from
+    /// empty.
+    stereo_groups: Vec<StereoGroup>,
 }
 
 impl Molecule {
@@ -140,6 +153,7 @@ impl Molecule {
             residues: Vec::new(),
             cell: None,
             space_group: None,
+            stereo_groups: Vec::new(),
         }
     }
 
@@ -157,6 +171,7 @@ impl Molecule {
             residues: Vec::new(),
             cell: None,
             space_group: None,
+            stereo_groups: Vec::new(),
         }
     }
 
@@ -195,8 +210,13 @@ impl Molecule {
 
         // The cell and space group deliberately do NOT go. They index nothing
         // and reference no atom, so adding one leaves them exactly as true as
-        // they were. This is the one exception to the rule above, and it is
-        // easier to find here than in a field comment.
+        // they were.
+        //
+        // Stereo groups also survive, for a different reason: unlike chains
+        // and residues, they carry no completeness invariant (a group is
+        // just "these atoms", not a range required to cover every atom), so
+        // an existing group's meaning is untouched by a new atom that was
+        // never a member of it.
 
         let mut new_graph = MoleculeGraph::new(self.atoms.len());
         for (bond_idx, bond) in self.bonds.iter().enumerate() {
@@ -529,6 +549,43 @@ impl Molecule {
         self.residues.clear();
     }
 
+    /// This molecule's enhanced stereochemistry groups, in file order. Empty
+    /// if it asserts none.
+    pub fn stereo_groups(&self) -> &[StereoGroup] {
+        &self.stereo_groups
+    }
+
+    /// Sets this molecule's enhanced stereochemistry groups.
+    ///
+    /// Each group's atom indices are validated against the atom count, the
+    /// same reasoning as [`Self::set_topology`]: an out-of-range index would
+    /// otherwise silently claim a stereo relationship for the wrong atom, or
+    /// panic later at whatever unlucky point first indexes with it.
+    ///
+    /// # Errors
+    /// [`MoleculeError::InvalidStereoGroups`], naming the offending group and
+    /// index, if any atom index is out of bounds.
+    pub fn set_stereo_groups(&mut self, groups: Vec<StereoGroup>) -> Result<(), MoleculeError> {
+        for (ix, group) in groups.iter().enumerate() {
+            for &atom_idx in &group.atoms {
+                if atom_idx >= self.atoms.len() {
+                    return Err(MoleculeError::InvalidStereoGroups(format!(
+                        "group {ix} names atom {atom_idx} but the molecule has {}",
+                        self.atoms.len()
+                    )));
+                }
+            }
+        }
+        self.stereo_groups = groups;
+        Ok(())
+    }
+
+    /// Discards enhanced stereochemistry groups, leaving `Chirality` markers
+    /// on the atoms themselves alone.
+    pub fn clear_stereo_groups(&mut self) {
+        self.stereo_groups.clear();
+    }
+
     /// This molecule's unit cell, if it is a periodic structure.
     ///
     /// Returned by value — [`UnitCell`] is six `f64`s and `Copy`.
@@ -612,35 +669,136 @@ impl Molecule {
         &self.properties
     }
 
+    /// How many hydrogens the organic-subset shorthand implies for this atom:
+    /// the valence its element supports at this charge, less the bond orders
+    /// already accounted for.
+    ///
+    /// Shared between the two sides of a round trip on purpose. The reader
+    /// uses it to fill in what a bare `C` left unsaid
+    /// ([`Self::calculate_implicit_hydrogens`]), and
+    /// [`crate::io::smiles_writer`] uses it to decide whether an atom can be
+    /// written bare at all -- an atom holding some other number needs bracket
+    /// notation to say so (#241). Two functions answering that question
+    /// separately would let the writer emit a bare atom the reader fills
+    /// differently, which is a silently wrong molecule rather than a
+    /// formatting difference.
+    ///
+    /// Aromatic bonds count 1.5 apiece and the sum is rounded, so a pyrrole
+    /// nitrogen's two aromatic bonds come to 3 and imply no hydrogen -- which
+    /// is why its real hydrogen has to be written as `[nH]`.
+    ///
+    /// Zero for an element with no typical valence, and for an atom whose
+    /// bonds already meet or exceed it.
+    pub fn implied_hydrogens(&self, atom_idx: usize) -> u8 {
+        let atom = &self.atoms[atom_idx];
+
+        // How a charge moves the valence is not uniform across the periodic
+        // table, so the rule lives on `Element` and is shared with
+        // `io::aromaticity::kekulize` rather than re-derived here (#240).
+        let adjusted_valence = atom.element().valence_for_charge(atom.formal_charge());
+        if adjusted_valence == 0 {
+            return 0;
+        }
+
+        let mut explicit_valence = 0.0_f64;
+        for neighbor in self.graph.neighbors(atom_idx) {
+            let bond = &self.bonds[neighbor.bond_idx];
+            explicit_valence += bond.order().value();
+        }
+        adjusted_valence.saturating_sub(explicit_valence.round() as u8)
+    }
+
+    /// Unpaired electrons on this atom: what its valence leaves room for,
+    /// less the hydrogens it actually carries.
+    ///
+    /// Derived rather than stored, because for anything this crate can assert
+    /// a valence for the answer is determined -- `[S]` has two, nitric oxide's
+    /// nitrogen one, a carbene carbon two. Storing it would re-open the
+    /// question #240, #241 and #244 spent three stories closing: which of two
+    /// places holds the truth.
+    ///
+    /// Two things it therefore cannot say, both deliberate:
+    ///
+    /// - Nothing for an element outside the eleven
+    ///   [`crate::core::atom::Element::typical_valence`] covers. RDKit gives
+    ///   `[Na]` one and `[Se]` two; this returns 0, the same declining-to-guess
+    ///   that makes [`Self::calculate_implicit_hydrogens`] skip them.
+    /// - Nothing for a count that contradicts the valence. commonchem permits
+    ///   `impHs: 4` alongside `nRad: 2`, but that is an over-full carbon rather
+    ///   than chemistry, and RDKit's own writer never emits one.
+    ///
+    /// The subtraction floors, which is what makes hypervalent sulfur and an
+    /// aromatic `[nH]` come out at zero rather than wrapping (#247).
+    ///
+    /// **Zero whenever the hydrogen count was never stated.** A deficiency is
+    /// only evidence of unpaired electrons if the hydrogens are known; an atom
+    /// that said nothing may simply have hydrogens nobody wrote down. This is
+    /// [`crate::core::atom::Atom::hydrogens`]'s `None` doing the same work it
+    /// does in [`Self::calculate_implicit_hydrogens`], and without it every
+    /// atom of every structure whose format leaves hydrogens unstated would be
+    /// reported as a multi-radical.
+    ///
+    /// Which atoms those are narrowed in #285: PDB now implies a count for the
+    /// atoms `CONECT` describes, and they report zero here because the implied
+    /// and stated counts agree by construction. It is the atoms a structure
+    /// file says nothing about -- everything in an XYZ, mmCIF or GRO, and
+    /// whatever `CONECT` left out -- that this paragraph is still protecting.
+    pub fn radical_electrons(&self, atom_idx: usize) -> u8 {
+        let atom = &self.atoms[atom_idx];
+        if atom.hydrogens().is_none() {
+            return 0;
+        }
+        self.implied_hydrogens(atom_idx)
+            .saturating_sub(atom.total_hydrogens())
+    }
+
     pub fn calculate_implicit_hydrogens(&mut self) {
         for atom_idx in 0..self.atoms.len() {
-            let atom = &self.atoms[atom_idx];
-
-            // Skip if explicit H count is already set
-            if atom.explicit_hydrogens() > 0 {
+            // The source already said how many -- including when it said
+            // none. `Some(0)` and `None` are different answers and only the
+            // second is an invitation to fill: `[C]` states no hydrogens
+            // while a bare `C` states nothing, and before #244 both arrived
+            // here as a plain 0 and left as methane.
+            if self.atoms[atom_idx].hydrogens().is_some() {
                 continue;
             }
 
-            let element = atom.element();
-            let typical_valence = element.typical_valence();
+            let implied = self.implied_hydrogens(atom_idx);
+            self.atoms[atom_idx].set_hydrogens(implied);
+        }
+    }
 
-            if typical_valence == 0 {
+    /// Fills the count for atoms whose bonds can imply one, leaving a bondless
+    /// atom alone.
+    ///
+    /// What separates this from [`Self::calculate_implicit_hydrogens`] is what
+    /// a bondless atom *means*. In SMILES a bare `C` is bondless and a
+    /// complete statement -- methane -- so filling its four hydrogens is
+    /// right. In a structure file an atom with no bond means the connectivity
+    /// was never stated, and [`Self::implied_hydrogens`] would hand it the
+    /// free-atom valence: a protein backbone carbon reads as methane, and `[C]`
+    /// through Mol2 came back as `C` (#291).
+    ///
+    /// So a bondless atom keeps `None` and stays visibly unknown. Callers that
+    /// want the SMILES rule want the other function; this one is for the
+    /// readers of formats where connectivity is stated separately from the
+    /// atoms, and where its absence is silence rather than an assertion.
+    ///
+    /// Like its sibling it never overwrites a stated count (#244), so a format
+    /// that names one keeps it, and an explicit hydrogen *atom* -- a real graph
+    /// node, as PDB and Mol2 both allow -- is counted through the bond it
+    /// forms rather than twice.
+    pub fn calculate_implicit_hydrogens_where_bonded(&mut self) {
+        for atom_idx in 0..self.atoms.len() {
+            if self.atoms[atom_idx].hydrogens().is_some() {
+                continue;
+            }
+            if self.graph.neighbors(atom_idx).is_empty() {
                 continue;
             }
 
-            let mut explicit_valence = 0.0_f64;
-            for neighbor in self.graph.neighbors(atom_idx) {
-                let bond = &self.bonds[neighbor.bond_idx];
-                explicit_valence += bond.order().value();
-            }
-
-            let charge = atom.formal_charge();
-            let adjusted_valence = (typical_valence as i16 - charge as i16) as u8;
-
-            if (explicit_valence.round() as u8) < adjusted_valence {
-                let implicit_h = adjusted_valence - explicit_valence.round() as u8;
-                self.atoms[atom_idx].set_implicit_hydrogens(implicit_h);
-            }
+            let implied = self.implied_hydrogens(atom_idx);
+            self.atoms[atom_idx].set_hydrogens(implied);
         }
     }
 
@@ -784,7 +942,7 @@ mod tests {
     fn test_formula() {
         let mut mol = Molecule::new();
         mol.add_atom(Atom::new(Element::carbon()));
-        mol.atoms_mut()[0].set_implicit_hydrogens(4);
+        mol.atoms_mut()[0].set_hydrogens(4);
         assert_eq!(mol.formula(), "CH4");
     }
 
@@ -792,9 +950,241 @@ mod tests {
     fn test_molecular_weight() {
         let mut mol = Molecule::new();
         mol.add_atom(Atom::new(Element::oxygen()));
-        mol.atoms_mut()[0].set_implicit_hydrogens(2);
+        mol.atoms_mut()[0].set_hydrogens(2);
         let weight = mol.molecular_weight();
         assert!((weight - 18.016).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_radical_electrons_matches_the_oracle() {
+        // Verified against RDKit 2025.3.3 for every element `typical_valence`
+        // covers. The rows that look like they should break the derivation
+        // are the point of the test: hypervalent sulfur and the aromatic
+        // nitrogen come out at zero because the subtraction floors, and the
+        // carbanion because `valence_for_charge` already folds the charge in,
+        // so a lone pair never reads as two unpaired electrons.
+        let radicals = |smiles: &str| {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            (0..mol.num_atoms())
+                .map(|i| mol.radical_electrons(i))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(radicals("[S]"), vec![2], "a bare sulfur atom");
+        assert_eq!(radicals("[N]=O"), vec![1, 0], "nitric oxide");
+        assert_eq!(radicals("[O][O]"), vec![1, 1], "two oxygen radicals");
+        assert_eq!(radicals("O=O"), vec![0, 0], "dioxygen as written");
+        assert_eq!(
+            radicals("S(=O)(=O)(O)O"),
+            vec![0; 5],
+            "hypervalent sulfur floors"
+        );
+        assert_eq!(radicals("[CH3-]"), vec![0], "a carbanion has a lone pair");
+        assert_eq!(radicals("C[C]C"), vec![0, 2, 0], "dimethylcarbene");
+        assert_eq!(radicals("[13C]"), vec![4], "a bare carbon atom");
+        assert_eq!(
+            radicals("[nH]1cccc1"),
+            vec![0; 5],
+            "aromatic nitrogen floors"
+        );
+    }
+
+    #[test]
+    fn test_ordinary_molecules_carry_no_radicals() {
+        // The control: a derivation that leaked would put unpaired electrons
+        // on everything, and these are the molecules that would notice.
+        for smiles in [
+            "C",
+            "CCO",
+            "c1ccccc1",
+            "N[C@@H](C)C(=O)O",
+            "CC(=O)[O-]",
+            "[NH4+]",
+        ] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            let total: u32 = (0..mol.num_atoms())
+                .map(|i| u32::from(mol.radical_electrons(i)))
+                .sum();
+            assert_eq!(total, 0, "{smiles}");
+        }
+    }
+
+    #[test]
+    fn test_an_unstated_hydrogen_count_reports_no_radicals() {
+        // A deficiency only means unpaired electrons when the hydrogens are
+        // known. PDB and mmCIF deliberately leave them unstated, and without
+        // this guard every atom of every structure file reads as a
+        // multi-radical -- a protein backbone nitrogen as a 3-radical. Caught
+        // by `test_atoms_are_written_relative_to_the_defaults`, which builds
+        // exactly this shape by hand.
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single))
+            .expect("valid bond");
+
+        assert_eq!(mol.atom(0).hydrogens(), None, "nothing was said");
+        assert_eq!(mol.implied_hydrogens(0), 3, "there is room for three");
+        assert_eq!(mol.radical_electrons(0), 0, "but silence is not evidence");
+
+        // Say it, and the same atom is a radical.
+        mol.atom_mut(0).set_hydrogens(0);
+        assert_eq!(mol.radical_electrons(0), 3);
+    }
+
+    #[test]
+    fn test_an_element_with_no_valence_reports_no_radicals() {
+        // Stated rather than discovered: RDKit gives `[Na]` one unpaired
+        // electron and `[Se]` two, but this crate asserts no valence for
+        // either, so it declines to assert a radical count too.
+        for smiles in ["[Na+].[Cl-]", "[Mg+2]"] {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            assert_eq!(mol.radical_electrons(0), 0, "{smiles}");
+        }
+    }
+
+    #[test]
+    fn test_implied_hydrogens_across_the_aromatic_cases() {
+        // The count the organic-subset shorthand implies, which is what the
+        // SMILES writer compares an atom against to decide brackets (#241).
+        // Aromatic bonds contribute 1.5 apiece and the sum is rounded, so
+        // these rows are the ones worth pinning independently of the writer.
+        let implied = |smiles: &str, atom_idx: usize| {
+            crate::io::smiles::parse_smiles(smiles)
+                .expect("valid SMILES")
+                .implied_hydrogens(atom_idx)
+        };
+
+        assert_eq!(implied("c1ccccc1", 0), 1, "benzene C: two aromatic bonds");
+        assert_eq!(
+            implied("c1ccncc1", 3),
+            0,
+            "pyridine N: saturated by its ring"
+        );
+        // The one that matters: a pyrrole nitrogen's ring bonds already meet
+        // its valence, so the hydrogen it really has is not implied -- which
+        // is why it has to be written as `[nH]`.
+        assert_eq!(implied("c1cc[nH]c1", 3), 0, "pyrrole N implies none");
+        assert_eq!(implied("Cc1ccccc1", 1), 0, "toluene's substituted ring C");
+        assert_eq!(implied("CC", 0), 3, "a carbon with one single bond");
+        assert_eq!(implied("CCO", 2), 1, "hydroxyl O");
+    }
+
+    #[test]
+    fn test_implied_hydrogens_is_zero_where_there_is_no_valence_left() {
+        let implied = |smiles: &str, atom_idx: usize| {
+            crate::io::smiles::parse_smiles(smiles)
+                .expect("valid SMILES")
+                .implied_hydrogens(atom_idx)
+        };
+        // No typical valence at all, and an anion whose charge spends it.
+        assert_eq!(implied("[Na+].[Cl-]", 0), 0, "sodium");
+        assert_eq!(implied("[Na+].[Cl-]", 1), 0, "chloride");
+        assert_eq!(implied("CC(=O)[O-]", 3), 0, "carboxylate O");
+        // Saturated past its valence rather than short of it.
+        assert_eq!(implied("C[N+](C)(C)C", 1), 0, "quaternary N");
+    }
+
+    /// #240: how many hydrogens does the charged atom end up carrying?
+    ///
+    /// Parsed rather than hand-built, because `calculate_implicit_hydrogens`
+    /// is what `parse_smiles` calls and the guard it opens with -- skip an
+    /// atom whose hydrogens were spelled out -- is half the behaviour under
+    /// test.
+    fn implicit_h_on(smiles: &str, atom_idx: usize) -> u8 {
+        let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+        mol.atom(atom_idx).total_hydrogens()
+    }
+
+    #[test]
+    fn test_an_anion_does_not_gain_hydrogens() {
+        // Every one of these carried two spurious hydrogens before #240: the
+        // valence was computed as `typical - charge`, so an oxygen with one
+        // bond was given a target valence of three.
+        assert_eq!(implicit_h_on("CC(=O)[O-]", 3), 0, "acetate's O-");
+        assert_eq!(implicit_h_on("C[S-]", 1), 0, "thiolate");
+        assert_eq!(implicit_h_on("FC(F)(F)[O-]", 4), 0, "trifluoromethoxide");
+        assert_eq!(
+            implicit_h_on("C[C-](C)C", 1),
+            0,
+            "a carbanion, with three bonds"
+        );
+        assert_eq!(
+            implicit_h_on("[H-]", 0),
+            0,
+            "a hydride is not a hydrogen molecule"
+        );
+        assert_eq!(implicit_h_on("[Cl-]", 0), 0, "an unbonded chloride");
+    }
+
+    #[test]
+    fn test_the_cases_that_were_already_right_stay_right() {
+        // Boron is the trap: it is electron-deficient, so the *original*
+        // subtraction was correct for it and a plain sign flip would have
+        // broken it. The rest short-circuit on a spelled-out hydrogen count
+        // or on a saturated valence, which is why the defect went unnoticed.
+        assert_eq!(
+            implicit_h_on("[B-](F)(F)(F)F", 0),
+            0,
+            "borohydride-shaped anion"
+        );
+        assert_eq!(
+            implicit_h_on("[NH4+]", 0),
+            4,
+            "ammonium spells its hydrogens"
+        );
+        assert_eq!(
+            implicit_h_on("[OH-]", 0),
+            1,
+            "hydroxide spells its hydrogen"
+        );
+        assert_eq!(implicit_h_on("C[N+](C)(C)C", 1), 0, "already saturated");
+    }
+
+    #[test]
+    fn test_a_cation_gains_hydrogens_where_it_should() {
+        // The other direction, which the reported defect did not cover:
+        // nitrogen and oxygen gain valence with positive charge.
+        assert_eq!(
+            implicit_h_on("C[NH+](C)C", 1),
+            1,
+            "a protonated tertiary amine"
+        );
+        assert_eq!(implicit_h_on("[NH4+]", 0), 4);
+    }
+
+    #[test]
+    fn test_neutral_molecules_are_untouched() {
+        assert_eq!(implicit_h_on("C", 0), 4);
+        assert_eq!(implicit_h_on("CCO", 0), 3);
+        assert_eq!(implicit_h_on("CCO", 1), 2);
+        assert_eq!(implicit_h_on("CCO", 2), 1);
+        assert_eq!(implicit_h_on("c1ccccc1", 0), 1);
+    }
+
+    #[test]
+    fn test_formula_and_weight_of_common_anions() {
+        // The user-visible half of #240. Acetate read `C2H5O2` at 61.060
+        // before the fix, against a real 59.04 -- and carboxylates,
+        // phosphates, sulfonates and nitro groups are most drug-like ligands
+        // at physiological pH.
+        let cases: &[(&str, &str, f64)] = &[
+            ("CC(=O)[O-]", "C2H3O2", 59.04),
+            ("C[N+](=O)[O-]", "CH3NO2", 61.04),
+            // HPO4(2-), not H2PO4(-): 1.008 + 30.974 + 4 x 15.999.
+            ("OP(=O)([O-])[O-]", "HO4P", 95.98),
+            ("CS(=O)(=O)[O-]", "CH3O3S", 95.10),
+            ("C[S-]", "CH3S", 47.10),
+        ];
+        for (smiles, formula, weight) in cases {
+            let mol = crate::io::smiles::parse_smiles(smiles).expect("valid SMILES");
+            assert_eq!(&mol.formula(), formula, "{smiles}");
+            assert!(
+                (mol.molecular_weight() - weight).abs() < 0.05,
+                "{smiles}: {} vs {weight}",
+                mol.molecular_weight()
+            );
+        }
     }
 
     #[test]
@@ -1529,5 +1919,62 @@ mod tests {
 
         let cloned = mol.clone();
         assert_eq!(cloned.coord(1), Some(Point2::new(1.5, 0.0)));
+    }
+    #[test]
+    fn test_a_count_is_implied_for_a_bonded_atom_and_withheld_from_a_bondless_one() {
+        // The whole difference from `calculate_implicit_hydrogens`. A bondless
+        // atom has no bond orders to subtract, so `implied_hydrogens` returns
+        // the free-atom valence -- filling it turns a lone carbon into methane
+        // (#291) and a protein backbone into a bag of small alkanes (#285).
+        let mut mol = Molecule::new();
+        let bonded_a = mol.add_atom(Atom::new(Element::carbon()));
+        let bonded_b = mol.add_atom(Atom::new(Element::carbon()));
+        let lone = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(bonded_a, bonded_b, BondOrder::Single))
+            .expect("a valid bond");
+
+        mol.calculate_implicit_hydrogens_where_bonded();
+
+        assert_eq!(mol.atom(bonded_a).hydrogens(), Some(3));
+        assert_eq!(mol.atom(bonded_b).hydrogens(), Some(3));
+        assert_eq!(
+            mol.atom(lone).hydrogens(),
+            None,
+            "a bondless atom's count is unknown, not four"
+        );
+    }
+
+    #[test]
+    fn test_a_stated_count_is_never_overwritten() {
+        // Same contract as the unguarded form (#244): `Some(0)` is an answer.
+        let mut mol = Molecule::new();
+        let a = mol.add_atom(Atom::new(Element::carbon()).with_hydrogens(0));
+        let b = mol.add_atom(Atom::new(Element::carbon()));
+        mol.add_bond(Bond::new(a, b, BondOrder::Single))
+            .expect("a valid bond");
+
+        mol.calculate_implicit_hydrogens_where_bonded();
+
+        assert_eq!(mol.atom(a).hydrogens(), Some(0));
+        assert_eq!(mol.atom(b).hydrogens(), Some(3));
+    }
+
+    #[test]
+    fn test_an_element_with_no_typical_valence_gets_a_stated_zero() {
+        // Sodium has no valence this crate will assert, so `implied_hydrogens`
+        // declines to guess and returns 0. Worth pinning because the atom still
+        // moves from "unstated" to "stated none" -- which is the right answer
+        // for a bonded one, and why the bondless guard above matters more than
+        // it looks.
+        let mut mol = Molecule::new();
+        let na = mol.add_atom(Atom::new(Element::new(11).expect("sodium")));
+        let cl = mol.add_atom(Atom::new(Element::new(17).expect("chlorine")));
+        mol.add_bond(Bond::new(na, cl, BondOrder::Single))
+            .expect("a valid bond");
+
+        mol.calculate_implicit_hydrogens_where_bonded();
+
+        assert_eq!(mol.atom(na).hydrogens(), Some(0));
+        assert_eq!(mol.atom(cl).hydrogens(), Some(0));
     }
 }

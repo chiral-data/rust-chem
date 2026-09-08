@@ -9,6 +9,7 @@ pub mod residue;
 pub mod rings;
 pub mod site;
 pub mod stereo;
+pub mod stereo_group;
 
 pub mod elements;
 
@@ -25,6 +26,7 @@ pub mod prelude {
     pub use crate::core::rings::{Ring, find_sssr, perceive_rings, ring_count};
     pub use crate::core::site::AtomSite;
     pub use crate::core::stereo::perceive_bond_stereo;
+    pub use crate::core::stereo_group::{StereoGroup, StereoGroupKind};
 }
 
 #[cfg(test)]
@@ -35,7 +37,7 @@ mod tests {
     fn test_basic_workflow() {
         let mut mol = Molecule::new();
         let c = mol.add_atom(Atom::new(Element::carbon()));
-        mol.atom_mut(c).set_implicit_hydrogens(4);
+        mol.atom_mut(c).set_hydrogens(4);
         assert_eq!(mol.num_atoms(), 1);
         assert_eq!(mol.formula(), "CH4");
     }

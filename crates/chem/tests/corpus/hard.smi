@@ -19,3 +19,15 @@ F/C=C\F cis-difluoroethene
 c1cc[nH]c1 pyrrole
 # Isotope. Same connectivity, same charge, different molecule.
 [13CH4] carbon-13-methane
+# A bracket says everything about its atom, so no H inside one means *none*.
+# Every other bracket above carries a charge, an isotope, chirality or a count,
+# which is why nothing here could see #244: [C] parsed as methane.
+#
+# Both are open-shell, and unavoidably so: an atom stating fewer hydrogens than
+# its valence implies *is* a radical (RDKit counts 2 unpaired electrons on the
+# carbene carbon and 4 on the bare one). They cost three stories to make round
+# trip: #244 so a bracket could state zero hydrogens, #247 to derive the
+# radical count and write commonchem's `nRad`, and #250 for the molfile's
+# valence column. Every check now passes for both.
+C[C]C dimethylcarbene
+[13C] carbon-13-atom
