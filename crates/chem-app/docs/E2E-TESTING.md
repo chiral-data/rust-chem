@@ -133,6 +133,11 @@ iterating, not fine as evidence.
   shows as blank or repeated rows while scrolling fast.
 - **Each file in the list shows its format and molecule count.** Load a `.smi`
   and a `.sdf` and confirm both are labelled correctly.
+- **Load three files in one go** — select all three in the dialog, or drag them
+  onto the window. Three entries appear in load order and the **first** is
+  active, not the last. Loading them one at a time still works and still leaves
+  you on the one you just loaded, since with one file first and last are the
+  same.
 - **Load three files, then remove the *first* while looking at the third.** The
   third must still be the active one, with its fingerprints and results intact.
   This is the case the feature can get quietly wrong: every entry after the
@@ -177,10 +182,12 @@ for f in sdf cxsmiles xyz pdb mmcif mol2 pdbqt gro cml commonchem; do
 done
 ```
 
-- **Open each one.** The Files list must name the *right* format, and the molecule
-  count must match what `chem info` reports for the same file. A file that
-  half-loads looks exactly like one that fully loaded, which is why the status
-  line reports skipped records.
+- **Open them all at once**, selecting every file in the dialog or dragging the
+  directory's contents in. Eleven entries, each naming the *right* format, each
+  molecule count matching what `chem info` reports for the same file. The status
+  line summarises the batch rather than reporting only the last one — that is
+  what it is for, and a file that half-loads looks exactly like one that fully
+  loaded unless it says so.
 - **The SMILES column**, three answers rather than two (#283):
 
   | shows | formats | because |
@@ -228,6 +235,33 @@ show before anything is computed:
   `.json` is correctly rejected — the four structure formats used to accept it
   as one molecule with no atoms instead (#268); the status line now reports it
   skipped, the same as the other seven always did.
+
+### Dragging files in (#296)
+
+Its own section because it is the only feature whose two halves are *different
+code on the two targets*, and because a drop target that does not say it is one
+is invisible.
+
+- **Drag a file over the window without letting go.** The screen dims and says
+  "Drop to load 1 file" — drag three and it says three. Let go outside the
+  window and the hint goes away with nothing loaded.
+- **Drop three files at once.** Three entries, load order, first one active —
+  the same result as selecting three in the dialog, which is the point.
+- **Drop a `.png` and a `.pdb` together.** The PDB loads; the status line names
+  the PNG and says it is not a format this build reads. This rule is drops only:
+  the dialog still treats an unrecognised extension as SMILES, because there the
+  filter list already steered the choice.
+- **Drop a *binary* named `.smi`.** It gets past the extension check and fails
+  where it should, and the status still names it even when a good file lands
+  beside it. That message has nowhere else to appear — a refused file leaves no
+  entry in the Files list at all.
+- **Drop two files with the same name from different directories.** One entry,
+  and the status says `replaced`. The list matches on the bare filename, so the
+  second wins; before #296 this happened silently.
+- **On the web build, drop a large SDF.** It arrives a moment *after* the drop:
+  eframe reads the bytes asynchronously and hands them over when the read
+  finishes. Native has the path immediately and reads it itself. If a web drop
+  ever appears to do nothing, wait a beat before concluding it is broken.
 
 ### SVG export (#109)
 

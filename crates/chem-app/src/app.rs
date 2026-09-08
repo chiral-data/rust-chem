@@ -247,6 +247,39 @@ impl WorkbenchApp {
         }
     }
 
+    /// Says the app will take a drop, while files are over it.
+    ///
+    /// On a foreground layer over the whole screen rather than in the
+    /// `CentralPanel`: the windows tile the entire available rect, so anything
+    /// drawn on the panel is covered by them. The panel's own "No windows open"
+    /// label reads fine only because it appears when nothing is there to cover
+    /// it.
+    fn dropped_file_hint(&self, ctx: &egui::Context) {
+        let hovering = ctx.input(|i| i.raw.hovered_files.len());
+        if hovering == 0 {
+            return;
+        }
+
+        let screen = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("dropped_file_hint"),
+        ));
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+        let label = if hovering == 1 {
+            "Drop to load 1 file".to_string()
+        } else {
+            format!("Drop to load {hovering} files")
+        };
+        painter.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(24.0),
+            ctx.style().visuals.strong_text_color(),
+        );
+    }
+
     /// The workspace the windows float over. Deliberately empty: no content
     /// lives here, which is what makes a window free to be any size rather than
     /// squeezed into a panel's fixed width.
@@ -333,5 +366,7 @@ impl eframe::App for WorkbenchApp {
         self.windows.ensure_layout(ctx.available_rect());
         self.workspace(ctx);
         self.show_windows(ctx);
+        // Last, so it covers the windows it is telling you to drop onto.
+        self.dropped_file_hint(ctx);
     }
 }

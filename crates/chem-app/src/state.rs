@@ -32,7 +32,7 @@ use std::rc::Rc;
 #[cfg(target_arch = "wasm32")]
 type PendingGpuInit = Rc<RefCell<Option<Result<(GpuMorganFingerprint, GpuTanimoto), String>>>>;
 #[cfg(target_arch = "wasm32")]
-type PendingFileLoad = Rc<RefCell<Option<(String, Vec<u8>)>>>;
+type PendingFileLoad = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
 /// Formats a duration for display, switching to microseconds below 1ms so fast
 /// operations (a single small-molecule fingerprint, say) don't just show as
@@ -333,6 +333,125 @@ fn molecule_file_dialog() -> rfd::AsyncFileDialog {
     dialog
 }
 
+/// The name and bytes of a dropped file, whichever half the backend filled in.
+///
+/// The two backends describe a drop differently and neither fills in the other's
+/// fields. `egui-winit` sets `path` and leaves `name` **empty**; eframe's web
+/// backend sets `name` and `bytes` and has no path to give. So on native the
+/// name has to come from the path — using `DroppedFile::name` there would hand
+/// `DatasetFormat::from_filename` an empty string, which resolves to SMILES, and
+/// a dropped `.pdb` would parse as SMILES, skip every line, and look like an
+/// empty file rather than a bug.
+fn dropped_file_contents(file: &egui::DroppedFile) -> Option<(String, Vec<u8>)> {
+    if let Some(bytes) = &file.bytes {
+        return Some((file.name.clone(), bytes.to_vec()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = &file.path {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        match std::fs::read(path) {
+            Ok(bytes) => return Some((name, bytes)),
+            Err(e) => {
+                log::error!("Could not read dropped file {name}: {e}");
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+/// One line for a whole batch, naming what did not load.
+///
+/// The counts are what the Files list already shows per entry, so the summary
+/// leads with them and then spends its length on what the list *cannot* show: a
+/// refused file has no entry, a skipped record has no entry, and a replaced name
+/// looks identical to a file that simply loaded.
+fn summarise_load(outcomes: &[FileLoad]) -> String {
+    // Deduplicated by name, keeping the last: a file that replaced an entry of
+    // the same name did not add one, and counting both would report "2 files, 3
+    // molecules" for a Files list holding one entry of two.
+    let mut surviving: Vec<(&str, usize)> = Vec::new();
+    for outcome in outcomes {
+        if let FileLoad::Loaded {
+            name, molecules, ..
+        } = outcome
+        {
+            match surviving.iter_mut().find(|(seen, _)| *seen == name) {
+                Some(entry) => entry.1 = *molecules,
+                None => surviving.push((name, *molecules)),
+            }
+        }
+    }
+    let molecules: usize = surviving.iter().map(|(_, n)| n).sum();
+
+    let mut summary = match surviving.len() {
+        0 => "Loaded nothing".to_string(),
+        1 => format!("Loaded {molecules} {}", plural(molecules, "molecule")),
+        files => format!(
+            "Loaded {files} files, {molecules} {}",
+            plural(molecules, "molecule")
+        ),
+    };
+
+    for outcome in outcomes {
+        match outcome {
+            FileLoad::Loaded {
+                name,
+                skipped,
+                replaced,
+                ..
+            } => {
+                if *skipped > 0 {
+                    summary.push_str(&format!(" \u{b7} {name}: {skipped} skipped"));
+                }
+                if *replaced {
+                    summary.push_str(&format!(" \u{b7} {name}: replaced"));
+                }
+            }
+            FileLoad::Refused { name, reason } => {
+                summary.push_str(&format!(" \u{b7} {name}: {reason}"));
+            }
+        }
+    }
+    summary
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+/// What became of one file in a load.
+///
+/// [`AppState::apply_loaded_file_bytes`] used to return `()`, which was enough
+/// while a load was one file: it wrote `dataset_status` and the caller had
+/// nothing to decide. A batch has to say what happened to *each* file, because
+/// the Files list cannot — a refused file leaves no entry in it at all, so
+/// mixed with a good one it would vanish without this (#296).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLoad {
+    Loaded {
+        name: String,
+        /// Where it landed, so a batch can activate the first one it loaded.
+        index: usize,
+        molecules: usize,
+        skipped: usize,
+        /// An entry of this name already existed and was replaced in place.
+        /// Silent until now, and much easier to hit when several files arrive
+        /// at once: two directories can each hold a `d.smi`.
+        replaced: bool,
+    },
+    Refused {
+        name: String,
+        reason: &'static str,
+    },
+}
+
 impl AppState {
     pub fn new(ctx: &egui::Context) -> Self {
         Self::with_engine(ctx, FingerprintSearch::new())
@@ -394,7 +513,7 @@ impl AppState {
             query_fingerprint_task: Task::new(),
             search_task: Task::new(),
             #[cfg(target_arch = "wasm32")]
-            pending_file_load: Rc::new(RefCell::new(None)),
+            pending_file_load: Rc::new(RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
             repaint: ctx.clone(),
@@ -515,13 +634,17 @@ impl AppState {
         // is safe on native since blocking the calling thread doesn't stop
         // other threads from driving the future forward.
         let picked = pollster::block_on(async {
-            let file = molecule_file_dialog().pick_file().await?;
-            let name = file.file_name();
-            Some((name, file.read().await))
+            let files = molecule_file_dialog().pick_files().await?;
+            let mut picked = Vec::with_capacity(files.len());
+            for file in files {
+                let name = file.file_name();
+                picked.push((name, file.read().await));
+            }
+            Some(picked)
         });
 
-        if let Some((name, bytes)) = picked {
-            self.apply_loaded_file_bytes(name, bytes);
+        if let Some(picked) = picked {
+            self.apply_loaded_files(picked);
         }
     }
 
@@ -534,11 +657,17 @@ impl AppState {
         let slot = self.pending_file_load.clone();
         let ctx = self.repaint.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let file = molecule_file_dialog().pick_file().await;
-            if let Some(file) = file {
-                let name = file.file_name();
-                let bytes = file.read().await;
-                *slot.borrow_mut() = Some((name, bytes));
+            let files = molecule_file_dialog().pick_files().await;
+            if let Some(files) = files {
+                let mut picked = Vec::with_capacity(files.len());
+                for file in files {
+                    let name = file.file_name();
+                    picked.push((name, file.read().await));
+                }
+                // Extends rather than replaces: the slot used to hold one file,
+                // so a second pick before the next frame silently dropped the
+                // first (#296).
+                slot.borrow_mut().extend(picked);
                 // Closing the picker is not itself an input event the canvas
                 // sees, so without this the file stays unloaded until the user
                 // moves the mouse (#186).
@@ -547,13 +676,37 @@ impl AppState {
         });
     }
 
-    pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) {
+    /// Whether any format this build can read claims this file's extension.
+    ///
+    /// Only drops ask. A file chosen through the dialog came from a list built
+    /// from the registry (#266), so an unrecognised extension there is someone
+    /// overriding the filter on purpose and keeps the documented behaviour of
+    /// being read as SMILES. A dropped file passed no filter at all, so this is
+    /// the only place the answer can come from.
+    fn is_readable_extension(name: &str) -> bool {
+        let Some(extension) = std::path::Path::new(name).extension() else {
+            return false;
+        };
+        let Some(extension) = extension.to_str() else {
+            return false;
+        };
+        let extension = extension.to_ascii_lowercase();
+        format::all()
+            .filter(|f| f.can_read())
+            .flat_map(|f| f.extensions().iter().copied())
+            .any(|known| known.eq_ignore_ascii_case(&extension))
+    }
+
+    pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) -> FileLoad {
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(e) => {
                 self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
                 log::error!("Dataset load failed: {}", e);
-                return;
+                return FileLoad::Refused {
+                    name,
+                    reason: "not valid UTF-8",
+                };
             }
         };
 
@@ -589,8 +742,94 @@ impl AppState {
             );
         }
 
-        self.loaded_files.add_and_activate(name, dataset, format);
+        let molecules = dataset.len();
+        let skipped = outcome.skipped.len();
+        let replaced = self.loaded_files.names().any(|existing| existing == name);
+        self.loaded_files
+            .add_and_activate(name.clone(), dataset, format);
         self.invalidate_active_dataset();
+        FileLoad::Loaded {
+            name,
+            index: self.loaded_files.active_index(),
+            molecules,
+            skipped,
+            replaced,
+        }
+    }
+
+    /// Loads several files as one action, from the dialog or from a drop.
+    ///
+    /// Two things it does that a loop over
+    /// [`AppState::apply_loaded_file_bytes`] would not.
+    ///
+    /// It writes **one** status for the batch. `dataset_status` is a single
+    /// string rendered by a single label, so per-file messages overwrite each
+    /// other and the last file wins — which would silently swallow a refusal,
+    /// the one outcome that leaves no Files entry to notice afterwards.
+    ///
+    /// And it activates the **first** file that loaded rather than the last.
+    /// `add_and_activate` activates whatever it just added, so without this the
+    /// batch would leave you looking at the file you happened to select last.
+    /// Going back through [`AppState::activate_loaded_file`] rather than
+    /// `LoadedFiles::activate` matters: it runs the same invalidation a click in
+    /// the list does, and fingerprints belong to whichever dataset was active
+    /// when they were computed.
+    pub fn apply_loaded_files(&mut self, files: Vec<(String, Vec<u8>)>) {
+        let outcomes: Vec<FileLoad> = files
+            .into_iter()
+            .map(|(name, bytes)| self.apply_loaded_file_bytes(name, bytes))
+            .collect();
+        self.finish_batch(outcomes);
+    }
+
+    /// Refuses a dropped file whose extension no readable format claims, and
+    /// otherwise loads it.
+    ///
+    /// The refusal is the whole difference from the dialog path. Refusals go
+    /// into the same list as the loads, in the order the files arrived, so the
+    /// summary reads as one sentence about one gesture -- building a second
+    /// summary for them and appending it produced `Loaded 2 files, 3 molecules
+    /// \u{b7} Loaded nothing \u{b7} logo.png: ...`, which is two answers to one
+    /// question.
+    pub fn apply_dropped_files(&mut self, files: Vec<(String, Vec<u8>)>) {
+        let outcomes: Vec<FileLoad> = files
+            .into_iter()
+            .map(|(name, bytes)| {
+                if Self::is_readable_extension(&name) {
+                    self.apply_loaded_file_bytes(name, bytes)
+                } else {
+                    FileLoad::Refused {
+                        name,
+                        reason: "not a format this build reads",
+                    }
+                }
+            })
+            .collect();
+        self.finish_batch(outcomes);
+    }
+
+    /// Activates the first file that loaded, then says what became of the batch.
+    ///
+    /// The first rather than the last because `add_and_activate` activates
+    /// whatever it just added, so a batch would otherwise leave you looking at
+    /// whichever file happened to be selected last. Going back through
+    /// [`AppState::activate_loaded_file`] rather than `LoadedFiles::activate`
+    /// runs the same invalidation a click in the list does -- and it writes its
+    /// own status, which is why the summary is written after it rather than
+    /// before.
+    fn finish_batch(&mut self, outcomes: Vec<FileLoad>) {
+        if outcomes.is_empty() {
+            return;
+        }
+
+        if let Some(FileLoad::Loaded { index, .. }) = outcomes
+            .iter()
+            .find(|outcome| matches!(outcome, FileLoad::Loaded { .. }))
+        {
+            self.activate_loaded_file(*index);
+        }
+
+        self.dataset_status = summarise_load(&outcomes);
     }
 
     pub fn load_example_dataset(&mut self) {
@@ -1000,10 +1239,10 @@ impl AppState {
     pub fn poll_pending_work(&mut self) {
         #[cfg(target_arch = "wasm32")]
         {
-            let loaded = self.pending_file_load.borrow_mut().take();
-            if let Some((name, bytes)) = loaded {
-                self.apply_loaded_file_bytes(name, bytes);
-            }
+            // Drained whole, so the Files list never shows half a batch.
+            let loaded: Vec<(String, Vec<u8>)> =
+                self.pending_file_load.borrow_mut().drain(..).collect();
+            self.apply_loaded_files(loaded);
 
             let gpu_init = self.pending_gpu_init.borrow_mut().take();
             match gpu_init {
@@ -1015,6 +1254,16 @@ impl AppState {
                 }
                 None => {} // still pending
             }
+        }
+
+        // Dropped files are raw input, read through the stored context rather
+        // than a parameter -- it is the same one eframe passes to `update`.
+        // egui clears them each frame, so this is the one chance to take them.
+        let dropped: Vec<egui::DroppedFile> = self.repaint.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let files: Vec<(String, Vec<u8>)> =
+                dropped.iter().filter_map(dropped_file_contents).collect();
+            self.apply_dropped_files(files);
         }
 
         // Collected on both platforms alike: the task ran on a spawned future
@@ -1874,5 +2123,267 @@ END
             "{}",
             state.dataset_status
         );
+    }
+    /// Two atoms and a CONECT, so it is a real PDB rather than something the
+    /// reader would reject for having no atoms (#292).
+    const WATER_PDB: &str = "\
+ATOM      1  O   HOH A   1       0.000   0.000   0.000  1.00 20.00           O
+ATOM      2  H1  HOH A   1       0.759   0.000   0.504  1.00 20.00           H
+CONECT    1    2
+END
+";
+
+    #[test]
+    fn test_a_dropped_file_is_named_by_its_path_when_that_is_all_the_backend_gave() {
+        // The native half, and the one that fails silently. `egui-winit` sets
+        // `path` and leaves `name` empty, so reading `name` here would hand
+        // `from_filename` an empty string -- which resolves to SMILES, and a
+        // dropped PDB would then skip every line and look like an empty file
+        // rather than a bug.
+        let dir = std::env::temp_dir().join("chem-app-drop-native");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("water.pdb");
+        std::fs::write(&path, WATER_PDB).expect("fixture");
+
+        let dropped = egui::DroppedFile {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let (name, bytes) = dropped_file_contents(&dropped).expect("reads from the path");
+
+        assert_eq!(name, "water.pdb");
+        assert_eq!(DatasetFormat::from_filename(&name), DatasetFormat::PDB);
+        assert_eq!(bytes, WATER_PDB.as_bytes());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_a_dropped_file_uses_the_bytes_when_the_backend_gave_those_instead() {
+        // The web half: eframe reads the file itself and hands over name and
+        // bytes with no path, so nothing may touch the filesystem here.
+        let dropped = egui::DroppedFile {
+            name: "water.pdb".to_string(),
+            bytes: Some(WATER_PDB.as_bytes().to_vec().into()),
+            ..Default::default()
+        };
+        let (name, bytes) = dropped_file_contents(&dropped).expect("uses the bytes");
+
+        assert_eq!(name, "water.pdb");
+        assert_eq!(bytes, WATER_PDB.as_bytes());
+    }
+
+    #[test]
+    fn test_a_batch_activates_the_first_file_it_loaded() {
+        // `add_and_activate` activates whatever it just added, so without the
+        // batch stepping back the user would be left looking at whichever file
+        // happened to be selected last.
+        let mut state = AppState::cpu_only();
+        let before = state.loaded_files.entries().len();
+
+        state.apply_loaded_files(vec![
+            (
+                "first.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+            (
+                "second.smi".to_string(),
+                b"CC
+CCC
+"
+                .to_vec(),
+            ),
+            (
+                "third.smi".to_string(),
+                b"C
+"
+                .to_vec(),
+            ),
+        ]);
+
+        let names: Vec<&str> = state.loaded_files.names().collect();
+        assert_eq!(names.len(), before + 3);
+        assert!(names.ends_with(&["first.smi", "second.smi", "third.smi"]));
+        assert_eq!(
+            state.loaded_files.entries()[state.loaded_files.active_index()].name,
+            "first.smi"
+        );
+        assert!(
+            state.dataset_status.contains("Loaded 3 files"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_a_refused_file_is_named_and_the_ones_beside_it_still_load() {
+        // A drop passes no filter, so this is the only place a user is told
+        // that a file is not one this build reads. The status is the only
+        // place it can be said: a refused file leaves no Files entry.
+        let mut state = AppState::cpu_only();
+        let before = state.loaded_files.entries().len();
+
+        state.apply_dropped_files(vec![
+            ("logo.png".to_string(), vec![0x89, b'P', b'N', b'G']),
+            (
+                "good.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+        ]);
+
+        assert_eq!(state.loaded_files.entries().len(), before + 1);
+        assert!(
+            state.dataset_status.contains("logo.png")
+                && state
+                    .dataset_status
+                    .contains("not a format this build reads"),
+            "{}",
+            state.dataset_status
+        );
+        assert!(
+            state.dataset_status.contains("Loaded"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_a_file_that_is_not_utf8_is_still_reported_beside_one_that_loaded() {
+        // The regression the checklist rests on: "a binary file is refused with
+        // 'not valid UTF-8' and the current dataset is left alone". One status
+        // line means a naive loop would let the good file overwrite that, and
+        // the refusal leaves no entry to notice afterwards. `.smi` so it gets
+        // past the extension check and fails where it is meant to.
+        let mut state = AppState::cpu_only();
+
+        state.apply_dropped_files(vec![
+            ("broken.smi".to_string(), vec![0xff, 0xfe]),
+            (
+                "good.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+        ]);
+
+        assert!(
+            state.dataset_status.contains("broken.smi")
+                && state.dataset_status.contains("not valid UTF-8"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_two_files_of_one_name_collapse_and_the_status_says_so() {
+        // `add_and_activate` replaces a same-named entry in place, which is
+        // right for reloading a file and surprising when two directories each
+        // hold a `d.smi` -- much easier to hit now that a drop can carry both.
+        let mut state = AppState::cpu_only();
+        let before = state.loaded_files.entries().len();
+
+        state.apply_loaded_files(vec![
+            (
+                "d.smi".to_string(),
+                b"CCO
+"
+                .to_vec(),
+            ),
+            (
+                "d.smi".to_string(),
+                b"CC
+CCC
+"
+                .to_vec(),
+            ),
+        ]);
+
+        assert_eq!(state.loaded_files.entries().len(), before + 1);
+        assert!(
+            state.dataset_status.contains("d.smi: replaced"),
+            "{}",
+            state.dataset_status
+        );
+    }
+
+    #[test]
+    fn test_only_extensions_a_readable_format_claims_are_accepted_from_a_drop() {
+        for name in ["a.smi", "a.pdb", "a.mol2", "a.CIF", "a.json"] {
+            assert!(
+                AppState::is_readable_extension(name),
+                "{name} should be accepted"
+            );
+        }
+        for name in ["logo.png", "notes", "report.docx", "archive.tar.gz"] {
+            assert!(
+                !AppState::is_readable_extension(name),
+                "{name} should be refused"
+            );
+        }
+    }
+    #[test]
+    fn test_the_status_says_what_became_of_every_file_in_the_batch() {
+        // Exact strings, not `contains`. The first version of this feature
+        // built a second summary for the refusals and appended it, producing
+        // `Loaded 2 files, 3 molecules \u{b7} Loaded nothing \u{b7} logo.png: ...`
+        // -- two answers to one question -- and a `contains("logo.png")`
+        // assertion passed the whole way through.
+        /// A batch to drop, and the one line it should produce.
+        type Case = (Vec<(String, Vec<u8>)>, &'static str);
+
+        let cases: Vec<Case> = vec![
+            (
+                vec![("a.smi".into(), b"CCO\n".to_vec())],
+                "Loaded 1 molecule",
+            ),
+            (
+                vec![
+                    ("a.smi".into(), b"CCO\n".to_vec()),
+                    ("b.smi".into(), b"CC\nC\n".to_vec()),
+                ],
+                "Loaded 2 files, 3 molecules",
+            ),
+            (
+                vec![
+                    ("a.smi".into(), b"CCO\n".to_vec()),
+                    ("logo.png".into(), vec![0x89]),
+                ],
+                "Loaded 1 molecule \u{b7} logo.png: not a format this build reads",
+            ),
+            (
+                vec![("logo.png".into(), vec![0x89])],
+                "Loaded nothing \u{b7} logo.png: not a format this build reads",
+            ),
+            (
+                vec![
+                    ("a.smi".into(), b"CCO\n".to_vec()),
+                    ("broken.smi".into(), vec![0xff, 0xfe]),
+                ],
+                "Loaded 1 molecule \u{b7} broken.smi: not valid UTF-8",
+            ),
+            (
+                // Two entries went in and one came out, so the count is the
+                // survivor's rather than the sum -- "2 files, 3 molecules"
+                // would describe a Files list that does not exist.
+                vec![
+                    ("d.smi".into(), b"CCO\n".to_vec()),
+                    ("d.smi".into(), b"CC\nC\n".to_vec()),
+                ],
+                "Loaded 2 molecules \u{b7} d.smi: replaced",
+            ),
+            (
+                vec![("s.smi".into(), b"CCO\nnot a molecule!!\n".to_vec())],
+                "Loaded 1 molecule \u{b7} s.smi: 1 skipped",
+            ),
+        ];
+
+        for (files, expected) in cases {
+            let mut state = AppState::cpu_only();
+            state.apply_dropped_files(files);
+            assert_eq!(state.dataset_status, expected);
+        }
     }
 }
