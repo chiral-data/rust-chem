@@ -466,7 +466,7 @@ impl AppState {
     /// Its context is detached from any window, which is what a test wants: a
     /// repaint request can be observed but never has to be serviced.
     #[cfg(test)]
-    fn cpu_only() -> Self {
+    pub(crate) fn cpu_only() -> Self {
         Self::with_engine(&egui::Context::default(), FingerprintSearch::new_cpu_only())
     }
 
