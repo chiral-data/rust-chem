@@ -154,36 +154,43 @@ rename — only the token needs care.
   bytes SRI covers and the browser refuses the module. Transport compression is
   fine, being decoded before the hash is checked.
 
-## What is reproducible, and what is not
+## What is reproducible
 
-You cannot rebuild a commit and get the bytes that are live. Measured on `8a8329f`, three builds and
-the tools run by hand on a fixed input:
+**A rebuild of the same commit produces the same bundle.** Measured three times over:
 
-| stage | deterministic? |
+```
+full trunk build --release, x3    cargo: 98708dfce822c839    dist: 9ce26fda4af38915
+```
+
+Every stage is deterministic — rustc, wasm-bindgen and wasm-opt alike — so the content hash in a
+filename is a function of the source, and a bundle can be verified against a rebuild.
+
+That was **not** true before wasm-bindgen 0.2.128, and the shape of the old failure is worth keeping,
+because it is what a recurrence would look like. On 0.2.106 the same input gave a different bundle
+every run: identical *length*, with ~3,500 bytes differing across the `import`, `export`, `element`,
+`code` and `name` sections while `data`, `type` and `function` stayed byte-identical. The 452 imports
+and 18 exports were the same *set* in a different *order*, and the JS diff was a single closure-invoke
+shim changing position — hash-iteration order, upstream, fixed by the bump in #299.
+
+Still true regardless, and the reason to read it rather than rebuild:
+
+- **`build-info.json` and the id in the corner are the identity.** They come from `CHEM_BUILD_ID`,
+  which is the commit, and they answer "what is live?" in one request. A rebuild answers it in
+  minutes and only while every input happens to match.
+
+What is pinned, and why it matters separately from reproducibility — it stops an upstream release
+changing what production serves without anyone choosing it:
+
+| input | pinned by |
 |---|---|
-| rustc → `chem-app.wasm` | **yes** — identical across three builds |
-| wasm-bindgen | **no** — same 5,946,865 bytes out, 3,750 of them different every run |
-| wasm-opt `-O2` | **yes** — identical across three runs on one input |
-
-So the content hash in the filename changes on every build of the same source, and `wasm-opt` is not
-the reason: it is deterministic, and it is pinned. wasm-bindgen is the one that moves, and it is
-already pinned to the version in `Cargo.lock` — the nondeterminism is inside that version, not a
-question of which version runs. Equal output length with scattered differences is what iteration
-order looks like.
-
-What that means in practice:
-
-- **`build-info.json` and the id in the corner are the identity**, not the hash in the filename. They
-  come from `CHEM_BUILD_ID`, which is the commit.
-- **A rebuilt bundle is not comparable byte-for-byte** to a deployed one. If you need to know whether
-  production is a given commit, read `build-info.json`; do not rebuild and diff.
-- **Version pinning still matters** for a different reason: it stops an upstream release changing what
-  production serves without anyone choosing it. Trunk is pinned in both workflows, `wasm-opt` in
-  `Trunk.toml`, wasm-bindgen by `Cargo.lock`.
+| Trunk | `0.21.14`, in both workflows |
+| wasm-opt | `version_123`, in `Trunk.toml` (#288) |
+| wasm-bindgen, js-sys, web-sys | `Cargo.lock` — versioned in lockstep, so they move together |
 
 One input is **not** pinned: the Rust toolchain. CI uses `dtolnay/rust-toolchain@stable` and there is
-no `rust-toolchain.toml`, so a Rust release changes the output. That is a deliberate decision to make
-rather than a bug, and a larger lever on the bytes than the optimiser ever was.
+no `rust-toolchain.toml`, so a Rust release changes the output. rustc is deterministic for a given
+version, so unlike the old wasm-bindgen problem this one *is* fixable by pinning — a deliberate
+decision to make rather than a bug, and the largest remaining lever on the bytes.
 
 ## Headers, and why they are not in a `vercel.json`
 
