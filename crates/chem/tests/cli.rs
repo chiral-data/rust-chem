@@ -32,12 +32,28 @@ fn run(args: &[&str], stdin: Option<&str>) -> Run {
         .expect("spawn chem");
 
     if let Some(text) = stdin {
-        child
-            .stdin
-            .as_mut()
-            .expect("piped stdin")
-            .write_all(text.as_bytes())
-            .expect("write stdin");
+        // A command that rejects its arguments exits without reading standard
+        // input, which closes the read end of this pipe -- so this write fails
+        // with EPIPE, and unwrapping it panicked *here*, reporting the failure
+        // against whichever test happened to race (#248). One run aborted at
+        // "644 passed, 1 failed" without even naming one.
+        //
+        // Whether it happens at all is scheduling. EPIPE needs the read end
+        // *closed*, not merely unread, so a payload smaller than the pipe
+        // buffer lands there and succeeds although nobody will ever read it --
+        // which is why this was green until the machine was busy.
+        //
+        // Tolerated rather than ignored: the child having exited early is the
+        // outcome the error-path tests assert, and every assertion below still
+        // runs, so an early exit on a path that *should* consume stdin still
+        // fails -- at its own assertion. A write failing for any other reason
+        // is still a bug and still panics.
+        let pipe = child.stdin.as_mut().expect("piped stdin");
+        match pipe.write_all(text.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("write stdin: {e}"),
+        }
     }
 
     let out = child.wait_with_output().expect("wait");
@@ -1093,6 +1109,34 @@ fn test_format_bogus_is_an_error_not_a_clap_panic() {
     // rejected by clap itself. Now it's a registry lookup -- same outcome,
     // different mechanism, and the message should say so plainly.
     let r = run(&["info", "--format", "bogus"], Some(GOOD));
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("unrecognized format code"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_writing_stdin_survives_a_command_that_exits_before_reading_it() {
+    // The helper's own regression (#248), and deterministic where the flake was
+    // not. `--format bogus` fails in `resolve_format_code`, which runs as an
+    // argument to `stream::read_input` and therefore *before* a byte of stdin
+    // is consumed -- so the child exits with the pipe unread.
+    //
+    // The payload is what makes this reliable. Over the pipe buffer (64 KiB on
+    // Linux) the write cannot fit, so it blocks until the child exits and then
+    // fails with EPIPE -- measured 20 times out of 20. A small payload usually
+    // lands in the buffer and succeeds instead, which is exactly why the flake
+    // needed a loaded machine to appear.
+    let big = "CCO ethanol\n".repeat(100_000);
+    assert!(
+        big.len() > 64 * 1024,
+        "the payload must exceed the pipe buffer"
+    );
+
+    let r = run(&["info", "--format", "bogus"], Some(&big));
+
     assert_ne!(r.code, 0);
     assert!(
         r.stderr.contains("unrecognized format code"),
