@@ -2,6 +2,21 @@
 target = "index.html"
 dist = "dist"
 
+# Pinned here rather than left to Trunk's own default. Trunk 0.21.14 happens to
+# choose `version_123` (`Tool::default_version`), so the version was already
+# fixed as long as Trunk is -- but only as a side effect of that pin, so the
+# next Trunk bump would move the optimiser too and change what
+# chem.chiral.one serves without anyone choosing it. Naming it here makes that
+# one decision instead of two, and puts the version where someone looks for it
+# rather than inside a dependency's source (#288).
+#
+# Not `wasm_bindgen`: `find_wasm_bindgen_version` checks this table *before*
+# Cargo.lock, so an entry here would override the lockfile and could disagree
+# with the wasm-bindgen compiled into the binary. The lockfile is the right
+# source and Trunk already uses it.
+[tools]
+wasm_opt = "version_123"
+
 [watch]
 ignore = ["dist"]
 
