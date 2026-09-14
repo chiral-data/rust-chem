@@ -97,9 +97,13 @@ pub fn read(content: &str, format: Format) -> ReadOutcome {
 
 /// [`read`], with explicit per-format options (#212). No format has a read
 /// option yet; this exists so a future one only widens this signature once.
+///
+/// Routed through [`Format::read_bytes_with_options`] (#309) so there is one
+/// canonical read path, text or binary — decoding `content` back to bytes is
+/// always lossless since it started as a `&str`.
 pub fn read_with_options(content: &str, format: Format, options: &ReadOptions) -> ReadOutcome {
-    match format.reader() {
-        Some(reader) => reader(content, options),
+    match format.read_bytes_with_options(content.as_bytes(), options) {
+        Some(outcome) => outcome,
         None => ReadOutcome {
             records: Vec::new(),
             skipped: vec![Skipped {

@@ -315,11 +315,32 @@ impl Category {
     }
 }
 
+/// Whether a format's canonical bytes are UTF-8 text or an arbitrary binary
+/// layout.
+///
+/// Introduced by #309 so the registry can widen to binary formats (XTC, DCD,
+/// CCP4, ...) without repointing the eleven existing text `reader`/`writer`
+/// function pointers, which stay exactly as typed and shaped as they are
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Text,
+    Binary,
+}
+
 /// Parses a whole file into molecules.
 pub(crate) type ReadFn = fn(&str, &ReadOptions) -> ReadOutcome;
 
 /// Serialises named molecules into one file's worth of text.
 pub(crate) type WriteFn = fn(&[(String, Molecule)], &WriteOptions) -> String;
+
+/// Parses a whole file into molecules, from raw bytes rather than decoded
+/// text — what a binary format's reader is shaped like (#309).
+pub(crate) type ByteReadFn = fn(&[u8], &ReadOptions) -> ReadOutcome;
+
+/// Serialises named molecules into one file's worth of bytes — what a binary
+/// format's writer is shaped like (#309).
+pub(crate) type ByteWriteFn = fn(&[(String, Molecule)], &WriteOptions) -> Vec<u8>;
 
 /// Builds a streaming [`Supplier`] over a boxed reader (#213).
 pub(crate) type SupplierCtor = fn(Box<dyn BufRead>, &ReadOptions) -> Box<dyn Supplier>;
@@ -348,9 +369,18 @@ pub struct FormatDescriptor {
     /// today — see [`Carries`] on why that is not the same as what the
     /// specification allows.
     pub carries: Carries,
+    /// Whether this format's canonical bytes are UTF-8 text or binary.
+    pub encoding: Encoding,
 
     pub(crate) reader: Option<ReadFn>,
     pub(crate) writer: Option<WriteFn>,
+    /// Set only for a format whose canonical reader takes raw bytes (#309) —
+    /// `None` for every text format, including all eleven registered today.
+    pub(crate) reader_bytes: Option<ByteReadFn>,
+    /// Set only for a format whose canonical writer produces raw bytes
+    /// (#309) — `None` for every text format, including all eleven
+    /// registered today.
+    pub(crate) writer_bytes: Option<ByteWriteFn>,
     pub(crate) supplier: Option<SupplierCtor>,
     pub(crate) writer_stream: Option<WriterCtor>,
 }
@@ -384,6 +414,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_smiles_records),
         supplier: Some(smiles_supplier),
         writer_stream: Some(smiles_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -422,6 +455,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_sdf_records),
         supplier: Some(sdf_supplier),
         writer_stream: Some(sdf_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -454,6 +490,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_cxsmiles_records),
         supplier: Some(cxsmiles_supplier),
         writer_stream: Some(cxsmiles_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -475,6 +514,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_xyz_records),
         supplier: Some(xyz_supplier),
         writer_stream: Some(xyz_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -499,6 +541,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_pdb_records),
         supplier: Some(pdb_supplier),
         writer_stream: Some(pdb_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -520,6 +565,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_mmcif_records),
         supplier: Some(mmcif_supplier),
         writer_stream: Some(mmcif_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -546,6 +594,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_mol2_records),
         supplier: Some(mol2_supplier),
         writer_stream: Some(mol2_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -568,6 +619,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_pdbqt_records),
         supplier: Some(pdbqt_supplier),
         writer_stream: Some(pdbqt_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -586,6 +640,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_gro_records),
         supplier: Some(gro_supplier),
         writer_stream: Some(gro_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -609,6 +666,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_cml_records),
         supplier: Some(cml_supplier),
         writer_stream: Some(cml_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -640,6 +700,9 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_commonchem_records),
         supplier: Some(commonchem_supplier),
         writer_stream: Some(commonchem_writer_stream),
+        encoding: Encoding::Text,
+        reader_bytes: None,
+        writer_bytes: None,
     },
 ];
 
@@ -979,16 +1042,54 @@ impl Format {
         self.descriptor().carries
     }
 
+    /// Whether this format's canonical bytes are UTF-8 text or binary.
+    pub fn encoding(&self) -> Encoding {
+        self.descriptor().encoding
+    }
+
     pub fn can_read(&self) -> bool {
-        self.descriptor().reader.is_some()
+        let d = self.descriptor();
+        d.reader.is_some() || d.reader_bytes.is_some()
     }
 
     pub fn can_write(&self) -> bool {
-        self.descriptor().writer.is_some()
+        let d = self.descriptor();
+        d.writer.is_some() || d.writer_bytes.is_some()
     }
 
-    pub(crate) fn reader(&self) -> Option<ReadFn> {
-        self.descriptor().reader
+    /// Parses a whole file into molecules, from raw bytes (#309) — the
+    /// canonical read path every format goes through, text or binary, or
+    /// `None` if the format cannot be read.
+    ///
+    /// A binary format's `reader_bytes` is called directly. A text format
+    /// has none, so the bytes are decoded as UTF-8 first; invalid UTF-8
+    /// becomes a `Skipped` entry rather than a panic, matching the rest of
+    /// this crate's "reading a file cannot fail as a whole" contract.
+    pub fn read_bytes(&self, bytes: &[u8]) -> Option<ReadOutcome> {
+        self.read_bytes_with_options(bytes, &ReadOptions)
+    }
+
+    /// [`Self::read_bytes`], with explicit per-format options.
+    pub fn read_bytes_with_options(
+        &self,
+        bytes: &[u8],
+        options: &ReadOptions,
+    ) -> Option<ReadOutcome> {
+        let d = self.descriptor();
+        if let Some(reader_bytes) = d.reader_bytes {
+            return Some(reader_bytes(bytes, options));
+        }
+        d.reader.map(|reader| match std::str::from_utf8(bytes) {
+            Ok(text) => reader(text, options),
+            Err(e) => ReadOutcome {
+                records: Vec::new(),
+                skipped: vec![crate::io::reader::Skipped {
+                    position: 1,
+                    input: String::new(),
+                    error: format!("{} is not valid UTF-8: {e}", self.name()),
+                }],
+            },
+        })
     }
 
     /// Serialises molecules in this format with default options, carrying
@@ -1008,9 +1109,33 @@ impl Format {
         records: &[(String, Molecule)],
         options: &WriteOptions,
     ) -> Option<String> {
-        self.descriptor()
-            .writer
-            .map(|writer| writer(records, options))
+        // Text formats only, today — routed through `write_bytes_with_options`
+        // so there is one canonical write path (#309). `from_utf8` cannot
+        // fail here: every populated `writer` produces a `String` in the
+        // first place, so `write_bytes_with_options` only ever hands back
+        // its own bytes.
+        self.write_bytes_with_options(records, options)
+            .map(|bytes| String::from_utf8(bytes).expect("text writer produced valid UTF-8"))
+    }
+
+    /// Serialises molecules in this format into raw bytes (#309) — the
+    /// canonical write path every format goes through, text or binary, or
+    /// `None` if the format cannot be written.
+    pub fn write_bytes(&self, records: &[(String, Molecule)]) -> Option<Vec<u8>> {
+        self.write_bytes_with_options(records, &WriteOptions::default())
+    }
+
+    /// [`Self::write_bytes`], with explicit per-format options.
+    pub fn write_bytes_with_options(
+        &self,
+        records: &[(String, Molecule)],
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let d = self.descriptor();
+        if let Some(writer_bytes) = d.writer_bytes {
+            return Some(writer_bytes(records, options));
+        }
+        d.writer.map(|writer| writer(records, options).into_bytes())
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -1911,6 +2036,69 @@ mod tests {
                 "{format:?} declares no topology, so its mask is missing"
             );
         }
+    }
+
+    #[test]
+    fn test_every_registered_format_is_text_encoded_today() {
+        // #309 adds the byte-level path, but no format's descriptor is
+        // repointed at it yet -- that starts at #318 once `Kind` (#310)
+        // exists. Every one of today's 11 formats must still be plain text,
+        // with no binary reader/writer wired in.
+        for format in all() {
+            let d = format.descriptor();
+            assert_eq!(
+                d.encoding,
+                Encoding::Text,
+                "{format:?} is not registered as text"
+            );
+            assert!(
+                d.reader_bytes.is_none(),
+                "{format:?} has a byte reader already"
+            );
+            assert!(
+                d.writer_bytes.is_none(),
+                "{format:?} has a byte writer already"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_bytes_agrees_with_read() {
+        // Proves `read`/`read_with_options` genuinely delegate to
+        // `read_bytes_with_options` (#309) rather than sitting next to it as
+        // dead code: the same input through either path must yield the same
+        // records.
+        let sdf = "ethanol-ish\n  -ish-\n\nM  END\n$$$$\n";
+        let via_read = crate::io::reader::read(sdf, Format::SDF);
+        let via_bytes = Format::SDF
+            .read_bytes(sdf.as_bytes())
+            .expect("SDF can be read");
+        assert_eq!(via_read.records.len(), via_bytes.records.len());
+        assert_eq!(via_read.skipped.len(), via_bytes.skipped.len());
+    }
+
+    #[test]
+    fn test_read_bytes_reports_invalid_utf8_as_skipped_not_a_panic() {
+        let invalid = [b'C', 0xff, 0xfe];
+        let outcome = Format::SMILES
+            .read_bytes(&invalid)
+            .expect("SMILES can be read");
+        assert!(outcome.records.is_empty());
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.skipped[0].error.contains("UTF-8"));
+    }
+
+    #[test]
+    fn test_write_bytes_agrees_with_write() {
+        use crate::core::prelude::*;
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        let records = vec![("m".to_string(), mol)];
+
+        let via_write = Format::SDF.write(&records).expect("SDF writes");
+        let via_bytes = Format::SDF.write_bytes(&records).expect("SDF writes bytes");
+        assert_eq!(via_write.into_bytes(), via_bytes);
     }
 
     #[test]
