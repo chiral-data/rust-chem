@@ -811,7 +811,12 @@ mod tests {
         let mol = parse_smiles(smiles).expect("valid SMILES");
         let sdf = crate::io::sdf::write_sdf(&mol);
         let outcome = crate::io::reader::read_sdf(&sdf);
-        let back = &outcome.records.first().expect("one record").molecule;
+        let back = outcome
+            .records
+            .first()
+            .expect("one record")
+            .molecule()
+            .expect("SDF fixture is a molecule record");
         write_smiles_for_molecule_canonical(back)
     }
 

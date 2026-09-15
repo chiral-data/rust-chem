@@ -1350,7 +1350,12 @@ mod tests {
         // radical. This is #247's guard doing its work one layer down.
         let cif = include_str!("../../tests/corpus/mmcif/dipeptide-with-ligand.cif");
         let outcome = crate::io::reader::read_mmcif(cif);
-        let mol = &outcome.records.first().expect("one record").molecule;
+        let mol = outcome
+            .records
+            .first()
+            .expect("one record")
+            .molecule()
+            .expect("mmCIF fixture is a molecule record");
         let text = write_sdf(mol);
         let columns = valence_columns(&text);
         assert!(!columns.is_empty(), "the fixture should have atoms");
@@ -1420,8 +1425,9 @@ mod tests {
         assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
         assert_eq!(outcome.len(), 3);
         for (read, original) in outcome.records.iter().zip(&molecules) {
-            assert_eq!(read.molecule.num_atoms(), original.num_atoms());
-            assert!(read.molecule.has_coords());
+            let read_molecule = read.molecule().expect("SDF fixture is a molecule record");
+            assert_eq!(read_molecule.num_atoms(), original.num_atoms());
+            assert!(read_molecule.has_coords());
         }
     }
 

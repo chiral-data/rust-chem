@@ -33,10 +33,23 @@ use crate::io::smiles::parse_smiles;
 /// workbench stayed as written.
 pub use crate::io::format::Format;
 
-/// One molecule read from a file.
+/// What a record's payload holds.
+///
+/// Mirrors [`crate::io::format::Kind`] on the format that produced it: every
+/// registered format is `Kind::Molecules` today (#310), so this has one
+/// variant. `#[non_exhaustive]`, so a second variant — landing with whichever
+/// of #311-#314 needs it first — forces every exhaustive match on this crate
+/// to be revisited rather than silently miscompiling.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum Payload {
+    Molecule(Molecule),
+}
+
+/// One record read from a file.
 #[derive(Debug, Clone)]
 pub struct Record {
-    pub molecule: Molecule,
+    pub payload: Payload,
     /// The record's own name, or `Molecule_N` where the file gave none.
     pub name: String,
     /// The SMILES the molecule was read from, where there was one.
@@ -45,6 +58,20 @@ pub struct Record {
     /// SMILES string. A placeholder belongs in whatever displays this, not
     /// here — a library should not invent text for a value it does not have.
     pub smiles: Option<String>,
+}
+
+impl Record {
+    /// The molecule this record holds, or `None` if its payload is not one.
+    ///
+    /// Always `Some` today — [`Payload`] has one variant — but written as an
+    /// exhaustive match with no wildcard so this stops compiling, in this one
+    /// place, the day a second variant lands, rather than every caller
+    /// silently treating a future non-molecule record as if it had none.
+    pub fn molecule(&self) -> Option<&Molecule> {
+        match &self.payload {
+            Payload::Molecule(m) => Some(m),
+        }
+    }
 }
 
 /// A record that could not be read, and why.
@@ -148,7 +175,7 @@ pub fn read_smiles_with_options(content: &str, _options: &ReadOptions) -> ReadOu
 
         match parse_smiles(smiles) {
             Ok(molecule) => out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: Some(smiles.to_owned()),
             }),
@@ -195,7 +222,7 @@ pub fn read_cxsmiles_with_options(content: &str, _options: &ReadOptions) -> Read
 
         match crate::io::cxsmiles::parse_cxsmiles(smiles, block) {
             Ok(molecule) => out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: Some(smiles.to_owned()),
             }),
@@ -248,7 +275,7 @@ fn push_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
             out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: None,
             });
@@ -320,7 +347,7 @@ pub fn read_xyz_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("Molecule_{position}"));
                 out.records.push(Record {
-                    molecule,
+                    payload: Payload::Molecule(molecule),
                     name,
                     smiles: None,
                 });
@@ -380,7 +407,7 @@ fn push_pdb_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
             out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: None,
             });
@@ -434,7 +461,7 @@ fn push_mmcif_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
             out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: None,
             });
@@ -488,7 +515,7 @@ fn push_mol2_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
             out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: None,
             });
@@ -540,7 +567,7 @@ fn push_pdbqt_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
             out.records.push(Record {
-                molecule,
+                payload: Payload::Molecule(molecule),
                 name,
                 smiles: None,
             });
@@ -618,7 +645,7 @@ pub fn read_gro_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("Molecule_{position}"));
                 out.records.push(Record {
-                    molecule,
+                    payload: Payload::Molecule(molecule),
                     name,
                     smiles: None,
                 });
@@ -672,7 +699,7 @@ pub fn read_cml_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("Molecule_{position}"));
                 out.records.push(Record {
-                    molecule,
+                    payload: Payload::Molecule(molecule),
                     name,
                     smiles: None,
                 });
@@ -714,7 +741,7 @@ pub fn read_commonchem_with_options(content: &str, _options: &ReadOptions) -> Re
         Ok(records) => {
             for (name, molecule) in records {
                 out.records.push(Record {
-                    molecule,
+                    payload: Payload::Molecule(molecule),
                     name,
                     smiles: None,
                 });
@@ -852,7 +879,11 @@ $$$$
     fn test_read_dispatches_on_format() {
         let sdf = read(TWO_RECORDS, Format::SDF);
         assert_eq!(sdf.len(), 2);
-        assert!(sdf.records.iter().all(|r| r.molecule.num_atoms() > 0));
+        assert!(
+            sdf.records
+                .iter()
+                .all(|r| r.molecule().unwrap().num_atoms() > 0)
+        );
 
         // The same bytes read as SMILES yield nothing at all. Before #151 the
         // `$$$$` terminators survived as atomless molecules, so this reported

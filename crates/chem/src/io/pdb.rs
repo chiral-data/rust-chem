@@ -622,7 +622,10 @@ END
 
         let back = crate::io::reader::read(&framed, crate::io::format::Format::PDB);
         assert_eq!(back.records.len(), 2, "{framed}");
-        assert_eq!(back.records[0].molecule.num_atoms(), mol.num_atoms());
+        assert_eq!(
+            back.records[0].molecule().unwrap().num_atoms(),
+            mol.num_atoms()
+        );
     }
 
     #[test]

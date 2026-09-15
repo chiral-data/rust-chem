@@ -142,7 +142,7 @@ mod tests {
 
         let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
         let record = supplier.next().unwrap().unwrap();
-        assert_eq!(record.molecule.formula(), "C2H6O");
+        assert_eq!(record.molecule().unwrap().formula(), "C2H6O");
         assert_eq!(record.name, "ethanol");
         assert!(supplier.next().is_none());
 
@@ -172,7 +172,7 @@ mod tests {
 
         let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
         let read_back = supplier.next().unwrap().unwrap();
-        assert_eq!(read_back.molecule.num_atoms(), mol.num_atoms());
+        assert_eq!(read_back.molecule().unwrap().num_atoms(), mol.num_atoms());
         assert!(supplier.next().is_none());
 
         std::fs::remove_dir_all(&dir).ok();

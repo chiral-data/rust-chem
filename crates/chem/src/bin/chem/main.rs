@@ -390,7 +390,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 .outcome
                 .records
                 .iter()
-                .map(|r| r.molecule.clone())
+                .filter_map(|r| stream::molecule_or_report(r, &read.label).cloned())
                 .collect();
 
             let started = Instant::now();
@@ -449,7 +449,10 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut changed = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
-                let mut molecule = record.molecule.clone();
+                let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+                    continue;
+                };
+                let mut molecule = molecule.clone();
                 let before = aromatic_atoms(&molecule);
                 chem::io::aromaticity::detect_aromaticity(&mut molecule);
                 if aromatic_atoms(&molecule) != before {
@@ -502,7 +505,10 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut flattened = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
-                let mut molecule = record.molecule.clone();
+                let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+                    continue;
+                };
+                let mut molecule = molecule.clone();
                 let had = molecule.has_coords();
                 let ok = if *relayout {
                     chem::core::layout::layout(&mut molecule)
@@ -602,11 +608,22 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut skipped = 0usize;
             for (i, item) in supplier.by_ref().enumerate() {
                 match item {
-                    Ok(record) => {
-                        tracker.record(&record.name, &record.molecule);
-                        writer.write_molecule(&record.name, &record.molecule)?;
-                        written += 1;
-                    }
+                    // #310: every registered format is `Kind::Molecules`
+                    // today, so `record.molecule()` cannot be `None` yet --
+                    // handled the same way a parse failure already is,
+                    // rather than an `unwrap` that would need revisiting the
+                    // day a non-molecule format streams through here.
+                    Ok(record) => match record.molecule() {
+                        Some(molecule) => {
+                            tracker.record(&record.name, molecule);
+                            writer.write_molecule(&record.name, molecule)?;
+                            written += 1;
+                        }
+                        None => {
+                            eprintln!("skipping record {} of {label}: not a molecule", i + 1);
+                            skipped += 1;
+                        }
+                    },
                     Err(e) => {
                         eprintln!("skipping record {} of {label}: {e}", i + 1);
                         skipped += 1;
@@ -667,30 +684,38 @@ fn run(cli: &Cli) -> Result<i32> {
             let size = Vec2::new(*width, *height);
 
             let mut generated = 0;
-            let mut rendered = Vec::with_capacity(read.outcome.len());
+            // Named alongside its rendering, not derived from `read.outcome`
+            // again afterward: a name list built separately from the records
+            // actually drawn would silently misalign with `rendered` the
+            // moment a record here is skipped (#310) -- unreachable today,
+            // since every registered format is `Kind::Molecules`, but wrong
+            // to leave for whichever format makes it reachable first.
+            let mut drawn: Vec<(String, String)> = Vec::with_capacity(read.outcome.len());
             for record in &read.outcome.records {
-                let mut molecule = record.molecule.clone();
+                let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+                    continue;
+                };
+                let mut molecule = molecule.clone();
                 if !molecule.has_coords() {
                     chem::core::layout::layout(&mut molecule);
                     generated += 1;
                 }
-                rendered.push(structure_to_svg(&molecule, size, &options, &palette));
+                drawn.push((
+                    record.name.clone(),
+                    structure_to_svg(&molecule, size, &options, &palette),
+                ));
             }
             if generated > 0 {
                 eprintln!(
                     "generated coordinates for {generated} of {} molecules (use `chem coords` to do this explicitly)",
-                    rendered.len()
+                    drawn.len()
                 );
             }
 
             match outdir {
                 Some(dir) => {
-                    let names: Vec<String> = read
-                        .outcome
-                        .records
-                        .iter()
-                        .map(|r| r.name.clone())
-                        .collect();
+                    let names: Vec<String> = drawn.iter().map(|(name, _)| name.clone()).collect();
+                    let rendered: Vec<String> = drawn.into_iter().map(|(_, svg)| svg).collect();
                     let filenames = export::unique_filenames(&names);
                     let renamed = filenames
                         .iter()
@@ -708,7 +733,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     }
                 }
                 None => {
-                    stream::write_output(output.as_ref(), &rendered[0])?;
+                    stream::write_output(output.as_ref(), &drawn[0].1)?;
                 }
             }
 
@@ -1105,7 +1130,9 @@ fn describe(read: &stream::Input) -> String {
     // anyone is actually asking.
     let mut out = String::from("name\tatoms\tbonds\tcoords2d\tcoords3d\n");
     for record in &read.outcome.records {
-        let molecule = &record.molecule;
+        let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+            continue;
+        };
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n",
             record.name,
