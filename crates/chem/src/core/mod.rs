@@ -10,6 +10,7 @@ pub mod rings;
 pub mod site;
 pub mod stereo;
 pub mod stereo_group;
+pub mod trajectory;
 
 pub mod elements;
 
@@ -27,6 +28,7 @@ pub mod prelude {
     pub use crate::core::site::AtomSite;
     pub use crate::core::stereo::perceive_bond_stereo;
     pub use crate::core::stereo_group::{StereoGroup, StereoGroupKind};
+    pub use crate::core::trajectory::{Frame, FrameSource, Trajectory, TrajectoryError};
 }
 
 #[cfg(test)]

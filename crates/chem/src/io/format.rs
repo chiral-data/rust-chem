@@ -338,18 +338,21 @@ pub enum Encoding {
 /// making a claim about atoms at all before it can enforce one.
 ///
 /// `#[non_exhaustive]`, like [`Category`]: a variant added later (this enum
-/// names all five kinds the v0.9.0 milestone needs, but none of `Frames`,
-/// `Volume`, `Mesh` or `Table` has a container type yet) forces every
-/// exhaustive match inside this crate to be revisited rather than silently
-/// compiling with a wrong assumption.
+/// names all five kinds the v0.9.0 milestone needs, but none of `Volume`,
+/// `Mesh` or `Table` has a container type yet, and no format is registered
+/// as `Frames` even though its container, [`crate::core::trajectory::Trajectory`],
+/// exists as of #311) forces every exhaustive match inside this crate to be
+/// revisited rather than silently compiling with a wrong assumption.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// One conformer, one topology -- what every format registered before
     /// #310 already is.
     Molecules,
-    /// One topology, many conformers -- a trajectory. No format claims this
-    /// yet; the first will be #329 (LAMMPS trajectory) or #326 (TRR).
+    /// One topology, many conformers -- a trajectory
+    /// ([`crate::core::trajectory::Trajectory`], #311). No format is
+    /// registered as this yet; the first will be #329 (LAMMPS trajectory) or
+    /// #326 (TRR).
     Frames,
     /// A scalar field on a grid -- a density map. No format claims this yet.
     Volume,
