@@ -11,6 +11,7 @@ pub mod site;
 pub mod stereo;
 pub mod stereo_group;
 pub mod trajectory;
+pub mod volume;
 
 pub mod elements;
 
@@ -29,6 +30,7 @@ pub mod prelude {
     pub use crate::core::stereo::perceive_bond_stereo;
     pub use crate::core::stereo_group::{StereoGroup, StereoGroupKind};
     pub use crate::core::trajectory::{Frame, FrameSource, Trajectory, TrajectoryError};
+    pub use crate::core::volume::{Axis, VolumeGrid, VolumeGridError, VolumeStatistics};
 }
 
 #[cfg(test)]
