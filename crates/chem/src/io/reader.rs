@@ -21,6 +21,7 @@
 //! lets each front end decide what to do with them.
 
 use crate::core::molecule::Molecule;
+use crate::core::trajectory::Trajectory;
 use crate::io::options::ReadOptions;
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
@@ -35,19 +36,28 @@ pub use crate::io::format::Format;
 
 /// What a record's payload holds.
 ///
-/// Mirrors [`crate::io::format::Kind`] on the format that produced it: every
-/// registered format is `Kind::Molecules` today (#310), so this has one
-/// variant. `#[non_exhaustive]`, so a second variant — landing with whichever
-/// of #311-#314 needs it first — forces every exhaustive match on this crate
-/// to be revisited rather than silently miscompiling.
+/// Mirrors [`crate::io::format::Kind`] on the format that produced it.
+/// `#[non_exhaustive]`, so a variant added later — landing with whichever of
+/// #312-#314 needs it first — forces every exhaustive match on this crate to
+/// be revisited rather than silently miscompiling.
+///
+/// No longer `Clone` (#311): [`Trajectory`] holds a `Box<dyn FrameSource>`,
+/// which cannot derive it without every future trajectory-format backend
+/// committing to being cheaply cloneable before any of them exist to say
+/// whether that's always possible. Nothing in this crate or `chem-app` ever
+/// cloned a whole `Record`/`Payload` — only its individual `String` fields or
+/// its `Molecule` — so this costs nothing today.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Payload {
     Molecule(Molecule),
+    /// One topology, many frames (#311). No registered format produces this
+    /// yet — it lands with whichever of #325-#329 needs it first.
+    Frames(Trajectory),
 }
 
 /// One record read from a file.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Record {
     pub payload: Payload,
     /// The record's own name, or `Molecule_N` where the file gave none.
@@ -62,14 +72,18 @@ pub struct Record {
 
 impl Record {
     /// The molecule this record holds, or `None` if its payload is not one.
-    ///
-    /// Always `Some` today — [`Payload`] has one variant — but written as an
-    /// exhaustive match with no wildcard so this stops compiling, in this one
-    /// place, the day a second variant lands, rather than every caller
-    /// silently treating a future non-molecule record as if it had none.
     pub fn molecule(&self) -> Option<&Molecule> {
         match &self.payload {
             Payload::Molecule(m) => Some(m),
+            Payload::Frames(_) => None,
+        }
+    }
+
+    /// The trajectory this record holds, or `None` if its payload is not one.
+    pub fn trajectory(&self) -> Option<&Trajectory> {
+        match &self.payload {
+            Payload::Molecule(_) => None,
+            Payload::Frames(t) => Some(t),
         }
     }
 }
@@ -92,7 +106,9 @@ pub struct Skipped {
 /// unreadable file is the caller's problem before this is called, and every
 /// per-record failure is already carried in [`Self::skipped`]. The previous
 /// signature returned `anyhow::Result` and never once returned `Err`.
-#[derive(Debug, Clone, Default)]
+///
+/// No longer `Clone` (#311) — see [`Payload`]'s doc comment.
+#[derive(Debug, Default)]
 pub struct ReadOutcome {
     pub records: Vec<Record>,
     pub skipped: Vec<Skipped>,
