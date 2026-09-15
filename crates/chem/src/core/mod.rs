@@ -4,6 +4,7 @@ pub mod cell;
 pub mod geometry;
 pub mod graph;
 pub mod layout;
+pub mod mesh;
 pub mod molecule;
 pub mod residue;
 pub mod rings;
@@ -23,6 +24,7 @@ pub mod prelude {
     pub use crate::core::geometry::{BoundingBox, Point2, Point3};
     pub use crate::core::graph::{MoleculeGraph, Neighbor};
     pub use crate::core::layout::{ensure_coords, layout};
+    pub use crate::core::mesh::{Color32, Mesh, MeshError};
     pub use crate::core::molecule::{Molecule, MoleculeError};
     pub use crate::core::residue::{Chain, Residue};
     pub use crate::core::rings::{Ring, find_sssr, perceive_rings, ring_count};
