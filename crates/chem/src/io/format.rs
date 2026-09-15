@@ -80,6 +80,26 @@ impl Carries {
     /// claim was never testable. Appended rather than inserted so the existing
     /// bit numbering stays put; the report order is a separate table.
     pub const BONDS: Carries = Carries(1 << 16);
+    /// A force-field atom type name (`"CT"`, `"OW"`), from
+    /// [`crate::core::force_field::ForceFieldAtom::atom_type`]. PSF and TOP
+    /// state one per atom; PRMTOP does too, in `AMBER_ATOM_TYPE`.
+    pub const ATOM_TYPE: Carries = Carries(1 << 17);
+    /// A force-field atomic mass, from
+    /// [`crate::core::force_field::ForceFieldAtom::mass`]. All three of PSF,
+    /// TOP and PRMTOP state one per atom.
+    pub const MASS: Carries = Carries(1 << 18);
+    /// Three-atom angle terms, from
+    /// [`crate::core::force_field::ForceFieldTopology::angles`].
+    pub const ANGLES: Carries = Carries(1 << 19);
+    /// Four-atom proper-torsion terms, from
+    /// [`crate::core::force_field::ForceFieldTopology::dihedrals`].
+    pub const DIHEDRALS: Carries = Carries(1 << 20);
+    /// Four-atom improper (out-of-plane) torsion terms, from
+    /// [`crate::core::force_field::ForceFieldTopology::impropers`].
+    pub const IMPROPERS: Carries = Carries(1 << 21);
+    /// Nonbonded-exclusion atom pairs, from
+    /// [`crate::core::force_field::ForceFieldTopology::exclusions`].
+    pub const EXCLUSIONS: Carries = Carries(1 << 22);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -100,6 +120,14 @@ impl Carries {
         (Carries::PROPERTIES, "properties"),
         (Carries::QUERY, "query"),
         (Carries::STEREO_GROUP, "stereo_group"),
+        // Force-field attributes (#315), grouped together here even though
+        // their bits were appended at the end of the numeric list above.
+        (Carries::ATOM_TYPE, "atom_type"),
+        (Carries::MASS, "mass"),
+        (Carries::ANGLES, "angles"),
+        (Carries::DIHEDRALS, "dihedrals"),
+        (Carries::IMPROPERS, "impropers"),
+        (Carries::EXCLUSIONS, "exclusions"),
     ];
 
     pub const fn empty() -> Carries {
@@ -255,6 +283,39 @@ pub fn held(molecule: &Molecule) -> Carries {
             if site.b_factor.is_some() {
                 carries = carries | Carries::B_FACTOR;
             }
+        }
+    }
+
+    if let Some(force_field) = molecule.force_field() {
+        if let Some(atoms) = &force_field.atoms {
+            for atom in atoms {
+                if atom.atom_type.is_some() {
+                    carries = carries | Carries::ATOM_TYPE;
+                }
+                if atom.mass.is_some() {
+                    carries = carries | Carries::MASS;
+                }
+                // Ors into the same flag the `sites` loop above already
+                // sets -- a Mol2 charge and an Amber charge are different
+                // provenances for the same fact, and the mask only claims
+                // that a partial charge survives, not which table it lives
+                // in.
+                if atom.partial_charge.is_some() {
+                    carries = carries | Carries::PARTIAL_CHARGE;
+                }
+            }
+        }
+        if !force_field.angles.is_empty() {
+            carries = carries | Carries::ANGLES;
+        }
+        if !force_field.dihedrals.is_empty() {
+            carries = carries | Carries::DIHEDRALS;
+        }
+        if !force_field.impropers.is_empty() {
+            carries = carries | Carries::IMPROPERS;
+        }
+        if !force_field.exclusions.is_empty() {
+            carries = carries | Carries::EXCLUSIONS;
         }
     }
 
@@ -1541,6 +1602,7 @@ mod tests {
     /// whose claim is wrong.
     fn one_per_attribute() -> Vec<(Carries, Molecule)> {
         use crate::core::cell::UnitCell;
+        use crate::core::force_field::{ForceFieldAtom, ForceFieldTopology};
         use crate::core::geometry::{Point2, Point3};
         use crate::core::residue::{Chain, Residue};
         use crate::core::site::AtomSite;
@@ -1618,6 +1680,58 @@ mod tests {
             .expect("valid stereo groups");
             m
         };
+        let with_force_field_atom = |mutate: fn(&mut ForceFieldAtom)| {
+            let mut m = ethane();
+            let mut atom = ForceFieldAtom::empty();
+            mutate(&mut atom);
+            m.set_force_field(ForceFieldTopology {
+                atoms: Some(vec![atom, ForceFieldAtom::empty()]),
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        // Three and four atoms respectively -- ethane's two aren't enough
+        // for an angle or a dihedral/improper term. Propane and butane's
+        // real, linear connectivity is exactly the shape an angle and a
+        // proper torsion need; isobutane's branch point is the shape an
+        // improper needs (a central atom plus three substituents).
+        let with_angle = {
+            let mut m = parse_smiles("CCC").expect("valid SMILES");
+            m.set_force_field(ForceFieldTopology {
+                angles: vec![[0, 1, 2]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_dihedral = {
+            let mut m = parse_smiles("CCCC").expect("valid SMILES");
+            m.set_force_field(ForceFieldTopology {
+                dihedrals: vec![[0, 1, 2, 3]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_improper = {
+            let mut m = parse_smiles("CC(C)C").expect("valid SMILES");
+            m.set_force_field(ForceFieldTopology {
+                impropers: vec![[0, 1, 2, 3]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_exclusion = {
+            let mut m = ethane();
+            m.set_force_field(ForceFieldTopology {
+                exclusions: vec![[0, 1]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
 
         vec![
             (Carries::TOPOLOGY, ethane()),
@@ -1651,6 +1765,18 @@ mod tests {
             (Carries::PROPERTIES, with_properties),
             (Carries::RESIDUES, with_residues),
             (Carries::STEREO_GROUP, with_stereo_group),
+            (
+                Carries::ATOM_TYPE,
+                with_force_field_atom(|a| a.atom_type = Some("CT".to_string())),
+            ),
+            (
+                Carries::MASS,
+                with_force_field_atom(|a| a.mass = Some(12.011)),
+            ),
+            (Carries::ANGLES, with_angle),
+            (Carries::DIHEDRALS, with_dihedral),
+            (Carries::IMPROPERS, with_improper),
+            (Carries::EXCLUSIONS, with_exclusion),
         ]
     }
 
@@ -1668,6 +1794,32 @@ mod tests {
         // Nothing in the data model expresses a query yet, so there is
         // deliberately no fixture and `held` must never set it.
         assert!(!held(&one_per_attribute()[0].1).contains(Carries::QUERY));
+    }
+
+    #[test]
+    fn test_partial_charge_is_detected_from_a_force_field_alone() {
+        // `PARTIAL_CHARGE` already has a fixture via `AtomSite` above; this
+        // is the other source (#315) -- proving the `OR` in `held` actually
+        // fires, not just that it compiles, by using a molecule with no
+        // site data at all.
+        use crate::core::force_field::{ForceFieldAtom, ForceFieldTopology};
+        use crate::io::smiles::parse_smiles;
+
+        let mut m = parse_smiles("CC").expect("valid SMILES");
+        assert!(m.sites().is_none());
+        m.set_force_field(ForceFieldTopology {
+            atoms: Some(vec![
+                ForceFieldAtom {
+                    partial_charge: Some(-0.1),
+                    ..ForceFieldAtom::default()
+                },
+                ForceFieldAtom::empty(),
+            ]),
+            ..ForceFieldTopology::default()
+        })
+        .expect("valid force field");
+
+        assert!(held(&m).contains(Carries::PARTIAL_CHARGE));
     }
 
     #[test]
