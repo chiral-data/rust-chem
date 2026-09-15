@@ -22,6 +22,7 @@
 
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
+use crate::core::table::Table;
 use crate::core::trajectory::Trajectory;
 use crate::core::volume::VolumeGrid;
 use crate::io::options::ReadOptions;
@@ -38,10 +39,11 @@ pub use crate::io::format::Format;
 
 /// What a record's payload holds.
 ///
-/// Mirrors [`crate::io::format::Kind`] on the format that produced it.
-/// `#[non_exhaustive]`, so a variant added later — landing with whichever of
-/// #314 needs it first — forces every exhaustive match on this crate to
-/// be revisited rather than silently miscompiling.
+/// Mirrors [`crate::io::format::Kind`] on the format that produced it. Every
+/// `Kind` from the v0.9.0 milestone (#307) has a variant here as of #314.
+/// `#[non_exhaustive]` anyway: a variant added past this milestone would
+/// still force every exhaustive match on this crate to be revisited rather
+/// than silently miscompiling.
 ///
 /// No longer `Clone` (#311): [`Trajectory`] holds a `Box<dyn FrameSource>`,
 /// which cannot derive it without every future trajectory-format backend
@@ -63,6 +65,9 @@ pub enum Payload {
     /// A triangulated surface (#313). No registered format produces this
     /// yet — it lands with whichever of #335-#336 needs it first.
     Mesh(Mesh),
+    /// A column store (#314). No registered format produces this yet — it
+    /// lands with #337 (CSV).
+    Table(Table),
 }
 
 /// One record read from a file.
@@ -87,6 +92,7 @@ impl Record {
             Payload::Frames(_) => None,
             Payload::Volume(_) => None,
             Payload::Mesh(_) => None,
+            Payload::Table(_) => None,
         }
     }
 
@@ -97,6 +103,7 @@ impl Record {
             Payload::Frames(t) => Some(t),
             Payload::Volume(_) => None,
             Payload::Mesh(_) => None,
+            Payload::Table(_) => None,
         }
     }
 
@@ -107,6 +114,7 @@ impl Record {
             Payload::Frames(_) => None,
             Payload::Volume(v) => Some(v),
             Payload::Mesh(_) => None,
+            Payload::Table(_) => None,
         }
     }
 
@@ -117,6 +125,18 @@ impl Record {
             Payload::Frames(_) => None,
             Payload::Volume(_) => None,
             Payload::Mesh(m) => Some(m),
+            Payload::Table(_) => None,
+        }
+    }
+
+    /// The table this record holds, or `None` if its payload is not one.
+    pub fn table(&self) -> Option<&Table> {
+        match &self.payload {
+            Payload::Molecule(_) => None,
+            Payload::Frames(_) => None,
+            Payload::Volume(_) => None,
+            Payload::Mesh(_) => None,
+            Payload::Table(t) => Some(t),
         }
     }
 }

@@ -338,14 +338,10 @@ pub enum Encoding {
 /// making a claim about atoms at all before it can enforce one.
 ///
 /// `#[non_exhaustive]`, like [`Category`]: a variant added later (this enum
-/// names all five kinds the v0.9.0 milestone needs, but `Table` has no
-/// container type yet, and no format is registered as `Frames`, `Volume` or
-/// `Mesh` even though their containers,
-/// [`crate::core::trajectory::Trajectory`] (#311),
-/// [`crate::core::volume::VolumeGrid`] (#312) and
-/// [`crate::core::mesh::Mesh`] (#313), already exist) forces every
-/// exhaustive match inside this crate to be revisited rather than silently
-/// compiling with a wrong assumption.
+/// names all five kinds the v0.9.0 milestone needs, and as of #314 every one
+/// has a container type -- but no format is registered as anything but
+/// `Molecules` yet) forces every exhaustive match inside this crate to be
+/// revisited rather than silently compiling with a wrong assumption.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -365,7 +361,9 @@ pub enum Kind {
     /// ([`crate::core::mesh::Mesh`], #313). No format is registered as this
     /// yet; the first will be #335 (OBJ) or #336 (PLY).
     Mesh,
-    /// Typed columns, no structure implied. No format claims this yet.
+    /// Typed columns, no structure implied ([`crate::core::table::Table`],
+    /// #314). No format is registered as this yet; the first will be #337
+    /// (CSV).
     Table,
 }
 
