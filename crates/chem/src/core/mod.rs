@@ -1,6 +1,7 @@
 pub mod atom;
 pub mod bond;
 pub mod cell;
+pub mod force_field;
 pub mod geometry;
 pub mod graph;
 pub mod layout;
@@ -22,6 +23,7 @@ pub mod prelude {
     pub use crate::core::bond::{Bond, BondOrder, BondStereo, BondType};
     pub use crate::core::cell::{SpaceGroup, UnitCell};
     pub use crate::core::elements::{ATOMIC_MASSES, ELEMENT_NAMES, ELEMENT_SYMBOLS};
+    pub use crate::core::force_field::{ForceFieldAtom, ForceFieldTopology};
     pub use crate::core::geometry::{BoundingBox, Point2, Point3};
     pub use crate::core::graph::{MoleculeGraph, Neighbor};
     pub use crate::core::layout::{ensure_coords, layout};
