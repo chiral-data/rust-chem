@@ -100,6 +100,34 @@ impl Carries {
     /// Nonbonded-exclusion atom pairs, from
     /// [`crate::core::force_field::ForceFieldTopology::exclusions`].
     pub const EXCLUSIONS: Carries = Carries(1 << 22);
+    /// Per-atom velocities, from [`crate::core::trajectory::Frame::velocities`].
+    /// TRR carries these; XTC never does.
+    pub const VELOCITIES: Carries = Carries(1 << 23);
+    /// Per-atom forces, from [`crate::core::trajectory::Frame::forces`].
+    pub const FORCES: Carries = Carries(1 << 24);
+    /// A frame's simulation time, from
+    /// [`crate::core::trajectory::Frame::time`]. Named `FRAME_TIME` rather
+    /// than `TIME` to stay unambiguous next to
+    /// [`Category::KineticsAndThermodynamics`], a category nothing in this
+    /// type otherwise names.
+    pub const FRAME_TIME: Carries = Carries(1 << 25);
+    /// A grid's sampled scalar values, from
+    /// [`crate::core::volume::VolumeGrid::values`] — the one thing every
+    /// volumetric format holds, the same role [`Carries::TOPOLOGY`] plays
+    /// for a molecule.
+    pub const SAMPLES: Carries = Carries(1 << 26);
+    /// A mesh's vertex positions, from [`crate::core::mesh::Mesh::vertices`]
+    /// — the one thing every mesh format holds; see [`Carries::FACES`] for
+    /// why the faces are a separate flag.
+    pub const VERTICES: Carries = Carries(1 << 27);
+    /// A mesh's faces, separate from [`Carries::VERTICES`] the same reason
+    /// [`Carries::BONDS`] is separate from [`Carries::TOPOLOGY`]: a format
+    /// could in principle carry vertex positions with no face list at all
+    /// (a point cloud).
+    pub const FACES: Carries = Carries(1 << 28);
+    /// A table's columns, from [`crate::core::table::Table::columns`] — the
+    /// one thing every tabular format holds.
+    pub const COLUMNS: Carries = Carries(1 << 29);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -128,6 +156,15 @@ impl Carries {
         (Carries::DIHEDRALS, "dihedrals"),
         (Carries::IMPROPERS, "impropers"),
         (Carries::EXCLUSIONS, "exclusions"),
+        // Non-molecule kinds (#316): a trajectory's frames, a volume grid's
+        // samples, a mesh's surface, a table's columns.
+        (Carries::VELOCITIES, "velocities"),
+        (Carries::FORCES, "forces"),
+        (Carries::FRAME_TIME, "frame_time"),
+        (Carries::SAMPLES, "samples"),
+        (Carries::VERTICES, "vertices"),
+        (Carries::FACES, "faces"),
+        (Carries::COLUMNS, "columns"),
     ];
 
     pub const fn empty() -> Carries {
@@ -1881,6 +1918,21 @@ mod tests {
         )
     }
 
+    /// Every ordered `(source, target)` pair sharing a `Kind`.
+    ///
+    /// A conversion between two kinds that will never meet (there is no
+    /// CSV-to-DCD conversion to measure) is not a cell this matrix needs --
+    /// #316. At 11 formats, all `Kind::Molecules` today, this is every pair
+    /// `all() x all()` already produced; it starts pruning the day a second
+    /// `Kind` is registered (#325-#337).
+    fn pairs_within_kind() -> impl Iterator<Item = (Format, Format)> {
+        all().flat_map(|source| {
+            all()
+                .filter(move |target| target.kind() == source.kind())
+                .map(move |target| (source, target))
+        })
+    }
+
     #[test]
     fn test_every_format_pair_delivers_what_the_matrix_says() {
         // The masks are per-format; a conversion is a pair. What survives
@@ -1890,25 +1942,28 @@ mod tests {
         // `test_declared_masks_match_what_actually_survives` only walks the
         // diagonal.
         let fixtures = one_per_attribute();
-        for source in all() {
-            for target in all() {
-                let predicted_mask = fidelity(source, target);
-                for (flag, molecule) in &fixtures {
-                    let back = convert(source, target, molecule).unwrap_or_else(|| {
-                        panic!("{source:?} -> {target:?} wrote nothing readable")
-                    });
+        let pairs: Vec<(Format, Format)> = pairs_within_kind().collect();
+        // Vacuous today -- 11 formats, one `Kind` -- and worth pinning as
+        // such rather than trusting silently: 11 x 11, the same count
+        // `all() x all()` already produced, so this test is unchanged until
+        // a second `Kind` registers.
+        assert_eq!(pairs.len(), 121);
+        for (source, target) in pairs {
+            let predicted_mask = fidelity(source, target);
+            for (flag, molecule) in &fixtures {
+                let back = convert(source, target, molecule)
+                    .unwrap_or_else(|| panic!("{source:?} -> {target:?} wrote nothing readable"));
 
-                    let predicted = predicted_mask.contains(*flag);
-                    let survived = held(&back).contains(*flag);
+                let predicted = predicted_mask.contains(*flag);
+                let survived = held(&back).contains(*flag);
 
-                    assert_eq!(
-                        predicted,
-                        survived,
-                        "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
-                        source.name(),
-                        target.name()
-                    );
-                }
+                assert_eq!(
+                    predicted,
+                    survived,
+                    "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                    source.name(),
+                    target.name()
+                );
             }
         }
     }
@@ -2236,15 +2291,13 @@ mod tests {
         let fixtures = one_per_attribute();
         let mut found: Vec<(Format, Format)> = Vec::new();
 
-        for source in all() {
-            for target in all() {
-                let lost = fixtures.iter().any(|(_, molecule)| {
-                    convert(source, target, molecule)
-                        .is_none_or(|back| back.num_atoms() != molecule.num_atoms())
-                });
-                if lost {
-                    found.push((source, target));
-                }
+        for (source, target) in pairs_within_kind() {
+            let lost = fixtures.iter().any(|(_, molecule)| {
+                convert(source, target, molecule)
+                    .is_none_or(|back| back.num_atoms() != molecule.num_atoms())
+            });
+            if lost {
+                found.push((source, target));
             }
         }
 
@@ -2294,16 +2347,38 @@ mod tests {
                 format.can_read() || format.can_write(),
                 "{format:?} can do neither"
             );
-            // An empty mask on a molecule-shaped format means the entry was
-            // added without one, which would silently report every molecule
-            // as losing everything. Meaningless for a format whose records
-            // aren't molecules at all (#310) -- a density map has nothing to
-            // declare here, and requiring it would force a lie just to pass.
-            if matches!(format.kind(), Kind::Molecules | Kind::Frames) {
-                assert!(
-                    format.carries().contains(Carries::TOPOLOGY),
-                    "{format:?} declares no topology, so its mask is missing"
-                );
+            // An empty mask means the entry was added without a defining
+            // flag, which would silently report every record as losing
+            // everything. Every kind gets exactly one mandatory "you exist"
+            // flag (#316) -- TOPOLOGY for a molecule, SAMPLES for a grid,
+            // VERTICES for a mesh, COLUMNS for a table -- mirroring how
+            // BONDS/FACES are separate, optional facts once the mandatory
+            // one is satisfied.
+            match format.kind() {
+                Kind::Molecules | Kind::Frames => {
+                    assert!(
+                        format.carries().contains(Carries::TOPOLOGY),
+                        "{format:?} declares no topology, so its mask is missing"
+                    );
+                }
+                Kind::Volume => {
+                    assert!(
+                        format.carries().contains(Carries::SAMPLES),
+                        "{format:?} declares no samples, so its mask is missing"
+                    );
+                }
+                Kind::Mesh => {
+                    assert!(
+                        format.carries().contains(Carries::VERTICES),
+                        "{format:?} declares no vertices, so its mask is missing"
+                    );
+                }
+                Kind::Table => {
+                    assert!(
+                        format.carries().contains(Carries::COLUMNS),
+                        "{format:?} declares no columns, so its mask is missing"
+                    );
+                }
             }
         }
     }
@@ -2348,6 +2423,61 @@ mod tests {
         // need it.
         assert!(requires_topology(&bare(Kind::Molecules)));
         assert!(requires_topology(&bare(Kind::Frames)));
+    }
+
+    #[test]
+    fn test_every_kind_requires_its_own_defining_flag() {
+        // #316's half of the same proof, for the three kinds that gained a
+        // real container type (#312-#314) but no registered format yet --
+        // SAMPLES/VERTICES/COLUMNS are each kind's own "you exist" flag, the
+        // role TOPOLOGY plays for a molecule. The predicate here is written
+        // out independently of the real match in
+        // `test_every_registered_format_is_well_formed` rather than sharing
+        // it, the same discipline `requires_topology` above already follows
+        // -- a test that calls the function it is meant to catch bugs in
+        // proves nothing.
+        fn bare(kind: Kind, carries: Carries) -> FormatDescriptor {
+            FormatDescriptor {
+                name: "probe",
+                codes: &["probe"],
+                extensions: &["probe"],
+                category: Category::Miscellaneous,
+                carries,
+                encoding: Encoding::Text,
+                kind,
+                reader: None,
+                writer: None,
+                reader_bytes: None,
+                writer_bytes: None,
+                supplier: None,
+                writer_stream: None,
+            }
+        }
+
+        fn passes(d: &FormatDescriptor) -> bool {
+            match d.kind {
+                Kind::Molecules | Kind::Frames => d.carries.contains(Carries::TOPOLOGY),
+                Kind::Volume => d.carries.contains(Carries::SAMPLES),
+                Kind::Mesh => d.carries.contains(Carries::VERTICES),
+                Kind::Table => d.carries.contains(Carries::COLUMNS),
+            }
+        }
+
+        // Each kind's own defining flag satisfies it ...
+        assert!(passes(&bare(Kind::Volume, Carries::SAMPLES)));
+        assert!(passes(&bare(Kind::Mesh, Carries::VERTICES)));
+        assert!(passes(&bare(Kind::Table, Carries::COLUMNS)));
+
+        // ... an empty mask does not -- the loophole the issue opens with.
+        assert!(!passes(&bare(Kind::Volume, Carries::empty())));
+        assert!(!passes(&bare(Kind::Mesh, Carries::empty())));
+        assert!(!passes(&bare(Kind::Table, Carries::empty())));
+
+        // ... and declaring a different kind's defining flag does not
+        // satisfy this one -- the flags are not interchangeable.
+        assert!(!passes(&bare(Kind::Volume, Carries::VERTICES)));
+        assert!(!passes(&bare(Kind::Mesh, Carries::COLUMNS)));
+        assert!(!passes(&bare(Kind::Table, Carries::SAMPLES)));
     }
 
     #[test]
