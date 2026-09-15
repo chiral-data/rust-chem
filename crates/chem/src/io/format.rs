@@ -338,11 +338,13 @@ pub enum Encoding {
 /// making a claim about atoms at all before it can enforce one.
 ///
 /// `#[non_exhaustive]`, like [`Category`]: a variant added later (this enum
-/// names all five kinds the v0.9.0 milestone needs, but none of `Volume`,
-/// `Mesh` or `Table` has a container type yet, and no format is registered
-/// as `Frames` even though its container, [`crate::core::trajectory::Trajectory`],
-/// exists as of #311) forces every exhaustive match inside this crate to be
-/// revisited rather than silently compiling with a wrong assumption.
+/// names all five kinds the v0.9.0 milestone needs, but none of `Mesh` or
+/// `Table` has a container type yet, and no format is registered as `Frames`
+/// or `Volume` even though their containers,
+/// [`crate::core::trajectory::Trajectory`] (#311) and
+/// [`crate::core::volume::VolumeGrid`] (#312), already exist) forces every
+/// exhaustive match inside this crate to be revisited rather than silently
+/// compiling with a wrong assumption.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -354,7 +356,9 @@ pub enum Kind {
     /// registered as this yet; the first will be #329 (LAMMPS trajectory) or
     /// #326 (TRR).
     Frames,
-    /// A scalar field on a grid -- a density map. No format claims this yet.
+    /// A scalar field on a grid -- a density map
+    /// ([`crate::core::volume::VolumeGrid`], #312). No format is registered
+    /// as this yet; the first will be #331 (CUBE).
     Volume,
     /// Vertices, normals, faces -- no chemistry at all. No format claims
     /// this yet.

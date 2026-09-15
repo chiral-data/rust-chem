@@ -22,6 +22,7 @@
 
 use crate::core::molecule::Molecule;
 use crate::core::trajectory::Trajectory;
+use crate::core::volume::VolumeGrid;
 use crate::io::options::ReadOptions;
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
@@ -38,7 +39,7 @@ pub use crate::io::format::Format;
 ///
 /// Mirrors [`crate::io::format::Kind`] on the format that produced it.
 /// `#[non_exhaustive]`, so a variant added later — landing with whichever of
-/// #312-#314 needs it first — forces every exhaustive match on this crate to
+/// #313-#314 needs it first — forces every exhaustive match on this crate to
 /// be revisited rather than silently miscompiling.
 ///
 /// No longer `Clone` (#311): [`Trajectory`] holds a `Box<dyn FrameSource>`,
@@ -54,6 +55,10 @@ pub enum Payload {
     /// One topology, many frames (#311). No registered format produces this
     /// yet — it lands with whichever of #325-#329 needs it first.
     Frames(Trajectory),
+    /// A scalar sampled on a regular 3D grid (#312). No registered format
+    /// produces this yet — it lands with whichever of #331-#334 needs it
+    /// first.
+    Volume(VolumeGrid),
 }
 
 /// One record read from a file.
@@ -76,6 +81,7 @@ impl Record {
         match &self.payload {
             Payload::Molecule(m) => Some(m),
             Payload::Frames(_) => None,
+            Payload::Volume(_) => None,
         }
     }
 
@@ -84,6 +90,16 @@ impl Record {
         match &self.payload {
             Payload::Molecule(_) => None,
             Payload::Frames(t) => Some(t),
+            Payload::Volume(_) => None,
+        }
+    }
+
+    /// The volume grid this record holds, or `None` if its payload is not one.
+    pub fn volume(&self) -> Option<&VolumeGrid> {
+        match &self.payload {
+            Payload::Molecule(_) => None,
+            Payload::Frames(_) => None,
+            Payload::Volume(v) => Some(v),
         }
     }
 }
