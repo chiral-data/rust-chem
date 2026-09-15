@@ -338,11 +338,12 @@ pub enum Encoding {
 /// making a claim about atoms at all before it can enforce one.
 ///
 /// `#[non_exhaustive]`, like [`Category`]: a variant added later (this enum
-/// names all five kinds the v0.9.0 milestone needs, but none of `Mesh` or
-/// `Table` has a container type yet, and no format is registered as `Frames`
-/// or `Volume` even though their containers,
-/// [`crate::core::trajectory::Trajectory`] (#311) and
-/// [`crate::core::volume::VolumeGrid`] (#312), already exist) forces every
+/// names all five kinds the v0.9.0 milestone needs, but `Table` has no
+/// container type yet, and no format is registered as `Frames`, `Volume` or
+/// `Mesh` even though their containers,
+/// [`crate::core::trajectory::Trajectory`] (#311),
+/// [`crate::core::volume::VolumeGrid`] (#312) and
+/// [`crate::core::mesh::Mesh`] (#313), already exist) forces every
 /// exhaustive match inside this crate to be revisited rather than silently
 /// compiling with a wrong assumption.
 #[non_exhaustive]
@@ -360,8 +361,9 @@ pub enum Kind {
     /// ([`crate::core::volume::VolumeGrid`], #312). No format is registered
     /// as this yet; the first will be #331 (CUBE).
     Volume,
-    /// Vertices, normals, faces -- no chemistry at all. No format claims
-    /// this yet.
+    /// Vertices, normals, faces -- no chemistry at all
+    /// ([`crate::core::mesh::Mesh`], #313). No format is registered as this
+    /// yet; the first will be #335 (OBJ) or #336 (PLY).
     Mesh,
     /// Typed columns, no structure implied. No format claims this yet.
     Table,

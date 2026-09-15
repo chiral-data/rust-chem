@@ -20,6 +20,7 @@
 //! So [`ReadOutcome`] carries the skipped records alongside the good ones and
 //! lets each front end decide what to do with them.
 
+use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::trajectory::Trajectory;
 use crate::core::volume::VolumeGrid;
@@ -39,7 +40,7 @@ pub use crate::io::format::Format;
 ///
 /// Mirrors [`crate::io::format::Kind`] on the format that produced it.
 /// `#[non_exhaustive]`, so a variant added later — landing with whichever of
-/// #313-#314 needs it first — forces every exhaustive match on this crate to
+/// #314 needs it first — forces every exhaustive match on this crate to
 /// be revisited rather than silently miscompiling.
 ///
 /// No longer `Clone` (#311): [`Trajectory`] holds a `Box<dyn FrameSource>`,
@@ -59,6 +60,9 @@ pub enum Payload {
     /// produces this yet — it lands with whichever of #331-#334 needs it
     /// first.
     Volume(VolumeGrid),
+    /// A triangulated surface (#313). No registered format produces this
+    /// yet — it lands with whichever of #335-#336 needs it first.
+    Mesh(Mesh),
 }
 
 /// One record read from a file.
@@ -82,6 +86,7 @@ impl Record {
             Payload::Molecule(m) => Some(m),
             Payload::Frames(_) => None,
             Payload::Volume(_) => None,
+            Payload::Mesh(_) => None,
         }
     }
 
@@ -91,6 +96,7 @@ impl Record {
             Payload::Molecule(_) => None,
             Payload::Frames(t) => Some(t),
             Payload::Volume(_) => None,
+            Payload::Mesh(_) => None,
         }
     }
 
@@ -100,6 +106,17 @@ impl Record {
             Payload::Molecule(_) => None,
             Payload::Frames(_) => None,
             Payload::Volume(v) => Some(v),
+            Payload::Mesh(_) => None,
+        }
+    }
+
+    /// The mesh this record holds, or `None` if its payload is not one.
+    pub fn mesh(&self) -> Option<&Mesh> {
+        match &self.payload {
+            Payload::Molecule(_) => None,
+            Payload::Frames(_) => None,
+            Payload::Volume(_) => None,
+            Payload::Mesh(m) => Some(m),
         }
     }
 }
