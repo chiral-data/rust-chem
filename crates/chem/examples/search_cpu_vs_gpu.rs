@@ -48,7 +48,15 @@ fn main() -> anyhow::Result<()> {
     if outcome.is_empty() {
         anyhow::bail!("no molecules in {path}");
     }
-    let corpus: Vec<_> = outcome.records.iter().map(|r| r.molecule.clone()).collect();
+    let corpus: Vec<_> = outcome
+        .records
+        .iter()
+        .map(|r| {
+            r.molecule()
+                .expect("read_smiles is Kind::Molecules")
+                .clone()
+        })
+        .collect();
     println!("corpus: {} molecules from {path}", corpus.len());
     println!("params: radius {RADIUS}, {SIZE} bits, top {TOP_K}");
     println!("fingerprint generation is setup here, and not timed\n");

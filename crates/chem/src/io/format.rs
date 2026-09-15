@@ -328,6 +328,38 @@ pub enum Encoding {
     Binary,
 }
 
+/// What a format's records *are*.
+///
+/// `test_every_registered_format_is_well_formed`'s `Carries::TOPOLOGY`
+/// assertion used to be unconditional -- a fair typo-catcher while every
+/// registered format was a molecule format. #310 is the first format-shaped
+/// story where that stops being true: a density map, a mesh and a table have
+/// no atoms to declare, so the invariant has to know which formats are
+/// making a claim about atoms at all before it can enforce one.
+///
+/// `#[non_exhaustive]`, like [`Category`]: a variant added later (this enum
+/// names all five kinds the v0.9.0 milestone needs, but none of `Frames`,
+/// `Volume`, `Mesh` or `Table` has a container type yet) forces every
+/// exhaustive match inside this crate to be revisited rather than silently
+/// compiling with a wrong assumption.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// One conformer, one topology -- what every format registered before
+    /// #310 already is.
+    Molecules,
+    /// One topology, many conformers -- a trajectory. No format claims this
+    /// yet; the first will be #329 (LAMMPS trajectory) or #326 (TRR).
+    Frames,
+    /// A scalar field on a grid -- a density map. No format claims this yet.
+    Volume,
+    /// Vertices, normals, faces -- no chemistry at all. No format claims
+    /// this yet.
+    Mesh,
+    /// Typed columns, no structure implied. No format claims this yet.
+    Table,
+}
+
 /// Parses a whole file into molecules.
 pub(crate) type ReadFn = fn(&str, &ReadOptions) -> ReadOutcome;
 
@@ -371,6 +403,8 @@ pub struct FormatDescriptor {
     pub carries: Carries,
     /// Whether this format's canonical bytes are UTF-8 text or binary.
     pub encoding: Encoding,
+    /// What this format's records *are* -- see [`Kind`].
+    pub kind: Kind,
 
     pub(crate) reader: Option<ReadFn>,
     pub(crate) writer: Option<WriteFn>,
@@ -415,6 +449,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(smiles_supplier),
         writer_stream: Some(smiles_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -456,6 +491,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(sdf_supplier),
         writer_stream: Some(sdf_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -491,6 +527,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(cxsmiles_supplier),
         writer_stream: Some(cxsmiles_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -515,6 +552,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(xyz_supplier),
         writer_stream: Some(xyz_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -542,6 +580,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(pdb_supplier),
         writer_stream: Some(pdb_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -566,6 +605,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(mmcif_supplier),
         writer_stream: Some(mmcif_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -595,6 +635,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(mol2_supplier),
         writer_stream: Some(mol2_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -620,6 +661,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(pdbqt_supplier),
         writer_stream: Some(pdbqt_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -641,6 +683,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(gro_supplier),
         writer_stream: Some(gro_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -667,6 +710,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(cml_supplier),
         writer_stream: Some(cml_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -701,6 +745,7 @@ static FORMATS: &[FormatDescriptor] = &[
         supplier: Some(commonchem_supplier),
         writer_stream: Some(commonchem_writer_stream),
         encoding: Encoding::Text,
+        kind: Kind::Molecules,
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -1045,6 +1090,11 @@ impl Format {
     /// Whether this format's canonical bytes are UTF-8 text or binary.
     pub fn encoding(&self) -> Encoding {
         self.descriptor().encoding
+    }
+
+    /// What this format's records are — see [`Kind`].
+    pub fn kind(&self) -> Kind {
+        self.descriptor().kind
     }
 
     pub fn can_read(&self) -> bool {
@@ -1630,7 +1680,8 @@ mod tests {
                 let Some(back) = outcome.records.first() else {
                     panic!("{format:?} wrote nothing readable for {flag:?}");
                 };
-                let survived = held(&back.molecule).contains(flag);
+                let survived = held(back.molecule().expect("fixture format is Kind::Molecules"))
+                    .contains(flag);
                 let claimed = format.carries().contains(flag);
 
                 assert_eq!(
@@ -1652,12 +1703,23 @@ mod tests {
         let records = vec![("probe".to_string(), molecule.clone())];
         let as_source = source.write(&records).expect("can_write said so");
         let read_source = crate::io::reader::read(&as_source, source);
-        let intermediate = &read_source.records.first()?.molecule;
+        let intermediate = read_source
+            .records
+            .first()?
+            .molecule()
+            .expect("fixture format is Kind::Molecules");
 
         let records = vec![("probe".to_string(), intermediate.clone())];
         let as_target = target.write(&records).expect("can_write said so");
         let read_target = crate::io::reader::read(&as_target, target);
-        Some(read_target.records.first()?.molecule.clone())
+        Some(
+            read_target
+                .records
+                .first()?
+                .molecule()
+                .expect("fixture format is Kind::Molecules")
+                .clone(),
+        )
     }
 
     #[test]
@@ -1706,13 +1768,23 @@ mod tests {
         let records: Vec<(String, Molecule)> = outcome
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
 
         for format in all() {
             let text = format.write(&records).expect("every format writes");
             let back = crate::io::reader::read(&text, format);
-            let mut molecule = back.records[0].molecule.clone();
+            let mut molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules")
+                .clone();
             crate::core::layout::ensure_coords(&mut molecule);
 
             let coords = molecule.coords().expect("a layout, computed or read");
@@ -1788,13 +1860,22 @@ mod tests {
         let records: Vec<(String, Molecule)> = outcome
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
 
         for format in all() {
             let text = format.write(&records).expect("every format writes");
             let back = crate::io::reader::read(&text, format);
-            let molecule = &back.records[0].molecule;
+            let molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules");
 
             let aromatic_atoms = molecule.atoms().iter().filter(|a| a.is_aromatic()).count();
             let flagged = molecule.bonds().iter().filter(|b| b.is_aromatic()).count();
@@ -1874,20 +1955,36 @@ mod tests {
         let bonded: Vec<(String, Molecule)> = bonded
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
         // Two atoms, no bond between them, each stating it has no hydrogens.
         let lone = crate::io::reader::read("[C].[Cl] lone\n", Format::SMILES);
         let lone: Vec<(String, Molecule)> = lone
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
 
         for format in all().filter(|f| f.can_read() && f.can_write()) {
             let text = format.write(&bonded).expect("every format writes");
             let back = crate::io::reader::read(&text, format);
-            let molecule = &back.records[0].molecule;
+            let molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules");
 
             let mut bonded_atoms = 0;
             for index in 0..molecule.num_atoms() {
@@ -1911,7 +2008,9 @@ mod tests {
 
             let text = format.write(&lone).expect("every format writes");
             let back = crate::io::reader::read(&text, format);
-            let molecule = &back.records[0].molecule;
+            let molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules");
 
             for index in 0..molecule.num_atoms() {
                 assert!(
@@ -1943,7 +2042,14 @@ mod tests {
         let records: Vec<(String, Molecule)> = outcome
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
         assert_eq!(records.len(), 3, "the fixture must be multi-record");
 
@@ -2029,13 +2135,60 @@ mod tests {
                 format.can_read() || format.can_write(),
                 "{format:?} can do neither"
             );
-            // An empty mask means the entry was added without one, which would
-            // silently report every molecule as losing everything.
-            assert!(
-                format.carries().contains(Carries::TOPOLOGY),
-                "{format:?} declares no topology, so its mask is missing"
-            );
+            // An empty mask on a molecule-shaped format means the entry was
+            // added without one, which would silently report every molecule
+            // as losing everything. Meaningless for a format whose records
+            // aren't molecules at all (#310) -- a density map has nothing to
+            // declare here, and requiring it would force a lie just to pass.
+            if matches!(format.kind(), Kind::Molecules | Kind::Frames) {
+                assert!(
+                    format.carries().contains(Carries::TOPOLOGY),
+                    "{format:?} declares no topology, so its mask is missing"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn test_the_topology_invariant_is_kind_aware_not_disabled() {
+        // `test_every_registered_format_is_well_formed`'s relaxation above,
+        // exercised against real `FormatDescriptor` values that never enter
+        // `FORMATS` -- none of `Kind::Volume`/`Mesh`/`Table` has a real
+        // container type yet (#311-#314), so this is the only way to prove
+        // the relaxation works for the kinds it targets without waiting on
+        // them. Same condition as the real test, applied directly to a
+        // descriptor's own fields rather than duplicated in a helper.
+        fn bare(kind: Kind) -> FormatDescriptor {
+            FormatDescriptor {
+                name: "probe",
+                codes: &["probe"],
+                extensions: &["probe"],
+                category: Category::Miscellaneous,
+                carries: Carries::empty(),
+                encoding: Encoding::Text,
+                kind,
+                reader: None,
+                writer: None,
+                reader_bytes: None,
+                writer_bytes: None,
+                supplier: None,
+                writer_stream: None,
+            }
+        }
+
+        let requires_topology =
+            |d: &FormatDescriptor| matches!(d.kind, Kind::Molecules | Kind::Frames);
+
+        // A volume descriptor with nothing declared: the relaxed check
+        // accepts it -- an empty mask is meaningless for this kind.
+        assert!(!requires_topology(&bare(Kind::Volume)));
+        assert!(!requires_topology(&bare(Kind::Mesh)));
+        assert!(!requires_topology(&bare(Kind::Table)));
+        // A molecule/frames descriptor with nothing declared: still flagged
+        // -- the relaxation did not turn the check off for the kinds that
+        // need it.
+        assert!(requires_topology(&bare(Kind::Molecules)));
+        assert!(requires_topology(&bare(Kind::Frames)));
     }
 
     #[test]

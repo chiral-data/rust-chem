@@ -90,7 +90,22 @@ impl MoleculeDataset {
     pub fn from_outcome(outcome: &ReadOutcome, format: DatasetFormat) -> Self {
         let mut dataset = Self::new();
         for record in &outcome.records {
-            dataset.molecules.push(record.molecule.clone());
+            // #310 widened `Record` to hold a payload that is not necessarily
+            // a molecule. `MoleculeDataset` itself is still molecule-shaped --
+            // teaching it to show a non-molecule row is #342's job -- so for
+            // now such a record is dropped, the same way a record `read`
+            // itself couldn't parse is: reported, not silently included.
+            // Every registered format is `Kind::Molecules` today, so this
+            // branch cannot fire yet.
+            let Some(molecule) = record.molecule() else {
+                log::warn!(
+                    "Dropped a non-molecule record '{}' from a {} dataset",
+                    record.name,
+                    format.label()
+                );
+                continue;
+            };
+            dataset.molecules.push(molecule.clone());
             // Most formats carry coordinates and connectivity rather than a
             // SMILES string, so the column needs something to say. Both the
             // generated string and the placeholder are display decisions, made
@@ -104,14 +119,14 @@ impl MoleculeDataset {
             // format registered and a lie for the nine v0.8.0 added -- open a
             // PDB and every row claimed to be an SDF record (#266).
             let write_one =
-                states_a_bond_model(format) && record.molecule.num_atoms() <= GENERATE_UP_TO_ATOMS;
+                states_a_bond_model(format) && molecule.num_atoms() <= GENERATE_UP_TO_ATOMS;
             let written = record.smiles.clone().or_else(|| {
                 // An atomless molecule writes an empty string, and four readers
                 // accept any text as exactly that (#268), so an empty result
                 // falls through to the placeholder -- an empty cell reads as a
                 // rendering fault.
                 write_one
-                    .then(|| write_smiles_for_molecule_canonical(&record.molecule))
+                    .then(|| write_smiles_for_molecule_canonical(molecule))
                     .filter(|smiles| !smiles.is_empty())
             });
             dataset

@@ -60,7 +60,12 @@ fn main() {
     let records: Vec<(String, Molecule)> = outcome
         .records
         .iter()
-        .map(|r| (r.name.clone(), r.molecule.clone()))
+        .map(|r| {
+            (
+                r.name.clone(),
+                r.molecule().expect("SMILES is Kind::Molecules").clone(),
+            )
+        })
         .collect();
     for f in format::all() {
         let text = f

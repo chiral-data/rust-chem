@@ -10,7 +10,8 @@
 //! keeps the tool composable.
 
 use anyhow::{Context, Result};
-use chem::io::reader::{self, Format, ReadOutcome};
+use chem::core::molecule::Molecule;
+use chem::io::reader::{self, Format, ReadOutcome, Record};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +77,27 @@ pub fn write_output(path: Option<&PathBuf>, contents: &str) -> Result<()> {
             lock.write_all(contents.as_bytes())
                 .context("writing to standard output")?;
             lock.flush().context("flushing standard output")
+        }
+    }
+}
+
+/// The molecule in `record`, or `None` after reporting it as skipped.
+///
+/// #310 widened [`Record`] to allow a payload that is not a molecule. Every
+/// registered format is `Kind::Molecules` today, so this cannot fire yet --
+/// it exists so a molecule-only subcommand reports a future non-molecule
+/// record the same way [`report`] already reports a parse failure, on
+/// stderr and naming the record, rather than panicking on an `unwrap` or
+/// silently dropping it.
+pub fn molecule_or_report<'a>(record: &'a Record, label: &str) -> Option<&'a Molecule> {
+    match record.molecule() {
+        Some(molecule) => Some(molecule),
+        None => {
+            eprintln!(
+                "  skipped record '{}' in {label}: not a molecule",
+                record.name
+            );
+            None
         }
     }
 }

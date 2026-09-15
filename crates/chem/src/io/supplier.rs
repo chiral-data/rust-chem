@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 use crate::core::molecule::Molecule;
 use crate::io::errors::ReadError;
 use crate::io::options::{ReadOptions, WriteOptions};
-use crate::io::reader::Record;
+use crate::io::reader::{Payload, Record};
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
@@ -95,7 +95,7 @@ impl<R: BufRead> Iterator for SmilesSupplier<R> {
             return Some(
                 parse_smiles(smiles)
                     .map(|molecule| Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: Some(smiles.to_owned()),
                     })
@@ -163,7 +163,7 @@ impl<R: BufRead> Iterator for CxSmilesSupplier<R> {
             return Some(
                 crate::io::cxsmiles::parse_cxsmiles(smiles, block)
                     .map(|molecule| Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: Some(smiles.to_owned()),
                     })
@@ -240,7 +240,7 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -348,7 +348,7 @@ impl<R: BufRead> Iterator for MmcifSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -431,7 +431,7 @@ impl<R: BufRead> Iterator for Mol2Supplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -489,7 +489,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -587,7 +587,7 @@ impl<R: BufRead> Iterator for XyzSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -881,7 +881,7 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -1058,7 +1058,7 @@ impl<R: BufRead> Iterator for GroSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -1203,7 +1203,7 @@ impl<R: BufRead> Iterator for CmlSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -1283,7 +1283,7 @@ impl CommonchemSupplier {
                     .into_iter()
                     .map(|(name, molecule)| {
                         Ok(Record {
-                            molecule,
+                            payload: Payload::Molecule(molecule),
                             name,
                             smiles: None,
                         })
@@ -1365,12 +1365,12 @@ mod tests {
         let streamed_ok: Vec<_> = streamed
             .iter()
             .filter_map(|r| r.as_ref().ok())
-            .map(|r| (r.molecule.formula(), r.name.clone()))
+            .map(|r| (r.molecule().unwrap().formula(), r.name.clone()))
             .collect();
         let one_shot_ok: Vec<_> = one_shot
             .records
             .iter()
-            .map(|r| (r.molecule.formula(), r.name.clone()))
+            .map(|r| (r.molecule().unwrap().formula(), r.name.clone()))
             .collect();
         assert_eq!(streamed_ok, one_shot_ok);
 
@@ -1406,7 +1406,10 @@ mod tests {
         assert_eq!(streamed.len(), one_shot.records.len());
         for (streamed, one_shot) in streamed.iter().zip(one_shot.records.iter()) {
             let streamed = streamed.as_ref().unwrap();
-            assert_eq!(streamed.molecule.num_atoms(), one_shot.molecule.num_atoms());
+            assert_eq!(
+                streamed.molecule().unwrap().num_atoms(),
+                one_shot.molecule().unwrap().num_atoms()
+            );
             assert_eq!(streamed.name, one_shot.name);
         }
         assert_eq!(one_shot.records[0].name, "my-molecule");
