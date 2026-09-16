@@ -31,6 +31,8 @@ occupancy column beside it, which destroys the per-atom confidence a predicted
 structure stores there.
 """
 
+import tempfile
+from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
 import gemmi as _gemmi
@@ -79,16 +81,10 @@ class Summary(NamedTuple):
     residues: tuple[tuple[str, int, str], ...]
 
 
-def summarize(text: str, suffix: str = ".cif") -> Optional[Summary]:
-    """Reads `text` (mmCIF by default; pass `suffix=".pdb"` for PDB) and
-    summarises what gemmi saw, or `None` if gemmi could not read it at all
-    (either it raised, or it read zero models — gemmi does both depending
-    on exactly what's missing, so both count as "could not read this").
+def _summarize_structure(structure: "_gemmi.Structure") -> Optional[Summary]:
+    """The part [`summarize`] and [`summarize_bytes`] share once gemmi has
+    already produced a `Structure`, whether from text or from a file.
     """
-    try:
-        structure = _gemmi.read_structure_string(text, format=_FORMAT[suffix])
-    except Exception:
-        return None
     if len(structure) == 0:
         return None
 
@@ -113,6 +109,41 @@ def summarize(text: str, suffix: str = ".cif") -> Optional[Summary]:
         for residue in chain
     )
     return Summary(atom_count, cell, chain_ids, residues)
+
+
+def summarize(text: str, suffix: str = ".cif") -> Optional[Summary]:
+    """Reads `text` (mmCIF by default; pass `suffix=".pdb"` for PDB) and
+    summarises what gemmi saw, or `None` if gemmi could not read it at all
+    (either it raised, or it read zero models — gemmi does both depending
+    on exactly what's missing, so both count as "could not read this").
+    """
+    try:
+        structure = _gemmi.read_structure_string(text, format=_FORMAT[suffix])
+    except Exception:
+        return None
+    return _summarize_structure(structure)
+
+
+def summarize_bytes(data: bytes) -> Optional[Summary]:
+    """The BinaryCIF counterpart of [`summarize`] (#319).
+
+    gemmi's BinaryCIF path needs a real file rather than
+    `read_structure_string` (there is no bytes-taking string-reader
+    equivalent for a binary format), so this writes `data` to a temporary
+    `.bcif` file and reads it back from there -- the file is scratch, not a
+    fixture, and is removed once gemmi is done with it.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".bcif", delete=False) as f:
+        f.write(data)
+        path = Path(f.name)
+    try:
+        try:
+            structure = _gemmi.read_structure(str(path))
+        except Exception:
+            return None
+        return _summarize_structure(structure)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 class Sites(NamedTuple):

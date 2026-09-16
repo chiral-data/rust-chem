@@ -886,6 +886,35 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
     },
+    FormatDescriptor {
+        name: "BinaryCIF",
+        codes: &["bcif", "binarycif"],
+        extensions: &["bcif"],
+        category: Category::BiologicalData,
+        // Same mask as mmCIF, and for the same reasons -- see `io/mmcif.rs`'s
+        // module doc. Both formats go through the same
+        // `cif_model::build_molecule`/`build_rows` (#319), so what survives
+        // a round trip is identical by construction.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::RESIDUES)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(bcif_supplier),
+        writer_stream: Some(bcif_writer_stream),
+        encoding: Encoding::Binary,
+        kind: Kind::Molecules,
+        // MessagePack has no fixed leading bytes -- its first byte encodes
+        // the top-level value's own type and length, so there is nothing
+        // to sniff. Resolved by extension only, same as every format
+        // registered before #317 added `magic` at all.
+        magic: &[],
+        reader_bytes: Some(crate::io::bcif::read_bcif_with_options),
+        writer_bytes: Some(crate::io::bcif::write_bcif_records),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -934,6 +963,10 @@ fn cml_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
     Box::new(crate::io::supplier::CmlSupplier::new(reader, options))
 }
 
+fn bcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::bcif::BcifSupplier::new(reader, options))
+}
+
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::SmilesWriter::new(writer, options))
 }
@@ -976,6 +1009,10 @@ fn commonchem_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> B
 
 fn cml_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::CmlWriter::new(writer, options))
+}
+
+fn bcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::bcif::BcifWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -1157,6 +1194,15 @@ impl Format {
     /// the ruling #184 closed with — see `Cargo.toml`'s `serde_json`
     /// dependency comment.
     pub const COMMONCHEM: Format = Format(10);
+    /// BinaryCIF (#319) — MessagePack-encoded mmCIF, the same
+    /// `cif_model::build_molecule`/`build_rows` mmCIF text goes through,
+    /// see [`crate::io::bcif`]. The first format to use `Encoding::Binary`,
+    /// `reader_bytes`/`writer_bytes` (#309's plumbing, unused until now),
+    /// and a hand-rolled codec ([`crate::io::msgpack`]) rather than a
+    /// dependency — the crate's existing style for a small, bounded
+    /// surface, the same reasoning `Carries` is hand-rolled instead of
+    /// depending on `bitflags`.
+    pub const BCIF: Format = Format(11);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1288,7 +1334,7 @@ impl Format {
     }
 
     /// Serialises molecules in this format with default options, carrying
-    /// their names, or `None` if the format cannot be written.
+    /// their names, or `None` if the format cannot be written as text.
     ///
     /// The public way to reach a writer. The function pointer itself stays
     /// private — the binary is a separate crate, so `pub(crate)` would not
@@ -1304,11 +1350,14 @@ impl Format {
         records: &[(String, Molecule)],
         options: &WriteOptions,
     ) -> Option<String> {
-        // Text formats only, today — routed through `write_bytes_with_options`
-        // so there is one canonical write path (#309). `from_utf8` cannot
-        // fail here: every populated `writer` produces a `String` in the
-        // first place, so `write_bytes_with_options` only ever hands back
-        // its own bytes.
+        // `None` for a binary format (BinaryCIF, #319, the first one) rather
+        // than forcing its bytes through `from_utf8` -- they are not text,
+        // and were never going to decode as any. `write_bytes`/
+        // `write_bytes_with_options` is the canonical path for a caller that
+        // wants a binary format's own bytes.
+        if self.encoding() == Encoding::Binary {
+            return None;
+        }
         self.write_bytes_with_options(records, options)
             .map(|bytes| String::from_utf8(bytes).expect("text writer produced valid UTF-8"))
     }
@@ -1400,6 +1449,14 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         "every atom line names a residue; absent input writes UNK",
     ),
     (
+        // Same reason as MMCIF, verbatim: both go through
+        // `cif_model::build_rows` (#319), so what one supplies, the other
+        // does too, by construction.
+        Format::BCIF,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
         Format::MOL2,
         Carries::RESIDUES,
         "every atom line names a substructure; absent input writes UNK",
@@ -1426,6 +1483,12 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         "fixed column; absent input writes 1.00",
     ),
     (
+        // Same reason as MMCIF -- shares `cif_model::build_rows` (#319).
+        Format::BCIF,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
         Format::PDBQT,
         Carries::OCCUPANCY,
         "fixed column; absent input writes 1.00",
@@ -1437,6 +1500,12 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
     ),
     (
         Format::MMCIF,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    (
+        // Same reason as MMCIF -- shares `cif_model::build_rows` (#319).
+        Format::BCIF,
         Carries::B_FACTOR,
         "fixed column; absent input writes 0.00",
     ),
@@ -1956,8 +2025,8 @@ mod tests {
             }
             for (flag, molecule) in one_per_attribute() {
                 let records = vec![("probe".to_string(), molecule)];
-                let text = format.write(&records).expect("can_write said so");
-                let outcome = crate::io::reader::read(&text, format);
+                let bytes = format.write_bytes(&records).expect("can_write said so");
+                let outcome = format.read_bytes(&bytes).expect("can_read said so");
                 let Some(back) = outcome.records.first() else {
                     panic!("{format:?} wrote nothing readable for {flag:?}");
                 };
@@ -1978,12 +2047,17 @@ mod tests {
     /// One conversion, exactly as `chem convert` performs it: read the source
     /// file, write the target, read it back.
     ///
+    /// Goes through `write_bytes`/`read_bytes` rather than the text-only
+    /// `write`/`reader::read` -- the canonical path every format goes
+    /// through regardless of encoding (#309), and the only one BinaryCIF
+    /// (#319) can use at all, since its bytes are not valid UTF-8.
+    ///
     /// Returns `None` when a format writes something it cannot read back,
     /// which is a failure rather than a loss and is reported as one.
     fn convert(source: Format, target: Format, molecule: &Molecule) -> Option<Molecule> {
         let records = vec![("probe".to_string(), molecule.clone())];
-        let as_source = source.write(&records).expect("can_write said so");
-        let read_source = crate::io::reader::read(&as_source, source);
+        let as_source = source.write_bytes(&records)?;
+        let read_source = source.read_bytes(&as_source)?;
         let intermediate = read_source
             .records
             .first()?
@@ -1991,8 +2065,8 @@ mod tests {
             .expect("fixture format is Kind::Molecules");
 
         let records = vec![("probe".to_string(), intermediate.clone())];
-        let as_target = target.write(&records).expect("can_write said so");
-        let read_target = crate::io::reader::read(&as_target, target);
+        let as_target = target.write_bytes(&records)?;
+        let read_target = target.read_bytes(&as_target)?;
         Some(
             read_target
                 .records
@@ -2007,7 +2081,7 @@ mod tests {
     ///
     /// A conversion between two kinds that will never meet (there is no
     /// CSV-to-DCD conversion to measure) is not a cell this matrix needs --
-    /// #316. At 11 formats, all `Kind::Molecules` today, this is every pair
+    /// #316. At 12 formats, all `Kind::Molecules` today, this is every pair
     /// `all() x all()` already produced; it starts pruning the day a second
     /// `Kind` is registered (#325-#337).
     fn pairs_within_kind() -> impl Iterator<Item = (Format, Format)> {
@@ -2028,11 +2102,11 @@ mod tests {
         // diagonal.
         let fixtures = one_per_attribute();
         let pairs: Vec<(Format, Format)> = pairs_within_kind().collect();
-        // Vacuous today -- 11 formats, one `Kind` -- and worth pinning as
-        // such rather than trusting silently: 11 x 11, the same count
+        // Vacuous today -- 12 formats, one `Kind` -- and worth pinning as
+        // such rather than trusting silently: 12 x 12, the same count
         // `all() x all()` already produced, so this test is unchanged until
         // a second `Kind` registers.
-        assert_eq!(pairs.len(), 121);
+        assert_eq!(pairs.len(), 144);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             for (flag, molecule) in &fixtures {
@@ -2078,8 +2152,10 @@ mod tests {
             .collect();
 
         for format in all() {
-            let text = format.write(&records).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
+            let bytes = format.write_bytes(&records).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
             let mut molecule = back.records[0]
                 .molecule()
                 .expect("fixture format is Kind::Molecules")
@@ -2170,8 +2246,10 @@ mod tests {
             .collect();
 
         for format in all() {
-            let text = format.write(&records).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
+            let bytes = format.write_bytes(&records).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
             let molecule = back.records[0]
                 .molecule()
                 .expect("fixture format is Kind::Molecules");
@@ -2279,8 +2357,10 @@ mod tests {
             .collect();
 
         for format in all().filter(|f| f.can_read() && f.can_write()) {
-            let text = format.write(&bonded).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
+            let bytes = format.write_bytes(&bonded).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
             let molecule = back.records[0]
                 .molecule()
                 .expect("fixture format is Kind::Molecules");
@@ -2305,8 +2385,10 @@ mod tests {
                 format.name()
             );
 
-            let text = format.write(&lone).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
+            let bytes = format.write_bytes(&lone).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
             let molecule = back.records[0]
                 .molecule()
                 .expect("fixture format is Kind::Molecules");
@@ -2353,8 +2435,10 @@ mod tests {
         assert_eq!(records.len(), 3, "the fixture must be multi-record");
 
         for format in all() {
-            let text = format.write(&records).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
+            let bytes = format.write_bytes(&records).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
             assert_eq!(
                 back.records.len(),
                 records.len(),
@@ -2636,12 +2720,15 @@ mod tests {
     }
 
     #[test]
-    fn test_every_registered_format_is_text_encoded_today() {
-        // #309 adds the byte-level path, but no format's descriptor is
-        // repointed at it yet -- that starts at #318 once `Kind` (#310)
-        // exists. Every one of today's 11 formats must still be plain text,
-        // with no binary reader/writer wired in.
+    fn test_every_text_format_stays_text_encoded() {
+        // #309 added the byte-level path; #319 (BinaryCIF) is the first
+        // format to actually use it -- named here as the one exception
+        // rather than deleting the invariant, since every *other* format
+        // must still be plain text with no binary reader/writer wired in.
         for format in all() {
+            if format == Format::BCIF {
+                continue;
+            }
             let d = format.descriptor();
             assert_eq!(
                 d.encoding,
@@ -2765,7 +2852,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 11);
+        assert_eq!(all().count(), 12);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

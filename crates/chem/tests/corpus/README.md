@@ -39,6 +39,7 @@ molecule against several and pass for the wrong reason.
 | `pdb/ligand-fully-connected.pdb` | The **hydrogen count**. Every atom in a `CONECT` record, which is what lets an oracle compare a count PDB never states (#293) |
 | `mmcif/` | The mmCIF analogues of the first two |
 | `sdf/ethanol.mol` | A real molfile as it actually looks: no `$$$$` at all, which is an SDF multi-record separator a single-molecule `.mol` file never has (#318) |
+| `bcif/` | The BinaryCIF encoding of the two `mmcif/` fixtures beside them, generated with `chem convert *.cif --to bcif` -- this crate's own writer, not vendored bytes, so what's tested is that its encoder and decoder agree on real structure-sized input (#319) |
 
 ## Pinned gaps
 

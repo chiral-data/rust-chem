@@ -572,6 +572,76 @@ def check_mmcif(oracles: list[Oracle], verbose: bool) -> Report:
     return report
 
 
+BCIF_CORPUS = CORPUS / "bcif"
+
+
+def check_binarycif(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem`'s BinaryCIF round trip agree with gemmi's independent
+    read (#319)?
+
+    Two checks per fixture, not one -- a self-round-trip through `chem`
+    alone could hide a decoder bug that the encoder mirrors consistently:
+
+    1. **bcif -> bcif**, the direct analogue of `check_mmcif`'s cif -> cif:
+       gemmi's summary of the original bytes must match gemmi's summary of
+       what `chem convert --from bcif --to bcif` wrote back.
+    2. **bcif -> mmcif**, cross-checked against the *already-established*
+       mmCIF oracle result for the same-named `.cif` fixture in
+       `MMCIF_CORPUS` -- this is the one that actually proves the decoder
+       got the encoding math right, independent of `chem`'s own encoder,
+       since it compares against a completely different write path.
+
+    Like `check_mmcif`, this ignores `oracles` and drives gemmi directly --
+    neither RDKit nor OpenBabel can judge a structure format.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    summarize = gemmi_oracle.load_gemmi()
+    report = Report()
+    for path in sorted(BCIF_CORPUS.glob("*.bcif")):
+        original = path.read_bytes()
+        reference = gemmi_oracle.summarize_bytes(original)
+        if reference is None:
+            report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+            continue
+
+        written = chem.convert_binarycif(original, "bcif")
+        if written is None:
+            report.mismatch(f"{path.name}: chem could not round-trip this file")
+            continue
+
+        ours = gemmi_oracle.summarize_bytes(written)
+        if ours is None:
+            report.mismatch(f"{path.name}: gemmi cannot read what chem wrote back")
+            continue
+        if ours != reference:
+            report.mismatch(
+                f"{path.name}: chem's bcif round trip disagrees with gemmi — {reference} vs {ours}"
+            )
+            continue
+
+        as_mmcif = chem.convert_binarycif(original, "mmcif")
+        sibling = MMCIF_CORPUS / f"{path.stem}.cif"
+        if as_mmcif is None or not sibling.exists():
+            report.ok()
+            if verbose:
+                print(f"    ok         {path.name:<34} {reference.atom_count} atoms (no mmcif cross-check)")
+            continue
+
+        cross_reference = summarize(sibling.read_text())
+        cross_ours = summarize(as_mmcif)
+        if cross_reference is not None and cross_ours != cross_reference:
+            report.mismatch(
+                f"{path.name}: bcif decoded to mmcif disagrees with the sibling .cif fixture — "
+                f"{cross_reference} vs {cross_ours}"
+            )
+        else:
+            report.ok()
+            if verbose:
+                print(f"    ok         {path.name:<34} {reference.atom_count} atoms")
+    return report
+
+
 PDB_CORPUS = CORPUS / "pdb"
 
 
@@ -853,6 +923,7 @@ CHECKS = {
     "sdf": check_sdf,
     "fp": check_fp,
     "mmcif": check_mmcif,
+    "binarycif": check_binarycif,
     "pdb": check_pdb,
     "pdbqt": check_pdbqt,
     "json": check_json,
