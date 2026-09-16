@@ -38,6 +38,7 @@ molecule against several and pass for the wrong reason.
 | `pdb/water-no-cell.pdb` | The contrast to the file beside it: no `CRYST1`, no `CONECT`, explicit hydrogen *atoms* |
 | `pdb/ligand-fully-connected.pdb` | The **hydrogen count**. Every atom in a `CONECT` record, which is what lets an oracle compare a count PDB never states (#293) |
 | `mmcif/` | The mmCIF analogues of the first two |
+| `sdf/ethanol.mol` | A real molfile as it actually looks: no `$$$$` at all, which is an SDF multi-record separator a single-molecule `.mol` file never has (#318) |
 
 ## Pinned gaps
 

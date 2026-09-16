@@ -936,6 +936,17 @@ $$$$
     }
 
     #[test]
+    fn test_a_genuinely_unterminated_single_record_still_parses() {
+        // Not `TWO_RECORDS` with its last `$$$$` trimmed off (that's the test
+        // above) -- a real `.mol` file, the shape #318 fixed extension
+        // resolution for, never had `$$$$` anywhere in it to begin with.
+        let content = include_str!("../../tests/corpus/sdf/ethanol.mol");
+        let out = read_sdf(content);
+        assert_eq!(out.len(), 1);
+        assert!(out.skipped.is_empty());
+    }
+
+    #[test]
     fn test_reading_an_empty_file_yields_nothing_rather_than_failing() {
         for content in ["", "\n\n", "# only a comment\n"] {
             let out = read(content, Format::SMILES);

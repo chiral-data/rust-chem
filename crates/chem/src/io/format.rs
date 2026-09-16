@@ -579,7 +579,11 @@ static FORMATS: &[FormatDescriptor] = &[
     FormatDescriptor {
         name: "MDL MOL format",
         codes: &["sdf", "sd", "mol", "mdl"],
-        extensions: &["sdf"],
+        // `mol` is also a code (`-imol` already worked), but was missing
+        // here -- a `.mol` file, the more common name for a single-molecule
+        // molfile than `.sdf`, silently read as SMILES with every line
+        // skipped (#318).
+        extensions: &["sdf", "mol"],
         category: Category::CommonCheminformatics,
         // An atom block holds one set of positions, and the program line's
         // dimensional code says which. Charges, isotopes, chirality and bond
@@ -1703,6 +1707,10 @@ mod tests {
         // no PDB format was registered. #223 registered one, so this changed
         // -- exactly the point the old comment here was making.
         assert_eq!(Format::from_filename("a.pdb"), Format::PDB);
+        // Another case that used to fall back: `.mol` files register `mol`
+        // as a code (`-imol` already worked) but not as an extension, so
+        // every line of a real molfile silently skipped. #318 added it.
+        assert_eq!(Format::from_filename("a.mol"), Format::SDF);
     }
 
     /// One minimal molecule per attribute, each holding that attribute and as
