@@ -161,6 +161,76 @@ END
 """
 
 
+class SmallMoleculeSummary(NamedTuple):
+    """The structural facts [`check_cif_core`] compares against `chem`'s own
+    read of the small-molecule dictionary (#320) -- fractional sites rather
+    than [`Summary`]'s Cartesian ones, and no chain/residue concept at all in
+    this dictionary.
+    """
+
+    cell: Optional[tuple[float, float, float, float, float, float]]
+    spacegroup_hm: Optional[str]
+    sites: tuple[tuple[str, str, float, float, float, float, Optional[float]], ...]
+
+
+def summarize_small_molecule(text: str) -> Optional[SmallMoleculeSummary]:
+    """The CIF-core counterpart of [`summarize`] (#320) -- a different gemmi
+    entry point entirely (`make_small_structure_from_block`, not
+    `read_structure_string`), since this is a different dictionary, not a
+    parameter variant of mmCIF/PDB reading.
+    """
+    try:
+        doc = _gemmi.cif.Document()
+        doc.parse_string(text)
+        block = doc.sole_block()
+        st = _gemmi.make_small_structure_from_block(block)
+    except Exception:
+        return None
+    if len(st.sites) == 0:
+        return None
+
+    cell = (
+        (st.cell.a, st.cell.b, st.cell.c, st.cell.alpha, st.cell.beta, st.cell.gamma)
+        if st.cell.a > 0
+        else None
+    )
+    sites = tuple(
+        (
+            site.label,
+            site.type_symbol,
+            round(site.fract.x, 4),
+            round(site.fract.y, 4),
+            round(site.fract.z, 4),
+            round(site.occ, 2),
+            round(site.u_iso, 4) if site.u_iso else None,
+        )
+        for site in st.sites
+    )
+    return SmallMoleculeSummary(cell, st.spacegroup_hm or None, sites)
+
+
+#: A minimal but complete small-molecule CIF -- one atom, a cell, a space
+#: group, esd on a cell length, so the sanity check exercises the same three
+#: things `check_cif_core` actually relies on.
+SANITY_CIF_CORE = """data_sanity
+_cell_length_a 4.9134(2)
+_cell_length_b 4.9134
+_cell_length_c 5.4052
+_cell_angle_alpha 90.00
+_cell_angle_beta 90.00
+_cell_angle_gamma 120.00
+_symmetry_space_group_name_H-M 'P 32 2 1'
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+Si1 Si 0.4697 0.0000 0.3333 1.0
+"""
+
+
 def load_gemmi() -> Callable[..., Optional[Summary]]:
     """Confirms gemmi can read something, the same way `oracles.load()`
     confirms RDKit/OpenBabel can before trusting either. Returns
@@ -186,5 +256,14 @@ def load_gemmi() -> Callable[..., Optional[Summary]]:
         raise RuntimeError(
             f"gemmi reports {measured} for a fixture stating 0.80/42.50, so its "
             "per-atom values cannot be trusted as a reference"
+        )
+    # The small-molecule path (#320) is a different gemmi entry point
+    # entirely (`make_small_structure_from_block`) -- gated the same way the
+    # PDB path is, so a `check_cif_core` failure is unambiguously about chem.
+    if summarize_small_molecule(SANITY_CIF_CORE) is None:
+        raise RuntimeError(
+            "gemmi cannot read a trivial small-molecule CIF fixture, so it "
+            "is broken rather than strict — refusing to report its answers "
+            "as findings"
         )
     return summarize

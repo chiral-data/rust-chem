@@ -64,12 +64,31 @@ fn supply(
 ///
 /// A correctly-named file never pays for the peek: extension resolution
 /// short-circuits before `fill_buf` is ever called.
+///
+/// One exception: a bare `.cif` extension resolves to mmCIF *or* CIF core
+/// (#320) depending on content — the two dictionaries share that extension,
+/// and nothing about the name says which one a given file is. `.mmcif`
+/// stays unambiguous and skips this check entirely.
 fn resolve_format(path: &Path, reader: &mut dyn BufRead) -> io::Result<Format> {
-    if let Some(format) = Format::from_filename_checked(&degzipped_name(path)) {
+    let name = degzipped_name(path);
+    if let Some(format) = Format::from_filename_checked(&name) {
+        if format == Format::MMCIF && has_extension(&name, "cif") {
+            let buf = reader.fill_buf()?;
+            if let Ok(text) = std::str::from_utf8(buf)
+                && crate::io::cif_core::is_small_molecule_cif(text)
+            {
+                return Ok(Format::CIF_CORE);
+            }
+        }
         return Ok(format);
     }
     let buf = reader.fill_buf()?;
     Ok(crate::io::format::sniff(buf).unwrap_or(Format::SMILES))
+}
+
+fn has_extension(name: &str, extension: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(extension))
 }
 
 /// Creates (or truncates) `path` and streams molecules to it, one at a

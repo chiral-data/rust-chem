@@ -572,6 +572,51 @@ def check_mmcif(oracles: list[Oracle], verbose: bool) -> Report:
     return report
 
 
+CIF_CORE_CORPUS = CORPUS / "cif_core"
+
+
+def check_cif_core(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does `chem`'s CIF-core round trip agree with gemmi's independent
+    read (#320)?
+
+    Unlike BinaryCIF (#319), gemmi genuinely reads this dictionary
+    (`gemmi.make_small_structure_from_block`, a different entry point than
+    mmCIF/PDB's `read_structure_string`) -- confirmed by `load_gemmi`'s own
+    sanity gate. Otherwise this mirrors `check_mmcif` exactly: structural
+    comparison (cell, space group, fractional sites) between gemmi's read
+    of the original fixture and gemmi's read of what `chem convert --from
+    cif-core --to cif-core` wrote back.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    gemmi_oracle.load_gemmi()
+    report = Report()
+    for path in sorted(CIF_CORE_CORPUS.glob("*.cif")):
+        original = path.read_text()
+        reference = gemmi_oracle.summarize_small_molecule(original)
+        if reference is None:
+            report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+            continue
+
+        written = chem.convert_cif_core(original, "cif-core")
+        if written is None:
+            report.mismatch(f"{path.name}: chem could not round-trip this file")
+            continue
+
+        ours = gemmi_oracle.summarize_small_molecule(written)
+        if ours is None:
+            report.mismatch(f"{path.name}: gemmi cannot read what chem wrote back")
+        elif ours != reference:
+            report.mismatch(
+                f"{path.name}: chem's round trip disagrees with gemmi — {reference} vs {ours}"
+            )
+        else:
+            report.ok()
+            if verbose:
+                print(f"    ok         {path.name:<34} {len(reference.sites)} sites")
+    return report
+
+
 PDB_CORPUS = CORPUS / "pdb"
 
 
@@ -853,6 +898,7 @@ CHECKS = {
     "sdf": check_sdf,
     "fp": check_fp,
     "mmcif": check_mmcif,
+    "cif_core": check_cif_core,
     "pdb": check_pdb,
     "pdbqt": check_pdbqt,
     "json": check_json,

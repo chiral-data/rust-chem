@@ -1556,6 +1556,84 @@ fn test_convert_list_shows_mmcif_has_no_bonds_claimed() {
     assert!(!r.stdout.contains("formal_charge"), "{:?}", r.stdout);
 }
 
+const QUARTZ_CIF_CORE: &str = "\
+data_quartz
+_cell_length_a 4.9134(2)
+_cell_length_b 4.9134(2)
+_cell_length_c 5.4052(3)
+_cell_angle_alpha 90.00
+_cell_angle_beta 90.00
+_cell_angle_gamma 120.00
+_symmetry_space_group_name_H-M 'P 32 2 1'
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+_atom_site_U_iso_or_equiv
+Si1 Si 0.4697(1) 0.0000 0.3333 1.0 0.0090(2)
+O1 O 0.4133(3) 0.2672(3) 0.2144(2) 1.0 0.0140(4)
+";
+
+#[test]
+fn test_convert_round_trips_cif_core_through_itself() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            QUARTZ_CIF_CORE,
+            "--from",
+            "cif-core",
+            "--to",
+            "cif-core",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("_atom_site_fract_x"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("Si1"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_convert_list_shows_cif_core_has_no_residues_claimed() {
+    let r = run(&["convert", "-L", "cif-core"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("coords_3d"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("unit_cell"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("residues"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("bonds"), "{:?}", r.stdout);
+}
+
+#[test]
+fn test_a_dot_cif_file_with_flat_tags_dispatches_to_cif_core_with_no_from() {
+    // The dispatch itself (#320): a real file, no `--from`, and the flat
+    // `_atom_site_fract_x`-style tags are the only signal deciding this
+    // isn't mmCIF.
+    let path = fixture("quartz.cif", QUARTZ_CIF_CORE);
+    let r = run(
+        &["convert", path.to_str().unwrap(), "--to", "cif-core"],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.contains("_atom_site_fract_x"),
+        "did not dispatch to CIF core: {:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn test_a_dot_cif_file_with_dot_namespaced_tags_still_dispatches_to_mmcif() {
+    // The mirror-image regression guard: an ordinary mmCIF `.cif` file must
+    // keep resolving as mmCIF now that `.cif` is ambiguous.
+    let path = fixture("water.cif", WATER_MMCIF);
+    let r = run(&["convert", path.to_str().unwrap(), "--to", "mmcif"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("_atom_site.Cartn_x"), "{:?}", r.stdout);
+}
+
 const BENZENE_MOL2: &str = "\
 @<TRIPOS>MOLECULE
 benzene

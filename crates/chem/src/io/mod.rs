@@ -1,5 +1,6 @@
 pub mod aromaticity;
 pub mod bcif;
+pub mod cif_core;
 pub mod cif_model;
 pub mod cml;
 pub mod commonchem;

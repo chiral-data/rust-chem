@@ -45,7 +45,11 @@ use crate::io::errors::MmcifError;
 /// nothing) and ends one (followed by whitespace or nothing) — the
 /// standard CIF quoting rule, so `O5'` (a common atom name containing an
 /// apostrophe) is not mistaken for the start of a quoted string.
-fn tokenize_line(line: &str) -> Vec<String> {
+///
+/// `pub(crate)`: the CIF grammar this tokenizes is shared with
+/// [`crate::io::cif_core`] (#320), which has no dictionary-specific
+/// knowledge baked into it.
+pub(crate) fn tokenize_line(line: &str) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
