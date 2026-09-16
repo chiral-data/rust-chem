@@ -42,28 +42,6 @@ def run(args: list[str], stdin: str = "") -> Run:
 
 
 @dataclass
-class RunBytes:
-    stdout: bytes
-    stderr: str
-    code: int
-
-
-def run_bytes(args: list[str], stdin: bytes = b"") -> RunBytes:
-    """[`run`], for a binary format (BinaryCIF, #319) whose stdout is not
-    text -- `text=True` would force a UTF-8 decode that fails outright, so
-    this captures stdout as raw bytes instead. stderr stays a `str`: chem's
-    own diagnostics are always UTF-8, whatever the format under test is.
-    """
-    result = subprocess.run(
-        [str(binary()), *args],
-        input=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return RunBytes(result.stdout, result.stderr.decode("utf-8", "replace"), result.returncode)
-
-
-@dataclass
 class Record:
     name: str
     smiles: str
@@ -161,24 +139,6 @@ def convert_pdbqt(text: str, to_format: str) -> str | None:
     """Round-trips PDBQT text through `chem convert`, returning what it wrote."""
     result = run(["convert", "-", "--from", "pdbqt", "--to", to_format], stdin=text)
     return result.stdout if result.code == 0 and result.stdout.strip() else None
-
-
-def convert_binarycif(data: bytes, to_format: str) -> bytes | str | None:
-    """Round-trips BinaryCIF bytes through `chem convert` (#319).
-
-    `to_format="bcif"` returns bytes; any other target format is text, and
-    is decoded as UTF-8 -- `chem convert`'s stdin/stdout already go through
-    the byte-canonical supplier/writer path regardless of format, so this is
-    the one oracle helper that has to pick its return type from `to_format`
-    rather than always answering `str` (`convert_mmcif` et al.) or always
-    answering `bytes`.
-    """
-    result = run_bytes(["convert", "-", "--from", "bcif", "--to", to_format], stdin=data)
-    if result.code != 0 or not result.stdout:
-        return None
-    if to_format == "bcif":
-        return result.stdout
-    return result.stdout.decode("utf-8")
 
 
 def write_commonchem(smiles: str) -> str | None:
