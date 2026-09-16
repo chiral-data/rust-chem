@@ -1002,6 +1002,41 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
     },
+    FormatDescriptor {
+        name: "PRMTOP",
+        codes: &["prmtop"],
+        extensions: &["prmtop", "parm7"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Topology only (#322) -- PRMTOP states substantially more of the
+        // force field than PSF does (force constants, equilibrium values,
+        // Lennard-Jones coefficients), but those have no home in
+        // `ForceFieldTopology`, which already frames them as out of scope
+        // for this milestone, and `Carries` is completely full at 32/32
+        // bits. Same topology mask PSF uses, minus DONORS/ACCEPTORS --
+        // PRMTOP has no donor/acceptor section at all.
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::RESIDUES)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::EXCLUSIONS),
+        reader: Some(crate::io::reader::read_prmtop_with_options),
+        writer: Some(write_prmtop_records),
+        supplier: Some(prmtop_supplier),
+        writer_stream: Some(prmtop_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `%VERSION` text -- nothing fixed-offset to sniff, and no
+        // extension ambiguity to resolve (`.prmtop`/`.parm7` are claimed by
+        // nothing else), so `magic` buys nothing here.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1030,6 +1065,10 @@ fn mmcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Su
 
 fn psf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::PsfSupplier::new(reader, options))
+}
+
+fn prmtop_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::PrmtopSupplier::new(reader, options))
 }
 
 fn cif_core_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1088,6 +1127,10 @@ fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dy
 
 fn psf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::PsfWriter::new(writer, options))
+}
+
+fn prmtop_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::PrmtopWriter::new(writer, options))
 }
 
 fn cif_core_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1200,6 +1243,16 @@ fn write_psf_records(records: &[(String, Molecule)], _options: &WriteOptions) ->
     let mut out = String::new();
     for (_, molecule) in records {
         out.push_str(&crate::io::psf::write_psf(molecule));
+    }
+    out
+}
+
+fn write_prmtop_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `PrmtopWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::prmtop::write_prmtop(molecule));
     }
     out
 }
@@ -1340,6 +1393,12 @@ impl Format {
     /// exactly this but never wired to a format until now). No coordinates
     /// at all — a PSF is paired with a DCD or a PDB for geometry.
     pub const PSF: Format = Format(13);
+    /// PRMTOP (#322) -- AMBER's topology format, also named `.parm7`, see
+    /// [`crate::io::prmtop`]. Topology only: PRMTOP states substantially
+    /// more of the force field than PSF does, but the actual parameters
+    /// (force constants, equilibrium values, Lennard-Jones coefficients)
+    /// have no home in `ForceFieldTopology` and are parsed-and-discarded.
+    pub const PRMTOP: Format = Format(14);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1613,6 +1672,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Carries::RESIDUES,
         "every atom line names a residue; absent input writes UNK",
     ),
+    (
+        // `write_prmtop` (#322) always states a residue label, the same
+        // reason PSF does.
+        Format::PRMTOP,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
     // PSF's atom-type and mass columns are required fields in every real
     // file, the same "must state something" shape as the columns below --
     // absent input falls back to the element symbol and its standard
@@ -1624,6 +1690,18 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
     ),
     (
         Format::PSF,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
+    // PRMTOP's AMBER_ATOM_TYPE/MASS sections are equally required fields
+    // in every real file, the same shape as PSF's own columns above.
+    (
+        Format::PRMTOP,
+        Carries::ATOM_TYPE,
+        "fixed column; absent input writes the element symbol",
+    ),
+    (
+        Format::PRMTOP,
         Carries::MASS,
         "fixed column; absent input writes the standard atomic weight",
     ),
@@ -1699,6 +1777,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         // `write_psf` (#321) always states a charge, the same reason Mol2
         // and PDBQT do.
         Format::PSF,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_prmtop` (#322) always states a charge, the same reason
+        // PSF does.
+        Format::PRMTOP,
         Carries::PARTIAL_CHARGE,
         "per-atom charge column; absent input writes 0.000",
     ),
@@ -2303,7 +2388,7 @@ mod tests {
         // such rather than trusting silently: 14 x 14, the same count
         // `all() x all()` already produced, so this test is unchanged until
         // a second `Kind` registers.
-        assert_eq!(pairs.len(), 196);
+        assert_eq!(pairs.len(), 225);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             for (flag, molecule) in &fixtures {
@@ -3049,7 +3134,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 14);
+        assert_eq!(all().count(), 15);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
