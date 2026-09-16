@@ -292,3 +292,30 @@ pub enum ReadError {
     #[error("record {position} failed to parse: {message}")]
     Parse { position: usize, message: String },
 }
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum BcifError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// Malformed MessagePack itself -- a truncated buffer, a length prefix
+    /// that runs past the end of the input, and so on.
+    #[error("Invalid MessagePack: {0}")]
+    InvalidMessagePack(String),
+
+    /// A MessagePack type tag this crate does not decode: ext types,
+    /// timestamps, str64/array64/map64. None of these appear in a real
+    /// BinaryCIF file (#319) -- a hard error here means a producer this
+    /// crate has never seen, not a silently wrong read.
+    #[error("Unsupported MessagePack tag: 0x{0:02x}")]
+    UnsupportedTag(u8),
+
+    /// An encoding step's `"kind"` string is not one of the seven BinaryCIF
+    /// defines.
+    #[error("Unknown BinaryCIF encoding kind: {0}")]
+    UnknownEncoding(String),
+
+    #[error(transparent)]
+    Mmcif(#[from] MmcifError),
+}

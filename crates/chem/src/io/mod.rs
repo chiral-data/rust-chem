@@ -1,4 +1,6 @@
 pub mod aromaticity;
+pub mod bcif;
+pub mod cif_model;
 pub mod cml;
 pub mod commonchem;
 pub mod cxsmiles;
@@ -7,6 +9,7 @@ pub mod format;
 pub mod gro;
 pub mod mmcif;
 pub mod mol2;
+pub mod msgpack;
 pub mod open;
 pub mod options;
 pub mod pdb;

@@ -473,7 +473,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let format = resolve_output_format(out_format, Carries::empty(), output.as_deref());
             write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
-            stream::write_output(output.as_ref(), &write::render(format, &records))?;
+            stream::write_output(output.as_ref(), &write::render(format, &records)?)?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -559,7 +559,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let format = resolve_output_format(out_format, Carries::COORDS_2D, output.as_deref());
             write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
-            stream::write_output(output.as_ref(), &write::render(format, &records))?;
+            stream::write_output(output.as_ref(), &write::render(format, &records)?)?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);

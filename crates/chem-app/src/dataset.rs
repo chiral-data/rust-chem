@@ -523,9 +523,18 @@ mod tests {
     #[test]
     fn test_every_format_fills_the_column_and_names_itself_only_when_it_must() {
         // The general guard, in the spirit of #257's mask assertions: one loop
-        // over the registry rather than a test per format, so a twelfth format
+        // over the registry rather than a test per format, so a new format
         // is covered the day it registers.
-        for format in chem::io::format::all().filter(|f| f.can_read() && f.can_write()) {
+        //
+        // BinaryCIF (#319) is excluded: its canonical bytes are not text, so
+        // `DatasetFormat::write` correctly answers `None` for it (same as
+        // `chem::io::format::Format::write`) rather than the `round_trip`
+        // helper's text-only path applying. The app itself doesn't load or
+        // write binary formats yet -- that's #342, not this loop.
+        for format in chem::io::format::all()
+            .filter(|f| f.can_read() && f.can_write())
+            .filter(|f| f.encoding() == chem::io::format::Encoding::Text)
+        {
             let (outcome, dataset) = round_trip(format, "benzene", "c1ccccc1");
             let cell = &dataset.smiles[0];
             let placeholder = *cell == format!("({})", format.label());

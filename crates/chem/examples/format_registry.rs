@@ -68,14 +68,19 @@ fn main() {
         })
         .collect();
     for f in format::all() {
-        let text = f
-            .write(&records)
+        // `write_bytes`, not `write` -- BinaryCIF's (#319) canonical bytes
+        // are not text, and `f.write(&records)` correctly answers `None`
+        // for it rather than forcing an invalid UTF-8 decode.
+        let bytes = f
+            .write_bytes(&records)
             .expect("every registered format writes today");
-        let back = reader::read(&text, f);
+        let back = f
+            .read_bytes(&bytes)
+            .expect("every registered format reads its own bytes");
         println!(
             "  {:<6} {:>6} bytes -> {} molecules back",
             f.label(),
-            text.len(),
+            bytes.len(),
             back.len()
         );
     }
