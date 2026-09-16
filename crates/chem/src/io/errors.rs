@@ -164,6 +164,27 @@ pub enum CifCoreError {
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
+pub enum PsfError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomRow(String),
+
+    /// PSF states no element directly -- only a name/type label (ambiguous:
+    /// `CA` is alpha-carbon in every protein PSF, not calcium) and a mass,
+    /// which this crate infers the element from instead. This is what a
+    /// mass matching no real element within tolerance reports (#321).
+    #[error("No element matches mass {0}")]
+    InvalidElement(f64),
+
+    /// No `!NATOM` section was ever seen at all.
+    #[error("No atoms in PSF")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Mol2Error {
     #[error("Parse error: {0}")]
     ParseError(String),

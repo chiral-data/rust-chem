@@ -1,0 +1,36 @@
+PSF
+
+       1 !NTITLE
+ REMARKS test fixture -- exclusions, two atoms' worth
+
+       4 !NATOM
+       1 MOL  1    LIG  C1   CT     0.000000       12.0110           0
+       2 MOL  1    LIG  C2   CT     0.000000       12.0110           0
+       3 MOL  1    LIG  C3   CT     0.000000       12.0110           0
+       4 MOL  1    LIG  C4   CT     0.000000       12.0110           0
+
+       3 !NBOND: bonds
+       1       2       2       3       3       4
+
+       0 !NTHETA: angles
+
+
+       0 !NPHI: dihedrals
+
+
+       0 !NIMPHI: impropers
+
+
+       0 !NDON: donors
+
+
+       0 !NACC: acceptors
+
+
+       3 !NNB
+       3       4       4
+
+       2       3       3       3
+
+       1       0 !NGRP
+       0       0       0

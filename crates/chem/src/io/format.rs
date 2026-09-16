@@ -128,6 +128,16 @@ impl Carries {
     /// A table's columns, from [`crate::core::table::Table::columns`] — the
     /// one thing every tabular format holds.
     pub const COLUMNS: Carries = Carries(1 << 29);
+    /// Hydrogen-bond donor pairs, from
+    /// [`crate::core::force_field::ForceFieldTopology::donors`]. PSF is the
+    /// first format to state these (#321).
+    pub const DONORS: Carries = Carries(1 << 30);
+    /// Hydrogen-bond acceptor pairs, from
+    /// [`crate::core::force_field::ForceFieldTopology::acceptors`]. PSF is
+    /// the first format to state these (#321). The last bit this `u32` has
+    /// room for — a 33rd flag needs a wider representation, not this one's
+    /// problem.
+    pub const ACCEPTORS: Carries = Carries(1 << 31);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -156,6 +166,8 @@ impl Carries {
         (Carries::DIHEDRALS, "dihedrals"),
         (Carries::IMPROPERS, "impropers"),
         (Carries::EXCLUSIONS, "exclusions"),
+        (Carries::DONORS, "donors"),
+        (Carries::ACCEPTORS, "acceptors"),
         // Non-molecule kinds (#316): a trajectory's frames, a volume grid's
         // samples, a mesh's surface, a table's columns.
         (Carries::VELOCITIES, "velocities"),
@@ -353,6 +365,12 @@ pub fn held(molecule: &Molecule) -> Carries {
         }
         if !force_field.exclusions.is_empty() {
             carries = carries | Carries::EXCLUSIONS;
+        }
+        if !force_field.donors.is_empty() {
+            carries = carries | Carries::DONORS;
+        }
+        if !force_field.acceptors.is_empty() {
+            carries = carries | Carries::ACCEPTORS;
         }
     }
 
@@ -949,6 +967,41 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
     },
+    FormatDescriptor {
+        name: "PSF",
+        codes: &["psf"],
+        extensions: &["psf"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Deliberately no COORDS_2D/COORDS_3D -- PSF states no coordinates
+        // at all, the same "topology-only, zero geometry" shape SMILES
+        // already establishes as legitimate. The first real user of
+        // `ForceFieldTopology` (#315), and of its DONORS/ACCEPTORS flags
+        // (#321) -- see `io/psf.rs`'s module doc.
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::RESIDUES)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::EXCLUSIONS)
+            .or(Carries::DONORS)
+            .or(Carries::ACCEPTORS),
+        reader: Some(crate::io::reader::read_psf_with_options),
+        writer: Some(write_psf_records),
+        supplier: Some(psf_supplier),
+        writer_stream: Some(psf_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `PSF` text -- nothing fixed-offset to sniff, and no
+        // extension ambiguity to resolve (`.psf` is claimed by nothing
+        // else), so `magic` buys nothing here.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -973,6 +1026,10 @@ fn pdb_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn mmcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::MmcifSupplier::new(reader, options))
+}
+
+fn psf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::PsfSupplier::new(reader, options))
 }
 
 fn cif_core_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1027,6 +1084,10 @@ fn pdb_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::MmcifWriter::new(writer, options))
+}
+
+fn psf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::PsfWriter::new(writer, options))
 }
 
 fn cif_core_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1129,6 +1190,16 @@ fn write_mmcif_records(records: &[(String, Molecule)], _options: &WriteOptions) 
     let mut out = String::new();
     for (_, molecule) in records {
         out.push_str(&crate::io::mmcif::write_mmcif(molecule));
+    }
+    out
+}
+
+fn write_psf_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `PsfWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::psf::write_psf(molecule));
     }
     out
 }
@@ -1263,6 +1334,12 @@ impl Format {
     /// format registered that does — disambiguated by content, not name,
     /// in [`crate::io::open`] and the CLI's own input path.
     pub const CIF_CORE: Format = Format(12);
+    /// PSF (#321) — CHARMM/NAMD's topology format, see [`crate::io::psf`].
+    /// The first real consumer of
+    /// [`crate::core::force_field::ForceFieldTopology`] (#315, built for
+    /// exactly this but never wired to a format until now). No coordinates
+    /// at all — a PSF is paired with a DCD or a PDB for geometry.
+    pub const PSF: Format = Format(13);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1531,6 +1608,25 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Carries::RESIDUES,
         "every atom line names a residue; absent input writes LIG",
     ),
+    (
+        Format::PSF,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    // PSF's atom-type and mass columns are required fields in every real
+    // file, the same "must state something" shape as the columns below --
+    // absent input falls back to the element symbol and its standard
+    // atomic weight.
+    (
+        Format::PSF,
+        Carries::ATOM_TYPE,
+        "fixed column; absent input writes the element symbol",
+    ),
+    (
+        Format::PSF,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
     // The PDB family's fixed occupancy and temperature-factor columns.
     (
         Format::PDB,
@@ -1596,6 +1692,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
     ),
     (
         Format::PDBQT,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_psf` (#321) always states a charge, the same reason Mol2
+        // and PDBQT do.
+        Format::PSF,
         Carries::PARTIAL_CHARGE,
         "per-atom charge column; absent input writes 0.000",
     ),
@@ -1997,6 +2100,24 @@ mod tests {
             .expect("valid force field");
             m
         };
+        let with_donor = {
+            let mut m = ethane();
+            m.set_force_field(ForceFieldTopology {
+                donors: vec![[0, 1]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_acceptor = {
+            let mut m = ethane();
+            m.set_force_field(ForceFieldTopology {
+                acceptors: vec![[0, 1]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
 
         vec![
             (Carries::TOPOLOGY, ethane()),
@@ -2042,6 +2163,8 @@ mod tests {
             (Carries::DIHEDRALS, with_dihedral),
             (Carries::IMPROPERS, with_improper),
             (Carries::EXCLUSIONS, with_exclusion),
+            (Carries::DONORS, with_donor),
+            (Carries::ACCEPTORS, with_acceptor),
         ]
     }
 
@@ -2176,11 +2299,11 @@ mod tests {
         // diagonal.
         let fixtures = one_per_attribute();
         let pairs: Vec<(Format, Format)> = pairs_within_kind().collect();
-        // Vacuous today -- 13 formats, one `Kind` -- and worth pinning as
-        // such rather than trusting silently: 13 x 13, the same count
+        // Vacuous today -- 14 formats, one `Kind` -- and worth pinning as
+        // such rather than trusting silently: 14 x 14, the same count
         // `all() x all()` already produced, so this test is unchanged until
         // a second `Kind` registers.
-        assert_eq!(pairs.len(), 169);
+        assert_eq!(pairs.len(), 196);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             for (flag, molecule) in &fixtures {
@@ -2926,7 +3049,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 13);
+        assert_eq!(all().count(), 14);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

@@ -15,6 +15,7 @@ pub mod open;
 pub mod options;
 pub mod pdb;
 pub mod pdbqt;
+pub mod psf;
 pub mod reader;
 pub mod sdf;
 pub mod smiles;

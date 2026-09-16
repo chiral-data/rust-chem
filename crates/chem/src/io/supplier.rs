@@ -444,6 +444,92 @@ impl<R: BufRead> Iterator for CifCoreSupplier<R> {
     }
 }
 
+/// One topology per `PSF` block (#321). Mirrors [`MmcifSupplier`]'s own
+/// shape exactly -- `PSF` is a *start* marker here too, so the same
+/// one-line lookahead applies. A real PSF is always exactly one topology;
+/// this exists so a *file this crate wrote* concatenating several still
+/// reads back as many records as it was given (#267), the same invariant
+/// every other format satisfies.
+pub struct PsfSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> PsfSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            _options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for PsfSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim() == "PSF";
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::psf::parse_psf(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        payload: Payload::Molecule(molecule),
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
 /// One molecule per `@<TRIPOS>MOLECULE` block (#225). Mirrors
 /// [`MmcifSupplier`]'s own shape exactly -- `@<TRIPOS>MOLECULE` is a
 /// *start* marker too, so the same one-line lookahead applies.
@@ -891,6 +977,33 @@ impl<W: Write> Writer for CifCoreWriter<W> {
     fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
         self.writer
             .write_all(crate::io::cif_core::write_cif_core(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams PSF out, one `PSF` block per molecule (#321). No per-record name
+/// threaded through -- PSF has no title-line concept for a record's name,
+/// same reasoning as [`PdbWriter`]. Each call writes a complete,
+/// self-delimited block, so unlike [`CommonchemWriter`] this needs no
+/// buffering at all: a second molecule just means a second `PSF` header
+/// later in the stream, which [`PsfSupplier`] already knows to split on.
+pub struct PsfWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> PsfWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for PsfWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::psf::write_psf(molecule).as_bytes())
     }
 
     fn finish(self: Box<Self>) -> std::io::Result<()> {

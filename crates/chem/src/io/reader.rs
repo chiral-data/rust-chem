@@ -595,6 +595,62 @@ fn push_cif_core_record(out: &mut ReadOutcome, lines: &[&str], position: usize) 
     }
 }
 
+/// [`read_psf_with_options`] with default options.
+pub fn read_psf(content: &str) -> ReadOutcome {
+    read_psf_with_options(content, &ReadOptions)
+}
+
+/// A real PSF is always exactly one topology -- but this crate's own
+/// invariant (every registered format writes and reads back as many
+/// records as it was given, #267) means a *file this crate wrote* may hold
+/// several, back to back, each with its own `PSF` header line acting as a
+/// start marker -- mirroring `read_mmcif_with_options`'s `data_` splitting
+/// exactly, since PSF has no real multi-topology convention of its own to
+/// borrow instead.
+pub fn read_psf_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        let starts_new_block = line.trim() == "PSF";
+        if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
+            position += 1;
+            push_psf_record(&mut out, &lines, position);
+            lines.clear();
+        }
+        lines.push(line);
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_psf_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_psf_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::psf::parse_psf(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                payload: Payload::Molecule(molecule),
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 /// [`read_mol2_with_options`] with default options.
 pub fn read_mol2(content: &str) -> ReadOutcome {
     read_mol2_with_options(content, &ReadOptions)
