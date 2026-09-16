@@ -145,6 +145,25 @@ pub enum MmcifError {
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
+pub enum CifCoreError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom_site row: {0}")]
+    InvalidAtomRow(String),
+
+    #[error("Invalid element symbol: {0}")]
+    InvalidElement(String),
+
+    /// No `_atom_site_label` `loop_` was ever seen at all, so zero atoms were
+    /// read -- the same distinction #268 draws for mmCIF between "genuinely
+    /// no atom-site loop" and "an atom-site loop stating zero rows."
+    #[error("No atoms in CIF core")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Mol2Error {
     #[error("Parse error: {0}")]
     ParseError(String),

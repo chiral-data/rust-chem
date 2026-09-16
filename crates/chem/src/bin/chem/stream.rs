@@ -34,12 +34,31 @@ pub fn read_input(path: Option<&Path>, format: Option<Format>) -> Result<Input> 
     // `from_filename` already answers SMILES for a name nothing claims — the
     // branch that used to be here was restating the fallback, in a second
     // place where it could drift from it.
-    let format = format.unwrap_or_else(|| Format::from_filename(&label));
+    let format = format.unwrap_or_else(|| resolve_format_from_content(&label, &content));
     Ok(Input {
         outcome: reader::read(&content, format),
         format,
         label,
     })
+}
+
+/// [`Format::from_filename`], plus one addition that function doesn't make
+/// on its own: `.cif` resolves to mmCIF *or* CIF core (#320) depending on
+/// content, since the two dictionaries share that extension. Mirrors
+/// `chem::io::open::resolve_format`'s own special case for the file-path
+/// entry point.
+fn resolve_format_from_content(label: &str, content: &str) -> Format {
+    let format = Format::from_filename(label);
+    let has_cif_extension = label
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("cif"));
+    if format == Format::MMCIF
+        && has_cif_extension
+        && chem::io::cif_core::is_small_molecule_cif(content)
+    {
+        return Format::CIF_CORE;
+    }
+    format
 }
 
 /// Reads a named file, or stdin when the path is absent or `-`.

@@ -40,6 +40,8 @@ molecule against several and pass for the wrong reason.
 | `mmcif/` | The mmCIF analogues of the first two |
 | `sdf/ethanol.mol` | A real molfile as it actually looks: no `$$$$` at all, which is an SDF multi-record separator a single-molecule `.mol` file never has (#318) |
 | `bcif/` | The BinaryCIF encoding of the two `mmcif/` fixtures beside them, generated with `chem convert *.cif --to bcif` -- this crate's own writer, not vendored bytes, so what's tested is that its encoder and decoder agree on real structure-sized input (#319). No oracle here: gemmi has no BinaryCIF support at all (confirmed from its source -- `CoorFormat` only knows `Pdb`/`Mmcif`/`Mmjson`, and anything else is silently misread as PDB text rather than rejected), so unlike `pdb/`/`mmcif/` this format is checked at the unit level and against a real, independently-produced `.bcif` file during development, not vendored here |
+| `cif_core/quartz.cif` | The small-molecule crystallography dictionary, not mmCIF's: fractional coordinates, an estimated standard deviation on nearly every number (`4.9134(2)`), both a space-group symbol and its International Tables number (#320). Unlike BinaryCIF, gemmi genuinely reads this dictionary (`gemmi.read_small_structure`), so it is oracle-checked |
+| `cif_core/symmetry-operators.cif` | A `_symmetry_equiv_pos_as_xyz` loop present and deliberately unused: this crate reads and writes only the asymmetric unit a file states, never expanding symmetry, so this fixture is what proves the operator loop is parsed-and-discarded rather than choking the reader |
 
 ## Pinned gaps
 

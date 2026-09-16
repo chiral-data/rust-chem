@@ -915,6 +915,40 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: Some(crate::io::bcif::read_bcif_with_options),
         writer_bytes: Some(crate::io::bcif::write_bcif_records),
     },
+    FormatDescriptor {
+        name: "CIF core",
+        // Not "cif" -- mmCIF's descriptor already claims that code
+        // (`codes: &["mmcif", "cif"]` above), and codes must be unique
+        // (`test_every_registered_format_is_well_formed`). Extensions are
+        // not required to be unique, which is exactly what lets this share
+        // `.cif` with mmCIF at all -- content, not the name, decides which
+        // one a `.cif` file resolves to (#320, see `cif_core::
+        // is_small_molecule_cif` and its two call sites in `io::open` and
+        // `bin::chem::stream`).
+        codes: &["cif-core"],
+        extensions: &["cif"],
+        category: Category::Crystallography,
+        // No BONDS, no RESIDUES: this dictionary has no bond loop and no
+        // chain/residue notion at all (no `label_asym_id`/`auth_seq_id`
+        // machinery) -- see `io/cif_core.rs`'s module doc.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_cif_core_with_options),
+        writer: Some(write_cif_core_records),
+        supplier: Some(cif_core_supplier),
+        writer_stream: Some(cif_core_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `data_` text, same as mmCIF -- nothing fixed-offset to
+        // sniff; the `.cif` dispatch special case does its own scan
+        // instead of going through this mechanism, see the module doc.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -939,6 +973,10 @@ fn pdb_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn mmcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::MmcifSupplier::new(reader, options))
+}
+
+fn cif_core_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::CifCoreSupplier::new(reader, options))
 }
 
 fn mol2_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -989,6 +1027,10 @@ fn pdb_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::MmcifWriter::new(writer, options))
+}
+
+fn cif_core_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::CifCoreWriter::new(writer, options))
 }
 
 fn mol2_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1087,6 +1129,16 @@ fn write_mmcif_records(records: &[(String, Molecule)], _options: &WriteOptions) 
     let mut out = String::new();
     for (_, molecule) in records {
         out.push_str(&crate::io::mmcif::write_mmcif(molecule));
+    }
+    out
+}
+
+fn write_cif_core_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `CifCoreWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::cif_core::write_cif_core(molecule));
     }
     out
 }
@@ -1203,6 +1255,14 @@ impl Format {
     /// surface, the same reasoning `Carries` is hand-rolled instead of
     /// depending on `bitflags`.
     pub const BCIF: Format = Format(11);
+    /// CIF core (#320) — the small-molecule crystallography dictionary,
+    /// old-style flat tags and fractional coordinates rather than mmCIF's
+    /// dot-namespace and Cartesian ones, see [`crate::io::cif_core`]. Reads
+    /// and writes only the asymmetric unit a file states, no symmetry
+    /// expansion. Shares the `.cif` extension with mmCIF — the first
+    /// format registered that does — disambiguated by content, not name,
+    /// in [`crate::io::open`] and the CLI's own input path.
+    pub const CIF_CORE: Format = Format(12);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1494,6 +1554,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         "fixed column; absent input writes 1.00",
     ),
     (
+        // `write_cif_core` (#320) defaults occupancy to 1.00 the same way
+        // mmCIF's writer does, for the same reason.
+        Format::CIF_CORE,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
         Format::PDB,
         Carries::B_FACTOR,
         "fixed column; absent input writes 0.00",
@@ -1511,6 +1578,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
     ),
     (
         Format::PDBQT,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    (
+        // `write_cif_core` (#320) defaults B-factor to 0.00 the same way
+        // mmCIF's writer does, for the same reason.
+        Format::CIF_CORE,
         Carries::B_FACTOR,
         "fixed column; absent input writes 0.00",
     ),
@@ -2102,11 +2176,11 @@ mod tests {
         // diagonal.
         let fixtures = one_per_attribute();
         let pairs: Vec<(Format, Format)> = pairs_within_kind().collect();
-        // Vacuous today -- 12 formats, one `Kind` -- and worth pinning as
-        // such rather than trusting silently: 12 x 12, the same count
+        // Vacuous today -- 13 formats, one `Kind` -- and worth pinning as
+        // such rather than trusting silently: 13 x 13, the same count
         // `all() x all()` already produced, so this test is unchanged until
         // a second `Kind` registers.
-        assert_eq!(pairs.len(), 144);
+        assert_eq!(pairs.len(), 169);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             for (flag, molecule) in &fixtures {
@@ -2852,7 +2926,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 12);
+        assert_eq!(all().count(), 13);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

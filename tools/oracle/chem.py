@@ -124,6 +124,18 @@ def convert_mmcif(text: str, to_format: str) -> str | None:
     return result.stdout if result.code == 0 and result.stdout.strip() else None
 
 
+def convert_cif_core(text: str, to_format: str) -> str | None:
+    """Round-trips CIF-core text through `chem convert` (#320).
+
+    `--from cif-core` names the format explicitly by code rather than
+    relying on content-sniffing — the same reason `convert_mmcif` passes
+    `--from mmcif` rather than letting `.cif` (which both dictionaries
+    share) be guessed from a filename stdin doesn't have.
+    """
+    result = run(["convert", "-", "--from", "cif-core", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
 def convert_pdb(text: str, to_format: str) -> str | None:
     """Round-trips PDB text through `chem convert`, returning what it wrote.
 

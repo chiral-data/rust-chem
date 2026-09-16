@@ -38,7 +38,9 @@ pub(crate) fn find_tag(tags: &[String], full: &str) -> Option<usize> {
     tags.iter().position(|t| t == full)
 }
 
-fn element_from_symbol(sym: &str) -> Option<Element> {
+/// `pub(crate)`: shared with [`crate::io::cif_core`] (#320), which parses
+/// the same `_atom_site_type_symbol`-shaped element symbols.
+pub(crate) fn element_from_symbol(sym: &str) -> Option<Element> {
     let sym = sym.trim();
     let mut chars = sym.chars();
     let normalised = match (chars.next(), chars.next()) {
