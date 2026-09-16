@@ -186,6 +186,24 @@ mod tests {
     }
 
     #[test]
+    fn test_a_dot_mol_file_reads_as_sdf_not_smiles() {
+        // The literal, reported bug (#318): before `mol` was added to
+        // Format::SDF's extensions, this wrote a real molfile to a `.mol`
+        // path and it came back as SMILES, every line skipped.
+        let dir = std::env::temp_dir().join(format!("chem-mol-ext-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ethanol.mol");
+        std::fs::write(&path, include_str!("../../tests/corpus/sdf/ethanol.mol")).unwrap();
+
+        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let record = supplier.next().unwrap().unwrap();
+        assert_eq!(record.molecule().unwrap().num_atoms(), 3);
+        assert!(supplier.next().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_extension_wins_over_content() {
         // A `.smi` file whose actual bytes don't parse as SMILES at all
         // still resolves as `Format::SMILES` by extension -- sniffing is

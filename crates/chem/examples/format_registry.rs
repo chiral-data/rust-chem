@@ -84,7 +84,10 @@ fn main() {
     assert_eq!(Format::from_code("mol"), Some(Format::SDF));
     assert_eq!(Format::SMILES.label(), "SMILES");
     assert_eq!(Format::SDF.name(), "MDL MOL format");
-    // `mol` is a *code*, not an extension — so a `.mol` file still reads as SMILES.
-    assert_eq!(Format::from_filename("a.mol"), Format::SMILES);
+    // `mol` used to be a code but not an extension, so a `.mol` file fell
+    // back to SMILES with every line skipped. #318 added it as an
+    // extension too -- it's the more common name for a single-molecule
+    // molfile than `.sdf`.
+    assert_eq!(Format::from_filename("a.mol"), Format::SDF);
     println!("\nall assertions held");
 }
