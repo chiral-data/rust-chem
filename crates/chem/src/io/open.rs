@@ -19,7 +19,7 @@ use crate::io::supplier::{Supplier, Writer};
 /// The format is resolved by extension first (with a trailing `.gz` removed
 /// first, if present, so `ligand.sdf.gz` resolves as SDF), content-sniffing
 /// second when nothing claims the extension, and the SMILES default last
-/// (#317) — see [`resolve_format`].
+/// (#317) — see this module's private `resolve_format`.
 pub fn open_supplier(path: &Path, options: &ReadOptions) -> io::Result<Box<dyn Supplier>> {
     let file = BufReader::new(File::open(path)?);
     let mut reader = maybe_decompress(file)?;
@@ -31,7 +31,7 @@ pub fn open_supplier(path: &Path, options: &ReadOptions) -> io::Result<Box<dyn S
 /// from `path` — for a caller that already knows (or was told, e.g. `chem
 /// convert --from`) which format the bytes are in regardless of the name
 /// on disk. Nothing to resolve, so neither the extension check nor the
-/// content sniff in [`resolve_format`] applies here.
+/// content sniff in `resolve_format` applies here.
 pub fn open_supplier_as(
     path: &Path,
     format: Format,
