@@ -56,16 +56,19 @@ pub(crate) fn element_from_symbol(sym: &str) -> Option<Element> {
         .and_then(|n| Element::new(n as u8))
 }
 
+/// `pub(crate)`: shared with [`crate::io::psf`] (#321), which groups atoms
+/// into chains/residues by its own segid/resid/resname triple rather than
+/// mmCIF's `auth_*` fields, but through this same grouping algorithm.
 #[derive(Clone, PartialEq, Eq)]
-struct ResidueKey {
-    chain_id: String,
-    name: String,
-    sequence: i32,
-    insertion_code: Option<char>,
-    is_hetero: bool,
+pub(crate) struct ResidueKey {
+    pub(crate) chain_id: String,
+    pub(crate) name: String,
+    pub(crate) sequence: i32,
+    pub(crate) insertion_code: Option<char>,
+    pub(crate) is_hetero: bool,
 }
 
-fn group_into_chains_and_residues(keys: &[ResidueKey]) -> (Vec<Chain>, Vec<Residue>) {
+pub(crate) fn group_into_chains_and_residues(keys: &[ResidueKey]) -> (Vec<Chain>, Vec<Residue>) {
     let mut chains = Vec::new();
     let mut residues = Vec::new();
     let mut current_chain_id: Option<&str> = None;

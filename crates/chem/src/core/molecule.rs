@@ -502,6 +502,12 @@ impl Molecule {
         for (ix, exclusion) in force_field.exclusions.iter().enumerate() {
             check_force_field_term("exclusion", ix, exclusion, num_atoms)?;
         }
+        for (ix, donor) in force_field.donors.iter().enumerate() {
+            check_force_field_term("donor", ix, donor, num_atoms)?;
+        }
+        for (ix, acceptor) in force_field.acceptors.iter().enumerate() {
+            check_force_field_term("acceptor", ix, acceptor, num_atoms)?;
+        }
 
         self.force_field = Some(force_field);
         Ok(())
@@ -1525,6 +1531,8 @@ mod tests {
                 ForceFieldAtom::empty(),
             ]),
             exclusions: vec![[0, 1]],
+            donors: vec![[0, 1]],
+            acceptors: vec![[1, 0]],
             ..ForceFieldTopology::default()
         };
         mol.set_force_field(force_field).expect("valid force field");
@@ -1536,6 +1544,8 @@ mod tests {
             Some("CT")
         );
         assert_eq!(back.exclusions, vec![[0, 1]]);
+        assert_eq!(back.donors, vec![[0, 1]]);
+        assert_eq!(back.acceptors, vec![[1, 0]]);
 
         // Independent of the site/coordinate tables, the same as they are of
         // each other.
@@ -1568,8 +1578,9 @@ mod tests {
 
     #[test]
     fn test_an_out_of_range_term_atom_is_refused() {
-        // One representative term kind; angles, dihedrals, impropers and
-        // exclusions all funnel through the same `check_force_field_term`.
+        // One representative term kind; angles, dihedrals, impropers,
+        // exclusions, donors and acceptors all funnel through the same
+        // `check_force_field_term` (#321).
         let mut mol = propane();
         let force_field = ForceFieldTopology {
             angles: vec![[0, 1, 9]],

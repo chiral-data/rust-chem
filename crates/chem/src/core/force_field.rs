@@ -65,6 +65,10 @@ pub struct ForceFieldTopology {
     pub impropers: Vec<[usize; 4]>,
     /// Atom pairs excluded from nonbonded interactions.
     pub exclusions: Vec<[usize; 2]>,
+    /// Hydrogen-bond donor pairs: `[donor, hydrogen]` (#321).
+    pub donors: Vec<[usize; 2]>,
+    /// Hydrogen-bond acceptor pairs: `[acceptor, antecedent]` (#321).
+    pub acceptors: Vec<[usize; 2]>,
 }
 
 #[cfg(test)]
@@ -103,5 +107,7 @@ mod tests {
         assert!(topology.dihedrals.is_empty());
         assert!(topology.impropers.is_empty());
         assert!(topology.exclusions.is_empty());
+        assert!(topology.donors.is_empty());
+        assert!(topology.acceptors.is_empty());
     }
 }
