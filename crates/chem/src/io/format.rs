@@ -479,6 +479,17 @@ pub(crate) type ByteReadFn = fn(&[u8], &ReadOptions) -> ReadOutcome;
 /// format's writer is shaped like (#309).
 pub(crate) type ByteWriteFn = fn(&[(String, Molecule)], &WriteOptions) -> Vec<u8>;
 
+/// A byte pattern identifying a format's content, independent of any
+/// filename: the exact bytes expected starting at `offset` (#317).
+///
+/// CCP4's `MAP ` sits at byte 208, not byte 0 — the offset is part of the
+/// signature, not always zero the way gzip's `\x1f\x8b` is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Signature {
+    pub offset: usize,
+    pub bytes: &'static [u8],
+}
+
 /// Builds a streaming [`Supplier`] over a boxed reader (#213).
 pub(crate) type SupplierCtor = fn(Box<dyn BufRead>, &ReadOptions) -> Box<dyn Supplier>;
 
@@ -510,6 +521,12 @@ pub struct FormatDescriptor {
     pub encoding: Encoding,
     /// What this format's records *are* -- see [`Kind`].
     pub kind: Kind,
+    /// Content signatures identifying this format independent of its
+    /// filename — checked by `crate::io::open::open_supplier` only when
+    /// nothing claims the file's extension, before falling back to SMILES
+    /// (#317). Empty for every format registered today; a binary format
+    /// story (#319, #325-#337) is what will populate this.
+    pub(crate) magic: &'static [Signature],
 
     pub(crate) reader: Option<ReadFn>,
     pub(crate) writer: Option<WriteFn>,
@@ -555,6 +572,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(smiles_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -597,6 +615,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(sdf_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -633,6 +652,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(cxsmiles_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -658,6 +678,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(xyz_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -686,6 +707,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(pdb_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -711,6 +733,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(mmcif_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -741,6 +764,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(mol2_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -767,6 +791,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(pdbqt_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -789,6 +814,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(gro_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -816,6 +842,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(cml_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -851,6 +878,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_stream: Some(commonchem_writer_stream),
         encoding: Encoding::Text,
         kind: Kind::Molecules,
+        magic: &[],
         reader_bytes: None,
         writer_bytes: None,
     },
@@ -1156,9 +1184,17 @@ impl Format {
     /// times: here, again for output paths in the CLI's writer, and a third
     /// time as a stdin special case.
     pub fn from_filename(name: &str) -> Format {
+        Self::from_filename_checked(name).unwrap_or(Format::SMILES)
+    }
+
+    /// Like [`Self::from_filename`], but `None` rather than the SMILES
+    /// default when nothing claims the extension — what a caller that wants
+    /// to try something else first (content-sniffing, in
+    /// `crate::io::open::open_supplier`, #317) needs instead of the default
+    /// already baked in.
+    pub fn from_filename_checked(name: &str) -> Option<Format> {
         name.rsplit_once('.')
             .and_then(|(_, extension)| Format::from_extension(extension))
-            .unwrap_or(Format::SMILES)
     }
 
     pub fn name(&self) -> &'static str {
@@ -1572,6 +1608,47 @@ pub fn fidelity(source: Format, target: Format) -> Carries {
     let both = source.carries() & target.carries();
     let manufactured = supplied(target) & target.carries();
     (both | manufactured | pair_extra(source, target)) & !pair_loss(source, target)
+}
+
+/// Whether `bytes` contains `pattern` starting at `offset` — never panics on
+/// a buffer shorter than `offset + pattern.len()`, since `slice::get` on an
+/// out-of-range range answers `None` rather than indexing (#317).
+fn has_magic_at(bytes: &[u8], offset: usize, pattern: &[u8]) -> bool {
+    bytes.get(offset..offset + pattern.len()) == Some(pattern)
+}
+
+/// The dispatch [`sniff`] runs, factored out so it can be proven against a
+/// hand-built candidate list rather than the real registry (#317) — a
+/// `Format` is always a real, registered handle (see its own doc comment),
+/// so there is no way to hand this a fake one the way a bare
+/// [`FormatDescriptor`] could stand in for an unregistered `Kind` in #310's
+/// own tests. Pairing a *real* `Format` with a *made-up* signature list
+/// sidesteps that: the matching logic under test is identical either way.
+fn find_signature(
+    bytes: &[u8],
+    candidates: impl Iterator<Item = (Format, &'static [Signature])>,
+) -> Option<Format> {
+    candidates
+        .filter(|(_, sigs)| {
+            sigs.iter()
+                .any(|sig| has_magic_at(bytes, sig.offset, sig.bytes))
+        })
+        .map(|(format, _)| format)
+        .next()
+}
+
+/// Matches `bytes` against every registered format's content signature, or
+/// `None` if nothing recognizes it (#317).
+///
+/// The last resort `crate::io::open::open_supplier` reaches for before
+/// `Format::from_filename`'s SMILES default, and only when the file's own
+/// extension claimed nothing. Every registered format's `magic` is empty
+/// today — #309 built the byte-reading path a binary format needs, but none
+/// has registered a signature yet (#319, #325-#337) — so this always
+/// answers `None`, the same "the mechanism lands now, a later story
+/// populates it" shape every Phase-1 story since #311 has followed.
+pub(crate) fn sniff(bytes: &[u8]) -> Option<Format> {
+    find_signature(bytes, all().map(|f| (f, f.descriptor().magic)))
 }
 
 impl fmt::Debug for Format {
@@ -2401,6 +2478,7 @@ mod tests {
                 carries: Carries::empty(),
                 encoding: Encoding::Text,
                 kind,
+                magic: &[],
                 reader: None,
                 writer: None,
                 reader_bytes: None,
@@ -2445,6 +2523,7 @@ mod tests {
                 carries,
                 encoding: Encoding::Text,
                 kind,
+                magic: &[],
                 reader: None,
                 writer: None,
                 reader_bytes: None,
@@ -2478,6 +2557,74 @@ mod tests {
         assert!(!passes(&bare(Kind::Volume, Carries::VERTICES)));
         assert!(!passes(&bare(Kind::Mesh, Carries::COLUMNS)));
         assert!(!passes(&bare(Kind::Table, Carries::SAMPLES)));
+    }
+
+    #[test]
+    fn test_has_magic_at_matches_and_never_panics_on_short_input() {
+        assert!(has_magic_at(b"\x1f\x8bxxxx", 0, b"\x1f\x8b"));
+        assert!(!has_magic_at(b"nope", 0, b"\x1f\x8b"));
+        // CCP4's `MAP ` sits at byte 208, not byte 0 -- a signature is not
+        // always anchored at the start of the file.
+        let mut buf = vec![0u8; 212];
+        buf[208..212].copy_from_slice(b"MAP ");
+        assert!(has_magic_at(&buf, 208, b"MAP "));
+        // Too short to hold the pattern at that offset at all -- must not
+        // panic, only answer false.
+        assert!(!has_magic_at(b"MA", 208, b"MAP "));
+        assert!(!has_magic_at(b"", 0, b"\x1f\x8b"));
+    }
+
+    #[test]
+    fn test_find_signature_matches_the_right_candidate() {
+        // `Format` is always a real, registered handle (see its own doc
+        // comment), so there is no way to hand this a fake one -- pairing a
+        // real `Format` with a made-up signature list proves the same
+        // matching/dispatch logic `sniff` uses without waiting on a real
+        // binary format to register one (#317).
+        let candidates: Vec<(Format, &'static [Signature])> = vec![
+            (
+                Format::SMILES,
+                &[Signature {
+                    offset: 0,
+                    bytes: b"AA",
+                }],
+            ),
+            (
+                Format::SDF,
+                &[Signature {
+                    offset: 2,
+                    bytes: b"BB",
+                }],
+            ),
+        ];
+
+        assert_eq!(
+            find_signature(b"AAxx", candidates.iter().copied()),
+            Some(Format::SMILES)
+        );
+        assert_eq!(
+            find_signature(b"xxBB", candidates.iter().copied()),
+            Some(Format::SDF)
+        );
+        assert_eq!(find_signature(b"zzzz", candidates.iter().copied()), None);
+    }
+
+    #[test]
+    fn test_sniff_is_a_confirmed_no_op_today() {
+        // No registered format has declared a signature yet -- #309 built
+        // the byte-reading path a binary format needs, but #319/#325-#337
+        // are what will populate `magic` for a real one. Pinned explicitly
+        // rather than trusted silently, the same discipline #316's
+        // `pairs_within_kind` count assertion follows.
+        for format in all() {
+            assert!(
+                format.descriptor().magic.is_empty(),
+                "{format:?} already has a signature"
+            );
+        }
+        assert!(sniff(b"\x1f\x8b\x08\x00").is_none());
+        assert!(sniff(b"CORD").is_none());
+        assert!(sniff(b"").is_none());
     }
 
     #[test]
