@@ -7,6 +7,7 @@ use std::ops::{BitAnd, BitOr, Not};
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
+use crate::core::trajectory::Trajectory;
 use crate::io::options::{ReadOptions, WriteOptions};
 use crate::io::reader::ReadOutcome;
 use crate::io::supplier::{Supplier, Writer};
@@ -497,6 +498,15 @@ pub(crate) type ByteReadFn = fn(&[u8], &ReadOptions) -> ReadOutcome;
 /// format's writer is shaped like (#309).
 pub(crate) type ByteWriteFn = fn(&[(String, Molecule)], &WriteOptions) -> Vec<u8>;
 
+/// Serialises a whole trajectory into one file's worth of bytes (#326) —
+/// singular, unlike [`ByteWriteFn`]'s `&[(String, Molecule)]` list, since one
+/// trajectory file holds exactly one trajectory, not a list of named
+/// records. A new, parallel field rather than a widened `WriteFn`/
+/// `ByteWriteFn`: those are fundamentally shaped for `Molecule`, and
+/// generalising them to be payload-polymorphic is separate, larger work
+/// this format does not need (see [`crate::io::trr`]'s module doc).
+pub(crate) type ByteWriteTrajectoryFn = fn(&mut Trajectory, &WriteOptions) -> Vec<u8>;
+
 /// A byte pattern identifying a format's content, independent of any
 /// filename: the exact bytes expected starting at `offset` (#317).
 ///
@@ -557,6 +567,11 @@ pub struct FormatDescriptor {
     pub(crate) writer_bytes: Option<ByteWriteFn>,
     pub(crate) supplier: Option<SupplierCtor>,
     pub(crate) writer_stream: Option<WriterCtor>,
+    /// Set only for a format whose writer takes a whole [`Trajectory`]
+    /// rather than a `&[(String, Molecule)]` list (#326) — `None` for every
+    /// `Kind::Molecules` format, including all seventeen registered before
+    /// TRR.
+    pub(crate) writer_trajectory: Option<ByteWriteTrajectoryFn>,
 }
 
 /// Every format compiled into this build.
@@ -593,6 +608,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -640,6 +656,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -677,6 +694,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -703,6 +721,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -732,6 +751,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -758,6 +778,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -789,6 +810,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -816,6 +838,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -839,6 +862,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -867,6 +891,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -903,6 +928,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "BinaryCIF",
@@ -932,6 +958,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: Some(crate::io::bcif::read_bcif_with_options),
         writer_bytes: Some(crate::io::bcif::write_bcif_records),
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "CIF core",
@@ -966,6 +993,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "PSF",
@@ -1001,6 +1029,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "PRMTOP",
@@ -1045,6 +1074,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "TOP",
@@ -1081,6 +1111,7 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
     },
     FormatDescriptor {
         name: "LAMMPS Data",
@@ -1120,6 +1151,40 @@ static FORMATS: &[FormatDescriptor] = &[
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
+        writer_trajectory: None,
+    },
+    FormatDescriptor {
+        name: "TRR",
+        codes: &["trr"],
+        extensions: &["trr"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The first `Kind::Frames` format -- topology (a bare atom count,
+        // see `io/trr.rs`'s module doc), positions, and whatever a given
+        // frame happened to also state: velocities, forces, simulation
+        // time, a box. No RESIDUES/ATOM_TYPE/MASS/BONDS -- TRR states none
+        // of a molecule's identity, only its trajectory.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::VELOCITIES)
+            .or(Carries::FORCES)
+            .or(Carries::FRAME_TIME)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(trr_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // GROMACS's own fixed magic number, big-endian -- the first real,
+        // populated signature in this crate (#317 built the mechanism;
+        // #319/#325-#337 are what populate it for a real format).
+        magic: &[Signature {
+            offset: 0,
+            bytes: &[0x00, 0x00, 0x07, 0xC9],
+        }],
+        reader_bytes: Some(crate::io::trr::read_trr_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::trr::write_trr_bytes),
     },
 ];
 
@@ -1193,6 +1258,10 @@ fn cml_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn bcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::bcif::BcifSupplier::new(reader, options))
+}
+
+fn trr_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::trr::TrrSupplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1534,6 +1603,16 @@ impl Format {
     /// numeric type and mass, never a name, and inventing an element from
     /// mass would fail outright for coarse-grained/reduced-unit systems.
     pub const LAMMPS_DATA: Format = Format(16);
+    /// TRR (#326), see [`crate::io::trr`]. The first format registered as
+    /// [`Kind::Frames`] rather than [`Kind::Molecules`] -- a shared topology
+    /// (every atom [`crate::core::atom::Element::UNKNOWN`], TRR states no
+    /// chemical identity at all) plus lazily-read frames, each carrying
+    /// positions and whatever else it happened to state: velocities,
+    /// forces, a box. The first format with a real, populated `magic`
+    /// signature, and the first with a trajectory writer (this format
+    /// descriptor's own `writer_trajectory` field) rather than a
+    /// `&[(String, Molecule)]`-shaped one.
+    pub const TRR: Format = Format(17);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1626,7 +1705,7 @@ impl Format {
 
     pub fn can_write(&self) -> bool {
         let d = self.descriptor();
-        d.writer.is_some() || d.writer_bytes.is_some()
+        d.writer.is_some() || d.writer_bytes.is_some() || d.writer_trajectory.is_some()
     }
 
     /// Parses a whole file into molecules, from raw bytes (#309) — the
@@ -1711,6 +1790,23 @@ impl Format {
             return Some(writer_bytes(records, options));
         }
         d.writer.map(|writer| writer(records, options).into_bytes())
+    }
+
+    /// Serialises a whole trajectory into raw bytes (#326), or `None` if
+    /// this format has no trajectory writer — every `Kind::Molecules`
+    /// format, and any `Kind::Frames` format that has not implemented one.
+    pub fn write_trajectory_bytes(&self, trajectory: &mut Trajectory) -> Option<Vec<u8>> {
+        self.write_trajectory_bytes_with_options(trajectory, &WriteOptions::default())
+    }
+
+    /// [`Self::write_trajectory_bytes`], with explicit per-format options.
+    pub fn write_trajectory_bytes_with_options(
+        &self,
+        trajectory: &mut Trajectory,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_trajectory = self.descriptor().writer_trajectory?;
+        Some(writer_trajectory(trajectory, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -2571,7 +2667,11 @@ mod tests {
         // that overstates makes the drop report lie about the very data it
         // exists to protect.
         for format in all() {
-            if !format.can_write() || !format.can_read() {
+            // `one_per_attribute`'s fixtures are all `Molecule`s -- a
+            // `Kind::Frames` format (TRR, #326) has no Molecule-shaped
+            // writer to probe here; it is proven correct on its own terms
+            // in `crate::io::trr`'s own test module instead.
+            if format.kind() != Kind::Molecules || !format.can_write() || !format.can_read() {
                 continue;
             }
             for (flag, molecule) in one_per_attribute() {
@@ -2628,19 +2728,19 @@ mod tests {
         )
     }
 
-    /// Every ordered `(source, target)` pair sharing a `Kind`.
-    ///
-    /// A conversion between two kinds that will never meet (there is no
-    /// CSV-to-DCD conversion to measure) is not a cell this matrix needs --
-    /// #316. At 12 formats, all `Kind::Molecules` today, this is every pair
-    /// `all() x all()` already produced; it starts pruning the day a second
-    /// `Kind` is registered (#325-#337).
+    /// Every ordered `(source, target)` pair sharing a `Kind`, restricted to
+    /// `Kind::Molecules` -- the only kind [`one_per_attribute`]'s fixtures
+    /// (and this whole fidelity matrix) are shaped for. TRR (#326) is the
+    /// first format registered outside it; generalising this matrix to work
+    /// across kinds is #338/#339's job, not this story's.
     fn pairs_within_kind() -> impl Iterator<Item = (Format, Format)> {
-        all().flat_map(|source| {
-            all()
-                .filter(move |target| target.kind() == source.kind())
-                .map(move |target| (source, target))
-        })
+        all()
+            .filter(|f| f.kind() == Kind::Molecules)
+            .flat_map(|source| {
+                all()
+                    .filter(move |target| target.kind() == source.kind())
+                    .map(move |target| (source, target))
+            })
     }
 
     #[test]
@@ -2653,10 +2753,9 @@ mod tests {
         // diagonal.
         let fixtures = one_per_attribute();
         let pairs: Vec<(Format, Format)> = pairs_within_kind().collect();
-        // Vacuous today -- 14 formats, one `Kind` -- and worth pinning as
-        // such rather than trusting silently: 14 x 14, the same count
-        // `all() x all()` already produced, so this test is unchanged until
-        // a second `Kind` registers.
+        // 17 `Kind::Molecules` formats, 17 x 17 -- TRR (#326) is the first
+        // format `pairs_within_kind` excludes, being the first registered
+        // outside that kind, so this count is unchanged by its arrival.
         assert_eq!(pairs.len(), 289);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
@@ -2718,7 +2817,7 @@ mod tests {
             })
             .collect();
 
-        for format in all() {
+        for format in all().filter(|f| f.kind() == Kind::Molecules) {
             let bytes = format.write_bytes(&records).expect("every format writes");
             let back = format
                 .read_bytes(&bytes)
@@ -2812,7 +2911,7 @@ mod tests {
             })
             .collect();
 
-        for format in all() {
+        for format in all().filter(|f| f.kind() == Kind::Molecules) {
             let bytes = format.write_bytes(&records).expect("every format writes");
             let back = format
                 .read_bytes(&bytes)
@@ -2923,7 +3022,8 @@ mod tests {
             })
             .collect();
 
-        for format in all().filter(|f| f.can_read() && f.can_write()) {
+        for format in all().filter(|f| f.kind() == Kind::Molecules && f.can_read() && f.can_write())
+        {
             let bytes = format.write_bytes(&bonded).expect("every format writes");
             let back = format
                 .read_bytes(&bytes)
@@ -3001,7 +3101,7 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 3, "the fixture must be multi-record");
 
-        for format in all() {
+        for format in all().filter(|f| f.kind() == Kind::Molecules) {
             let bytes = format.write_bytes(&records).expect("every format writes");
             let back = format
                 .read_bytes(&bytes)
@@ -3144,6 +3244,7 @@ mod tests {
                 writer_bytes: None,
                 supplier: None,
                 writer_stream: None,
+                writer_trajectory: None,
             }
         }
 
@@ -3189,6 +3290,7 @@ mod tests {
                 writer_bytes: None,
                 supplier: None,
                 writer_stream: None,
+                writer_trajectory: None,
             }
         }
 
@@ -3269,13 +3371,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_is_a_confirmed_no_op_today() {
-        // No registered format has declared a signature yet -- #309 built
-        // the byte-reading path a binary format needs, but #319/#325-#337
-        // are what will populate `magic` for a real one. Pinned explicitly
-        // rather than trusted silently, the same discipline #316's
-        // `pairs_within_kind` count assertion follows.
+    fn test_sniff_resolves_trrs_real_signature_and_nothing_else_has_one_yet() {
+        // TRR (#326) is the first format to populate `magic` for real --
+        // #309 built the byte-reading path a binary format needs, and
+        // #317 built this matching mechanism, but every format before TRR
+        // left `magic` empty. Pinned explicitly rather than trusted
+        // silently, the same discipline #316's `pairs_within_kind` count
+        // assertion follows.
         for format in all() {
+            if format == Format::TRR {
+                continue;
+            }
             assert!(
                 format.descriptor().magic.is_empty(),
                 "{format:?} already has a signature"
@@ -3284,16 +3390,19 @@ mod tests {
         assert!(sniff(b"\x1f\x8b\x08\x00").is_none());
         assert!(sniff(b"CORD").is_none());
         assert!(sniff(b"").is_none());
+
+        // GROMACS's own fixed magic number, big-endian.
+        assert_eq!(sniff(b"\x00\x00\x07\xc9REST"), Some(Format::TRR));
     }
 
     #[test]
     fn test_every_text_format_stays_text_encoded() {
-        // #309 added the byte-level path; #319 (BinaryCIF) is the first
-        // format to actually use it -- named here as the one exception
-        // rather than deleting the invariant, since every *other* format
-        // must still be plain text with no binary reader/writer wired in.
+        // #309 added the byte-level path; #319 (BinaryCIF) and #326 (TRR)
+        // are the formats that actually use it -- skipped here by their
+        // `Encoding`, not by name, since every *other* format must still be
+        // plain text with no binary reader/writer wired in.
         for format in all() {
-            if format == Format::BCIF {
+            if format.encoding() == Encoding::Binary {
                 continue;
             }
             let d = format.descriptor();
@@ -3419,7 +3528,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 17);
+        assert_eq!(all().count(), 18);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

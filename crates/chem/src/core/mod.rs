@@ -17,6 +17,7 @@ pub mod trajectory;
 pub mod volume;
 
 pub mod elements;
+pub(crate) mod units;
 
 pub mod prelude {
     pub use crate::core::atom::{Atom, Chirality, Element, Hybridization};
