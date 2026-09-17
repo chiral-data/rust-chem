@@ -9,8 +9,17 @@ pub struct Element {
 }
 
 impl Element {
+    /// No real chemical identity, only a numeric label from a format that
+    /// never states one -- a LAMMPS data file's atom types, for instance
+    /// (#324). `core::elements`'s `ELEMENT_SYMBOLS`/`ELEMENT_NAMES`/
+    /// `ATOMIC_MASSES` already carry an unused placeholder entry at index
+    /// 0 (`""`, `""`, `0.0`); `typical_valence`'s wildcard arm already
+    /// answers `0` for it, honestly declining to imply a hydrogen count
+    /// from a valence nothing states.
+    pub const UNKNOWN: Element = Element { atomic_number: 0 };
+
     pub const fn new(atomic_number: u8) -> Option<Self> {
-        if atomic_number == 0 || atomic_number > 118 {
+        if atomic_number > 118 {
             None
         } else {
             Some(Element { atomic_number })
@@ -279,8 +288,20 @@ mod tests {
         assert_eq!(carbon.atomic_number, 6);
         assert_eq!(carbon.symbol(), "C");
         assert_eq!(carbon.name(), "Carbon");
-        assert!(Element::new(0).is_none());
         assert!(Element::new(119).is_none());
+    }
+
+    #[test]
+    fn test_unknown_element_is_a_real_atomic_number_zero() {
+        // Not a special-cased variant elsewhere in the type -- the same
+        // `Element`, at the one atomic number that was previously refused,
+        // reusing core::elements's own placeholder entry rather than
+        // inventing a new one (#324).
+        assert_eq!(Element::new(0), Some(Element::UNKNOWN));
+        assert_eq!(Element::UNKNOWN.symbol(), "");
+        assert_eq!(Element::UNKNOWN.name(), "");
+        assert_eq!(Element::UNKNOWN.typical_valence(), 0);
+        assert_eq!(Element::UNKNOWN.valence_for_charge(1), 0);
     }
 
     #[test]

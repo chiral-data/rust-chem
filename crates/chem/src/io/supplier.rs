@@ -615,6 +615,86 @@ impl<R: BufRead> Iterator for PrmtopSupplier<R> {
     }
 }
 
+/// One topology per `"Written by chem"` block (#324). Mirrors
+/// [`PrmtopSupplier`]'s own shape exactly, but the marker is this crate's
+/// own writer's fixed title line, not something a real file states -- see
+/// `read_lammps_data_with_options`'s own doc comment for why that's still
+/// correct for a genuine third-party file (its arbitrary title only ever
+/// appears once, so it never triggers a split).
+pub struct LammpsDataSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    options: ReadOptions,
+}
+
+impl<R: BufRead> LammpsDataSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            options: *options,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for LammpsDataSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim() == "Written by chem";
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::lammps::parse_lammps_data(&buffer, &self.options.lammps)
+                .map(|molecule| Record {
+                    payload: Payload::Molecule(molecule),
+                    name: format!("Molecule_{position}"),
+                    smiles: None,
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
 /// One molecule per `@<TRIPOS>MOLECULE` block (#225). Mirrors
 /// [`MmcifSupplier`]'s own shape exactly -- `@<TRIPOS>MOLECULE` is a
 /// *start* marker too, so the same one-line lookahead applies.
@@ -1116,6 +1196,34 @@ impl<W: Write> Writer for PrmtopWriter<W> {
     fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
         self.writer
             .write_all(crate::io::prmtop::write_prmtop(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams LAMMPS data out, one `"Written by chem"` block per molecule
+/// (#324). No per-record name threaded through -- LAMMPS has no
+/// title-line concept for a record's name either, same reasoning as
+/// [`PsfWriter`]/[`PrmtopWriter`]. Each call writes a complete,
+/// self-delimited block, so this needs no buffering: a second molecule
+/// just means a second fixed title line later in the stream, which
+/// [`LammpsDataSupplier`] already knows to split on.
+pub struct LammpsDataWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> LammpsDataWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for LammpsDataWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::lammps::write_lammps_data(molecule).as_bytes())
     }
 
     fn finish(self: Box<Self>) -> std::io::Result<()> {
@@ -1760,7 +1868,7 @@ mod tests {
     use std::io::Cursor;
 
     fn options() -> ReadOptions {
-        ReadOptions
+        ReadOptions::default()
     }
 
     #[test]
@@ -1852,7 +1960,7 @@ mod tests {
             writer.write_molecule("ethanol", &mol).unwrap();
         }
         let text = String::from_utf8(out).unwrap();
-        let read_back = read_smiles_with_options(&text, &ReadOptions);
+        let read_back = read_smiles_with_options(&text, &ReadOptions::default());
         assert_eq!(read_back.records.len(), 1);
         assert_eq!(read_back.records[0].name, "ethanol");
     }
@@ -1866,7 +1974,7 @@ mod tests {
             writer.write_molecule("ethanol", &mol).unwrap();
         }
         let text = String::from_utf8(out).unwrap();
-        let read_back = read_sdf_with_options(&text, &ReadOptions);
+        let read_back = read_sdf_with_options(&text, &ReadOptions::default());
         assert_eq!(read_back.records.len(), 1);
         assert_eq!(read_back.records[0].name, "ethanol");
     }

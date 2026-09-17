@@ -205,7 +205,7 @@ mod tests {
         let path = dir.join("plain.smi");
         std::fs::write(&path, "CCO ethanol\n").unwrap();
 
-        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let mut supplier = open_supplier(&path, &ReadOptions::default()).unwrap();
         let record = supplier.next().unwrap().unwrap();
         assert_eq!(record.molecule().unwrap().formula(), "C2H6O");
         assert_eq!(record.name, "ethanol");
@@ -224,7 +224,7 @@ mod tests {
         let path = dir.join("ethanol.mol");
         std::fs::write(&path, include_str!("../../tests/corpus/sdf/ethanol.mol")).unwrap();
 
-        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let mut supplier = open_supplier(&path, &ReadOptions::default()).unwrap();
         let record = supplier.next().unwrap().unwrap();
         assert_eq!(record.molecule().unwrap().num_atoms(), 3);
         assert!(supplier.next().is_none());
@@ -250,7 +250,7 @@ mod tests {
         let path = dir.join("probe.smi");
         std::fs::write(&path, [0x00u8, 0x01, 0x02, 0x03]).unwrap();
 
-        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let mut supplier = open_supplier(&path, &ReadOptions::default()).unwrap();
         assert!(
             supplier.next().unwrap().is_err(),
             "resolved as SMILES (by extension) and failed to parse, rather \
@@ -271,7 +271,7 @@ mod tests {
         let path = dir.join("plain.probe");
         std::fs::write(&path, "CCO ethanol\n").unwrap();
 
-        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let mut supplier = open_supplier(&path, &ReadOptions::default()).unwrap();
         let record = supplier.next().unwrap().unwrap();
         assert_eq!(record.molecule().unwrap().formula(), "C2H6O");
 
@@ -287,7 +287,7 @@ mod tests {
         let path = dir.join("empty.probe");
         std::fs::write(&path, []).unwrap();
 
-        let supplier = open_supplier(&path, &ReadOptions);
+        let supplier = open_supplier(&path, &ReadOptions::default());
         assert!(supplier.is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -314,7 +314,7 @@ mod tests {
             encoder.finish().unwrap();
         }
 
-        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let mut supplier = open_supplier(&path, &ReadOptions::default()).unwrap();
         let read_back = supplier.next().unwrap().unwrap();
         assert_eq!(read_back.molecule().unwrap().num_atoms(), mol.num_atoms());
         assert!(supplier.next().is_none());
@@ -335,7 +335,7 @@ mod tests {
         // be detected as gzip and enough to fail to parse as SDF.
         std::fs::write(&path, [0x1fu8, 0x8b, 0x08, 0x00, 0x00, 0x00]).unwrap();
 
-        let mut supplier = open_supplier(&path, &ReadOptions).unwrap();
+        let mut supplier = open_supplier(&path, &ReadOptions::default()).unwrap();
         assert!(supplier.next().unwrap().is_err());
 
         std::fs::remove_dir_all(&dir).ok();

@@ -6,10 +6,43 @@
 //! the plan already recorded on those type aliases before any format needed
 //! a real option (#212).
 
-/// No options exist yet. A real field lands here the first time a reader
-/// needs one to configure, rather than being invented ahead of that need.
+/// One field per format that has a read option today (#324's `lammps` is
+/// the first). A real field lands here the first time a reader needs one
+/// to configure, rather than being invented ahead of that need.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReadOptions;
+pub struct ReadOptions {
+    pub lammps: LammpsReadOptions,
+}
+
+/// LAMMPS data's own read option: which `Atoms`-section column layout to
+/// assume when the section header carries no recognized `# style` comment
+/// and the column count alone is ambiguous (#324) -- `charge` and
+/// `molecular` (which also covers `bond`/`angle`'s identical shape) share
+/// a column count both with and without the optional image-flag triplet.
+/// `None` (the default) means: resolve from the comment or an unambiguous
+/// column count, refusing rather than guessing when neither settles it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LammpsReadOptions {
+    pub atom_style: Option<AtomStyle>,
+}
+
+/// A LAMMPS `atom_style`, restricted to the four column layouts this crate
+/// models (#324). `molecular`, `bond` and `angle` share one shape --
+/// `id, molecule-id, type, x, y, z` -- so `Molecular` covers all three;
+/// this crate never needs to tell them apart. Any other real style
+/// (`sphere`, `ellipsoid`, `electron`, ...) is a clear, refusing error
+/// rather than a guessed-at column layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomStyle {
+    /// `id, type, x, y, z`.
+    Atomic,
+    /// `id, type, charge, x, y, z`.
+    Charge,
+    /// `id, molecule-id, type, x, y, z` -- also `bond` and `angle`.
+    Molecular,
+    /// `id, molecule-id, type, charge, x, y, z`.
+    Full,
+}
 
 /// One field per format that has a write option today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

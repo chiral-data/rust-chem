@@ -8,6 +8,7 @@ pub mod cxsmiles;
 pub mod errors;
 pub mod format;
 pub mod gro;
+pub mod lammps;
 pub mod mmcif;
 pub mod mol2;
 pub mod msgpack;

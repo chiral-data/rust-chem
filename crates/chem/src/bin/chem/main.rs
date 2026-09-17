@@ -846,7 +846,10 @@ fn resolve_convert_input(
     if let Some(text) = literal {
         let format = from.unwrap_or(Format::SMILES);
         let supplier = format
-            .supplier(Cursor::new(text.as_bytes().to_vec()), &ReadOptions)
+            .supplier(
+                Cursor::new(text.as_bytes().to_vec()),
+                &ReadOptions::default(),
+            )
             .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
         return Ok((supplier, "<literal>".to_string(), format));
     }
@@ -855,15 +858,15 @@ fn resolve_convert_input(
         Some(path) => {
             let format = from.unwrap_or_else(|| chem::io::open::format_for_path(path));
             let supplier = match from {
-                Some(format) => open_supplier_as(path, format, &ReadOptions)?,
-                None => chem::io::open::open_supplier(path, &ReadOptions)?,
+                Some(format) => open_supplier_as(path, format, &ReadOptions::default())?,
+                None => chem::io::open::open_supplier(path, &ReadOptions::default())?,
             };
             Ok((supplier, path.display().to_string(), format))
         }
         None => {
             let format = from.unwrap_or(Format::SMILES);
             let supplier = format
-                .supplier(std::io::stdin().lock(), &ReadOptions)
+                .supplier(std::io::stdin().lock(), &ReadOptions::default())
                 .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
             Ok((supplier, "-".to_string(), format))
         }
