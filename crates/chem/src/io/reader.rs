@@ -651,6 +651,64 @@ fn push_psf_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_prmtop_with_options`] with default options.
+pub fn read_prmtop(content: &str) -> ReadOutcome {
+    read_prmtop_with_options(content, &ReadOptions)
+}
+
+/// A real PRMTOP is always exactly one topology -- but this crate's own
+/// invariant (every registered format writes and reads back as many
+/// records as it was given, #267) means a *file this crate wrote* may hold
+/// several, back to back, each with its own `%VERSION` header line acting
+/// as a start marker -- mirroring [`read_psf_with_options`]'s splitting
+/// exactly, since PRMTOP has no real multi-topology convention of its own
+/// to borrow instead. Unlike PSF's bare `PSF` line, a real `%VERSION` line
+/// carries trailing content (`VERSION_STAMP = ...`), so the marker check is
+/// a prefix match, not an exact one.
+pub fn read_prmtop_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        let starts_new_block = line.trim_start().starts_with("%VERSION");
+        if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
+            position += 1;
+            push_prmtop_record(&mut out, &lines, position);
+            lines.clear();
+        }
+        lines.push(line);
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_prmtop_record(&mut out, &lines, position);
+    }
+
+    out
+}
+
+fn push_prmtop_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+    let record = lines.join("\n");
+    match crate::io::prmtop::parse_prmtop(&record) {
+        Ok(molecule) => {
+            let name = molecule
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Molecule_{position}"));
+            out.records.push(Record {
+                payload: Payload::Molecule(molecule),
+                name,
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 /// [`read_mol2_with_options`] with default options.
 pub fn read_mol2(content: &str) -> ReadOutcome {
     read_mol2_with_options(content, &ReadOptions)

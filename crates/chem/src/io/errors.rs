@@ -185,6 +185,27 @@ pub enum PsfError {
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
+pub enum PrmtopError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// PRMTOP's `ATOMIC_NUMBER` section is optional (AmberTools 12+); when
+    /// absent, or when it names nothing in range, the element is inferred
+    /// from mass instead, the same fallback PSF's own `element_from_mass`
+    /// provides (#322). This is what neither route resolving reports.
+    #[error("No element matches atomic number {atomic_number:?} or mass {mass}")]
+    InvalidElement {
+        atomic_number: Option<i64>,
+        mass: f64,
+    },
+
+    /// No `%FLAG ATOM_NAME` section was ever seen at all.
+    #[error("No atoms in PRMTOP")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Mol2Error {
     #[error("Parse error: {0}")]
     ParseError(String),

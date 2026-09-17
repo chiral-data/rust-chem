@@ -44,6 +44,9 @@ molecule against several and pass for the wrong reason.
 | `cif_core/symmetry-operators.cif` | A `_symmetry_equiv_pos_as_xyz` loop present and deliberately unused: this crate reads and writes only the asymmetric unit a file states, never expanding symmetry, so this fixture is what proves the operator loop is parsed-and-discarded rather than choking the reader |
 | `psf/water.psf` | A small, complete topology: bonds, one angle, donors, and acceptors, with zero exclusions (`!NNB` present but empty) (#321) |
 | `psf/exclusions.psf` | The `!NNB` two-array reconstruction specifically: more than one atom has exclusion partners, which an off-by-one in the `IBLO14` cumulative-pointer walk would get wrong while still parsing successfully |
+| `prmtop/water.prmtop` | A small, complete topology: bonds, one angle, an `ATOMIC_NUMBER` section, and a charge stated in Amber units to prove the 18.2223 scaling round-trips (#322) |
+| `prmtop/exclusions.prmtop` | `NUMBER_EXCLUDED_ATOMS`/`EXCLUDED_ATOMS_LIST`'s sequential-consume shape specifically: more than one atom has real exclusions, and more than one uses the `1`/`0` "no exclusions" sentinel, which a miscounted consume would get wrong while still parsing successfully |
+| `prmtop/no_atomic_number.prmtop` | No `ATOMIC_NUMBER` section at all -- the mass-based element-inference fallback every real PRMTOP reader (this one included) needs for pre-AmberTools-12 files |
 
 ## Pinned gaps
 
