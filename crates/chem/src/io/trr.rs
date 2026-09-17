@@ -156,10 +156,11 @@ fn read_points(
     natoms: usize,
     floatsize: usize,
 ) -> Result<Vec<Point3>, TrrError> {
-    let v = read_reals(r, natoms * 3, floatsize)?;
-    Ok(v.chunks_exact(3)
-        .map(|c| Point3::new(c[0], c[1], c[2]))
-        .collect())
+    let mut out = Vec::with_capacity(natoms);
+    for _ in 0..natoms {
+        out.push(read_point(r, floatsize)?);
+    }
+    Ok(out)
 }
 
 fn angle_degrees(a: Point3, b: Point3) -> f64 {
