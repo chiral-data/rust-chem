@@ -709,6 +709,40 @@ fn push_prmtop_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_top_with_options`] with default options.
+pub fn read_top(content: &str) -> ReadOutcome {
+    read_top_with_options(content, &ReadOptions)
+}
+
+/// One record per `[ moleculetype ]` block (#323) -- unlike PSF/PRMTOP
+/// (exactly one topology per call, split only to satisfy this crate's own
+/// round-trip invariant), a GROMACS `.top` file legitimately defines
+/// several moleculetypes already, so `top::parse_top` returns all of them
+/// from one pass over the whole buffer -- the same "parse once, get many"
+/// shape as `read_commonchem_with_options`, not a line-scan split.
+pub fn read_top_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+
+    match crate::io::top::parse_top(content) {
+        Ok(records) => {
+            for (name, molecule) in records {
+                out.records.push(Record {
+                    payload: Payload::Molecule(molecule),
+                    name,
+                    smiles: None,
+                });
+            }
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position: 1,
+            input: content.to_string(),
+            error: e.to_string(),
+        }),
+    }
+
+    out
+}
+
 /// [`read_mol2_with_options`] with default options.
 pub fn read_mol2(content: &str) -> ReadOutcome {
     read_mol2_with_options(content, &ReadOptions)

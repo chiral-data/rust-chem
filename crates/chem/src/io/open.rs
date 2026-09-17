@@ -65,10 +65,12 @@ fn supply(
 /// A correctly-named file never pays for the peek: extension resolution
 /// short-circuits before `fill_buf` is ever called.
 ///
-/// One exception: a bare `.cif` extension resolves to mmCIF *or* CIF core
+/// Two exceptions: a bare `.cif` extension resolves to mmCIF *or* CIF core
 /// (#320) depending on content — the two dictionaries share that extension,
 /// and nothing about the name says which one a given file is. `.mmcif`
-/// stays unambiguous and skips this check entirely.
+/// stays unambiguous and skips this check entirely. A bare `.top`
+/// extension resolves to PRMTOP *or* GROMACS TOP (#323) the same way —
+/// AMBER and GROMACS both use it.
 fn resolve_format(path: &Path, reader: &mut dyn BufRead) -> io::Result<Format> {
     let name = degzipped_name(path);
     if let Some(format) = Format::from_filename_checked(&name) {
@@ -78,6 +80,14 @@ fn resolve_format(path: &Path, reader: &mut dyn BufRead) -> io::Result<Format> {
                 && crate::io::cif_core::is_small_molecule_cif(text)
             {
                 return Ok(Format::CIF_CORE);
+            }
+        }
+        if format == Format::PRMTOP && has_extension(&name, "top") {
+            let buf = reader.fill_buf()?;
+            if let Ok(text) = std::str::from_utf8(buf)
+                && crate::io::top::is_gromacs_top(text)
+            {
+                return Ok(Format::TOP);
             }
         }
         return Ok(format);

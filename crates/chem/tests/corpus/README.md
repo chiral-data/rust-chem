@@ -47,6 +47,9 @@ molecule against several and pass for the wrong reason.
 | `prmtop/water.prmtop` | A small, complete topology: bonds, one angle, an `ATOMIC_NUMBER` section, and a charge stated in Amber units to prove the 18.2223 scaling round-trips (#322) |
 | `prmtop/exclusions.prmtop` | `NUMBER_EXCLUDED_ATOMS`/`EXCLUDED_ATOMS_LIST`'s sequential-consume shape specifically: more than one atom has real exclusions, and more than one uses the `1`/`0` "no exclusions" sentinel, which a miscounted consume would get wrong while still parsing successfully |
 | `prmtop/no_atomic_number.prmtop` | No `ATOMIC_NUMBER` section at all -- the mass-based element-inference fallback every real PRMTOP reader (this one included) needs for pre-AmberTools-12 files |
+| `top/urea_like.top` | A small, complete single-moleculetype topology: bonds, one angle, one proper (funct 9) and one improper (funct 4) dihedral, an `[ exclusions ]` entry, and an unresolved `#include` that this reader records but never follows (#323) |
+| `top/multi_moleculetype.top` | Two `[ moleculetype ]` blocks in one file -- normal GROMACS practice, not a round-trip artifact -- proving one `Molecule` per block, plus a `[ molecules ]` count (`Water 1000`) this crate never expands |
+| `top/conditional.top` | `#ifdef`/`#else` driven by an in-file `#define`: both branches state a same-atoms `[ angles ]` line in a different order, so reading the wrong branch (or both) is directly visible in the result |
 
 ## Pinned gaps
 

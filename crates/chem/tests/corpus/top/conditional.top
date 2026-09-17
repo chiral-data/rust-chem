@@ -1,0 +1,28 @@
+;
+; Exercises #ifdef/#else evaluated against an in-file #define (#323). Both
+; branches state an [ angles ] section over the same three atoms, in
+; different orders -- if the conditional were evaluated wrongly (or not at
+; all), both would be read and angles.len() would be 2, not 1.
+;
+
+[ moleculetype ]
+; name  nrexcl
+Test    3
+
+[ atoms ]
+; nr type resnr residue atom cgnr charge mass
+1  C  1  RES  C1  1  0.000000  12.01100
+2  C  1  RES  C2  2  0.000000  12.01100
+3  C  1  RES  C3  3  0.000000  12.01100
+
+#define FLEXIBLE
+
+#ifdef FLEXIBLE
+[ angles ]
+; the branch that must survive
+1 2 3 1
+#else
+[ angles ]
+; the branch that must NOT survive
+3 2 1 1
+#endif

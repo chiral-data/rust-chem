@@ -1005,7 +1005,16 @@ static FORMATS: &[FormatDescriptor] = &[
     FormatDescriptor {
         name: "PRMTOP",
         codes: &["prmtop"],
-        extensions: &["prmtop", "parm7"],
+        // `"top"` included deliberately (#323): AMBER topologies are
+        // sometimes saved under `.top` too, alongside the native
+        // `prmtop`/`parm7`. `Format::from_filename_checked` resolves a bare
+        // `.top` to whichever format is registered first -- this one, so
+        // no behavior change for anyone already relying on it -- and
+        // `io::open::resolve_format`/`bin/chem/stream.rs`'s own copy
+        // override to `Format::TOP` by content when `top::is_gromacs_top`
+        // says so, the same shape `.cif`'s mmCIF/CIF-core disambiguation
+        // already uses.
+        extensions: &["prmtop", "parm7", "top"],
         category: Category::MolecularDynamicsAndDocking,
         // Topology only (#322) -- PRMTOP states substantially more of the
         // force field than PSF does (force constants, equilibrium values,
@@ -1033,6 +1042,42 @@ static FORMATS: &[FormatDescriptor] = &[
         // ASCII `%VERSION` text -- nothing fixed-offset to sniff, and no
         // extension ambiguity to resolve (`.prmtop`/`.parm7` are claimed by
         // nothing else), so `magic` buys nothing here.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+    },
+    FormatDescriptor {
+        name: "TOP",
+        codes: &["top"],
+        // Shares `.top` with PRMTOP -- see PRMTOP's own `extensions`
+        // comment for the disambiguation story (#323).
+        extensions: &["top"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Topology only, same reasoning as PRMTOP: force constants,
+        // equilibrium values and the `[ *types ]` tables that carry them
+        // have no home in `ForceFieldTopology`, and `Carries` is
+        // completely full at 32/32 bits. Same mask PSF/PRMTOP use, minus
+        // DONORS/ACCEPTORS -- GROMACS has no such section either.
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::RESIDUES)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::EXCLUSIONS),
+        reader: Some(crate::io::reader::read_top_with_options),
+        writer: Some(write_top_records),
+        supplier: Some(top_supplier),
+        writer_stream: Some(top_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `[ section ]` text -- nothing fixed-offset to sniff, and
+        // the one extension ambiguity that exists (`.top`, with PRMTOP) is
+        // resolved by `is_gromacs_top` at the `io::open`/CLI entry points,
+        // not through this mechanism.
         magic: &[],
         reader_bytes: None,
         writer_bytes: None,
@@ -1069,6 +1114,10 @@ fn psf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn prmtop_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::PrmtopSupplier::new(reader, options))
+}
+
+fn top_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::TopSupplier::new(reader, options))
 }
 
 fn cif_core_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1131,6 +1180,10 @@ fn psf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn prmtop_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::PrmtopWriter::new(writer, options))
+}
+
+fn top_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::TopWriter::new(writer, options))
 }
 
 fn cif_core_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1255,6 +1308,14 @@ fn write_prmtop_records(records: &[(String, Molecule)], _options: &WriteOptions)
         out.push_str(&crate::io::prmtop::write_prmtop(molecule));
     }
     out
+}
+
+fn write_top_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // Unlike PSF/PRMTOP (looping and concatenating), this one takes all
+    // records at once, the same reason `write_commonchem_records` does --
+    // see `TopWriter`'s own doc comment: the `[ system ]`/`[ molecules ]`
+    // footer can only be written once every record has arrived.
+    crate::io::top::write_top(records)
 }
 
 fn write_cif_core_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -1399,6 +1460,13 @@ impl Format {
     /// (force constants, equilibrium values, Lennard-Jones coefficients)
     /// have no home in `ForceFieldTopology` and are parsed-and-discarded.
     pub const PRMTOP: Format = Format(14);
+    /// GROMACS topology (#323), see [`crate::io::top`]. Topology only, same
+    /// scope as PSF/PRMTOP. Shares the `.top` extension with PRMTOP,
+    /// disambiguated by content (`top::is_gromacs_top`) at the `io::open`/
+    /// CLI entry points, the same way `.cif` disambiguates mmCIF from CIF
+    /// core. One `Molecule` per `[ moleculetype ]` block, unlike PSF/PRMTOP
+    /// which hold exactly one topology each.
+    pub const TOP: Format = Format(15);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1679,6 +1747,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Carries::RESIDUES,
         "every atom line names a residue; absent input writes UNK",
     ),
+    (
+        // `write_top` (#323) always states a residue name, the same
+        // reason PSF/PRMTOP do.
+        Format::TOP,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
     // PSF's atom-type and mass columns are required fields in every real
     // file, the same "must state something" shape as the columns below --
     // absent input falls back to the element symbol and its standard
@@ -1702,6 +1777,18 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
     ),
     (
         Format::PRMTOP,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
+    // GROMACS TOP's `type`/`mass` columns are equally required fields in
+    // every real file, the same shape as PSF/PRMTOP's own columns above.
+    (
+        Format::TOP,
+        Carries::ATOM_TYPE,
+        "fixed column; absent input writes the element symbol",
+    ),
+    (
+        Format::TOP,
         Carries::MASS,
         "fixed column; absent input writes the standard atomic weight",
     ),
@@ -1784,6 +1871,13 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         // `write_prmtop` (#322) always states a charge, the same reason
         // PSF does.
         Format::PRMTOP,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_top` (#323) always states a charge, the same reason
+        // PSF/PRMTOP do.
+        Format::TOP,
         Carries::PARTIAL_CHARGE,
         "per-atom charge column; absent input writes 0.000",
     ),
@@ -2388,7 +2482,7 @@ mod tests {
         // such rather than trusting silently: 14 x 14, the same count
         // `all() x all()` already produced, so this test is unchanged until
         // a second `Kind` registers.
-        assert_eq!(pairs.len(), 225);
+        assert_eq!(pairs.len(), 256);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             for (flag, molecule) in &fixtures {
@@ -3134,7 +3228,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 15);
+        assert_eq!(all().count(), 16);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

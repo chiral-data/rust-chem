@@ -185,6 +185,29 @@ pub enum PsfError {
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
+pub enum TopError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    /// GROMACS states no element directly -- only a force-field-specific
+    /// type string (`opls_135`, ambiguous by design) -- and this reader does
+    /// not resolve `[ atomtypes ]` defaults, so mass must be stated inline.
+    /// This is what a mass matching no real element within tolerance
+    /// reports (#323), the same fallback PSF's own `element_from_mass`
+    /// provides.
+    #[error("No element matches mass {0}")]
+    InvalidElement(f64),
+
+    /// No `[ moleculetype ]` was ever seen at all.
+    #[error("No atoms in TOP")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PrmtopError {
     #[error("Parse error: {0}")]
     ParseError(String),
