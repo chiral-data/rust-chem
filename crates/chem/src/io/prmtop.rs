@@ -276,9 +276,9 @@ fn decode_bonded_terms<const N: usize>(
         )));
     }
     let mut terms = Vec::with_capacity(raw.len() / (N + 1));
-    for chunk in raw.chunks_exact(N + 1) {
+    for start in (0..raw.len()).step_by(N + 1) {
         let mut atoms = [0usize; N];
-        for (slot, &value) in atoms.iter_mut().zip(chunk) {
+        for (slot, &value) in atoms.iter_mut().zip(&raw[start..start + N]) {
             *slot = coord_index(value, num_atoms)?;
         }
         terms.push(atoms);
@@ -302,13 +302,13 @@ fn decode_dihedrals(raw: &[i64], num_atoms: usize) -> Result<Dihedrals, PrmtopEr
     }
     let mut dihedrals = Vec::new();
     let mut impropers = Vec::new();
-    for chunk in raw.chunks_exact(5) {
-        let is_improper = chunk[3] < 0;
+    for start in (0..raw.len()).step_by(5) {
+        let is_improper = raw[start + 3] < 0;
         let atoms = [
-            coord_index(chunk[0], num_atoms)?,
-            coord_index(chunk[1], num_atoms)?,
-            coord_index(chunk[2], num_atoms)?,
-            coord_index(chunk[3], num_atoms)?,
+            coord_index(raw[start], num_atoms)?,
+            coord_index(raw[start + 1], num_atoms)?,
+            coord_index(raw[start + 2], num_atoms)?,
+            coord_index(raw[start + 3], num_atoms)?,
         ];
         if is_improper {
             impropers.push(atoms);
