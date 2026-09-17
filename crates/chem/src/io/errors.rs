@@ -208,6 +208,36 @@ pub enum TopError {
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
+pub enum LammpsError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid atom line: {0}")]
+    InvalidAtomLine(String),
+
+    /// The `Atoms` section carries no recognized `# style` comment, no
+    /// explicit `LammpsReadOptions::atom_style` was given, and this many
+    /// columns matches more than one supported atom style (#324) --
+    /// `charge` and `molecular`/`bond`/`angle` share a column count both
+    /// with and without the optional image-flag triplet. A guess here is
+    /// how a charge column becomes a molecule id.
+    #[error(
+        "{0} columns in the Atoms section is ambiguous between atom styles; specify LammpsReadOptions::atom_style"
+    )]
+    AmbiguousAtomStyle(usize),
+
+    /// A recognized `# style` comment names a real LAMMPS atom style this
+    /// reader does not model (`sphere`, `ellipsoid`, `electron`, ...).
+    #[error("Unsupported LAMMPS atom style: {0}")]
+    UnsupportedAtomStyle(String),
+
+    /// No `Atoms` section was ever seen, or it stated zero atoms.
+    #[error("No atoms in LAMMPS data file")]
+    NoAtoms,
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PrmtopError {
     #[error("Parse error: {0}")]
     ParseError(String),

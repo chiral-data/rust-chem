@@ -50,6 +50,11 @@ molecule against several and pass for the wrong reason.
 | `top/urea_like.top` | A small, complete single-moleculetype topology: bonds, one angle, one proper (funct 9) and one improper (funct 4) dihedral, an `[ exclusions ]` entry, and an unresolved `#include` that this reader records but never follows (#323) |
 | `top/multi_moleculetype.top` | Two `[ moleculetype ]` blocks in one file -- normal GROMACS practice, not a round-trip artifact -- proving one `Molecule` per block, plus a `[ molecules ]` count (`Water 1000`) this crate never expands |
 | `top/conditional.top` | `#ifdef`/`#else` driven by an in-file `#define`: both branches state a same-atoms `[ angles ]` line in a different order, so reading the wrong branch (or both) is directly visible in the result |
+| `lammps/atomic.data` | A small, topology-free `atomic`-style system with a nonzero box origin (`xlo`/`ylo`/`zlo` all `10.0`), proving both that a bondless file reads fine and that the origin-loss decision is real (#324) |
+| `lammps/full.data` | A `full`-style system (bonds, one angle, a proper and an improper dihedral) with an explicit `Atoms # full` comment, exercising the comment-based atom-style resolution path |
+| `lammps/ambiguous_style.data` | A 6-column `Atoms` section with no style comment -- ambiguous between `charge` and `molecular`/`bond`/`angle` -- proving `AmbiguousAtomStyle` fires by default and `LammpsReadOptions::atom_style` is the escape hatch |
+| `lammps/coarse_grained.data` | A `Masses` entry stating `1.0`, a reduced-unit bead mass matching no real element -- proving this reads as `Element::UNKNOWN`, not a failure or a guess |
+| `lammps/triclinic.data` | A genuinely non-orthogonal box (`xy xz yz` all nonzero) -- pins the closed-form box-to-`UnitCell` conversion's shape, which a sign or swapped cosine would still "succeed" while getting wrong |
 
 ## Pinned gaps
 

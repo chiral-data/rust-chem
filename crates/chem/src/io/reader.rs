@@ -188,7 +188,7 @@ impl ReadOutcome {
 /// whole" contract [`ReadOutcome`] documents, rather than introducing a
 /// `Result` for a case the caller can already see in `skipped`.
 pub fn read(content: &str, format: Format) -> ReadOutcome {
-    read_with_options(content, format, &ReadOptions)
+    read_with_options(content, format, &ReadOptions::default())
 }
 
 /// [`read`], with explicit per-format options (#212). No format has a read
@@ -213,7 +213,7 @@ pub fn read_with_options(content: &str, format: Format, options: &ReadOptions) -
 
 /// [`read_smiles_with_options`] with default options.
 pub fn read_smiles(content: &str) -> ReadOutcome {
-    read_smiles_with_options(content, &ReadOptions)
+    read_smiles_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per line: the SMILES, then optionally a name.
@@ -261,7 +261,7 @@ pub fn read_smiles_with_options(content: &str, _options: &ReadOptions) -> ReadOu
 
 /// [`read_cxsmiles_with_options`] with default options.
 pub fn read_cxsmiles(content: &str) -> ReadOutcome {
-    read_cxsmiles_with_options(content, &ReadOptions)
+    read_cxsmiles_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per line: a SMILES, optionally followed by a `|...|`
@@ -308,7 +308,7 @@ pub fn read_cxsmiles_with_options(content: &str, _options: &ReadOptions) -> Read
 
 /// [`read_sdf_with_options`] with default options.
 pub fn read_sdf(content: &str) -> ReadOutcome {
-    read_sdf_with_options(content, &ReadOptions)
+    read_sdf_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per `$$$$`-terminated record.
@@ -359,7 +359,7 @@ fn push_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
 
 /// [`read_xyz_with_options`] with default options.
 pub fn read_xyz(content: &str) -> ReadOutcome {
-    read_xyz_with_options(content, &ReadOptions)
+    read_xyz_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per frame: a count line, a comment line, then that many
@@ -435,7 +435,7 @@ pub fn read_xyz_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
 
 /// [`read_pdb_with_options`] with default options.
 pub fn read_pdb(content: &str) -> ReadOutcome {
-    read_pdb_with_options(content, &ReadOptions)
+    read_pdb_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per structure. A file may hold several back to back via
@@ -491,7 +491,7 @@ fn push_pdb_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
 
 /// [`read_mmcif_with_options`] with default options.
 pub fn read_mmcif(content: &str) -> ReadOutcome {
-    read_mmcif_with_options(content, &ReadOptions)
+    read_mmcif_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per `data_` block (#224). A block boundary is a line
@@ -545,7 +545,7 @@ fn push_mmcif_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
 
 /// [`read_cif_core_with_options`] with default options.
 pub fn read_cif_core(content: &str) -> ReadOutcome {
-    read_cif_core_with_options(content, &ReadOptions)
+    read_cif_core_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per `data_` block (#320) -- the CIF-core analogue of
@@ -597,7 +597,7 @@ fn push_cif_core_record(out: &mut ReadOutcome, lines: &[&str], position: usize) 
 
 /// [`read_psf_with_options`] with default options.
 pub fn read_psf(content: &str) -> ReadOutcome {
-    read_psf_with_options(content, &ReadOptions)
+    read_psf_with_options(content, &ReadOptions::default())
 }
 
 /// A real PSF is always exactly one topology -- but this crate's own
@@ -653,7 +653,7 @@ fn push_psf_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
 
 /// [`read_prmtop_with_options`] with default options.
 pub fn read_prmtop(content: &str) -> ReadOutcome {
-    read_prmtop_with_options(content, &ReadOptions)
+    read_prmtop_with_options(content, &ReadOptions::default())
 }
 
 /// A real PRMTOP is always exactly one topology -- but this crate's own
@@ -709,9 +709,70 @@ fn push_prmtop_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
     }
 }
 
+/// [`read_lammps_data_with_options`] with default options.
+pub fn read_lammps_data(content: &str) -> ReadOutcome {
+    read_lammps_data_with_options(content, &ReadOptions::default())
+}
+
+/// A real LAMMPS data file is always exactly one topology -- but this
+/// crate's own invariant (every registered format writes and reads back as
+/// many records as it was given, #267) means a *file this crate wrote* may
+/// hold several, back to back. LAMMPS has no natural repeating start
+/// marker the way PSF's bare `PSF` line or PRMTOP's `%VERSION` line do (a
+/// real file's title/comment line is arbitrary text) -- so this crate's own
+/// writer emits a fixed, literal title line, `"Written by chem"`, and that
+/// is the marker this splits on, mirroring PSF/PRMTOP's exact splitting
+/// idiom. A real third-party file's arbitrary title line only ever appears
+/// once, so it is simply read as the ordinary skipped first line and never
+/// triggers a split.
+pub fn read_lammps_data_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
+    let mut out = ReadOutcome::default();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut position = 0;
+
+    for line in content.lines() {
+        let starts_new_block = line.trim() == "Written by chem";
+        if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
+            position += 1;
+            push_lammps_record(&mut out, &lines, position, &options.lammps);
+            lines.clear();
+        }
+        lines.push(line);
+    }
+    if lines.iter().any(|line| !line.trim().is_empty()) {
+        position += 1;
+        push_lammps_record(&mut out, &lines, position, &options.lammps);
+    }
+
+    out
+}
+
+fn push_lammps_record(
+    out: &mut ReadOutcome,
+    lines: &[&str],
+    position: usize,
+    options: &crate::io::options::LammpsReadOptions,
+) {
+    let record = lines.join("\n");
+    match crate::io::lammps::parse_lammps_data(&record, options) {
+        Ok(molecule) => {
+            out.records.push(Record {
+                payload: Payload::Molecule(molecule),
+                name: format!("Molecule_{position}"),
+                smiles: None,
+            });
+        }
+        Err(e) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: e.to_string(),
+        }),
+    }
+}
+
 /// [`read_top_with_options`] with default options.
 pub fn read_top(content: &str) -> ReadOutcome {
-    read_top_with_options(content, &ReadOptions)
+    read_top_with_options(content, &ReadOptions::default())
 }
 
 /// One record per `[ moleculetype ]` block (#323) -- unlike PSF/PRMTOP
@@ -745,7 +806,7 @@ pub fn read_top_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
 
 /// [`read_mol2_with_options`] with default options.
 pub fn read_mol2(content: &str) -> ReadOutcome {
-    read_mol2_with_options(content, &ReadOptions)
+    read_mol2_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per `@<TRIPOS>MOLECULE` block (#225) -- a ligand library's
@@ -799,7 +860,7 @@ fn push_mol2_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
 
 /// [`read_pdbqt_with_options`] with default options.
 pub fn read_pdbqt(content: &str) -> ReadOutcome {
-    read_pdbqt_with_options(content, &ReadOptions)
+    read_pdbqt_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per structure. `ENDMDL` is the record boundary for a
@@ -851,7 +912,7 @@ fn push_pdbqt_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
 
 /// [`read_gro_with_options`] with default options.
 pub fn read_gro(content: &str) -> ReadOutcome {
-    read_gro_with_options(content, &ReadOptions)
+    read_gro_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per frame: a title line, a count line, that many atom
@@ -933,7 +994,7 @@ pub fn read_gro_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
 
 /// [`read_cml_with_options`] with default options.
 pub fn read_cml(content: &str) -> ReadOutcome {
-    read_cml_with_options(content, &ReadOptions)
+    read_cml_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per `<molecule>` element (#228). A byte-offset scan over
@@ -991,7 +1052,7 @@ pub fn read_cml_with_options(content: &str, _options: &ReadOptions) -> ReadOutco
 
 /// [`read_commonchem_with_options`] with default options.
 pub fn read_commonchem(content: &str) -> ReadOutcome {
-    read_commonchem_with_options(content, &ReadOptions)
+    read_commonchem_with_options(content, &ReadOptions::default())
 }
 
 /// One molecule per entry in the document's `molecules` array (#229).

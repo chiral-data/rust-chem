@@ -1082,6 +1082,45 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
     },
+    FormatDescriptor {
+        name: "LAMMPS Data",
+        codes: &["lammps"],
+        // No reliable extension convention really exists for this format
+        // (confirmed by research -- real files are often named
+        // `data.<system>` with no suffix at all); these are a reasonable,
+        // non-colliding default, not a claim of authority (#324).
+        extensions: &["lammps", "lmp", "data"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The first force-field-topology format that also states
+        // coordinates -- see `io/lammps.rs`'s module doc. Topology only,
+        // same reasoning as PSF/PRMTOP/TOP. No RESIDUES (a molecule-id
+        // column exists but is a bare integer, no name to build a residue
+        // from) and no EXCLUSIONS (LAMMPS has no such section at all --
+        // exclusions are an input-script `special_bonds` setting, not
+        // file data).
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::COORDS_3D)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_lammps_data_with_options),
+        writer: Some(write_lammps_data_records),
+        supplier: Some(lammps_data_supplier),
+        writer_stream: Some(lammps_data_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII text with an arbitrary first line -- nothing fixed-offset
+        // to sniff, and no extension ambiguity to resolve (nothing else
+        // claims `lammps`/`lmp`/`data`).
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1114,6 +1153,12 @@ fn psf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn prmtop_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::PrmtopSupplier::new(reader, options))
+}
+
+fn lammps_data_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::LammpsDataSupplier::new(
+        reader, options,
+    ))
 }
 
 fn top_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1180,6 +1225,10 @@ fn psf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn 
 
 fn prmtop_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::PrmtopWriter::new(writer, options))
+}
+
+fn lammps_data_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::LammpsDataWriter::new(writer, options))
 }
 
 fn top_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1306,6 +1355,16 @@ fn write_prmtop_records(records: &[(String, Molecule)], _options: &WriteOptions)
     let mut out = String::new();
     for (_, molecule) in records {
         out.push_str(&crate::io::prmtop::write_prmtop(molecule));
+    }
+    out
+}
+
+fn write_lammps_data_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `LammpsDataWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::lammps::write_lammps_data(molecule));
     }
     out
 }
@@ -1467,6 +1526,14 @@ impl Format {
     /// core. One `Molecule` per `[ moleculetype ]` block, unlike PSF/PRMTOP
     /// which hold exactly one topology each.
     pub const TOP: Format = Format(15);
+    /// LAMMPS data (#324), see [`crate::io::lammps`]. The first
+    /// force-field-topology format that also states coordinates -- PSF/
+    /// PRMTOP/TOP never touch `coords3`, but LAMMPS combines topology and
+    /// geometry in one file. Every atom reads as
+    /// [`crate::core::atom::Element::UNKNOWN`] -- this format states a
+    /// numeric type and mass, never a name, and inventing an element from
+    /// mass would fail outright for coarse-grained/reduced-unit systems.
+    pub const LAMMPS_DATA: Format = Format(16);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1571,7 +1638,7 @@ impl Format {
     /// becomes a `Skipped` entry rather than a panic, matching the rest of
     /// this crate's "reading a file cannot fail as a whole" contract.
     pub fn read_bytes(&self, bytes: &[u8]) -> Option<ReadOutcome> {
-        self.read_bytes_with_options(bytes, &ReadOptions)
+        self.read_bytes_with_options(bytes, &ReadOptions::default())
     }
 
     /// [`Self::read_bytes`], with explicit per-format options.
@@ -1881,6 +1948,37 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Carries::PARTIAL_CHARGE,
         "per-atom charge column; absent input writes 0.000",
     ),
+    (
+        // `write_lammps_data` (#324) always states a position, even for a
+        // source with no coordinates at all -- the origin, the same
+        // "something has to go here" reasoning `cif_core`'s own
+        // cell-less-molecule writer already uses.
+        Format::LAMMPS_DATA,
+        Carries::COORDS_3D,
+        "every atom line states a position; absent input writes 0.0 0.0 0.0",
+    ),
+    (
+        // Every atom's LAMMPS type/mass is synthesized on write, whether
+        // or not the source stated one -- the same shape PSF/PRMTOP/TOP's
+        // own atom-type/mass columns already have.
+        Format::LAMMPS_DATA,
+        Carries::ATOM_TYPE,
+        "a type is always synthesized; absent input still gets one",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
+    (
+        // Box bounds are mandatory in every real LAMMPS data file; a
+        // source with no periodic cell at all still gets a placeholder
+        // box (a bounding box of its coordinates, padded to be
+        // non-degenerate -- see `write_lammps_data`'s own doc comment).
+        Format::LAMMPS_DATA,
+        Carries::UNIT_CELL,
+        "box bounds are mandatory; absent input gets a placeholder box",
+    ),
 ];
 
 /// Attributes a conversion delivers that neither mask claims.
@@ -1947,7 +2045,7 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
 /// no per-format mask can express it -- and `held` sets `TOPOLOGY` on the atom
 /// count alone, so one atom of six satisfies every claim a mask makes.
 static PAIR_GAPS: &[(Format, Format, &str)] = &[
-    // Empty since #259. PDBQT's writer kept only the largest connected
+    // Empty from #259 to #324. PDBQT's writer kept only the largest connected
     // component, so a source carrying no bonds arrived as N one-atom fragments
     // and left as one atom -- four pairs, `pdbqt -> pdbqt` among them, which is
     // why the A -> A diagonal could not see it. The writer now writes every
@@ -1955,6 +2053,83 @@ static PAIR_GAPS: &[(Format, Format, &str)] = &[
     //
     // The mechanism stays: this is the only way to express a loss no mask can,
     // and it took a milestone to notice the first one.
+    //
+    // LAMMPS data (#324) states no element at all, only a numeric type --
+    // every atom reads back as `Element::UNKNOWN`, whose symbol is the empty
+    // string. Every format below needs a real atomic symbol to write an atom
+    // at all, so a LAMMPS-sourced molecule fails to round-trip through any of
+    // them. Not a bug on either side: the format genuinely never stated what
+    // these targets need to recover.
+    (
+        Format::LAMMPS_DATA,
+        Format::SMILES,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::SDF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::CXSMILES,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::XYZ,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::PDB,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::MMCIF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::MOL2,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::PDBQT,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::GRO,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::CML,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::BCIF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::CIF_CORE,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::PSF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::TOP,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
 ];
 
 /// Everything `target`'s writer manufactures when the input has none.
@@ -2482,12 +2657,28 @@ mod tests {
         // such rather than trusting silently: 14 x 14, the same count
         // `all() x all()` already produced, so this test is unchanged until
         // a second `Kind` registers.
-        assert_eq!(pairs.len(), 256);
+        assert_eq!(pairs.len(), 289);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             for (flag, molecule) in &fixtures {
-                let back = convert(source, target, molecule)
-                    .unwrap_or_else(|| panic!("{source:?} -> {target:?} wrote nothing readable"));
+                let back = match convert(source, target, molecule) {
+                    Some(back) => back,
+                    // A pair pinned in `PAIR_GAPS` may fail to produce
+                    // anything readable at all, not just lose an
+                    // attribute -- LAMMPS's `Element::UNKNOWN` has no
+                    // atomic symbol for a target that requires one. Any
+                    // other pair failing here is a real bug, not a known
+                    // gap, so it still panics.
+                    None => {
+                        assert!(
+                            pair_gap(source, target).is_some(),
+                            "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                            source.name(),
+                            target.name()
+                        );
+                        continue;
+                    }
+                };
 
                 let predicted = predicted_mask.contains(*flag);
                 let survived = held(&back).contains(*flag);
@@ -3228,7 +3419,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 16);
+        assert_eq!(all().count(), 17);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
