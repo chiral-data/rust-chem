@@ -433,3 +433,23 @@ pub enum BcifError {
     #[error(transparent)]
     Mmcif(#[from] MmcifError),
 }
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum TrrError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// GROMACS's XDR trajectory magic number is a fixed `1993` -- anything
+    /// else at byte 0 is not a TRR file.
+    #[error("Not a TRR file: expected magic number 1993, got {0}")]
+    InvalidMagicNumber(i32),
+
+    /// A header's array size resolved to neither 4 nor 8 bytes per real
+    /// number, the two precisions the classic `xdrfile` format supports.
+    #[error("Unsupported TRR precision")]
+    UnsupportedPrecision,
+
+    #[error(transparent)]
+    Trajectory(#[from] crate::core::trajectory::TrajectoryError),
+}
