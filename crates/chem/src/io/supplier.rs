@@ -1672,6 +1672,87 @@ impl<W: Write> Writer for CommonchemWriter<W> {
     }
 }
 
+/// GROMACS TOP's `[ moleculetype ]` blocks, one at a time (#323).
+///
+/// **Not streamable, and this type satisfies the trait rather than
+/// exploiting it** -- the same shape as [`CommonchemSupplier`]. Real
+/// topologies mix `#include`/`#ifdef` preprocessing with parameter-level
+/// and system-level sections that span the whole buffer, so there is no
+/// per-record boundary a byte-stream scan could find; the whole input is
+/// read and parsed once in `new`, and this iterator walks the result.
+pub struct TopSupplier {
+    records: std::vec::IntoIter<Result<Record, ReadError>>,
+}
+
+impl TopSupplier {
+    pub fn new<R: BufRead>(mut reader: R, _options: &ReadOptions) -> Self {
+        let mut text = String::new();
+        let records = match reader.read_to_string(&mut text) {
+            Err(source) => vec![Err(ReadError::Io {
+                position: 1,
+                source,
+            })],
+            Ok(_) => match crate::io::top::parse_top(&text) {
+                Ok(molecules) => molecules
+                    .into_iter()
+                    .map(|(name, molecule)| {
+                        Ok(Record {
+                            payload: Payload::Molecule(molecule),
+                            name,
+                            smiles: None,
+                        })
+                    })
+                    .collect(),
+                Err(e) => vec![Err(ReadError::Parse {
+                    position: 1,
+                    message: e.to_string(),
+                })],
+            },
+        };
+        Self {
+            records: records.into_iter(),
+        }
+    }
+}
+
+impl Iterator for TopSupplier {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.next()
+    }
+}
+
+/// Buffers every molecule and emits the whole file in [`Writer::finish`] --
+/// the same shape as [`CommonchemWriter`], since GROMACS TOP's own
+/// `[ system ]`/`[ molecules ]` footer can only be written once every
+/// record has arrived.
+pub struct TopWriter<W> {
+    writer: W,
+    records: Vec<(String, Molecule)>,
+}
+
+impl<W: Write> TopWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self {
+            writer,
+            records: Vec::new(),
+        }
+    }
+}
+
+impl<W: Write> Writer for TopWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.records.push((name.to_string(), molecule.clone()));
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        let text = crate::io::top::write_top(&self.records);
+        self.writer.write_all(text.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

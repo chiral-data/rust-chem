@@ -42,21 +42,26 @@ pub fn read_input(path: Option<&Path>, format: Option<Format>) -> Result<Input> 
     })
 }
 
-/// [`Format::from_filename`], plus one addition that function doesn't make
+/// [`Format::from_filename`], plus two additions that function doesn't make
 /// on its own: `.cif` resolves to mmCIF *or* CIF core (#320) depending on
-/// content, since the two dictionaries share that extension. Mirrors
-/// `chem::io::open::resolve_format`'s own special case for the file-path
+/// content, since the two dictionaries share that extension, and `.top`
+/// resolves to PRMTOP *or* GROMACS TOP (#323) the same way. Mirrors
+/// `chem::io::open::resolve_format`'s own special cases for the file-path
 /// entry point.
 fn resolve_format_from_content(label: &str, content: &str) -> Format {
     let format = Format::from_filename(label);
-    let has_cif_extension = label
-        .rsplit_once('.')
-        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("cif"));
+    let extension = label.rsplit_once('.').map(|(_, ext)| ext);
+    let has_extension =
+        |wanted: &str| extension.is_some_and(|ext| ext.eq_ignore_ascii_case(wanted));
+
     if format == Format::MMCIF
-        && has_cif_extension
+        && has_extension("cif")
         && chem::io::cif_core::is_small_molecule_cif(content)
     {
         return Format::CIF_CORE;
+    }
+    if format == Format::PRMTOP && has_extension("top") && chem::io::top::is_gromacs_top(content) {
+        return Format::TOP;
     }
     format
 }
