@@ -1186,6 +1186,34 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::trr::write_trr_bytes),
     },
+    FormatDescriptor {
+        name: "XTC",
+        codes: &["xtc"],
+        extensions: &["xtc"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The second `Kind::Frames` format -- same shared topology
+        // (`Element::UNKNOWN`) as TRR, but no VELOCITIES/FORCES at all:
+        // XTC's compressed coordinate block only ever carries positions.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::FRAME_TIME)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(xtc_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // GROMACS's own fixed magic number, big-endian -- distinct from
+        // TRR's `1993` by exactly 2 (#325).
+        magic: &[Signature {
+            offset: 0,
+            bytes: &[0x00, 0x00, 0x07, 0xCB],
+        }],
+        reader_bytes: Some(crate::io::xtc::read_xtc_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::xtc::write_xtc_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1262,6 +1290,10 @@ fn bcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Sup
 
 fn trr_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::trr::TrrSupplier::new(reader, options))
+}
+
+fn xtc_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::xtc::XtcSupplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1613,6 +1645,13 @@ impl Format {
     /// descriptor's own `writer_trajectory` field) rather than a
     /// `&[(String, Molecule)]`-shaped one.
     pub const TRR: Format = Format(17);
+    /// XTC (#325), see [`crate::io::xtc`]. GROMACS's compressed trajectory
+    /// format -- the same shared-topology `Kind::Frames` shape TRR
+    /// established, wrapped around a genuine lossy coordinate compressor
+    /// (a full, faithful port of GROMACS's own encoder heuristic, not a
+    /// simplified always-absolute variant). No velocities or forces at
+    /// all -- only positions, time, step and a box.
+    pub const XTC: Format = Format(18);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3371,15 +3410,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_resolves_trrs_real_signature_and_nothing_else_has_one_yet() {
-        // TRR (#326) is the first format to populate `magic` for real --
+    fn test_sniff_resolves_trr_and_xtcs_real_signatures_and_nothing_else_has_one_yet() {
+        // TRR (#326) was the first format to populate `magic` for real --
         // #309 built the byte-reading path a binary format needs, and
-        // #317 built this matching mechanism, but every format before TRR
-        // left `magic` empty. Pinned explicitly rather than trusted
-        // silently, the same discipline #316's `pairs_within_kind` count
-        // assertion follows.
+        // #317 built this matching mechanism -- and XTC (#325) is the
+        // second. Every other format leaves `magic` empty. Pinned
+        // explicitly rather than trusted silently, the same discipline
+        // #316's `pairs_within_kind` count assertion follows.
         for format in all() {
-            if format == Format::TRR {
+            if format == Format::TRR || format == Format::XTC {
                 continue;
             }
             assert!(
@@ -3391,8 +3430,9 @@ mod tests {
         assert!(sniff(b"CORD").is_none());
         assert!(sniff(b"").is_none());
 
-        // GROMACS's own fixed magic number, big-endian.
+        // GROMACS's own fixed magic numbers, big-endian, 2 apart.
         assert_eq!(sniff(b"\x00\x00\x07\xc9REST"), Some(Format::TRR));
+        assert_eq!(sniff(b"\x00\x00\x07\xcbREST"), Some(Format::XTC));
     }
 
     #[test]
@@ -3528,7 +3568,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 18);
+        assert_eq!(all().count(), 19);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

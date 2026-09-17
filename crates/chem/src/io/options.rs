@@ -45,9 +45,15 @@ pub enum AtomStyle {
 }
 
 /// One field per format that has a write option today.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// No longer `Eq` since #325's `xtc: XtcWriteOptions` carries an `f32` --
+/// nothing in this crate ever needed `WriteOptions` as a hash key or in an
+/// exhaustive-equality context, only `assert_eq!`, which only needs
+/// `PartialEq`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WriteOptions {
     pub sdf: SdfWriteOptions,
+    pub xtc: XtcWriteOptions,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,6 +72,21 @@ pub enum MolfileVersion {
     V2000,
 }
 
+/// XTC's own write option: the coordinate precision, in inverse nanometres
+/// (#325) -- a position rounds to the nearest `1.0 / precision` nm. `1000.0`
+/// (0.001 nm resolution) is the real format's own documented default and
+/// what every GROMACS-written file uses unless told otherwise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XtcWriteOptions {
+    pub precision: f32,
+}
+
+impl Default for XtcWriteOptions {
+    fn default() -> Self {
+        Self { precision: 1000.0 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +94,10 @@ mod tests {
     #[test]
     fn test_default_write_options_pick_v2000() {
         assert_eq!(WriteOptions::default().sdf.version, MolfileVersion::V2000);
+    }
+
+    #[test]
+    fn test_default_xtc_precision_is_the_formats_own_documented_default() {
+        assert_eq!(WriteOptions::default().xtc.precision, 1000.0);
     }
 }
