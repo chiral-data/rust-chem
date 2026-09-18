@@ -485,3 +485,27 @@ pub enum XtcError {
     #[error(transparent)]
     Trajectory(#[from] crate::core::trajectory::TrajectoryError),
 }
+
+/// DCD's own errors (#327). No shared framing piece the way TRR/XTC share
+/// [`XdrError`] -- DCD's Fortran unformatted records are a self-contained,
+/// per-file-endianness convention with no analogue in `io::xdr`.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum DcdError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// The leading Fortran record marker is `84` in every real DCD file
+    /// (little- or big-endian) -- anything else means this isn't one.
+    #[error("Not a DCD file: expected a leading record marker of 84")]
+    InvalidMagicNumber,
+
+    /// The rarer "new-style CHARMM symmetric box-vector" unit-cell
+    /// encoding -- a full matrix decomposition this crate does not
+    /// implement, reported clearly rather than silently misread.
+    #[error("Unsupported DCD unit cell encoding (new-style CHARMM box vectors)")]
+    UnsupportedUnitCellFormat,
+
+    #[error(transparent)]
+    Trajectory(#[from] crate::core::trajectory::TrajectoryError),
+}

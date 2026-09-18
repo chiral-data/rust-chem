@@ -1214,6 +1214,36 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::xtc::write_xtc_bytes),
     },
+    FormatDescriptor {
+        name: "DCD",
+        codes: &["dcd"],
+        extensions: &["dcd"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The third `Kind::Frames` format -- same shared topology
+        // (`Element::UNKNOWN`) as TRR/XTC, no VELOCITIES/FORCES: DCD never
+        // carries either.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::FRAME_TIME)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(dcd_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // "CORD" at byte 4, not byte 0 -- the leading four bytes are a
+        // Fortran record-length marker whose own byte order depends on
+        // the file's endianness, but "CORD" itself is plain ASCII and
+        // endianness-independent (#327).
+        magic: &[Signature {
+            offset: 4,
+            bytes: b"CORD",
+        }],
+        reader_bytes: Some(crate::io::dcd::read_dcd_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::dcd::write_dcd_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1294,6 +1324,10 @@ fn trr_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn xtc_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::xtc::XtcSupplier::new(reader, options))
+}
+
+fn dcd_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::dcd::DcdSupplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1652,6 +1686,13 @@ impl Format {
     /// simplified always-absolute variant). No velocities or forces at
     /// all -- only positions, time, step and a box.
     pub const XTC: Format = Format(18);
+    /// DCD (#327), see [`crate::io::dcd`]. CHARMM/NAMD's binary trajectory,
+    /// and the oldest format in the milestone -- Fortran unformatted
+    /// records, a per-file endianness this crate detects rather than
+    /// assumes, and a header dialect flag governing both the timestep's
+    /// storage type and whether a unit cell can be present at all. No
+    /// velocities or forces, same as XTC.
+    pub const DCD: Format = Format(19);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3410,15 +3451,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_resolves_trr_and_xtcs_real_signatures_and_nothing_else_has_one_yet() {
+    fn test_sniff_resolves_trr_xtc_and_dcds_real_signatures_and_nothing_else_has_one_yet() {
         // TRR (#326) was the first format to populate `magic` for real --
         // #309 built the byte-reading path a binary format needs, and
-        // #317 built this matching mechanism -- and XTC (#325) is the
-        // second. Every other format leaves `magic` empty. Pinned
-        // explicitly rather than trusted silently, the same discipline
-        // #316's `pairs_within_kind` count assertion follows.
+        // #317 built this matching mechanism -- XTC (#325) is the second,
+        // and DCD (#327) the third. Every other format leaves `magic`
+        // empty. Pinned explicitly rather than trusted silently, the same
+        // discipline #316's `pairs_within_kind` count assertion follows.
         for format in all() {
-            if format == Format::TRR || format == Format::XTC {
+            if format == Format::TRR || format == Format::XTC || format == Format::DCD {
                 continue;
             }
             assert!(
@@ -3433,6 +3474,9 @@ mod tests {
         // GROMACS's own fixed magic numbers, big-endian, 2 apart.
         assert_eq!(sniff(b"\x00\x00\x07\xc9REST"), Some(Format::TRR));
         assert_eq!(sniff(b"\x00\x00\x07\xcbREST"), Some(Format::XTC));
+        // DCD's "CORD" sits at byte 4, after the leading Fortran record
+        // marker (whatever it is) -- not byte 0.
+        assert_eq!(sniff(b"\x54\x00\x00\x00CORD"), Some(Format::DCD));
     }
 
     #[test]
@@ -3568,7 +3612,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 19);
+        assert_eq!(all().count(), 20);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

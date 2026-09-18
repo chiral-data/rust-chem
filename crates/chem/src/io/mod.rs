@@ -5,6 +5,7 @@ pub mod cif_model;
 pub mod cml;
 pub mod commonchem;
 pub mod cxsmiles;
+pub mod dcd;
 pub mod errors;
 pub mod format;
 pub mod gro;
