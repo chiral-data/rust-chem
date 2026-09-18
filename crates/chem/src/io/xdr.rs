@@ -1,21 +1,22 @@
 //! XDR (RFC 1014), hand-rolled rather than taken as a dependency.
 //!
-//! Only the subset TRR (and later XTC) actually need: signed/unsigned 32-bit
+//! Only the subset TRR and XTC actually need: signed/unsigned 32-bit
 //! integers, IEEE single/double floats, and length-prefixed, zero-padded
-//! opaque strings. Big-endian throughout, per the spec — independent of
-//! [`crate::io::msgpack`]'s own big-endian encoding, which is a different
-//! format entirely. Consistent with this crate's existing style of
-//! hand-rolling a small, bounded surface rather than depending on a
-//! general-purpose crate for it — see [`crate::io::format::Carries`]'s own
-//! doc comment.
+//! opaque data (both a UTF-8 string and an arbitrary byte blob — XTC's
+//! packed-bit coordinate block is the latter). Big-endian throughout, per
+//! the spec — independent of [`crate::io::msgpack`]'s own big-endian
+//! encoding, which is a different format entirely. Consistent with this
+//! crate's existing style of hand-rolling a small, bounded surface rather
+//! than depending on a general-purpose crate for it — see
+//! [`crate::io::format::Carries`]'s own doc comment.
 //!
 //! Every primitive here is already a multiple of 4 bytes — an `i32`/`f32` is
 //! exactly 4, an `f64` is exactly 8 (already a multiple of 4, so no padding
-//! quirk exists for it) — so only this module's own `read_string`/
-//! `write_string` need the length-prefix-plus-padding logic RFC 1014
-//! describes for opaque data.
+//! quirk exists for it) — so only this module's own `read_opaque`/
+//! `write_opaque` (and `read_string`/`write_string`, built on top of them)
+//! need the length-prefix-plus-padding logic RFC 1014 describes.
 
-use crate::io::errors::TrrError;
+use crate::io::errors::XdrError;
 
 pub(crate) struct XdrReader<'a> {
     bytes: &'a [u8],
@@ -31,50 +32,67 @@ impl<'a> XdrReader<'a> {
         self.pos
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], TrrError> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], XdrError> {
         let end = self
             .pos
             .checked_add(n)
             .filter(|&end| end <= self.bytes.len())
-            .ok_or_else(|| TrrError::ParseError("unexpected end of input".to_string()))?;
+            .ok_or_else(|| XdrError::ParseError("unexpected end of input".to_string()))?;
         let slice = &self.bytes[self.pos..end];
         self.pos = end;
         Ok(slice)
     }
 
-    pub(crate) fn read_i32(&mut self) -> Result<i32, TrrError> {
+    pub(crate) fn read_i32(&mut self) -> Result<i32, XdrError> {
         Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    pub(crate) fn read_u32(&mut self) -> Result<u32, TrrError> {
+    pub(crate) fn read_u32(&mut self) -> Result<u32, XdrError> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    pub(crate) fn read_f32(&mut self) -> Result<f32, TrrError> {
+    pub(crate) fn read_f32(&mut self) -> Result<f32, XdrError> {
         Ok(f32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    pub(crate) fn read_f64(&mut self) -> Result<f64, TrrError> {
+    pub(crate) fn read_f64(&mut self) -> Result<f64, XdrError> {
         Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// RFC 1014's `xdr_string`: a length prefix (the string's own length,
-    /// no NUL terminator), that many raw bytes, zero-padded to a multiple
-    /// of 4. Confirmed against the real `xdr_string`/`xdr_opaque` in the
-    /// classic `xdrfile` library's own C source (`xdrfile.c`) — not
-    /// `xdrfile_write_string`'s own outer `slen` (`strlen(s) + 1`), which
-    /// TRR's header writes as a *separate*, preceding plain integer before
-    /// ever calling this (see [`crate::io::trr`]'s own header parsing).
-    pub(crate) fn read_string(&mut self) -> Result<String, TrrError> {
-        let len = self.read_u32()? as usize;
+    /// RFC 1014's `xdr_opaque`: `len` raw bytes, zero-padded to a multiple
+    /// of 4 — **no length of its own** on the wire. XTC's coordinate block
+    /// calls exactly this (via `xdrfile_read_opaque`/`xdrfile_write_opaque`)
+    /// with a length it already read/wrote as its own separate plain `int`
+    /// field; [`Self::read_opaque`]/[`XdrWriter::write_opaque`] below are
+    /// the different, length-*prefixed* shape `xdr_string` builds on top of
+    /// this, which is what TRR's version string and every other string
+    /// field actually need.
+    pub(crate) fn read_padded(&mut self, len: usize) -> Result<Vec<u8>, XdrError> {
         let padded = len.div_ceil(4) * 4;
         let bytes = self.take(padded)?;
-        String::from_utf8(bytes[..len].to_vec()).map_err(|e| TrrError::ParseError(e.to_string()))
+        Ok(bytes[..len].to_vec())
+    }
+
+    /// RFC 1014's `xdr_string`-style framing: a length prefix, then
+    /// [`Self::read_padded`]. Confirmed against the real `xdr_string` in
+    /// the classic `xdrfile` library's own C source (`xdrfile.c`).
+    pub(crate) fn read_opaque(&mut self) -> Result<Vec<u8>, XdrError> {
+        let len = self.read_u32()? as usize;
+        self.read_padded(len)
+    }
+
+    /// [`Self::read_opaque`], then decoded as UTF-8 — RFC 1014's
+    /// `xdr_string`. Not `xdrfile_write_string`'s own outer `slen`
+    /// (`strlen(s) + 1`), which TRR's header writes as a *separate*,
+    /// preceding plain integer before ever calling this (see
+    /// [`crate::io::trr`]'s own header parsing).
+    pub(crate) fn read_string(&mut self) -> Result<String, XdrError> {
+        String::from_utf8(self.read_opaque()?).map_err(|e| XdrError::ParseError(e.to_string()))
     }
 
     /// Skips `n` bytes without decoding them — used for legacy header fields
     /// and body blocks (virial, pressure) this crate never stores.
-    pub(crate) fn skip(&mut self, n: usize) -> Result<(), TrrError> {
+    pub(crate) fn skip(&mut self, n: usize) -> Result<(), XdrError> {
         self.take(n)?;
         Ok(())
     }
@@ -101,13 +119,22 @@ impl XdrWriter {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
 
-    /// See [`XdrReader::read_string`]'s doc comment.
-    pub(crate) fn write_string(&mut self, s: &str) {
-        let bytes = s.as_bytes();
-        self.write_i32(bytes.len() as i32);
+    /// See [`XdrReader::read_padded`]'s doc comment.
+    pub(crate) fn write_padded(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
         let padded = bytes.len().div_ceil(4) * 4;
         self.buf.resize(self.buf.len() + (padded - bytes.len()), 0);
+    }
+
+    /// See [`XdrReader::read_opaque`]'s doc comment.
+    pub(crate) fn write_opaque(&mut self, bytes: &[u8]) {
+        self.write_i32(bytes.len() as i32);
+        self.write_padded(bytes);
+    }
+
+    /// See [`XdrReader::read_string`]'s doc comment.
+    pub(crate) fn write_string(&mut self, s: &str) {
+        self.write_opaque(s.as_bytes());
     }
 }
 
@@ -148,10 +175,47 @@ mod tests {
     }
 
     #[test]
+    fn test_opaque_bytes_of_every_length_class_round_trip_and_pad_to_a_multiple_of_four() {
+        for len in [0, 1, 3, 4, 5, 17] {
+            let data = vec![0xab; len];
+            let mut w = XdrWriter::new();
+            w.write_opaque(&data);
+            let bytes = w.into_bytes();
+            assert_eq!(
+                bytes.len() % 4,
+                0,
+                "{len} did not pad: {} bytes",
+                bytes.len()
+            );
+
+            let mut r = XdrReader::new(&bytes);
+            assert_eq!(r.read_opaque().unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn test_padded_bytes_carry_no_length_of_their_own_unlike_opaque() {
+        for len in [0, 1, 3, 4, 5, 17] {
+            let data = vec![0xcd; len];
+            let mut w = XdrWriter::new();
+            w.write_padded(&data);
+            let bytes = w.into_bytes();
+            assert_eq!(
+                bytes.len(),
+                len.div_ceil(4) * 4,
+                "{len} should pad with no length prefix"
+            );
+
+            let mut r = XdrReader::new(&bytes);
+            assert_eq!(r.read_padded(len).unwrap(), data);
+        }
+    }
+
+    #[test]
     fn test_truncated_input_is_a_clear_error_not_a_panic() {
         let mut r = XdrReader::new(&[0, 0, 0]);
         let err = r.read_i32().unwrap_err();
-        assert!(matches!(err, TrrError::ParseError(_)), "{err}");
+        assert!(matches!(err, XdrError::ParseError(_)), "{err}");
     }
 
     #[test]
@@ -163,7 +227,7 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = XdrReader::new(&bytes);
         let err = r.read_string().unwrap_err();
-        assert!(matches!(err, TrrError::ParseError(_)), "{err}");
+        assert!(matches!(err, XdrError::ParseError(_)), "{err}");
     }
 
     #[test]

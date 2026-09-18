@@ -434,6 +434,17 @@ pub enum BcifError {
     Mmcif(#[from] MmcifError),
 }
 
+/// What `crate::io::xdr`'s `XdrReader`/`XdrWriter` return internally --
+/// shared by every format built on top of XDR framing (TRR, XTC), so a
+/// truncated-input failure while parsing one doesn't surface as another
+/// format's own error type (#325).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum XdrError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+}
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum TrrError {
@@ -449,6 +460,27 @@ pub enum TrrError {
     /// number, the two precisions the classic `xdrfile` format supports.
     #[error("Unsupported TRR precision")]
     UnsupportedPrecision,
+
+    #[error(transparent)]
+    Xdr(#[from] XdrError),
+
+    #[error(transparent)]
+    Trajectory(#[from] crate::core::trajectory::TrajectoryError),
+}
+
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum XtcError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// GROMACS's XDR compressed-trajectory magic number is a fixed `1995`
+    /// -- anything else at byte 0 is not an XTC file.
+    #[error("Not an XTC file: expected magic number 1995, got {0}")]
+    InvalidMagicNumber(i32),
+
+    #[error(transparent)]
+    Xdr(#[from] XdrError),
 
     #[error(transparent)]
     Trajectory(#[from] crate::core::trajectory::TrajectoryError),
