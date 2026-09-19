@@ -221,11 +221,40 @@ fn scan_sections(text: &str) -> ScannedSections<'_> {
     out
 }
 
+/// The closed-form `lx/ly/lz/xy/xz/yz` (LAMMPS restricted-triclinic edge
+/// lengths and tilt factors) to [`UnitCell`] conversion -- shape-lossless,
+/// since both already share the "a along x, b in the xy plane" convention.
+/// Shared by [`parse_box`] (data-file `xlo xhi`-style bounds) and
+/// [`crate::io::lammpstrj`] (dump-file `BOX BOUNDS`, which needs its own
+/// bounding-box-to-edges inversion first, since a triclinic dump reports
+/// values already shifted by the tilt).
+pub(crate) fn unit_cell_from_lammps_box(
+    lx: f64,
+    ly: f64,
+    lz: f64,
+    xy: f64,
+    xz: f64,
+    yz: f64,
+) -> UnitCell {
+    let b = (ly * ly + xy * xy).sqrt();
+    let c = (lz * lz + xz * xz + yz * yz).sqrt();
+    let cos_alpha = ((xy * xz + ly * yz) / (b * c)).clamp(-1.0, 1.0);
+    let cos_beta = (xz / c).clamp(-1.0, 1.0);
+    let cos_gamma = (xy / b).clamp(-1.0, 1.0);
+
+    UnitCell::new(
+        lx,
+        b,
+        c,
+        cos_alpha.acos().to_degrees(),
+        cos_beta.acos().to_degrees(),
+        cos_gamma.acos().to_degrees(),
+    )
+}
+
 /// Converts LAMMPS's box bounds (`xlo xhi`/`ylo yhi`/`zlo zhi`, optional
-/// triclinic `xy xz yz`) into a [`UnitCell`] via the standard closed-form
-/// conversion -- shape-lossless, since both already share the "a along x,
-/// b in the xy plane" convention (see the module doc for the origin
-/// caveat this does *not* solve).
+/// triclinic `xy xz yz`) into a [`UnitCell`] via [`unit_cell_from_lammps_box`]
+/// (see the module doc for the origin caveat this does *not* solve).
 fn parse_box(header_lines: &[&str]) -> Result<UnitCell, LammpsError> {
     let mut xlo = None;
     let mut xhi = None;
@@ -274,20 +303,7 @@ fn parse_box(header_lines: &[&str]) -> Result<UnitCell, LammpsError> {
     let ly = yhi - ylo;
     let lz = zhi - zlo;
 
-    let b = (ly * ly + xy * xy).sqrt();
-    let c = (lz * lz + xz * xz + yz * yz).sqrt();
-    let cos_alpha = ((xy * xz + ly * yz) / (b * c)).clamp(-1.0, 1.0);
-    let cos_beta = (xz / c).clamp(-1.0, 1.0);
-    let cos_gamma = (xy / b).clamp(-1.0, 1.0);
-
-    Ok(UnitCell::new(
-        lx,
-        b,
-        c,
-        cos_alpha.acos().to_degrees(),
-        cos_beta.acos().to_degrees(),
-        cos_gamma.acos().to_degrees(),
-    ))
+    Ok(unit_cell_from_lammps_box(lx, ly, lz, xy, xz, yz))
 }
 
 fn parse_masses(lines: &[&str]) -> Result<HashMap<i64, f64>, LammpsError> {
@@ -552,6 +568,55 @@ pub fn parse_lammps_data(text: &str, options: &LammpsReadOptions) -> Result<Mole
     Ok(mol)
 }
 
+/// The inverse of [`unit_cell_from_lammps_box`]'s shape conversion, plus a
+/// coordinate-bounding-box fallback when there is no cell at all: LAMMPS box
+/// bounds (`xlo,xhi,ylo,yhi,zlo,zhi,xy,xz,yz`) from a [`UnitCell`] when one
+/// is present, or an exact min/max bounding box of `coords` when it is not
+/// -- a deterministic function of real data, never a fabricated placeholder.
+/// Shared by [`write_lammps_data`] and [`crate::io::lammpstrj`]'s writer,
+/// which additionally forward-shifts these into the dump format's
+/// bounding-box convention only when triclinic.
+pub(crate) fn lammps_box_bounds(
+    cell: Option<&UnitCell>,
+    coords: &[Point3],
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+    match cell {
+        Some(cell) => {
+            let (alpha, beta, gamma) = (
+                cell.alpha.to_radians(),
+                cell.beta.to_radians(),
+                cell.gamma.to_radians(),
+            );
+            let xy = cell.b * gamma.cos();
+            let xz = cell.c * beta.cos();
+            let ly = (cell.b * cell.b - xy * xy).sqrt();
+            let yz = (cell.b * cell.c * alpha.cos() - xy * xz) / ly;
+            let lz = (cell.c * cell.c - xz * xz - yz * yz).sqrt();
+            (0.0, cell.a, 0.0, ly, 0.0, lz, xy, xz, yz)
+        }
+        None => match coords.split_first() {
+            Some((first, rest)) => {
+                let (mut xlo, mut xhi) = (first.x, first.x);
+                let (mut ylo, mut yhi) = (first.y, first.y);
+                let (mut zlo, mut zhi) = (first.z, first.z);
+                for p in rest {
+                    xlo = xlo.min(p.x);
+                    xhi = xhi.max(p.x);
+                    ylo = ylo.min(p.y);
+                    yhi = yhi.max(p.y);
+                    zlo = zlo.min(p.z);
+                    zhi = zhi.max(p.z);
+                }
+                let (xlo, xhi) = ensure_nonzero_extent(xlo, xhi);
+                let (ylo, yhi) = ensure_nonzero_extent(ylo, yhi);
+                let (zlo, zhi) = ensure_nonzero_extent(zlo, zhi);
+                (xlo, xhi, ylo, yhi, zlo, zhi, 0.0, 0.0, 0.0)
+            }
+            None => (0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+        },
+    }
+}
+
 /// Writes a [`Molecule`] as a LAMMPS data file: topology only (see the
 /// module doc). LAMMPS integer types are synthesized from each atom's
 /// `ForceFieldAtom::atom_type` (falling back to its element symbol when
@@ -603,44 +668,8 @@ pub fn write_lammps_data(mol: &Molecule) -> String {
     };
     let has_charge = (0..mol.num_atoms()).any(|i| atom_charge(i).is_some());
 
-    let (xlo, xhi, ylo, yhi, zlo, zhi, xy, xz, yz) = match mol.cell() {
-        Some(cell) => {
-            let (alpha, beta, gamma) = (
-                cell.alpha.to_radians(),
-                cell.beta.to_radians(),
-                cell.gamma.to_radians(),
-            );
-            let xy = cell.b * gamma.cos();
-            let xz = cell.c * beta.cos();
-            let ly = (cell.b * cell.b - xy * xy).sqrt();
-            let yz = (cell.b * cell.c * alpha.cos() - xy * xz) / ly;
-            let lz = (cell.c * cell.c - xz * xz - yz * yz).sqrt();
-            (0.0, cell.a, 0.0, ly, 0.0, lz, xy, xz, yz)
-        }
-        None => {
-            let coords = mol.coords3().unwrap_or(&[]);
-            match coords.split_first() {
-                Some((first, rest)) => {
-                    let (mut xlo, mut xhi) = (first.x, first.x);
-                    let (mut ylo, mut yhi) = (first.y, first.y);
-                    let (mut zlo, mut zhi) = (first.z, first.z);
-                    for p in rest {
-                        xlo = xlo.min(p.x);
-                        xhi = xhi.max(p.x);
-                        ylo = ylo.min(p.y);
-                        yhi = yhi.max(p.y);
-                        zlo = zlo.min(p.z);
-                        zhi = zhi.max(p.z);
-                    }
-                    let (xlo, xhi) = ensure_nonzero_extent(xlo, xhi);
-                    let (ylo, yhi) = ensure_nonzero_extent(ylo, yhi);
-                    let (zlo, zhi) = ensure_nonzero_extent(zlo, zhi);
-                    (xlo, xhi, ylo, yhi, zlo, zhi, 0.0, 0.0, 0.0)
-                }
-                None => (0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0),
-            }
-        }
-    };
+    let (xlo, xhi, ylo, yhi, zlo, zhi, xy, xz, yz) =
+        lammps_box_bounds(mol.cell().as_ref(), mol.coords3().unwrap_or(&[]));
     let triclinic = xy.abs() > 1e-9 || xz.abs() > 1e-9 || yz.abs() > 1e-9;
 
     let mut out = String::from("Written by chem\n\n");

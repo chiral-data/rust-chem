@@ -558,3 +558,25 @@ pub enum NctrajError {
     #[error(transparent)]
     Trajectory(#[from] crate::core::trajectory::TrajectoryError),
 }
+
+/// The LAMMPS dump trajectory format's own errors (#329) -- text, so no
+/// magic-number/version-byte variants the way every binary trajectory
+/// format's error type has one.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum LammpstrjError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Expected an 'ITEM: {0}' header")]
+    MissingItemHeader(String),
+
+    /// None of the unscaled (`x y z`), scaled (`xs ys zs`) or unwrapped
+    /// (`xu yu zu`) coordinate conventions is present in the `ITEM: ATOMS`
+    /// column list.
+    #[error("No recognized coordinate columns (x/y/z, xs/ys/zs or xu/yu/zu) in the ATOMS header")]
+    MissingCoordinateColumns,
+
+    #[error(transparent)]
+    Trajectory(#[from] crate::core::trajectory::TrajectoryError),
+}

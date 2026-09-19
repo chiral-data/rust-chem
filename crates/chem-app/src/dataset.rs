@@ -531,9 +531,21 @@ mod tests {
         // `chem::io::format::Format::write`) rather than the `round_trip`
         // helper's text-only path applying. The app itself doesn't load or
         // write binary formats yet -- that's #342, not this loop.
+        //
+        // `Kind::Frames` formats (TRR/XTC/DCD/NCTRAJ/LAMMPS Trajectory,
+        // #325-#329) are excluded too, for the same reason regardless of
+        // encoding: their writer lives in `writer_trajectory`
+        // (`&mut Trajectory -> Vec<u8>`), not `writer`/`writer_bytes`
+        // (`&[(String, Molecule)] -> ...`), so `Format::write` -- and this
+        // test's `round_trip` helper, which only ever builds a `Molecule`
+        // -- correctly has nothing to call for them. LAMMPS Trajectory is
+        // the first of these that's also `Encoding::Text`, so the encoding
+        // filter alone stopped being enough to exclude every non-Molecules
+        // format once it registered.
         for format in chem::io::format::all()
             .filter(|f| f.can_read() && f.can_write())
             .filter(|f| f.encoding() == chem::io::format::Encoding::Text)
+            .filter(|f| f.kind() == chem::io::format::Kind::Molecules)
         {
             let (outcome, dataset) = round_trip(format, "benzene", "c1ccccc1");
             let cell = &dataset.smiles[0];

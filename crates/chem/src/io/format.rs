@@ -1282,6 +1282,43 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::nctraj::write_nctraj_bytes),
     },
+    FormatDescriptor {
+        name: "LAMMPS Trajectory",
+        codes: &["lammpstrj"],
+        extensions: &["lammpstrj", "dump"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The fifth `Kind::Frames` format, and the first that's text: same
+        // shared topology (`Element::UNKNOWN`) as TRR/XTC/DCD/NCTRAJ. The
+        // `ATOMS` column list can name `vx/vy/vz`/`fx/fy/fz`, so the mask
+        // states what the format is *capable* of carrying, the same
+        // always-on posture TRR's own VELOCITIES|FORCES already
+        // established -- not every file states them. No FRAME_TIME: a
+        // dump's TIMESTEP is a step count, not a time (#329).
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::VELOCITIES)
+            .or(Carries::FORCES)
+            .or(Carries::UNIT_CELL),
+        // Plain text, so this uses `reader` (the `&str` entry point) rather
+        // than `reader_bytes` -- keeps `Format::encoding` and the presence
+        // of a byte reader in agreement, the same invariant every
+        // `Kind::Molecules` text format already satisfies. Writing a
+        // trajectory has only one registry field at all
+        // (`writer_trajectory`, always byte-returning), so the writer
+        // stays there regardless of encoding.
+        reader: Some(crate::io::lammpstrj::read_lammpstrj),
+        writer: None,
+        supplier: Some(lammpstrj_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Frames,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture LAMMPS Data already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::lammpstrj::write_lammpstrj_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1370,6 +1407,12 @@ fn dcd_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn nctraj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::nctraj::NctrajSupplier::new(reader, options))
+}
+
+fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::lammpstrj::LammpstrjSupplier::new(
+        reader, options,
+    ))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1743,6 +1786,15 @@ impl Format {
     /// unit conversion. Can carry velocities, like TRR; unlike TRR, no
     /// per-frame time or step at all.
     pub const NCTRAJ: Format = Format(20);
+    /// LAMMPS Trajectory (#329), see [`crate::io::lammpstrj`]. The dump
+    /// format's `ITEM:`-delimited sections, one set per frame -- the first
+    /// [`Kind::Frames`] format that's text rather than binary. The column
+    /// list is read fresh every frame, never cached, and a coordinate
+    /// convention (unscaled/scaled/unwrapped) is resolved the same way.
+    /// Can carry velocities and forces, like TRR; no per-frame time, only
+    /// a step count, same reasoning DCD/XTC/NCTRAJ already settled for
+    /// whichever of the two their own format states.
+    pub const LAMMPS_TRAJECTORY: Format = Format(21);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3671,7 +3723,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 21);
+        assert_eq!(all().count(), 22);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
