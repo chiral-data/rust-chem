@@ -509,3 +509,52 @@ pub enum DcdError {
     #[error(transparent)]
     Trajectory(#[from] crate::core::trajectory::TrajectoryError),
 }
+
+/// The generic NetCDF-3 classic container's own errors (#328) -- no Amber
+/// awareness at all, shared by every format [`crate::io::netcdf3`] ever
+/// backs.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum Netcdf3Error {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// The first three bytes must be `CDF`, and the fourth the version
+    /// byte (`1` classic, `2` 64-bit offset) -- anything else isn't a
+    /// NetCDF-3 file at all.
+    #[error("Not a NetCDF-3 file: missing 'CDF' magic")]
+    InvalidMagicNumber,
+
+    /// A version byte other than `1` or `2`. NetCDF-4/HDF5 uses a wholly
+    /// different container and never reaches this check at all.
+    #[error("Unsupported NetCDF-3 version byte: {0}")]
+    UnsupportedVersion(u8),
+
+    #[error("Unknown NetCDF-3 type code: {0}")]
+    UnknownTypeCode(i32),
+}
+
+/// The Amber trajectory convention's own errors (#328), layered on top of
+/// [`Netcdf3Error`] the same way [`XtcError`] layers on [`XdrError`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum NctrajError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// The "refused by name" check the format itself asks for: a NetCDF-3
+    /// file with no `Conventions` attribute, or one that doesn't read
+    /// `AMBER`, is not an Amber trajectory and must not be read as an
+    /// empty one.
+    #[error("Not an Amber NetCDF trajectory: {0}")]
+    NotAmberConvention(String),
+
+    #[error("Missing required dimension: {0}")]
+    MissingDimension(String),
+
+    #[error(transparent)]
+    Netcdf3(#[from] Netcdf3Error),
+
+    #[error(transparent)]
+    Trajectory(#[from] crate::core::trajectory::TrajectoryError),
+}

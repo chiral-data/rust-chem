@@ -13,6 +13,8 @@ pub mod lammps;
 pub mod mmcif;
 pub mod mol2;
 pub mod msgpack;
+pub mod nctraj;
+pub mod netcdf3;
 pub mod open;
 pub mod options;
 pub mod pdb;
