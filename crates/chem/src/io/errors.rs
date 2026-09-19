@@ -559,6 +559,26 @@ pub enum NctrajError {
     Trajectory(#[from] crate::core::trajectory::TrajectoryError),
 }
 
+/// Gaussian's CUBE format's own errors (#331).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum CubeError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// A negative atom count (orbital data) or a stated `num_val != 1` on
+    /// the header line -- both mean more than one value per grid point,
+    /// which [`crate::core::volume::VolumeGrid`] does not model.
+    #[error("multiple values per grid point are not supported: {0}")]
+    MultipleValuesUnsupported(String),
+
+    #[error(transparent)]
+    Volume(#[from] crate::core::volume::VolumeGridError),
+
+    #[error(transparent)]
+    Molecule(#[from] crate::core::molecule::MoleculeError),
+}
+
 /// The LAMMPS dump trajectory format's own errors (#329) -- text, so no
 /// magic-number/version-byte variants the way every binary trajectory
 /// format's error type has one.

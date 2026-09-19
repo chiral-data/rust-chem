@@ -8,6 +8,7 @@ use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::molecule::Molecule;
 use crate::core::trajectory::Trajectory;
+use crate::core::volume::VolumeGrid;
 use crate::io::options::{ReadOptions, WriteOptions};
 use crate::io::reader::ReadOutcome;
 use crate::io::supplier::{Supplier, Writer};
@@ -507,6 +508,14 @@ pub(crate) type ByteWriteFn = fn(&[(String, Molecule)], &WriteOptions) -> Vec<u8
 /// this format does not need (see [`crate::io::trr`]'s module doc).
 pub(crate) type ByteWriteTrajectoryFn = fn(&mut Trajectory, &WriteOptions) -> Vec<u8>;
 
+/// Serialises a whole [`VolumeGrid`] into one file's worth of bytes (#331) —
+/// the same "new, parallel field" reasoning [`ByteWriteTrajectoryFn`] already
+/// documents, since a grid is neither a `Molecule` list nor a `Trajectory`.
+/// Byte-returning like that field too, so a later binary volumetric format
+/// (CCP4/DSN6, #332-#333) reuses this same field rather than needing a
+/// second one just because CUBE happened to be text.
+pub(crate) type ByteWriteVolumeFn = fn(&VolumeGrid, &WriteOptions) -> Vec<u8>;
+
 /// A byte pattern identifying a format's content, independent of any
 /// filename: the exact bytes expected starting at `offset` (#317).
 ///
@@ -572,6 +581,9 @@ pub struct FormatDescriptor {
     /// `Kind::Molecules` format, including all seventeen registered before
     /// TRR.
     pub(crate) writer_trajectory: Option<ByteWriteTrajectoryFn>,
+    /// Set only for a format whose writer takes a whole [`VolumeGrid`]
+    /// (#331) — `None` for every format registered before CUBE.
+    pub(crate) writer_volume: Option<ByteWriteVolumeFn>,
 }
 
 /// Every format compiled into this build.
@@ -609,6 +621,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -657,6 +670,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -695,6 +709,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -722,6 +737,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -752,6 +768,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -779,6 +796,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -811,6 +829,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -839,6 +858,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -863,6 +883,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -892,6 +913,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -929,6 +951,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "BinaryCIF",
@@ -959,6 +982,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: Some(crate::io::bcif::read_bcif_with_options),
         writer_bytes: Some(crate::io::bcif::write_bcif_records),
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "CIF core",
@@ -994,6 +1018,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "PSF",
@@ -1030,6 +1055,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "PRMTOP",
@@ -1075,6 +1101,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "TOP",
@@ -1112,6 +1139,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "LAMMPS Data",
@@ -1152,6 +1180,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: None,
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "TRR",
@@ -1185,6 +1214,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: Some(crate::io::trr::read_trr_bytes),
         writer_bytes: None,
         writer_trajectory: Some(crate::io::trr::write_trr_bytes),
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "XTC",
@@ -1213,6 +1243,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: Some(crate::io::xtc::read_xtc_bytes),
         writer_bytes: None,
         writer_trajectory: Some(crate::io::xtc::write_xtc_bytes),
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "DCD",
@@ -1243,6 +1274,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: Some(crate::io::dcd::read_dcd_bytes),
         writer_bytes: None,
         writer_trajectory: Some(crate::io::dcd::write_dcd_bytes),
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "NCTRAJ",
@@ -1281,6 +1313,7 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: Some(crate::io::nctraj::read_nctraj_bytes),
         writer_bytes: None,
         writer_trajectory: Some(crate::io::nctraj::write_nctraj_bytes),
+        writer_volume: None,
     },
     FormatDescriptor {
         name: "LAMMPS Trajectory",
@@ -1318,6 +1351,35 @@ static FORMATS: &[FormatDescriptor] = &[
         reader_bytes: None,
         writer_bytes: None,
         writer_trajectory: Some(crate::io::lammpstrj::write_lammpstrj_bytes),
+        writer_volume: None,
+    },
+    FormatDescriptor {
+        name: "CUBE",
+        codes: &["cube"],
+        extensions: &["cube", "cub"],
+        category: Category::VolumeData,
+        // The first `Kind::Volume` format, and the first to carry
+        // `TOPOLOGY`/`COORDS_3D` alongside `SAMPLES` -- CUBE genuinely
+        // states both a grid and the atoms that produced it
+        // (`VolumeGrid::atoms`, #331). No UNIT_CELL: CUBE states a
+        // sampling box, not a separate crystallographic cell.
+        carries: Carries::SAMPLES
+            .or(Carries::TOPOLOGY)
+            .or(Carries::COORDS_3D),
+        reader: Some(crate::io::cube::read_cube_with_options),
+        writer: None,
+        supplier: Some(cube_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Volume,
+        // Text, no magic bytes -- two free-text comment lines up front,
+        // resolved by extension only, the same posture every other text
+        // format in this crate already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::cube::write_cube_bytes),
     },
 ];
 
@@ -1413,6 +1475,10 @@ fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dy
     Box::new(crate::io::lammpstrj::LammpstrjSupplier::new(
         reader, options,
     ))
+}
+
+fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::cube::CubeSupplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1795,6 +1861,11 @@ impl Format {
     /// a step count, same reasoning DCD/XTC/NCTRAJ already settled for
     /// whichever of the two their own format states.
     pub const LAMMPS_TRAJECTORY: Format = Format(21);
+    /// CUBE (#331), see [`crate::io::cube`]. Gaussian's volumetric format --
+    /// the first ever registered as [`Kind::Volume`], and the first to
+    /// carry both a grid (`Carries::SAMPLES`) and the atoms that produced
+    /// it (`TOPOLOGY`/`COORDS_3D`, via [`crate::core::volume::VolumeGrid::atoms`]).
+    pub const CUBE: Format = Format(22);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -1887,7 +1958,10 @@ impl Format {
 
     pub fn can_write(&self) -> bool {
         let d = self.descriptor();
-        d.writer.is_some() || d.writer_bytes.is_some() || d.writer_trajectory.is_some()
+        d.writer.is_some()
+            || d.writer_bytes.is_some()
+            || d.writer_trajectory.is_some()
+            || d.writer_volume.is_some()
     }
 
     /// Parses a whole file into molecules, from raw bytes (#309) — the
@@ -1989,6 +2063,24 @@ impl Format {
     ) -> Option<Vec<u8>> {
         let writer_trajectory = self.descriptor().writer_trajectory?;
         Some(writer_trajectory(trajectory, options))
+    }
+
+    /// Serialises a whole [`VolumeGrid`] into raw bytes (#331), or `None` if
+    /// this format has no volume writer — every `Kind::Molecules`/
+    /// `Kind::Frames` format, and any `Kind::Volume` format that has not
+    /// implemented one.
+    pub fn write_volume_bytes(&self, grid: &VolumeGrid) -> Option<Vec<u8>> {
+        self.write_volume_bytes_with_options(grid, &WriteOptions::default())
+    }
+
+    /// [`Self::write_volume_bytes`], with explicit per-format options.
+    pub fn write_volume_bytes_with_options(
+        &self,
+        grid: &VolumeGrid,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_volume = self.descriptor().writer_volume?;
+        Some(writer_volume(grid, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -3427,6 +3519,7 @@ mod tests {
                 supplier: None,
                 writer_stream: None,
                 writer_trajectory: None,
+                writer_volume: None,
             }
         }
 
@@ -3473,6 +3566,7 @@ mod tests {
                 supplier: None,
                 writer_stream: None,
                 writer_trajectory: None,
+                writer_volume: None,
             }
         }
 
@@ -3723,7 +3817,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 22);
+        assert_eq!(all().count(), 23);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

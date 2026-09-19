@@ -4,6 +4,7 @@ pub mod cif_core;
 pub mod cif_model;
 pub mod cml;
 pub mod commonchem;
+pub mod cube;
 pub mod cxsmiles;
 pub mod dcd;
 pub mod errors;
