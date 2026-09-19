@@ -58,7 +58,7 @@ fn distance_scale(units: &str) -> f64 {
     match units.to_ascii_lowercase().as_str() {
         "angstrom" | "angstroms" | "a" | "" => 1.0,
         "nanometer" | "nanometers" | "nm" => crate::core::units::NM_TO_ANGSTROM,
-        "bohr" | "bohrs" => 0.529_177_210_903,
+        "bohr" | "bohrs" => crate::core::units::BOHR_TO_ANGSTROM,
         "meter" | "meters" | "m" => 1e10,
         // Unknown unit: best-effort, matching chemfiles' own "warn and
         // default to 1.0" rather than refusing the whole file over it.

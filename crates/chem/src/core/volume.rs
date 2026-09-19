@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::core::cell::UnitCell;
 use crate::core::geometry::Point3;
+use crate::core::molecule::Molecule;
 
 /// One of the three spatial axes a grid is sampled along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +86,7 @@ pub enum VolumeGridError {
 /// each axis — is independent of [`VolumeGrid::cell`], which is only ever
 /// the crystallographic cell a format happened to also state, or `None` for
 /// one (like DX) that states no cell at all.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct VolumeGrid {
     dims: [usize; 3],
     /// The grid's origin in Cartesian space.
@@ -103,6 +104,12 @@ pub struct VolumeGrid {
     values: Vec<f64>,
     cell: Option<UnitCell>,
     source_axis_order: Option<[Axis; 3]>,
+    /// The atoms that produced this grid, for a format that states them
+    /// (CUBE, #331) — `None` for one that doesn't (CCP4/DSN6/DX). Set via
+    /// [`Self::set_atoms`] rather than a constructor parameter, since no
+    /// format needed one before CUBE and nothing outside this type's own
+    /// doctests has ever called [`Self::new`]/[`Self::from_source_order`].
+    atoms: Option<Molecule>,
 }
 
 impl VolumeGrid {
@@ -125,6 +132,7 @@ impl VolumeGrid {
             values,
             cell,
             source_axis_order: None,
+            atoms: None,
         })
     }
 
@@ -210,6 +218,7 @@ impl VolumeGrid {
             values,
             cell,
             source_axis_order: Some(source_order),
+            atoms: None,
         })
     }
 
@@ -259,6 +268,17 @@ impl VolumeGrid {
     /// built from one that permuted axes — see [`Self::from_source_order`].
     pub fn source_axis_order(&self) -> Option<[Axis; 3]> {
         self.source_axis_order
+    }
+
+    /// The atoms that produced this grid, for a format that states them.
+    pub fn atoms(&self) -> Option<&Molecule> {
+        self.atoms.as_ref()
+    }
+
+    /// Sets the atoms that produced this grid (CUBE, #331) — independent of
+    /// the grid's own shape, so no validation ties atom count to `dims`.
+    pub fn set_atoms(&mut self, atoms: Molecule) {
+        self.atoms = Some(atoms);
     }
 
     /// The linear index into [`Self::values`] for grid coordinate
