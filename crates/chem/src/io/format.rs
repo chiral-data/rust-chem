@@ -1381,6 +1381,34 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::cube::write_cube_bytes),
     },
+    FormatDescriptor {
+        name: "CCP4/MRC",
+        codes: &["ccp4", "mrc"],
+        extensions: &["ccp4", "mrc", "map"],
+        category: Category::VolumeData,
+        // The second `Kind::Volume` format, and the first to carry a real
+        // crystallographic UNIT_CELL alongside SAMPLES -- CCP4 states one
+        // directly, unlike CUBE's atoms-shaped TOPOLOGY/COORDS_3D. No
+        // atoms at all here.
+        carries: Carries::SAMPLES.or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(ccp4_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Volume,
+        // "MAP " at byte 208, confirmed directly against a real file this
+        // story built with `gemmi` -- proves "this is a CCP4/MRC-shaped
+        // file", not that it's well-formed past that (see io::ccp4).
+        magic: &[Signature {
+            offset: 208,
+            bytes: b"MAP ",
+        }],
+        reader_bytes: Some(crate::io::ccp4::read_ccp4_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1479,6 +1507,10 @@ fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dy
 
 fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::cube::CubeSupplier::new(reader, options))
+}
+
+fn ccp4_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::ccp4::Ccp4Supplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1866,6 +1898,14 @@ impl Format {
     /// carry both a grid (`Carries::SAMPLES`) and the atoms that produced
     /// it (`TOPOLOGY`/`COORDS_3D`, via [`crate::core::volume::VolumeGrid::atoms`]).
     pub const CUBE: Format = Format(22);
+    /// CCP4/MRC (#332), see [`crate::io::ccp4`]. The standard electron-
+    /// density/cryo-EM map format -- a real crystallographic `UnitCell`
+    /// this time (unlike CUBE), and no atoms. Endianness comes from a
+    /// direct machine-stamp byte-pattern match (no DCD-style guessing);
+    /// `MAPC`/`MAPR`/`MAPS` permute which canonical axis each file
+    /// dimension is, the second real exercise of
+    /// [`crate::core::volume::VolumeGrid::from_source_order`].
+    pub const CCP4: Format = Format(23);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3647,19 +3687,21 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_resolves_every_trajectory_formats_real_signature_and_nothing_else_has_one_yet() {
+    fn test_sniff_resolves_every_binary_formats_real_signature_and_nothing_else_has_one_yet() {
         // TRR (#326) was the first format to populate `magic` for real --
         // #309 built the byte-reading path a binary format needs, and
         // #317 built this matching mechanism -- XTC (#325) is the second,
-        // DCD (#327) the third, and NCTRAJ (#328) the fourth. Every other
-        // format leaves `magic` empty. Pinned explicitly rather than
-        // trusted silently, the same discipline #316's `pairs_within_kind`
-        // count assertion follows.
+        // DCD (#327) the third, NCTRAJ (#328) the fourth, and CCP4 (#332)
+        // the fifth -- the first outside `Kind::Frames`. Every other format
+        // leaves `magic` empty. Pinned explicitly rather than trusted
+        // silently, the same discipline #316's `pairs_within_kind` count
+        // assertion follows.
         for format in all() {
             if format == Format::TRR
                 || format == Format::XTC
                 || format == Format::DCD
                 || format == Format::NCTRAJ
+                || format == Format::CCP4
             {
                 continue;
             }
@@ -3682,6 +3724,10 @@ mod tests {
         // doesn't prove it's an Amber trajectory, just a NetCDF-3 file.
         assert_eq!(sniff(b"CDF\x01REST"), Some(Format::NCTRAJ));
         assert_eq!(sniff(b"CDF\x02REST"), Some(Format::NCTRAJ));
+        // CCP4/MRC's "MAP " sits at byte 208, not byte 0.
+        let mut ccp4_like = vec![0u8; 212];
+        ccp4_like[208..212].copy_from_slice(b"MAP ");
+        assert_eq!(sniff(&ccp4_like), Some(Format::CCP4));
     }
 
     #[test]
@@ -3817,7 +3863,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 23);
+        assert_eq!(all().count(), 24);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
