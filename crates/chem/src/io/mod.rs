@@ -10,6 +10,7 @@ pub mod errors;
 pub mod format;
 pub mod gro;
 pub mod lammps;
+pub mod lammpstrj;
 pub mod mmcif;
 pub mod mol2;
 pub mod msgpack;
