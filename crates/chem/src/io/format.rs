@@ -1244,6 +1244,44 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::dcd::write_dcd_bytes),
     },
+    FormatDescriptor {
+        name: "NCTRAJ",
+        codes: &["nctraj"],
+        extensions: &["nc"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The fourth `Kind::Frames` format -- same shared topology
+        // (`Element::UNKNOWN`) as TRR/XTC/DCD. Unlike XTC/DCD, this format
+        // genuinely can carry velocities (like TRR); unlike TRR, it has no
+        // per-frame time/step at all -- `time`/`forces` are both out of
+        // scope for this story (#328).
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::VELOCITIES)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(nctraj_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // Every NetCDF-3 file starts with "CDF" then a version byte (`1`
+        // classic, `2` 64-bit offset) -- this only proves "a NetCDF-3
+        // file", not specifically an Amber one; the `Conventions ==
+        // "AMBER"` check happens one layer up, in `io::nctraj` itself.
+        magic: &[
+            Signature {
+                offset: 0,
+                bytes: b"CDF\x01",
+            },
+            Signature {
+                offset: 0,
+                bytes: b"CDF\x02",
+            },
+        ],
+        reader_bytes: Some(crate::io::nctraj::read_nctraj_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::nctraj::write_nctraj_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1328,6 +1366,10 @@ fn xtc_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn dcd_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::dcd::DcdSupplier::new(reader, options))
+}
+
+fn nctraj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::nctraj::NctrajSupplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1693,6 +1735,14 @@ impl Format {
     /// storage type and whether a unit cell can be present at all. No
     /// velocities or forces, same as XTC.
     pub const DCD: Format = Format(19);
+    /// NCTRAJ (#328), see [`crate::io::nctraj`]. Amber's NetCDF trajectory
+    /// -- the Amber convention layered on a hand-rolled, generic NetCDF-3
+    /// classic container ([`crate::io::netcdf3`]), the only route
+    /// available since the real `netcdf` crate is a `-sys` crate this
+    /// repo's own CI purity gate refuses. Coordinates are already Å, no
+    /// unit conversion. Can carry velocities, like TRR; unlike TRR, no
+    /// per-frame time or step at all.
+    pub const NCTRAJ: Format = Format(20);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3451,15 +3501,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_resolves_trr_xtc_and_dcds_real_signatures_and_nothing_else_has_one_yet() {
+    fn test_sniff_resolves_every_trajectory_formats_real_signature_and_nothing_else_has_one_yet() {
         // TRR (#326) was the first format to populate `magic` for real --
         // #309 built the byte-reading path a binary format needs, and
         // #317 built this matching mechanism -- XTC (#325) is the second,
-        // and DCD (#327) the third. Every other format leaves `magic`
-        // empty. Pinned explicitly rather than trusted silently, the same
-        // discipline #316's `pairs_within_kind` count assertion follows.
+        // DCD (#327) the third, and NCTRAJ (#328) the fourth. Every other
+        // format leaves `magic` empty. Pinned explicitly rather than
+        // trusted silently, the same discipline #316's `pairs_within_kind`
+        // count assertion follows.
         for format in all() {
-            if format == Format::TRR || format == Format::XTC || format == Format::DCD {
+            if format == Format::TRR
+                || format == Format::XTC
+                || format == Format::DCD
+                || format == Format::NCTRAJ
+            {
                 continue;
             }
             assert!(
@@ -3477,6 +3532,10 @@ mod tests {
         // DCD's "CORD" sits at byte 4, after the leading Fortran record
         // marker (whatever it is) -- not byte 0.
         assert_eq!(sniff(b"\x54\x00\x00\x00CORD"), Some(Format::DCD));
+        // Every NetCDF-3 file, classic or 64-bit offset -- this alone
+        // doesn't prove it's an Amber trajectory, just a NetCDF-3 file.
+        assert_eq!(sniff(b"CDF\x01REST"), Some(Format::NCTRAJ));
+        assert_eq!(sniff(b"CDF\x02REST"), Some(Format::NCTRAJ));
     }
 
     #[test]
@@ -3612,7 +3671,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 20);
+        assert_eq!(all().count(), 21);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
