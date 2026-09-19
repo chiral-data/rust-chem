@@ -12,6 +12,50 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadOptions {
     pub lammps: LammpsReadOptions,
+    pub xyz: XyzReadOptions,
+    pub pdb: PdbReadOptions,
+    pub pdbqt: PdbqtReadOptions,
+    pub gro: GroReadOptions,
+}
+
+/// Whether a format that was already multi-frame (XYZ, PDB, PDBQT, GRO --
+/// #330) reads as several independent [`crate::io::reader::Payload::Molecule`]
+/// records (the default, and every existing caller's current behavior) or as
+/// one [`crate::io::reader::Payload::Frames`] [`crate::core::trajectory::Trajectory`]
+/// sharing a single topology.
+///
+/// `Molecules` is the honest default: `Kind::Molecules` describes what these
+/// formats return unless told otherwise, not a lie a read can silently
+/// contradict. `Frames` is the disclosed exception a caller opts into --
+/// the first frame's fully-parsed topology (atoms, bonds, residues, whatever
+/// it stated) becomes the trajectory's shared topology; a later frame's own
+/// bonds (a later `MODEL`'s `CONECT`, say) are never consulted, since a
+/// `Trajectory` holds exactly one topology.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MultiFrameMode {
+    #[default]
+    Molecules,
+    Frames,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XyzReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PdbReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PdbqtReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroReadOptions {
+    pub multi_frame: MultiFrameMode,
 }
 
 /// LAMMPS data's own read option: which `Atoms`-section column layout to
