@@ -8,6 +8,7 @@ pub mod commonchem;
 pub mod cube;
 pub mod cxsmiles;
 pub mod dcd;
+pub mod dx;
 pub mod errors;
 pub mod format;
 pub mod gro;

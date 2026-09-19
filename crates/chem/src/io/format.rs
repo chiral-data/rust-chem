@@ -1409,6 +1409,35 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
     },
+    FormatDescriptor {
+        name: "DX",
+        codes: &["dx"],
+        extensions: &["dx"],
+        category: Category::VolumeData,
+        // The third `Kind::Volume` format, and the simplest -- no atoms,
+        // no axis permutation, no endianness. Deliberately no UNIT_CELL:
+        // DX states no crystallographic cell at all, so a CCP4-to-DX
+        // round trip loses it, and this absence is exactly how that loss
+        // is declared (#333).
+        carries: Carries::SAMPLES,
+        // Plain text, so this uses `reader` (the `&str` entry point)
+        // rather than `reader_bytes` -- keeps `Format::encoding` and the
+        // presence of a byte reader in agreement, the same posture CUBE
+        // and LAMMPS Trajectory already established.
+        reader: Some(crate::io::dx::read_dx_with_options),
+        writer: None,
+        supplier: Some(dx_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Volume,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture CUBE already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::dx::write_dx_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1511,6 +1540,10 @@ fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Sup
 
 fn ccp4_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::ccp4::Ccp4Supplier::new(reader, options))
+}
+
+fn dx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::dx::DxSupplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1906,6 +1939,12 @@ impl Format {
     /// dimension is, the second real exercise of
     /// [`crate::core::volume::VolumeGrid::from_source_order`].
     pub const CCP4: Format = Format(23);
+    /// DX (#333), see [`crate::io::dx`]. OpenDX's grid format -- the
+    /// simplest of the four volumetric formats: no atoms, no cell, no axis
+    /// permutation. Confirms [`crate::core::volume::VolumeGrid::axes`]
+    /// genuinely stores three full vectors, not three scalars -- DX's own
+    /// deltas need not be axis-aligned.
+    pub const DX: Format = Format(24);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3863,7 +3902,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 24);
+        assert_eq!(all().count(), 25);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

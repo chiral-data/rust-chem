@@ -628,3 +628,15 @@ pub enum Ccp4Error {
     #[error(transparent)]
     Volume(#[from] crate::core::volume::VolumeGridError),
 }
+
+/// OpenDX's grid format's own errors (#333) -- text, keyword-driven, with
+/// none of CCP4's magic-number/endianness/mode concerns.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum DxError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error(transparent)]
+    Volume(#[from] crate::core::volume::VolumeGridError),
+}
