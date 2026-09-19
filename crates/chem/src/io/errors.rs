@@ -600,3 +600,31 @@ pub enum LammpstrjError {
     #[error(transparent)]
     Trajectory(#[from] crate::core::trajectory::TrajectoryError),
 }
+
+/// The CCP4/MRC electron-density map format's own errors (#332).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum Ccp4Error {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// The format-table `Signature` only proves the file has the right
+    /// shape at byte 208 to be worth trying -- this is the actual refusal
+    /// once a real parse is attempted and the bytes there don't hold.
+    #[error("Not a CCP4/MRC file: missing 'MAP ' at byte 208")]
+    InvalidMagicNumber,
+
+    /// The machine-stamp word (byte 212) is neither of the two real,
+    /// documented byte patterns (little- or big-endian IEEE) -- a direct
+    /// byte-pattern match, not a guess, so there is nothing to fall back to.
+    #[error("Unrecognized machine stamp: not a known endianness pattern")]
+    UnknownMachineStamp,
+
+    /// Modes 3/4 are complex data; anything else is simply not a mode this
+    /// format defines. Refused by name rather than misread as density.
+    #[error("Unsupported CCP4 data mode: {0}")]
+    UnsupportedMode(i32),
+
+    #[error(transparent)]
+    Volume(#[from] crate::core::volume::VolumeGridError),
+}
