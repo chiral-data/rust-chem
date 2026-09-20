@@ -25,6 +25,7 @@ pub mod open;
 pub mod options;
 pub mod pdb;
 pub mod pdbqt;
+pub mod ply;
 pub mod prmtop;
 pub mod psf;
 pub mod reader;

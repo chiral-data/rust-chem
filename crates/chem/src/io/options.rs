@@ -98,6 +98,7 @@ pub enum AtomStyle {
 pub struct WriteOptions {
     pub sdf: SdfWriteOptions,
     pub xtc: XtcWriteOptions,
+    pub ply: PlyWriteOptions,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -129,6 +130,23 @@ impl Default for XtcWriteOptions {
     fn default() -> Self {
         Self { precision: 1000.0 }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlyWriteOptions {
+    pub encoding: PlyWriteEncoding,
+}
+
+/// Which of PLY's wire encodings to write (#336). Only these two -- the
+/// issue's own scope is "binary little-endian is the sensible default...
+/// with ASCII available through a write option"; nothing asks for a
+/// big-endian *write* path, unlike the reader, which must accept a real
+/// file that states one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlyWriteEncoding {
+    #[default]
+    BinaryLittleEndian,
+    Ascii,
 }
 
 #[cfg(test)]
