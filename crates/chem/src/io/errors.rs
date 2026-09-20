@@ -640,3 +640,20 @@ pub enum DxError {
     #[error(transparent)]
     Volume(#[from] crate::core::volume::VolumeGridError),
 }
+
+/// DSN6 (Frodo/O electron-density map)'s own errors (#334).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum Dsn6Error {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    /// DSN6 has no fixed byte signature -- header word 19 (1-based) is a
+    /// documented constant, always `100`, checked under both byte orders.
+    /// Neither matching means this isn't a DSN6 file at all, not a guess.
+    #[error("Not a valid DSN6 file: header word 19 is not 100 under either byte order")]
+    UnknownByteOrder,
+
+    #[error(transparent)]
+    Volume(#[from] crate::core::volume::VolumeGridError),
+}
