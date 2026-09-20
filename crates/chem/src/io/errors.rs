@@ -679,3 +679,14 @@ pub enum PlyError {
     #[error(transparent)]
     Mesh(#[from] crate::core::mesh::MeshError),
 }
+
+/// CSV's own errors (#337).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum CsvError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error(transparent)]
+    Table(#[from] crate::core::table::TableError),
+}

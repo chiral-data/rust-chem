@@ -9,13 +9,21 @@
 /// One field per format that has a read option today (#324's `lammps` is
 /// the first). A real field lands here the first time a reader needs one
 /// to configure, rather than being invented ahead of that need.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// No longer `Copy` since #337's `csv: CsvReadOptions` carries an
+/// `Option<String>` (naming a structure column) -- nothing in this crate
+/// ever needed `ReadOptions` to be `Copy` for its own sake, only every
+/// `*options` dereference in `io/supplier.rs` needed rewriting to
+/// `options.clone()`, the same shape `WriteOptions`'s own doc comment
+/// already describes for its own `Eq`-losing precedent (#325's `xtc`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadOptions {
     pub lammps: LammpsReadOptions,
     pub xyz: XyzReadOptions,
     pub pdb: PdbReadOptions,
     pub pdbqt: PdbqtReadOptions,
     pub gro: GroReadOptions,
+    pub csv: CsvReadOptions,
 }
 
 /// Whether a format that was already multi-frame (XYZ, PDB, PDBQT, GRO --
@@ -56,6 +64,35 @@ pub struct PdbqtReadOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroReadOptions {
     pub multi_frame: MultiFrameMode,
+}
+
+/// CSV's own read options (#337): whether row 0 is a header, and which
+/// column (if any) states a structure. `structure_column` is the whole
+/// resolution to "is this file a table or a set of molecules" -- an
+/// explicit name a caller states, never a heuristic (`SMILES`/`smiles`/
+/// `structure`/`canonical_smiles` are all real column-naming conventions,
+/// and guessing among them is exactly the hazard this option exists to
+/// avoid). `None` (the default) means: always a [`crate::core::table::Table`],
+/// the honest, always-safe reading -- the same "disclosed exception, safe
+/// default" shape [`MultiFrameMode`] already established for XYZ/PDB/PDBQT/
+/// GRO's own opt-in `Frames` reading.
+///
+/// `structure_column: Some(_)` combined with `has_header: false` is refused
+/// rather than silently ignored -- naming a column requires a header to
+/// name it against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsvReadOptions {
+    pub has_header: bool,
+    pub structure_column: Option<String>,
+}
+
+impl Default for CsvReadOptions {
+    fn default() -> Self {
+        Self {
+            has_header: true,
+            structure_column: None,
+        }
+    }
 }
 
 /// LAMMPS data's own read option: which `Atoms`-section column layout to
