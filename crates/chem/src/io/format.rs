@@ -1438,6 +1438,31 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::dx::write_dx_bytes),
     },
+    FormatDescriptor {
+        name: "DSN6",
+        codes: &["dsn6"],
+        extensions: &["dsn6", "omap"],
+        category: Category::VolumeData,
+        // The fourth and last `Kind::Volume` format -- always carries a
+        // real crystallographic cell (like CCP4, unlike DX), but with no
+        // axis permutation at all (a fixed c=X, r=Y, s=Z mapping) and no
+        // atoms (#334).
+        carries: Carries::SAMPLES.or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(dsn6_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Volume,
+        // No fixed byte signature at all -- the closest thing DSN6 has is a
+        // documented constant word, checked in io::dsn6's own reader, not a
+        // byte pattern this table can express. Resolved by extension only.
+        magic: &[],
+        reader_bytes: Some(crate::io::dsn6::read_dsn6_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::dsn6::write_dsn6_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1544,6 +1569,10 @@ fn ccp4_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Sup
 
 fn dx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::dx::DxSupplier::new(reader, options))
+}
+
+fn dsn6_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::dsn6::Dsn6Supplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -1945,6 +1974,15 @@ impl Format {
     /// genuinely stores three full vectors, not three scalars -- DX's own
     /// deltas need not be axis-aligned.
     pub const DX: Format = Format(24);
+    /// DSN6 (#334), see [`crate::io::dsn6`]. Frodo/O's bricked,
+    /// byte-quantized electron-density format -- the last of the four
+    /// volumetric formats, and the one with no live oracle available
+    /// anywhere in this environment to verify against. A real
+    /// crystallographic `UnitCell` (like CCP4), but a fixed axis mapping
+    /// (no `MAPC`/`MAPR`/`MAPS`-style permutation) and density values
+    /// quantized to a single byte per voxel via a `prod`/`plus` linear
+    /// scale.
+    pub const DSN6: Format = Format(25);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3902,7 +3940,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 25);
+        assert_eq!(all().count(), 26);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
