@@ -9,7 +9,7 @@ use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::table::Table;
-use crate::core::trajectory::Trajectory;
+use crate::core::trajectory::{Trajectory, TrajectoryError};
 use crate::core::volume::VolumeGrid;
 use crate::io::options::{ReadOptions, WriteOptions};
 use crate::io::reader::ReadOutcome;
@@ -2955,6 +2955,103 @@ pub fn fidelity(source: Format, target: Format) -> Carries {
     (both | manufactured | pair_extra(source, target)) & !pair_loss(source, target)
 }
 
+/// A short, human phrase for what a `Kind`'s records *are* — used only in
+/// [`kinds_compatible`]'s own refusal message.
+fn kind_description(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Molecules => "a set of molecules",
+        Kind::Frames => "a trajectory",
+        Kind::Volume => "a volumetric grid",
+        Kind::Mesh => "a mesh",
+        Kind::Table => "a table",
+    }
+}
+
+/// Whether `source` can feed `target` at all — the "refuse before reading
+/// any bytes" gate `chem convert` needs now that the registry has five
+/// `Kind`s (#338).
+///
+/// `Ok(())` for a same-`Kind` pair, and exactly one deliberately enumerated
+/// exception: a `Kind::Volume` source that also states real atoms
+/// (`Carries::TOPOLOGY`) can feed a `Kind::Molecules` target — CUBE's own
+/// dual nature (#331), and the *only* one in the whole registry, confirmed
+/// directly against every other `Kind::Volume`/`Mesh`/`Table` format's own
+/// mask before writing this. Never the reverse direction: no format can
+/// synthesize real grid samples from a bare molecule.
+///
+/// Every other cross-`Kind` pair is a genuine mismatch, refused by name
+/// rather than left to degrade into a per-record "not a molecule" skip and
+/// a generic empty-output exit — which is what every one of these pairs did
+/// before this function existed.
+pub fn kinds_compatible(source: Format, target: Format) -> Result<(), String> {
+    if source.kind() == target.kind() {
+        return Ok(());
+    }
+    if source.kind() == Kind::Volume
+        && source.carries().contains(Carries::TOPOLOGY)
+        && target.kind() == Kind::Molecules
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{} holds {}, {} holds {} -- there is no conversion between them",
+        source.name(),
+        kind_description(source.kind()),
+        target.name(),
+        kind_description(target.kind()),
+    ))
+}
+
+/// What a trajectory actually holds, the same "inspect the real instance,
+/// not the format's declared mask" discipline [`held`] already follows for
+/// a molecule (#338).
+///
+/// `TOPOLOGY`/`COORDS_3D` unconditionally — a trajectory with no positions
+/// is not a trajectory. `VELOCITIES`/`FORCES`/`FRAME_TIME`/`UNIT_CELL` only
+/// if frame 0 actually states them, since [`crate::core::trajectory::Frame`]
+/// keeps every one of those fields independently `Option` (TRR carries
+/// velocities and forces, XTC never does) and this crate's own binary
+/// trajectory formats never vary that per frame within one file.
+///
+/// # Errors
+/// Whatever reading frame 0 itself can fail with.
+pub fn held_from_trajectory(trajectory: &mut Trajectory) -> Result<Carries, TrajectoryError> {
+    let mut carries = Carries::TOPOLOGY.or(Carries::COORDS_3D);
+    if trajectory.frame_count() > 0 {
+        let frame = trajectory.frame(0)?;
+        if frame.velocities.is_some() {
+            carries = carries.or(Carries::VELOCITIES);
+        }
+        if frame.forces.is_some() {
+            carries = carries.or(Carries::FORCES);
+        }
+        if frame.time.is_some() {
+            carries = carries.or(Carries::FRAME_TIME);
+        }
+        if frame.cell.is_some() {
+            carries = carries.or(Carries::UNIT_CELL);
+        }
+    }
+    Ok(carries)
+}
+
+/// What a volume grid actually holds, the same discipline [`held`]/
+/// [`held_from_trajectory`] already follow (#338). `SAMPLES` unconditionally
+/// — a grid with no values is not a grid — plus `UNIT_CELL`/`TOPOLOGY.or(
+/// COORDS_3D)` only if this specific grid actually states a cell/atoms
+/// ([`VolumeGrid::cell`]/[`VolumeGrid::atoms`] — CUBE states atoms,
+/// CCP4/DSN6 state a cell but no atoms, DX states neither).
+pub fn held_from_volume(grid: &VolumeGrid) -> Carries {
+    let mut carries = Carries::SAMPLES;
+    if grid.cell().is_some() {
+        carries = carries.or(Carries::UNIT_CELL);
+    }
+    if grid.atoms().is_some() {
+        carries = carries.or(Carries::TOPOLOGY).or(Carries::COORDS_3D);
+    }
+    carries
+}
+
 /// Whether `bytes` contains `pattern` starting at `offset` — never panics on
 /// a buffer shorter than `offset + pattern.len()`, since `slice::get` on an
 /// out-of-range range answers `None` rather than indexing (#317).
@@ -4208,5 +4305,154 @@ mod tests {
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
+    }
+
+    #[test]
+    fn test_kinds_compatible_allows_a_same_kind_pair() {
+        assert!(kinds_compatible(Format::TRR, Format::XTC).is_ok());
+        assert!(kinds_compatible(Format::CCP4, Format::DX).is_ok());
+        assert!(kinds_compatible(Format::OBJ, Format::PLY).is_ok());
+        assert!(kinds_compatible(Format::CSV, Format::CSV).is_ok());
+    }
+
+    #[test]
+    fn test_kinds_compatible_allows_cubes_own_dual_nature_one_direction_only() {
+        // CUBE genuinely carries atoms (Carries::TOPOLOGY) alongside its
+        // grid -- the one deliberately enumerated exception.
+        assert!(kinds_compatible(Format::CUBE, Format::PDB).is_ok());
+        // Never the reverse: a molecule has no grid samples to offer.
+        let err = kinds_compatible(Format::PDB, Format::CUBE).unwrap_err();
+        assert!(err.contains("PDB"), "{err}");
+        assert!(err.contains("CUBE"), "{err}");
+    }
+
+    #[test]
+    fn test_kinds_compatible_refuses_a_genuine_cross_kind_pair_naming_both() {
+        let err = kinds_compatible(Format::CSV, Format::DCD).unwrap_err();
+        assert!(err.contains("CSV"), "{err}");
+        assert!(err.contains("DCD"), "{err}");
+        assert!(err.contains("table"), "{err}");
+        assert!(err.contains("trajectory"), "{err}");
+    }
+
+    #[test]
+    fn test_kinds_compatible_refuses_a_volume_format_with_no_atoms_into_molecules() {
+        // CCP4 is Kind::Volume but declares no Carries::TOPOLOGY -- unlike
+        // CUBE, it never has real atoms to offer, so it gets no exception.
+        let err = kinds_compatible(Format::CCP4, Format::PDB).unwrap_err();
+        assert!(err.contains("CCP4"), "{err}");
+        assert!(err.contains("PDB"), "{err}");
+    }
+
+    #[test]
+    fn test_held_from_volume_reports_only_what_this_specific_grid_states() {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::cell::UnitCell;
+        use crate::core::geometry::Point3;
+        use crate::core::molecule::Molecule;
+        use crate::core::volume::VolumeGrid;
+
+        // No cell, no atoms -- DX's own shape.
+        let bare = VolumeGrid::new(
+            [1, 1, 1],
+            Point3::ORIGIN,
+            [
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 1.0),
+            ],
+            vec![0.0],
+            None,
+        )
+        .unwrap();
+        assert_eq!(held_from_volume(&bare), Carries::SAMPLES);
+
+        // A cell but no atoms -- CCP4/DSN6's own shape.
+        let with_cell = VolumeGrid::new(
+            [1, 1, 1],
+            Point3::ORIGIN,
+            [
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 1.0),
+            ],
+            vec![0.0],
+            Some(UnitCell::cubic(10.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            held_from_volume(&with_cell),
+            Carries::SAMPLES.or(Carries::UNIT_CELL)
+        );
+
+        // Atoms but no cell -- CUBE's own shape.
+        let mut with_atoms = bare.clone();
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        with_atoms.set_atoms(mol);
+        assert_eq!(
+            held_from_volume(&with_atoms),
+            Carries::SAMPLES
+                .or(Carries::TOPOLOGY)
+                .or(Carries::COORDS_3D)
+        );
+    }
+
+    #[test]
+    fn test_held_from_trajectory_reports_only_what_frame_zero_states() {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::geometry::Point3;
+        use crate::core::molecule::Molecule;
+        use crate::core::trajectory::{Frame, FrameSource};
+
+        struct OneFrame(Frame);
+        impl FrameSource for OneFrame {
+            fn frame_count(&self) -> usize {
+                1
+            }
+            fn num_atoms(&self) -> usize {
+                self.0.num_atoms()
+            }
+            fn frame(&mut self, _index: usize) -> std::io::Result<Frame> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        // XTC's own shape: positions only.
+        let bare_frame = Frame {
+            positions: vec![Point3::ORIGIN],
+            velocities: None,
+            forces: None,
+            time: None,
+            step: None,
+            cell: None,
+        };
+        let mut bare = Trajectory::new(mol.clone(), Box::new(OneFrame(bare_frame))).unwrap();
+        assert_eq!(
+            held_from_trajectory(&mut bare).unwrap(),
+            Carries::TOPOLOGY.or(Carries::COORDS_3D)
+        );
+
+        // TRR's own shape: velocities and forces too.
+        let full_frame = Frame {
+            positions: vec![Point3::ORIGIN],
+            velocities: Some(vec![Point3::ORIGIN]),
+            forces: Some(vec![Point3::ORIGIN]),
+            time: Some(0.0),
+            step: None,
+            cell: None,
+        };
+        let mut full = Trajectory::new(mol, Box::new(OneFrame(full_frame))).unwrap();
+        assert_eq!(
+            held_from_trajectory(&mut full).unwrap(),
+            Carries::TOPOLOGY
+                .or(Carries::COORDS_3D)
+                .or(Carries::VELOCITIES)
+                .or(Carries::FORCES)
+                .or(Carries::FRAME_TIME)
+        );
     }
 }
