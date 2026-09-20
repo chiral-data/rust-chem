@@ -668,3 +668,14 @@ pub enum ObjError {
     #[error(transparent)]
     Mesh(#[from] crate::core::mesh::MeshError),
 }
+
+/// The Stanford PLY format's own errors (#336).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum PlyError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error(transparent)]
+    Mesh(#[from] crate::core::mesh::MeshError),
+}

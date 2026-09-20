@@ -1530,6 +1530,37 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: Some(crate::io::obj::write_obj_bytes),
     },
+    FormatDescriptor {
+        name: "PLY",
+        codes: &["ply"],
+        extensions: &["ply"],
+        category: Category::MeshData,
+        // The second and last `Kind::Mesh` format -- same defining mask as
+        // OBJ (#336).
+        carries: Carries::VERTICES.or(Carries::FACES),
+        reader: None,
+        writer: None,
+        supplier: Some(ply_supplier),
+        writer_stream: None,
+        // Binary, since two of PLY's three wire encodings (declared in its
+        // own header, sniffed by io::ply's reader) are raw bytes -- the
+        // ASCII variant is still read/written correctly through the same
+        // byte-based entry points, the same posture CCP4/DSN6 already take.
+        encoding: Encoding::Binary,
+        kind: Kind::Mesh,
+        // "ply\n" is byte-identical across all three encodings -- a real,
+        // reliable fixed signature, unlike OBJ/DX's extension-only
+        // resolution.
+        magic: &[Signature {
+            offset: 0,
+            bytes: b"ply\n",
+        }],
+        reader_bytes: Some(crate::io::ply::read_ply_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: Some(crate::io::ply::write_ply_bytes),
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1640,6 +1671,10 @@ fn dx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Suppl
 
 fn obj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::obj::ObjSupplier::new(reader, options))
+}
+
+fn ply_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::ply::PlySupplier::new(reader, options))
 }
 
 fn dsn6_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2063,6 +2098,16 @@ impl Format {
     /// vertices, since that type's normals are per-vertex, not per-face-
     /// corner like OBJ's own `v/vt/vn` indexing.
     pub const OBJ: Format = Format(26);
+    /// PLY (#336), see [`crate::io::ply`]. The Stanford polygon format --
+    /// second and last mesh story, and the first format whose header is a
+    /// genuine schema (`element`/`property` lines) rather than a fixed
+    /// field layout, the same class of work as PRMTOP's `%FORMAT` lines.
+    /// One descriptor covers all three of its wire encodings (`ascii`,
+    /// `binary_little_endian`, `binary_big_endian`), sniffed internally
+    /// from the header's own `format` line -- this crate's first "ASCII or
+    /// binary, both handled by one reader" format, unlike CCP4's
+    /// little/big-endian-only sniff.
+    pub const PLY: Format = Format(27);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3869,17 +3914,20 @@ mod tests {
         // TRR (#326) was the first format to populate `magic` for real --
         // #309 built the byte-reading path a binary format needs, and
         // #317 built this matching mechanism -- XTC (#325) is the second,
-        // DCD (#327) the third, NCTRAJ (#328) the fourth, and CCP4 (#332)
-        // the fifth -- the first outside `Kind::Frames`. Every other format
-        // leaves `magic` empty. Pinned explicitly rather than trusted
-        // silently, the same discipline #316's `pairs_within_kind` count
-        // assertion follows.
+        // DCD (#327) the third, NCTRAJ (#328) the fourth, CCP4 (#332) the
+        // fifth -- the first outside `Kind::Frames` -- and PLY (#336) the
+        // sixth -- the first outside `Kind::Volume` too, and the first
+        // `Kind::Mesh` format with a real fixed signature at all (OBJ has
+        // none). Every other format leaves `magic` empty. Pinned explicitly
+        // rather than trusted silently, the same discipline #316's
+        // `pairs_within_kind` count assertion follows.
         for format in all() {
             if format == Format::TRR
                 || format == Format::XTC
                 || format == Format::DCD
                 || format == Format::NCTRAJ
                 || format == Format::CCP4
+                || format == Format::PLY
             {
                 continue;
             }
@@ -3906,6 +3954,9 @@ mod tests {
         let mut ccp4_like = vec![0u8; 212];
         ccp4_like[208..212].copy_from_slice(b"MAP ");
         assert_eq!(sniff(&ccp4_like), Some(Format::CCP4));
+        // PLY's "ply\n" is byte-identical across all three of its wire
+        // encodings, at byte 0.
+        assert_eq!(sniff(b"ply\nformat ascii 1.0\n"), Some(Format::PLY));
     }
 
     #[test]
@@ -4041,7 +4092,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 27);
+        assert_eq!(all().count(), 28);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
