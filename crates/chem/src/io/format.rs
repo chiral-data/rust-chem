@@ -6,6 +6,7 @@ use std::ops::{BitAnd, BitOr, Not};
 
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
+use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::trajectory::Trajectory;
 use crate::core::volume::VolumeGrid;
@@ -403,6 +404,9 @@ pub enum Category {
     KineticsAndThermodynamics,
     MolecularDynamicsAndDocking,
     VolumeData,
+    /// A triangulated surface, no chemistry at all -- OBJ (#335), PLY
+    /// (#336).
+    MeshData,
     Json,
     Miscellaneous,
     BiologicalData,
@@ -425,6 +429,7 @@ impl Category {
             Category::KineticsAndThermodynamics => "Kinetics and Thermodynamics formats",
             Category::MolecularDynamicsAndDocking => "Molecular dynamics and docking formats",
             Category::VolumeData => "Volume data formats",
+            Category::MeshData => "Mesh data formats",
             Category::Json => "JSON formats",
             Category::Miscellaneous => "Miscellaneous formats",
             Category::BiologicalData => "Biological data formats",
@@ -516,6 +521,11 @@ pub(crate) type ByteWriteTrajectoryFn = fn(&mut Trajectory, &WriteOptions) -> Ve
 /// second one just because CUBE happened to be text.
 pub(crate) type ByteWriteVolumeFn = fn(&VolumeGrid, &WriteOptions) -> Vec<u8>;
 
+/// Serialises a whole [`Mesh`] into one file's worth of bytes (#335) — the
+/// same "new, parallel field" reasoning [`ByteWriteVolumeFn`] already
+/// documents, since a mesh is neither a `Molecule` list nor a `VolumeGrid`.
+pub(crate) type ByteWriteMeshFn = fn(&Mesh, &WriteOptions) -> Vec<u8>;
+
 /// A byte pattern identifying a format's content, independent of any
 /// filename: the exact bytes expected starting at `offset` (#317).
 ///
@@ -584,6 +594,9 @@ pub struct FormatDescriptor {
     /// Set only for a format whose writer takes a whole [`VolumeGrid`]
     /// (#331) — `None` for every format registered before CUBE.
     pub(crate) writer_volume: Option<ByteWriteVolumeFn>,
+    /// Set only for a format whose writer takes a whole [`Mesh`] (#335) —
+    /// `None` for every format registered before OBJ.
+    pub(crate) writer_mesh: Option<ByteWriteMeshFn>,
 }
 
 /// Every format compiled into this build.
@@ -622,6 +635,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -671,6 +685,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -710,6 +725,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -738,6 +754,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -769,6 +786,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -797,6 +815,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -830,6 +849,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -859,6 +879,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -884,6 +905,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -914,6 +936,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -952,6 +975,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "BinaryCIF",
@@ -983,6 +1007,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: Some(crate::io::bcif::write_bcif_records),
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "CIF core",
@@ -1019,6 +1044,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "PSF",
@@ -1056,6 +1082,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "PRMTOP",
@@ -1102,6 +1129,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "TOP",
@@ -1140,6 +1168,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "LAMMPS Data",
@@ -1181,6 +1210,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "TRR",
@@ -1215,6 +1245,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::trr::write_trr_bytes),
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "XTC",
@@ -1244,6 +1275,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::xtc::write_xtc_bytes),
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "DCD",
@@ -1275,6 +1307,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::dcd::write_dcd_bytes),
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "NCTRAJ",
@@ -1314,6 +1347,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::nctraj::write_nctraj_bytes),
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "LAMMPS Trajectory",
@@ -1352,6 +1386,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: Some(crate::io::lammpstrj::write_lammpstrj_bytes),
         writer_volume: None,
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "CUBE",
@@ -1380,6 +1415,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: Some(crate::io::cube::write_cube_bytes),
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "CCP4/MRC",
@@ -1408,6 +1444,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "DX",
@@ -1437,6 +1474,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: Some(crate::io::dx::write_dx_bytes),
+        writer_mesh: None,
     },
     FormatDescriptor {
         name: "DSN6",
@@ -1462,6 +1500,35 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_bytes: None,
         writer_trajectory: None,
         writer_volume: Some(crate::io::dsn6::write_dsn6_bytes),
+        writer_mesh: None,
+    },
+    FormatDescriptor {
+        name: "OBJ",
+        codes: &["obj"],
+        extensions: &["obj"],
+        category: Category::MeshData,
+        // The first `Kind::Mesh` format, and the first registered format
+        // with no chemistry at all. Always carries vertex positions and a
+        // face list -- OBJ's own `f` lines are what a mesh format is for
+        // (#335).
+        carries: Carries::VERTICES.or(Carries::FACES),
+        // Plain text, so this uses `reader` (the `&str` entry point)
+        // rather than `reader_bytes` -- the same posture CUBE/DX already
+        // established.
+        reader: Some(crate::io::obj::read_obj_with_options),
+        writer: None,
+        supplier: Some(obj_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Mesh,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture every other text format already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: Some(crate::io::obj::write_obj_bytes),
     },
 ];
 
@@ -1569,6 +1636,10 @@ fn ccp4_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Sup
 
 fn dx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::dx::DxSupplier::new(reader, options))
+}
+
+fn obj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::obj::ObjSupplier::new(reader, options))
 }
 
 fn dsn6_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1983,6 +2054,15 @@ impl Format {
     /// quantized to a single byte per voxel via a `prod`/`plus` linear
     /// scale.
     pub const DSN6: Format = Format(25);
+    /// OBJ (#335), see [`crate::io::obj`]. Wavefront's plain-text mesh
+    /// format, first story of Phase 5 and the first registered format with
+    /// no chemistry at all -- [`Kind::Mesh`], not `Kind::Molecules`. Faces
+    /// are fan-triangulated into [`crate::core::mesh::Mesh`]'s
+    /// triangles-only shape, and a vertex referenced with two different
+    /// normals across faces (a hard edge) is split into two output
+    /// vertices, since that type's normals are per-vertex, not per-face-
+    /// corner like OBJ's own `v/vt/vn` indexing.
+    pub const OBJ: Format = Format(26);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -2079,6 +2159,7 @@ impl Format {
             || d.writer_bytes.is_some()
             || d.writer_trajectory.is_some()
             || d.writer_volume.is_some()
+            || d.writer_mesh.is_some()
     }
 
     /// Parses a whole file into molecules, from raw bytes (#309) — the
@@ -2198,6 +2279,24 @@ impl Format {
     ) -> Option<Vec<u8>> {
         let writer_volume = self.descriptor().writer_volume?;
         Some(writer_volume(grid, options))
+    }
+
+    /// Serialises a whole [`Mesh`] into raw bytes (#335), or `None` if this
+    /// format has no mesh writer — every `Kind::Molecules`/`Kind::Frames`/
+    /// `Kind::Volume` format, and any `Kind::Mesh` format that has not
+    /// implemented one.
+    pub fn write_mesh_bytes(&self, mesh: &Mesh) -> Option<Vec<u8>> {
+        self.write_mesh_bytes_with_options(mesh, &WriteOptions::default())
+    }
+
+    /// [`Self::write_mesh_bytes`], with explicit per-format options.
+    pub fn write_mesh_bytes_with_options(
+        &self,
+        mesh: &Mesh,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_mesh = self.descriptor().writer_mesh?;
+        Some(writer_mesh(mesh, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -3637,6 +3736,7 @@ mod tests {
                 writer_stream: None,
                 writer_trajectory: None,
                 writer_volume: None,
+                writer_mesh: None,
             }
         }
 
@@ -3684,6 +3784,7 @@ mod tests {
                 writer_stream: None,
                 writer_trajectory: None,
                 writer_volume: None,
+                writer_mesh: None,
             }
         }
 
@@ -3940,7 +4041,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 26);
+        assert_eq!(all().count(), 27);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
