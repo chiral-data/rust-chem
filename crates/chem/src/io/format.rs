@@ -8,6 +8,7 @@ use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
+use crate::core::table::Table;
 use crate::core::trajectory::Trajectory;
 use crate::core::volume::VolumeGrid;
 use crate::io::options::{ReadOptions, WriteOptions};
@@ -407,6 +408,8 @@ pub enum Category {
     /// A triangulated surface, no chemistry at all -- OBJ (#335), PLY
     /// (#336).
     MeshData,
+    /// Named columns and rows, no structure implied -- CSV (#337).
+    TabularData,
     Json,
     Miscellaneous,
     BiologicalData,
@@ -430,6 +433,7 @@ impl Category {
             Category::MolecularDynamicsAndDocking => "Molecular dynamics and docking formats",
             Category::VolumeData => "Volume data formats",
             Category::MeshData => "Mesh data formats",
+            Category::TabularData => "Tabular data formats",
             Category::Json => "JSON formats",
             Category::Miscellaneous => "Miscellaneous formats",
             Category::BiologicalData => "Biological data formats",
@@ -526,6 +530,12 @@ pub(crate) type ByteWriteVolumeFn = fn(&VolumeGrid, &WriteOptions) -> Vec<u8>;
 /// documents, since a mesh is neither a `Molecule` list nor a `VolumeGrid`.
 pub(crate) type ByteWriteMeshFn = fn(&Mesh, &WriteOptions) -> Vec<u8>;
 
+/// Serialises a whole [`Table`] into one file's worth of bytes (#337) — the
+/// same "new, parallel field" reasoning [`ByteWriteMeshFn`] already
+/// documents, since a table is neither a `Molecule` list nor any of the
+/// other three payload shapes.
+pub(crate) type ByteWriteTableFn = fn(&Table, &WriteOptions) -> Vec<u8>;
+
 /// A byte pattern identifying a format's content, independent of any
 /// filename: the exact bytes expected starting at `offset` (#317).
 ///
@@ -597,6 +607,13 @@ pub struct FormatDescriptor {
     /// Set only for a format whose writer takes a whole [`Mesh`] (#335) —
     /// `None` for every format registered before OBJ.
     pub(crate) writer_mesh: Option<ByteWriteMeshFn>,
+    /// Set only for a format whose writer takes a whole [`Table`] (#337) —
+    /// `None` for every format registered before CSV. Unlike
+    /// `writer_volume`/`writer_mesh`, this can be populated *alongside* an
+    /// ordinary `writer`/`writer_bytes` on the same descriptor: CSV writes
+    /// both a `Table` (its declared kind) and, as a disclosed opt-in, a
+    /// molecule list with a `smiles` column.
+    pub(crate) writer_table: Option<ByteWriteTableFn>,
 }
 
 /// Every format compiled into this build.
@@ -636,6 +653,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -686,6 +704,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -726,6 +745,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -755,6 +775,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -787,6 +808,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -816,6 +838,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -850,6 +873,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -880,6 +904,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -906,6 +931,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -937,6 +963,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -976,6 +1003,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "BinaryCIF",
@@ -1008,6 +1036,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CIF core",
@@ -1045,6 +1074,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PSF",
@@ -1083,6 +1113,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PRMTOP",
@@ -1130,6 +1161,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "TOP",
@@ -1169,6 +1201,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "LAMMPS Data",
@@ -1211,6 +1244,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "TRR",
@@ -1246,6 +1280,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: Some(crate::io::trr::write_trr_bytes),
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "XTC",
@@ -1276,6 +1311,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: Some(crate::io::xtc::write_xtc_bytes),
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "DCD",
@@ -1308,6 +1344,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: Some(crate::io::dcd::write_dcd_bytes),
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "NCTRAJ",
@@ -1348,6 +1385,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: Some(crate::io::nctraj::write_nctraj_bytes),
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "LAMMPS Trajectory",
@@ -1387,6 +1425,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: Some(crate::io::lammpstrj::write_lammpstrj_bytes),
         writer_volume: None,
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CUBE",
@@ -1416,6 +1455,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::cube::write_cube_bytes),
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CCP4/MRC",
@@ -1445,6 +1485,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "DX",
@@ -1475,6 +1516,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::dx::write_dx_bytes),
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "DSN6",
@@ -1501,6 +1543,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: Some(crate::io::dsn6::write_dsn6_bytes),
         writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "OBJ",
@@ -1529,6 +1572,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: Some(crate::io::obj::write_obj_bytes),
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PLY",
@@ -1560,6 +1604,40 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_trajectory: None,
         writer_volume: None,
         writer_mesh: Some(crate::io::ply::write_ply_bytes),
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "CSV",
+        codes: &["csv"],
+        extensions: &["csv"],
+        category: Category::TabularData,
+        // The declared kind is Table -- the honest, always-safe default. A
+        // structure column is a disclosed, explicit read-option opt-in
+        // (io::csv::CsvReadOptions), the same "declared kind stays fixed,
+        // an option flips the produced Payload" mechanism #330 already
+        // proved safe for XYZ/PDB/PDBQT/GRO's own opt-in Frames reading
+        // (#337).
+        carries: Carries::COLUMNS,
+        reader: Some(crate::io::csv::read_csv_with_options),
+        // The opt-in molecule-list write shape -- a `smiles` column plus
+        // one column per distinct molecule property. Populated *alongside*
+        // `writer_table` below, a first for this registry: every other
+        // format with a writer_volume/writer_mesh leaves `writer` `None`.
+        writer: Some(crate::io::csv::write_csv_records),
+        supplier: Some(csv_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Table,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture every other text format already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        // The declared/primary write shape.
+        writer_table: Some(crate::io::csv::write_csv_table_bytes),
     },
 ];
 
@@ -1655,6 +1733,10 @@ fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dy
     Box::new(crate::io::lammpstrj::LammpstrjSupplier::new(
         reader, options,
     ))
+}
+
+fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::csv::CsvSupplier::new(reader, options))
 }
 
 fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2108,6 +2190,17 @@ impl Format {
     /// binary, both handled by one reader" format, unlike CCP4's
     /// little/big-endian-only sniff.
     pub const PLY: Format = Format(27);
+    /// CSV (#337), see [`crate::io::csv`]. The tabular format, last story of
+    /// Phase 5 -- declared [`Kind::Table`], with molecule production as an
+    /// explicit, disclosed read option (`structure_column`) rather than a
+    /// column-name heuristic, mirroring the exact "declared kind stays
+    /// fixed, an option flips the produced payload" mechanism #330 already
+    /// proved safe for XYZ/PDB/PDBQT/GRO's own opt-in `Frames` reading.
+    /// Parses via [`crate::core::table::Table::from_csv`] (#314) directly,
+    /// not a second RFC4180 parser. The first format to populate both
+    /// `writer` (an opt-in molecule-list shape) and `writer_table` (its
+    /// declared/primary shape) on the same descriptor.
+    pub const CSV: Format = Format(28);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -2205,6 +2298,7 @@ impl Format {
             || d.writer_trajectory.is_some()
             || d.writer_volume.is_some()
             || d.writer_mesh.is_some()
+            || d.writer_table.is_some()
     }
 
     /// Parses a whole file into molecules, from raw bytes (#309) — the
@@ -2342,6 +2436,22 @@ impl Format {
     ) -> Option<Vec<u8>> {
         let writer_mesh = self.descriptor().writer_mesh?;
         Some(writer_mesh(mesh, options))
+    }
+
+    /// Serialises a whole [`Table`] into raw bytes (#337), or `None` if this
+    /// format has no table writer — every format other than CSV today.
+    pub fn write_table_bytes(&self, table: &Table) -> Option<Vec<u8>> {
+        self.write_table_bytes_with_options(table, &WriteOptions::default())
+    }
+
+    /// [`Self::write_table_bytes`], with explicit per-format options.
+    pub fn write_table_bytes_with_options(
+        &self,
+        table: &Table,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_table = self.descriptor().writer_table?;
+        Some(writer_table(table, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -3782,6 +3892,7 @@ mod tests {
                 writer_trajectory: None,
                 writer_volume: None,
                 writer_mesh: None,
+                writer_table: None,
             }
         }
 
@@ -3830,6 +3941,7 @@ mod tests {
                 writer_trajectory: None,
                 writer_volume: None,
                 writer_mesh: None,
+                writer_table: None,
             }
         }
 
@@ -4092,7 +4204,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 28);
+        assert_eq!(all().count(), 29);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

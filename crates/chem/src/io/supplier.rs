@@ -54,7 +54,7 @@ impl<R: BufRead> SmilesSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -123,7 +123,7 @@ impl<R: BufRead> CxSmilesSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -190,7 +190,7 @@ impl<R: BufRead> SdfSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -268,7 +268,7 @@ impl<R: BufRead> PdbSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -294,7 +294,7 @@ impl<R: BufRead> MmcifSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -377,7 +377,7 @@ impl<R: BufRead> CifCoreSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -463,7 +463,7 @@ impl<R: BufRead> PsfSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -548,7 +548,7 @@ impl<R: BufRead> PrmtopSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -634,7 +634,7 @@ impl<R: BufRead> LammpsDataSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            options: *options,
+            options: options.clone(),
         }
     }
 }
@@ -711,7 +711,7 @@ impl<R: BufRead> Mol2Supplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -851,7 +851,7 @@ impl<R: BufRead> XyzSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -1272,7 +1272,7 @@ impl<R: BufRead> PdbqtSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -1411,7 +1411,7 @@ impl<R: BufRead> GroSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -1554,7 +1554,7 @@ impl<R: BufRead> CmlSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
