@@ -657,3 +657,14 @@ pub enum Dsn6Error {
     #[error(transparent)]
     Volume(#[from] crate::core::volume::VolumeGridError),
 }
+
+/// Wavefront OBJ's own errors (#335).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ObjError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error(transparent)]
+    Mesh(#[from] crate::core::mesh::MeshError),
+}
