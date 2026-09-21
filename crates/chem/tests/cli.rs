@@ -1331,6 +1331,204 @@ fn test_convert_writes_xyz_and_it_reads_back_the_same_atom_count() {
     assert_eq!(back.code, 0, "{:?}", back.stderr);
 }
 
+// A real, minimal, already-verified CUBE fixture (one carbon atom, a 2x3x4
+// grid of zeros) -- reused verbatim from `io::cube`'s own test module, which
+// already confirms it parses correctly.
+const MINIMAL_CUBE: &str = "\
+comment one
+comment two
+1   1.0 2.0 3.0
+-2  0.5 0.0 0.0
+3   0.0 0.5 0.0
+4   0.0 0.0 0.5
+6  0.0  1.0 2.0 3.0
+0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+";
+
+// A real, minimal, already-verified LAMMPS trajectory fixture (one atom, one
+// frame, an orthogonal box) -- reused verbatim from `io::lammpstrj`'s own
+// test module.
+const MINIMAL_LAMMPSTRJ: &str = "\
+ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+1
+ITEM: BOX BOUNDS pp pp pp
+0 10
+0 20
+0 30
+ITEM: ATOMS id type xs ys zs
+1 1 0.5 0.25 0.1
+";
+
+#[test]
+fn test_convert_refuses_a_genuine_cross_kind_pair_before_writing_anything() {
+    let out = std::env::temp_dir().join("chem-cli-test-cross-kind-out.dcd");
+    let _ = std::fs::remove_file(&out);
+
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "a,b\n1,2\n",
+            "--from",
+            "csv",
+            "--to",
+            "dcd",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("CSV"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("DCD"), "{:?}", r.stderr);
+    assert!(!out.exists(), "output file must not be created on refusal");
+}
+
+#[test]
+fn test_convert_cube_to_pdb_keeps_the_atoms_and_discloses_the_dropped_grid() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            MINIMAL_CUBE,
+            "--from",
+            "cube",
+            "--to",
+            "pdb",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ATOM"), "{:?}", r.stdout);
+    assert!(
+        r.stderr.contains("density grid"),
+        "the grid loss must be disclosed: {:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_refuses_the_reverse_of_cubes_own_exception() {
+    // A molecule has no grid samples to offer -- never allowed, even though
+    // CUBE -> PDB is.
+    let r = run(&["convert", "--literal", "CCO", "--to", "cube"], None);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("SMILES"), "{:?}", r.stderr);
+    assert!(r.stderr.contains("CUBE"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_cube_to_dx_discloses_the_lost_atoms_via_the_kind_drop_report() {
+    // Same Kind (Volume -> Volume) this time, so the ordinary held-vs-
+    // carries mechanism reports the loss, not the CUBE-exception's own
+    // fixed disclosure line.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            MINIMAL_CUBE,
+            "--from",
+            "cube",
+            "--to",
+            "dx",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_a_lammps_trajectory_round_trips_a_same_kind_conversion_for_the_first_time() {
+    // Before #338, this degraded into a per-record "not a molecule" skip
+    // spray, since every payload was assumed to be `Payload::Molecule`.
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            MINIMAL_LAMMPSTRJ,
+            "--from",
+            "lammpstrj",
+            "--to",
+            "lammpstrj",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ITEM: TIMESTEP"), "{:?}", r.stdout);
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_obj_to_ply_and_back_round_trips_a_mesh() {
+    let obj = "\
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+f 1 2 3
+";
+    let ply_path = std::env::temp_dir().join("chem-cli-test-mesh.ply");
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            obj,
+            "--from",
+            "obj",
+            "--to",
+            "ply",
+            "-o",
+            ply_path.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        std::fs::metadata(&ply_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
+        "PLY output must be non-empty"
+    );
+
+    let back = run(
+        &["convert", ply_path.to_str().unwrap(), "--to", "obj"],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+    let vertex_lines = back.stdout.lines().filter(|l| l.starts_with("v ")).count();
+    assert_eq!(vertex_lines, 3, "{:?}", back.stdout);
+}
+
+#[test]
+fn test_convert_csv_to_csv_round_trips_a_table_for_the_first_time() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "a,b\n1,2\n3,4\n",
+            "--from",
+            "csv",
+            "--to",
+            "csv",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("a,b"), "{:?}", r.stdout);
+    assert!(r.stdout.contains("1,2"), "{:?}", r.stdout);
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
 #[test]
 fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
     let path = fixture(

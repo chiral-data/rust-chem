@@ -185,6 +185,20 @@ pub fn report_drops(format: Format, records: &[(String, Molecule)], explain: boo
     tracker.report(format.label(), explain);
 }
 
+/// Says on stderr what a same-`Kind` `Frames`/`Volume` conversion drops
+/// (#338) — the one-shot counterpart to [`DropTracker`] for a `chem
+/// convert` shape that is always exactly one record, never a stream of
+/// many, so there is nothing to accumulate. Silent when nothing is lost,
+/// the same posture [`DropTracker::report`] already takes.
+pub fn report_kind_drop(target: Format, held: Carries) {
+    let dropped = held.difference(target.carries());
+    if dropped.is_empty() {
+        return;
+    }
+    let summary = dropped.names().collect::<Vec<_>>().join(", ");
+    eprintln!("{} cannot carry: {summary}", target.label());
+}
+
 /// Serialises molecules, carrying their names.
 ///
 /// The serialisation itself lives on the format descriptor now, so this is a
