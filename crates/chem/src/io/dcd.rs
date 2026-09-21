@@ -416,7 +416,12 @@ pub(crate) struct DcdFrameSource {
 }
 
 impl DcdFrameSource {
-    fn open(bytes: Vec<u8>) -> Result<Self, DcdError> {
+    // `pub(crate)` rather than private (#339): `io::format`'s own test
+    // module combines a PSF-parsed topology with a DCD `FrameSource` to
+    // demonstrate `Trajectory::new` accepting two different formats'
+    // output together, which needs a way to obtain one from outside this
+    // module -- the only reason this constructor is visible at all.
+    pub(crate) fn open(bytes: Vec<u8>) -> Result<Self, DcdError> {
         let header = read_header(&bytes)?;
         let (firstframesize, framesize) = frame_sizes(&header);
         let nset = header.nset.max(0) as usize;

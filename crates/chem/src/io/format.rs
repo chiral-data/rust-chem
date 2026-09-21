@@ -6,6 +6,7 @@ use std::ops::{BitAnd, BitOr, Not};
 
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
+use crate::core::geometry::Point3;
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::table::Table;
@@ -2720,6 +2721,81 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Carries::UNIT_CELL,
         "box bounds are mandatory; absent input gets a placeholder box",
     ),
+    (
+        // TRR's own binary layout has no way to represent "no time" at
+        // all -- confirmed directly (`io::trr::write_trr_frame`): the
+        // field is always written, `frame.time.unwrap_or(0.0)`, and the
+        // reader always reads it back as `Some`. Found by #339's own new
+        // Kind::Frames pair check, the first time TRR was ever exercised
+        // as a write target with no stated time.
+        Format::TRR,
+        Carries::FRAME_TIME,
+        "every frame states a time; absent input writes 0.0",
+    ),
+    (
+        // Same shape as TRR just above: XTC's own `write_frame` always
+        // writes `frame.time.unwrap_or(0.0)` and its reader always
+        // returns `Some(time as f64)` -- confirmed directly in
+        // `io::xtc.rs`. A second, independent GROMACS binary trajectory
+        // format with the identical gap, found the same way.
+        Format::XTC,
+        Carries::FRAME_TIME,
+        "every frame states a time; absent input writes 0.0",
+    ),
+    (
+        // A third, differently-shaped instance of the same fact: DCD has
+        // no per-frame time field at all -- confirmed directly
+        // (`io::dcd::write_dcd_bytes`/`DcdFrameSource::frame_inner`).
+        // Time is always *derived*, `header.delta * step`, and the
+        // reader always returns `Some(time)`; when the input states no
+        // time, the writer falls back to `delta = 1.0`.
+        Format::DCD,
+        Carries::FRAME_TIME,
+        "time is derived from istart/nsavc/delta; absent input defaults delta to 1.0",
+    ),
+    (
+        // The module's own doc comment already names this pattern
+        // (`io::ccp4`'s header comment: "the same disclosed no-cell
+        // fallback `io::lammps`'s own data-file writer already
+        // established") but never got the matching table row --
+        // confirmed directly (`write_ccp4`): a grid with no stated
+        // `VolumeGrid::cell` gets a synthesized orthogonal "cell equals
+        // box" one. Found by #339's new Kind::Volume pair check, the
+        // first time CCP4/MRC was exercised as a write target with no
+        // stated cell.
+        Format::CCP4,
+        Carries::UNIT_CELL,
+        "every map states a cell; absent input synthesizes cell equals box",
+    ),
+    (
+        // Same fallback as CCP4/MRC just above, confirmed directly
+        // (`io::dsn6::write_dsn6`): identical `grid.cell().unwrap_or_else`
+        // synthesizing cell-equals-box.
+        Format::DSN6,
+        Carries::UNIT_CELL,
+        "every map states a cell; absent input synthesizes cell equals box",
+    ),
+    (
+        // Already named in `io::cube`'s own doc comment ("[`VolumeGrid::
+        // atoms`] always set (even to an empty [`Molecule`] for `natoms
+        // == 0`) -- CUBE always states this block, unlike CCP4/DSN6/DX"),
+        // just missing the matching table row. `held_from_volume` treats
+        // `grid.atoms().is_some()` as TOPOLOGY, and CUBE's own reader
+        // always returns `Some`, even an empty one, for a source with no
+        // atoms at all.
+        Format::CUBE,
+        Carries::TOPOLOGY,
+        "always states an atom block; absent input writes zero atoms",
+    ),
+    (
+        // Same root cause as the TOPOLOGY row just above -- `held_from_
+        // volume` ORs COORDS_3D in on the identical `grid.atoms().is_
+        // some()` condition, so CUBE's always-present (possibly empty)
+        // atom block trips both flags together.
+        Format::CUBE,
+        Carries::COORDS_3D,
+        "always states an atom block; absent input writes zero atoms",
+    ),
 ];
 
 /// Attributes a conversion delivers that neither mask claims.
@@ -3013,10 +3089,19 @@ pub fn kinds_compatible(source: Format, target: Format) -> Result<(), String> {
 /// velocities and forces, XTC never does) and this crate's own binary
 /// trajectory formats never vary that per frame within one file.
 ///
+/// Also folds in `held(trajectory.topology())` (#339): every registered
+/// `Kind::Frames` format's own shared topology is bare (atoms and bonds
+/// only), so this changes nothing for them, but a trajectory built by
+/// hand from a real topology (PSF's own residues/atom types/masses paired
+/// with a DCD's frames, say) has to show that richness here too, or a
+/// drop report -- or a fidelity check -- would miss it entirely.
+///
 /// # Errors
 /// Whatever reading frame 0 itself can fail with.
 pub fn held_from_trajectory(trajectory: &mut Trajectory) -> Result<Carries, TrajectoryError> {
-    let mut carries = Carries::TOPOLOGY.or(Carries::COORDS_3D);
+    let mut carries = Carries::TOPOLOGY
+        .or(Carries::COORDS_3D)
+        .or(held(trajectory.topology()));
     if trajectory.frame_count() > 0 {
         let frame = trajectory.frame(0)?;
         if frame.velocities.is_some() {
@@ -3050,6 +3135,72 @@ pub fn held_from_volume(grid: &VolumeGrid) -> Carries {
         carries = carries.or(Carries::TOPOLOGY).or(Carries::COORDS_3D);
     }
     carries
+}
+
+/// Every ordered `(source, target)` pair sharing a `Kind` (#339) -- every
+/// kind now, not just `Kind::Molecules`: `one_per_attribute` (test-only) and
+/// its four siblings each shape a fixture set for their own kind, so nothing
+/// here needs to single one out any more. Promoted out of this module's own
+/// test code because `chem convert -L matrix` (`bin/chem/main.rs`) needs
+/// the exact same pair list a test would check, not a second one that
+/// could drift from it.
+pub fn pairs_within_kind() -> impl Iterator<Item = (Format, Format)> {
+    all().flat_map(|source| {
+        all()
+            .filter(move |target| target.kind() == source.kind())
+            .map(move |target| (source, target))
+    })
+}
+
+/// Every ordered cross-`Kind` pair the registry actually allows (#339) --
+/// derived *from* [`kinds_compatible`] itself, by trying every pair that
+/// doesn't already share a `Kind`, rather than a second, hand-maintained
+/// list that could silently drift out of sync with the gate that actually
+/// governs `chem convert`. Today this is exactly the 17 CUBE-to-
+/// `Kind::Molecules` pairs `kinds_compatible`'s own doc comment names as
+/// the only exception in the whole registry.
+pub fn cross_kind_pairs() -> impl Iterator<Item = (Format, Format)> {
+    all().flat_map(|source| {
+        all()
+            .filter(move |target| {
+                target.kind() != source.kind() && kinds_compatible(source, *target).is_ok()
+            })
+            .map(move |target| (source, target))
+    })
+}
+
+/// Every pair the fidelity matrix has anything meaningful to say about
+/// (#339): same-`Kind` pairs plus the enumerated cross-`Kind` exceptions --
+/// the one list both `chem convert -L matrix` and this module's own
+/// pair-level tests iterate, so the two can never disagree about scope.
+pub fn fidelity_pairs() -> impl Iterator<Item = (Format, Format)> {
+    pairs_within_kind().chain(cross_kind_pairs())
+}
+
+/// How far a `Kind::Frames` format's own binary encoding can move a
+/// position and still call the round trip faithful (#339).
+///
+/// `0.01` Å for XTC specifically -- its own real, documented quantization
+/// step at the default `precision = 1000.0` (`1.0 / 1000.0` nm = 0.01 Å,
+/// confirmed against [`crate::io::options::XtcWriteOptions`]'s own doc
+/// comment), the same value `io::xtc`'s own tests already settled on ad
+/// hoc, centralized here rather than copied a second time. `1e-3` Å for
+/// every other binary trajectory format -- `f32` rounding noise, not a
+/// deliberate compressor, the same tolerance `io::trr`'s own tests already
+/// use.
+pub fn frame_tolerance(format: Format) -> f64 {
+    if format == Format::XTC { 0.01 } else { 1e-3 }
+}
+
+/// Whether every position in `a` matches its counterpart in `b` within
+/// `tol` on each axis (#339) -- the value-level check the presence-only
+/// `Carries` machinery above cannot express, and the reason a `Kind::Frames`
+/// pair needs more than [`held_from_trajectory`] to be proven faithful.
+pub fn positions_match(a: &[Point3], b: &[Point3], tol: f64) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            (x.x - y.x).abs() <= tol && (x.y - y.y).abs() <= tol && (x.z - y.z).abs() <= tol
+        })
 }
 
 /// Whether `bytes` contains `pattern` starting at `offset` — never panics on
@@ -3110,6 +3261,7 @@ impl fmt::Display for Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::reader::{Payload, Record};
 
     #[test]
     fn test_lookup_by_code_finds_every_alias() {
@@ -3360,6 +3512,210 @@ mod tests {
         ]
     }
 
+    /// A `FrameSource` over exactly one, already-built [`Frame`] -- the
+    /// smallest possible test double, reused by every `Kind::Frames`
+    /// fixture below and by [`convert_trajectory`].
+    #[derive(Clone)]
+    struct OneFrame(crate::core::trajectory::Frame);
+
+    impl crate::core::trajectory::FrameSource for OneFrame {
+        fn frame_count(&self) -> usize {
+            1
+        }
+        fn num_atoms(&self) -> usize {
+            self.0.num_atoms()
+        }
+        fn frame(&mut self, _index: usize) -> std::io::Result<crate::core::trajectory::Frame> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// One minimal trajectory per `Kind::Frames`-relevant attribute (#339) --
+    /// the same "one flag, as little else as possible" discipline
+    /// [`one_per_attribute`] already established, sized to what this crate's
+    /// registered `Kind::Frames` formats actually draw from
+    /// ([`held_from_trajectory`]'s own flag list). Returns the shared
+    /// topology and the one frame separately, both `Clone`, rather than a
+    /// pre-built [`Trajectory`] (which cannot be cloned) -- callers build a
+    /// fresh one per use via [`build_trajectory`].
+    fn one_per_attribute_frames() -> Vec<(Carries, Molecule, crate::core::trajectory::Frame)> {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::cell::UnitCell;
+        use crate::core::trajectory::Frame;
+
+        // Ten atoms, not two: `io::xtc`'s own coordinate block stores
+        // `size <= 9` atoms as raw, lossless floats and only compresses
+        // above that threshold (see its module doc) -- a two-atom fixture
+        // never touches XTC's real lossy path at all, which is exactly
+        // what a deliberate-failure probe on `frame_tolerance` caught
+        // (#339): tightening XTC's tolerance below its real precision
+        // produced no failure, because there was never any real rounding
+        // error to catch. Ten is the smallest count XTC actually compresses.
+        //
+        // Non-grid-aligned positions for the same reason: `i as f64 *
+        // 1.0033` never lands on a multiple of XTC's 0.001nm quantization
+        // step, so the compression this fixture now reaches genuinely
+        // rounds every coordinate rather than passing a suspiciously exact
+        // one through unchanged.
+        let topology = || {
+            let mut m = Molecule::new();
+            for _ in 0..10 {
+                m.add_atom(Atom::new(Element::carbon()));
+            }
+            m
+        };
+        let positions = || {
+            (0..10)
+                .map(|i| Point3::new(i as f64 * 1.0033, 0.0, 0.0))
+                .collect::<Vec<_>>()
+        };
+        let bare = Frame {
+            positions: positions(),
+            velocities: None,
+            forces: None,
+            time: None,
+            step: None,
+            cell: None,
+        };
+
+        vec![
+            (Carries::TOPOLOGY, topology(), bare.clone()),
+            (Carries::COORDS_3D, topology(), bare.clone()),
+            (
+                Carries::VELOCITIES,
+                topology(),
+                Frame {
+                    velocities: Some(positions()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                Carries::FORCES,
+                topology(),
+                Frame {
+                    forces: Some(positions()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                Carries::FRAME_TIME,
+                topology(),
+                Frame {
+                    time: Some(1.5),
+                    ..bare.clone()
+                },
+            ),
+            (
+                Carries::UNIT_CELL,
+                topology(),
+                Frame {
+                    cell: Some(UnitCell::cubic(10.0)),
+                    ..bare.clone()
+                },
+            ),
+        ]
+    }
+
+    /// Builds a fresh, one-frame [`Trajectory`] from a fixture's own
+    /// topology/frame pair (#339).
+    fn build_trajectory(topology: &Molecule, frame: &crate::core::trajectory::Frame) -> Trajectory {
+        Trajectory::new(topology.clone(), Box::new(OneFrame(frame.clone())))
+            .expect("valid trajectory")
+    }
+
+    /// The `Kind::Frames` counterpart to [`convert`] (#339): writes `source`,
+    /// reads it back, writes `target`, reads that back -- the same two-hop
+    /// shape, over the whole-buffer `Trajectory` entry points every
+    /// `Kind::Frames` format actually uses (#325-#329) rather than the
+    /// per-record streaming a `Kind::Molecules` format's `Supplier` does.
+    fn convert_trajectory(
+        source: Format,
+        target: Format,
+        topology: &Molecule,
+        frame: &crate::core::trajectory::Frame,
+    ) -> Option<Trajectory> {
+        let mut trajectory = build_trajectory(topology, frame);
+        let as_source = source.write_trajectory_bytes(&mut trajectory)?;
+        let outcome = source.read_bytes(&as_source)?;
+        let crate::io::reader::Payload::Frames(mut intermediate) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+
+        let as_target = target.write_trajectory_bytes(&mut intermediate)?;
+        let outcome = target.read_bytes(&as_target)?;
+        let crate::io::reader::Payload::Frames(result) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+        Some(result)
+    }
+
+    /// One minimal volume grid per `Kind::Volume`-relevant attribute (#339),
+    /// the same discipline as [`one_per_attribute`]/[`one_per_attribute_frames`],
+    /// sized to [`held_from_volume`]'s own flag list. [`VolumeGrid`] is
+    /// `Clone`, so this returns the grids directly rather than needing a
+    /// rebuild-per-use helper.
+    fn one_per_attribute_volume() -> Vec<(Carries, VolumeGrid)> {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::cell::UnitCell;
+
+        let axes = [
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
+        ];
+        let bare = || {
+            VolumeGrid::new([1, 1, 1], Point3::ORIGIN, axes, vec![0.0], None).expect("valid grid")
+        };
+        let with_cell = VolumeGrid::new(
+            [1, 1, 1],
+            Point3::ORIGIN,
+            axes,
+            vec![0.0],
+            Some(UnitCell::cubic(10.0)),
+        )
+        .expect("valid grid");
+        let with_atoms = {
+            let mut g = bare();
+            let mut mol = Molecule::new();
+            mol.add_atom(Atom::new(Element::carbon()));
+            g.set_atoms(mol);
+            g
+        };
+
+        vec![
+            (Carries::SAMPLES, bare()),
+            (Carries::UNIT_CELL, with_cell),
+            (Carries::TOPOLOGY, with_atoms.clone()),
+            (Carries::COORDS_3D, with_atoms),
+        ]
+    }
+
+    /// The `Kind::Volume` counterpart to [`convert`]/[`convert_trajectory`]
+    /// (#339), over the whole-buffer [`VolumeGrid`] entry points every
+    /// `Kind::Volume` format actually uses (#331-#334).
+    fn convert_volume(source: Format, target: Format, grid: &VolumeGrid) -> Option<VolumeGrid> {
+        let as_source = source.write_volume_bytes(grid)?;
+        let outcome = source.read_bytes(&as_source)?;
+        let crate::io::reader::Payload::Volume(intermediate) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+
+        let as_target = target.write_volume_bytes(&intermediate)?;
+        let outcome = target.read_bytes(&as_target)?;
+        let crate::io::reader::Payload::Volume(result) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+        Some(result)
+    }
+
     #[test]
     fn test_every_flag_has_a_fixture_that_actually_holds_it() {
         // Guards the mask test from the other side. A fixture that failed to
@@ -3408,31 +3764,117 @@ mod tests {
         // kind of claim that rots. So they are checked against reality: a mask
         // that overstates makes the drop report lie about the very data it
         // exists to protect.
+        //
+        // Every module's own test suite already proves its parse/write
+        // functions agree with each other (#325-#337) -- this test proves a
+        // different, narrower thing per kind: the *registry's own dispatch*
+        // (`Format::write_*_bytes`/`read_bytes`) is honest, the same class
+        // of gap `can_write()` had for `writer_mesh`/`writer_table` before
+        // #335/#337 fixed it. `Kind::Mesh`/`Table` get a simpler check
+        // (#339): neither kind's registered formats have any optional flag
+        // beyond their own single defining one, so there is nothing to sweep
+        // per-attribute -- only "does the registry's own writer/reader pair
+        // actually deliver a real grid/mesh/table at all."
         for format in all() {
-            // `one_per_attribute`'s fixtures are all `Molecule`s -- a
-            // `Kind::Frames` format (TRR, #326) has no Molecule-shaped
-            // writer to probe here; it is proven correct on its own terms
-            // in `crate::io::trr`'s own test module instead.
-            if format.kind() != Kind::Molecules || !format.can_write() || !format.can_read() {
+            if !format.can_write() || !format.can_read() {
                 continue;
             }
-            for (flag, molecule) in one_per_attribute() {
-                let records = vec![("probe".to_string(), molecule)];
-                let bytes = format.write_bytes(&records).expect("can_write said so");
-                let outcome = format.read_bytes(&bytes).expect("can_read said so");
-                let Some(back) = outcome.records.first() else {
-                    panic!("{format:?} wrote nothing readable for {flag:?}");
-                };
-                let survived = held(back.molecule().expect("fixture format is Kind::Molecules"))
-                    .contains(flag);
-                let claimed = format.carries().contains(flag);
+            match format.kind() {
+                Kind::Molecules => {
+                    for (flag, molecule) in one_per_attribute() {
+                        let records = vec![("probe".to_string(), molecule)];
+                        let bytes = format.write_bytes(&records).expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(back) = outcome.records.first() else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived =
+                            held(back.molecule().expect("fixture format is Kind::Molecules"))
+                                .contains(flag);
+                        let claimed = format.carries().contains(flag);
 
-                assert_eq!(
-                    claimed,
-                    survived,
-                    "{} claims {flag:?}={claimed} but a round trip gives {survived}",
-                    format.name()
-                );
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::Frames => {
+                    for (flag, topology, frame) in one_per_attribute_frames() {
+                        let mut trajectory = build_trajectory(&topology, &frame);
+                        let bytes = format
+                            .write_trajectory_bytes(&mut trajectory)
+                            .expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(Payload::Frames(mut back)) =
+                            outcome.records.into_iter().next().map(|r| r.payload)
+                        else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived = held_from_trajectory(&mut back)
+                            .expect("frame 0 is readable")
+                            .contains(flag);
+                        let claimed = format.carries().contains(flag);
+
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::Volume => {
+                    for (flag, grid) in one_per_attribute_volume() {
+                        let bytes = format.write_volume_bytes(&grid).expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(Payload::Volume(back)) =
+                            outcome.records.into_iter().next().map(|r| r.payload)
+                        else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived = held_from_volume(&back).contains(flag);
+                        let claimed = format.carries().contains(flag);
+
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::Mesh => {
+                    let mesh = Mesh::new(
+                        vec![
+                            Point3::new(0.0, 0.0, 0.0),
+                            Point3::new(1.0, 0.0, 0.0),
+                            Point3::new(0.0, 1.0, 0.0),
+                        ],
+                        None,
+                        None,
+                        vec![[0, 1, 2]],
+                    )
+                    .expect("valid mesh");
+                    let bytes = format.write_mesh_bytes(&mesh).expect("can_write said so");
+                    let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                    let Some(back) = outcome.records.first().and_then(Record::mesh) else {
+                        panic!("{format:?} wrote nothing readable");
+                    };
+                    assert!(!back.vertices().is_empty(), "{}", format.name());
+                    assert!(!back.faces().is_empty(), "{}", format.name());
+                }
+                Kind::Table => {
+                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
+                    let bytes = format.write_table_bytes(&table).expect("can_write said so");
+                    let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                    let Some(back) = outcome.records.first().and_then(Record::table) else {
+                        panic!("{format:?} wrote nothing readable");
+                    };
+                    assert!(back.num_columns() > 0, "{}", format.name());
+                }
             }
         }
     }
@@ -3470,21 +3912,6 @@ mod tests {
         )
     }
 
-    /// Every ordered `(source, target)` pair sharing a `Kind`, restricted to
-    /// `Kind::Molecules` -- the only kind [`one_per_attribute`]'s fixtures
-    /// (and this whole fidelity matrix) are shaped for. TRR (#326) is the
-    /// first format registered outside it; generalising this matrix to work
-    /// across kinds is #338/#339's job, not this story's.
-    fn pairs_within_kind() -> impl Iterator<Item = (Format, Format)> {
-        all()
-            .filter(|f| f.kind() == Kind::Molecules)
-            .flat_map(|source| {
-                all()
-                    .filter(move |target| target.kind() == source.kind())
-                    .map(move |target| (source, target))
-            })
-    }
-
     #[test]
     fn test_every_format_pair_delivers_what_the_matrix_says() {
         // The masks are per-format; a conversion is a pair. What survives
@@ -3493,44 +3920,236 @@ mod tests {
         // nothing checked it, because
         // `test_declared_masks_match_what_actually_survives` only walks the
         // diagonal.
-        let fixtures = one_per_attribute();
-        let pairs: Vec<(Format, Format)> = pairs_within_kind().collect();
-        // 17 `Kind::Molecules` formats, 17 x 17 -- TRR (#326) is the first
-        // format `pairs_within_kind` excludes, being the first registered
-        // outside that kind, so this count is unchanged by its arrival.
-        assert_eq!(pairs.len(), 289);
+        //
+        // `fidelity()` itself is pure `Carries` bitwise arithmetic with no
+        // notion of `Kind` at all, so it already predicts every one of the
+        // kinds below correctly without any change (#339): a `Kind::Volume`
+        // source's `SAMPLES` bit is simply never present in any
+        // `Kind::Molecules` target's mask, so the cross-kind CUBE pairs
+        // predict "the grid is always lost" for free, the same arithmetic
+        // that predicts XTC losing TRR's velocities.
+        let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
+        // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
+        // 1x1 (Table) same-kind, plus the 17 CUBE -> Molecules cross-kind
+        // pairs `cross_kind_pairs()` derives from `kinds_compatible` -- a
+        // count this crate re-derives and pins, not one asserted from
+        // memory (#339).
+        assert_eq!(pairs.len(), 352);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
-            for (flag, molecule) in &fixtures {
-                let back = match convert(source, target, molecule) {
-                    Some(back) => back,
-                    // A pair pinned in `PAIR_GAPS` may fail to produce
-                    // anything readable at all, not just lose an
-                    // attribute -- LAMMPS's `Element::UNKNOWN` has no
-                    // atomic symbol for a target that requires one. Any
-                    // other pair failing here is a real bug, not a known
-                    // gap, so it still panics.
-                    None => {
-                        assert!(
-                            pair_gap(source, target).is_some(),
-                            "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+            match (source.kind(), target.kind()) {
+                (Kind::Molecules, Kind::Molecules) => {
+                    for (flag, molecule) in one_per_attribute() {
+                        let back = match convert(source, target, &molecule) {
+                            Some(back) => back,
+                            // A pair pinned in `PAIR_GAPS` may fail to
+                            // produce anything readable at all, not just
+                            // lose an attribute -- LAMMPS's
+                            // `Element::UNKNOWN` has no atomic symbol for
+                            // a target that requires one. Any other pair
+                            // failing here is a real bug, not a known
+                            // gap, so it still panics.
+                            None => {
+                                assert!(
+                                    pair_gap(source, target).is_some(),
+                                    "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                                    source.name(),
+                                    target.name()
+                                );
+                                continue;
+                            }
+                        };
+
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = held(&back).contains(flag);
+
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
                             source.name(),
                             target.name()
                         );
-                        continue;
                     }
-                };
+                }
+                (Kind::Frames, Kind::Frames) => {
+                    for (flag, topology, frame) in one_per_attribute_frames() {
+                        let Some(mut back) = convert_trajectory(source, target, &topology, &frame)
+                        else {
+                            assert!(
+                                pair_gap(source, target).is_some(),
+                                "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                                source.name(),
+                                target.name()
+                            );
+                            continue;
+                        };
 
-                let predicted = predicted_mask.contains(*flag);
-                let survived = held(&back).contains(*flag);
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = held_from_trajectory(&mut back)
+                            .expect("frame 0 is readable")
+                            .contains(flag);
 
-                assert_eq!(
-                    predicted,
-                    survived,
-                    "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
-                    source.name(),
-                    target.name()
-                );
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+
+                        // The new capability #339 adds: presence alone
+                        // cannot see a position silently corrupted within
+                        // its own claimed precision -- XTC's lossy
+                        // compression is exactly the case that needs this.
+                        if predicted_mask.contains(Carries::COORDS_3D) {
+                            let tol = frame_tolerance(source).max(frame_tolerance(target));
+                            let back_frame = back.frame(0).expect("frame 0 is readable");
+                            assert!(
+                                positions_match(&frame.positions, &back_frame.positions, tol),
+                                "{} -> {}: positions moved by more than {tol} -- {:?} vs {:?}",
+                                source.name(),
+                                target.name(),
+                                frame.positions,
+                                back_frame.positions
+                            );
+                        }
+                    }
+                }
+                (Kind::Volume, Kind::Volume) => {
+                    for (flag, grid) in one_per_attribute_volume() {
+                        let Some(back) = convert_volume(source, target, &grid) else {
+                            assert!(
+                                pair_gap(source, target).is_some(),
+                                "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                                source.name(),
+                                target.name()
+                            );
+                            continue;
+                        };
+
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = held_from_volume(&back).contains(flag);
+
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+                    }
+                }
+                (Kind::Mesh, Kind::Mesh) => {
+                    let mesh = Mesh::new(
+                        vec![
+                            Point3::new(0.0, 0.0, 0.0),
+                            Point3::new(1.0, 0.0, 0.0),
+                            Point3::new(0.0, 1.0, 0.0),
+                        ],
+                        None,
+                        None,
+                        vec![[0, 1, 2]],
+                    )
+                    .expect("valid mesh");
+                    let as_source = source.write_mesh_bytes(&mesh).expect("can_write said so");
+                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                    let intermediate = outcome
+                        .records
+                        .first()
+                        .and_then(Record::mesh)
+                        .expect("valid mesh readback")
+                        .clone();
+                    let as_target = target
+                        .write_mesh_bytes(&intermediate)
+                        .expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::mesh)
+                        .expect("valid mesh readback");
+                    assert!(
+                        !back.vertices().is_empty(),
+                        "{} -> {}",
+                        source.name(),
+                        target.name()
+                    );
+                    assert!(
+                        !back.faces().is_empty(),
+                        "{} -> {}",
+                        source.name(),
+                        target.name()
+                    );
+                }
+                (Kind::Table, Kind::Table) => {
+                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
+                    let as_source = source.write_table_bytes(&table).expect("can_write said so");
+                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                    let intermediate = outcome
+                        .records
+                        .first()
+                        .and_then(Record::table)
+                        .expect("valid table readback")
+                        .clone();
+                    let as_target = target
+                        .write_table_bytes(&intermediate)
+                        .expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::table)
+                        .expect("valid table readback");
+                    assert!(
+                        back.num_columns() > 0,
+                        "{} -> {}",
+                        source.name(),
+                        target.name()
+                    );
+                }
+                (Kind::Volume, Kind::Molecules) => {
+                    // CUBE's own dual nature (#338/#339) -- the only
+                    // cross-Kind pair this registry allows. `SAMPLES` is
+                    // never claimed by any `Kind::Molecules` target's own
+                    // mask, so `fidelity()`'s plain bitwise arithmetic
+                    // already predicts the grid is always lost here, same
+                    // as it predicts any other loss -- nothing hard-coded
+                    // beyond which fixture to use.
+                    let grid = one_per_attribute_volume()
+                        .into_iter()
+                        .find(|(flag, _)| *flag == Carries::TOPOLOGY)
+                        .expect("a with-atoms fixture exists")
+                        .1;
+                    let molecule = grid.atoms().expect("this fixture states atoms").clone();
+                    let records = vec![("probe".to_string(), molecule)];
+                    let as_target = target.write_bytes(&records).expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::molecule)
+                        .expect("valid molecule readback");
+
+                    let predicted = predicted_mask.contains(Carries::TOPOLOGY);
+                    let survived = held(back).contains(Carries::TOPOLOGY);
+                    assert_eq!(
+                        predicted,
+                        survived,
+                        "{} -> {}: the matrix says TOPOLOGY={predicted} but the conversion gives {survived}",
+                        source.name(),
+                        target.name()
+                    );
+                    assert!(
+                        !predicted_mask.contains(Carries::SAMPLES),
+                        "{} -> {}: a Kind::Molecules target must never claim SAMPLES",
+                        source.name(),
+                        target.name()
+                    );
+                }
+                (source_kind, target_kind) => unreachable!(
+                    "fidelity_pairs() only yields same-kind or CUBE-exception pairs, got {source_kind:?} -> {target_kind:?}"
+                ),
             }
         }
     }
@@ -3594,15 +4213,46 @@ mod tests {
         // does not actually manufacture, or a loss that stopped happening,
         // would otherwise sit in the table describing a crate that moved on.
         let fixtures = one_per_attribute();
+        let frame_fixtures = one_per_attribute_frames();
+        let volume_fixtures = one_per_attribute_volume();
 
         for (target, flag, why) in SUPPLIED {
-            let fires = all().any(|source| {
-                !source.carries().contains(*flag)
-                    && fixtures.iter().any(|(_, molecule)| {
-                        convert(source, *target, molecule)
-                            .is_some_and(|back| held(&back).contains(*flag))
-                    })
-            });
+            // Kind-aware (#339): a `SUPPLIED` row can now name a
+            // `Kind::Frames`/`Volume` target (TRR/XTC/DCD's manufactured
+            // time, CCP4/DSN6's synthesized cell, CUBE's always-present
+            // atom block), each re-derived through that kind's own
+            // fixtures and `held_*` function rather than the
+            // `Kind::Molecules`-only `convert`/`held` pair.
+            let fires = match target.kind() {
+                Kind::Molecules => all().any(|source| {
+                    !source.carries().contains(*flag)
+                        && fixtures.iter().any(|(_, molecule)| {
+                            convert(source, *target, molecule)
+                                .is_some_and(|back| held(&back).contains(*flag))
+                        })
+                }),
+                Kind::Frames => all().filter(|f| f.kind() == Kind::Frames).any(|source| {
+                    !source.carries().contains(*flag)
+                        && frame_fixtures.iter().any(|(_, topology, frame)| {
+                            convert_trajectory(source, *target, topology, frame).is_some_and(
+                                |mut back| {
+                                    held_from_trajectory(&mut back)
+                                        .is_ok_and(|carries| carries.contains(*flag))
+                                },
+                            )
+                        })
+                }),
+                Kind::Volume => all().filter(|f| f.kind() == Kind::Volume).any(|source| {
+                    !source.carries().contains(*flag)
+                        && volume_fixtures.iter().any(|(_, grid)| {
+                            convert_volume(source, *target, grid)
+                                .is_some_and(|back| held_from_volume(&back).contains(*flag))
+                        })
+                }),
+                Kind::Mesh | Kind::Table => {
+                    unreachable!("SUPPLIED has no Mesh/Table entries (#339)")
+                }
+            };
             assert!(
                 fires,
                 "{} is pinned as supplying {flag:?} ({why:?}) but never does -- delete the line",
@@ -3627,6 +4277,36 @@ mod tests {
                 target.name()
             );
         }
+
+        // The cross-kind exception list is not a hand-maintained table --
+        // `cross_kind_pairs()` derives it live from `kinds_compatible`
+        // (#339) -- but the *assumption* that makes it exactly 17 pairs
+        // (CUBE, and only CUBE, feeding every `Kind::Molecules` format)
+        // is still a claim worth re-deriving rather than trusting from
+        // memory, the same discipline as every table row above.
+        let volume_topology_sources: Vec<Format> = all()
+            .filter(|f| f.kind() == Kind::Volume && f.carries().contains(Carries::TOPOLOGY))
+            .collect();
+        assert_eq!(
+            volume_topology_sources,
+            vec![Format::CUBE],
+            "cross_kind_pairs() assumes CUBE is the only Kind::Volume format carrying \
+             Carries::TOPOLOGY; found {volume_topology_sources:?} -- update cross_kind_pairs() \
+             and this assertion together"
+        );
+        let cross_kind: Vec<(Format, Format)> = cross_kind_pairs().collect();
+        let molecules_count = all().filter(|f| f.kind() == Kind::Molecules).count();
+        assert_eq!(
+            cross_kind.len(),
+            molecules_count,
+            "cross_kind_pairs() should yield exactly one CUBE pair per Kind::Molecules target"
+        );
+        assert!(
+            cross_kind
+                .iter()
+                .all(|(source, target)| *source == Format::CUBE && target.kind() == Kind::Molecules),
+            "cross_kind_pairs() yielded a pair other than CUBE -> Kind::Molecules: {cross_kind:?}"
+        );
     }
 
     #[test]
@@ -3869,7 +4549,11 @@ mod tests {
         let fixtures = one_per_attribute();
         let mut found: Vec<(Format, Format)> = Vec::new();
 
-        for (source, target) in pairs_within_kind() {
+        // `num_atoms()` is a `Molecule`-only notion (#339): `pairs_within_
+        // kind()` now covers every kind, but the atom-loss question this
+        // test asks only makes sense for `Kind::Molecules` pairs, the
+        // same scope `PAIR_GAPS` has always been pinned against.
+        for (source, target) in pairs_within_kind().filter(|(s, _)| s.kind() == Kind::Molecules) {
             let lost = fixtures.iter().any(|(_, molecule)| {
                 convert(source, target, molecule)
                     .is_none_or(|back| back.num_atoms() != molecule.num_atoms())
@@ -4454,5 +5138,77 @@ mod tests {
                 .or(Carries::FORCES)
                 .or(Carries::FRAME_TIME)
         );
+    }
+
+    #[test]
+    fn test_psf_topology_combines_with_a_dcd_frame_source_into_one_trajectory() {
+        // PSF+DCD (#339): not a `(source, target)` pair at all, but two
+        // *sources* combining into one `Trajectory` neither format alone
+        // produces -- PSF's real topology (residues, atom types, masses)
+        // and DCD's positions. `Trajectory::new` is already generic
+        // enough to accept them together; the only missing piece was a
+        // way to obtain a DCD `FrameSource` from outside `io::dcd`, fixed
+        // by the small `pub(crate)` bump on `DcdFrameSource::open`.
+        use crate::core::atom::{Atom, Element};
+        use crate::core::trajectory::{Frame, FrameSource};
+        use crate::io::dcd::DcdFrameSource;
+        use crate::io::psf::parse_psf;
+
+        let psf_topology =
+            parse_psf(include_str!("../../tests/corpus/psf/water.psf")).expect("valid PSF");
+        assert_eq!(psf_topology.num_atoms(), 3);
+        // PSF alone never states coordinates -- confirmed directly in
+        // `io::psf` (`test_no_coordinates_are_ever_invented`) -- so this
+        // is proof the combine below is genuine, not vacuous.
+        assert!(!held(&psf_topology).contains(Carries::COORDS_3D));
+
+        // A bare 3-atom trajectory -- just positions, matching water's
+        // atom count -- to become real DCD bytes via the format's own
+        // writer, exactly what `chem convert` would produce.
+        struct OneFrame(Frame);
+        impl FrameSource for OneFrame {
+            fn frame_count(&self) -> usize {
+                1
+            }
+            fn num_atoms(&self) -> usize {
+                self.0.num_atoms()
+            }
+            fn frame(&mut self, _index: usize) -> std::io::Result<Frame> {
+                Ok(self.0.clone())
+            }
+        }
+        let mut bare_topology = Molecule::new();
+        for _ in 0..3 {
+            bare_topology.add_atom(Atom::new(Element::carbon()));
+        }
+        let frame = Frame {
+            positions: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            velocities: None,
+            forces: None,
+            time: None,
+            step: None,
+            cell: None,
+        };
+        let mut source_trajectory =
+            Trajectory::new(bare_topology, Box::new(OneFrame(frame))).expect("valid trajectory");
+        let dcd_bytes = Format::DCD
+            .write_trajectory_bytes(&mut source_trajectory)
+            .expect("DCD can write");
+
+        let dcd_source = DcdFrameSource::open(dcd_bytes).expect("valid DCD bytes");
+        let mut combined = Trajectory::new(psf_topology, Box::new(dcd_source))
+            .expect("PSF and DCD agree on atom count");
+
+        let combined_mask = held_from_trajectory(&mut combined).expect("frame 0 is readable");
+        // What DCD alone can never state -- PSF's real topology facts.
+        assert!(combined_mask.contains(Carries::RESIDUES));
+        assert!(combined_mask.contains(Carries::ATOM_TYPE));
+        assert!(combined_mask.contains(Carries::MASS));
+        // What PSF alone can never state -- real coordinates from a trajectory.
+        assert!(combined_mask.contains(Carries::COORDS_3D));
     }
 }
