@@ -1046,6 +1046,55 @@ def check_trajectory(oracles: list[Oracle], verbose: bool) -> Report:
                 report.ok()
                 if verbose:
                     print(f"    ok         {fmt:<10} {len(back.positions)} frames")
+
+        # The named traps a fixture has to be committed, not generated, to
+        # pin (#341): a big-endian DCD with a unit cell, and a LAMMPS dump
+        # combining a triclinic box with scaled coordinates. MDAnalysis can
+        # *read* both (its DCD reader auto-detects endianness; its
+        # DumpReader is read-only regardless of format) even though it
+        # cannot *author* either -- so unlike the generated fixtures above,
+        # these compare MDAnalysis's own read of the original committed
+        # file against MDAnalysis's read of chem's round-trip, the same
+        # "oracle reads both sides" shape `check_mmcif` already uses,
+        # rather than a Python-side hardcoded expectation duplicating what
+        # the fixture's own generator script already states.
+        for fmt, corpus_dir in (("dcd", CORPUS / "dcd"), ("lammpstrj", CORPUS / "lammpstrj")):
+            for path in sorted(corpus_dir.glob(f"*.{fmt}")):
+                reference = mda_oracle.read_frames(path, fmt)
+                if reference is None:
+                    report.mismatch(f"{path.name}: MDAnalysis itself could not read this fixture")
+                    continue
+
+                written = tmp / f"corpus_written_{path.stem}.{fmt}"
+                if not chem.convert_file(path, fmt, fmt, written):
+                    report.mismatch(f"{path.name}: chem could not round-trip this fixture")
+                    continue
+
+                ours = mda_oracle.read_frames(written, fmt)
+                if ours is None:
+                    report.mismatch(f"{path.name}: MDAnalysis cannot read what chem wrote back")
+                    continue
+
+                tol = frame_tolerance(fmt)
+                if len(ours.positions) != len(reference.positions):
+                    report.mismatch(
+                        f"{path.name}: {len(reference.positions)} frames in, "
+                        f"{len(ours.positions)} out of chem's round trip"
+                    )
+                elif not all(
+                    positions_match(expected, got, tol)
+                    for expected, got in zip(reference.positions, ours.positions)
+                ):
+                    report.mismatch(f"{path.name}: chem's round trip moved positions by more than {tol} Angstrom")
+                elif not boxes_match(reference.box, ours.box, tol):
+                    report.mismatch(
+                        f"{path.name}: box disagrees after chem's round trip — "
+                        f"{reference.box} vs {ours.box}"
+                    )
+                else:
+                    report.ok()
+                    if verbose:
+                        print(f"    ok         {path.name:<30} {len(ours.positions)} frames")
     return report
 
 
@@ -1136,21 +1185,54 @@ def check_ccp4(oracles: list[Oracle], verbose: bool) -> Report:
             return report
 
         ours = gemmi_oracle.summarize_ccp4(written)
-        if ours is None:
-            report.mismatch("ccp4: gemmi cannot read what chem wrote back")
-        elif ours.dims != reference.dims:
-            report.mismatch(f"ccp4: dims disagree — {reference.dims} vs {ours.dims}")
-        elif not boxes_match(reference.cell, ours.cell, CCP4_TOLERANCE):
-            report.mismatch(f"ccp4: cell disagrees — {reference.cell} vs {ours.cell}")
-        elif not all(
-            abs(a - b) <= CCP4_TOLERANCE for a, b in zip(reference.values, ours.values)
-        ):
-            report.mismatch("ccp4: density values disagree beyond float32 tolerance")
+        problem = _ccp4_disagreement(reference, ours)
+        if problem is not None:
+            report.mismatch(f"ccp4: {problem}")
         else:
             report.ok()
             if verbose:
                 print(f"    ok         ccp4       dims={ours.dims}")
+
+        # The named trap a fixture has to be committed, not generated, to
+        # pin (#341): a permuted MAPC/MAPR/MAPS with a non-cubic cell.
+        # Same "gemmi reads both sides of chem's round trip" shape as
+        # above, just against a permanent file instead of one this run
+        # authored and will discard.
+        for path in sorted((CORPUS / "ccp4").glob("*.ccp4")):
+            reference = gemmi_oracle.summarize_ccp4(path)
+            if reference is None:
+                report.mismatch(f"{path.name}: gemmi itself could not read this fixture")
+                continue
+
+            written = tmp / f"corpus_written_{path.stem}.ccp4"
+            if not chem.convert_file(path, "ccp4", "ccp4", written):
+                report.mismatch(f"{path.name}: chem could not round-trip this fixture")
+                continue
+
+            ours = gemmi_oracle.summarize_ccp4(written)
+            problem = _ccp4_disagreement(reference, ours)
+            if problem is not None:
+                report.mismatch(f"{path.name}: {problem}")
+            else:
+                report.ok()
+                if verbose:
+                    print(f"    ok         {path.name:<30} dims={ours.dims}")
     return report
+
+
+def _ccp4_disagreement(reference, ours) -> Optional[str]:
+    """The comparison `check_ccp4` runs on both its generated and its
+    committed fixture, factored out so the two don't drift apart.
+    """
+    if ours is None:
+        return "gemmi cannot read what chem wrote back"
+    if ours.dims != reference.dims:
+        return f"dims disagree — {reference.dims} vs {ours.dims}"
+    if not boxes_match(reference.cell, ours.cell, CCP4_TOLERANCE):
+        return f"cell disagrees — {reference.cell} vs {ours.cell}"
+    if not all(abs(a - b) <= CCP4_TOLERANCE for a, b in zip(reference.values, ours.values)):
+        return "density values disagree beyond float32 tolerance"
+    return None
 
 
 MESH_TOLERANCE = 1e-3
@@ -1188,25 +1270,54 @@ def check_mesh(oracles: list[Oracle], verbose: bool) -> Report:
                 continue
 
             ours = mesh_oracle.summarize(written)
-            if ours is None:
-                report.mismatch(f"{fmt}: trimesh cannot read what chem wrote")
-            elif ours.vertex_count != reference.vertex_count:
-                report.mismatch(
-                    f"{fmt}: {reference.vertex_count} vertices in, {ours.vertex_count} out"
-                )
-            elif ours.face_count != reference.face_count:
-                report.mismatch(
-                    f"{fmt}: {reference.face_count} faces in, {ours.face_count} out"
-                )
-            elif abs(ours.volume - reference.volume) > MESH_TOLERANCE:
-                report.mismatch(
-                    f"{fmt}: volume disagrees — {reference.volume} vs {ours.volume}"
-                )
+            problem = _mesh_disagreement(reference, ours)
+            if problem is not None:
+                report.mismatch(f"{fmt}: {problem}")
             else:
                 report.ok()
                 if verbose:
                     print(f"    ok         {fmt:<10} {ours.vertex_count}v {ours.face_count}f")
+
+        # The named trap a fixture has to be committed, not generated, to
+        # pin (#341): PLY's `binary_big_endian` encoding, the one trimesh
+        # cannot itself write (confirmed by survey) -- read only, both
+        # sides, the same "oracle reads both sides of chem's round trip"
+        # shape the trajectory/CCP4 corpus checks above use.
+        for path in sorted((CORPUS / "ply").glob("*.ply")):
+            reference = mesh_oracle.summarize(path)
+            if reference is None:
+                report.mismatch(f"{path.name}: trimesh itself could not read this fixture")
+                continue
+
+            written = tmp / f"corpus_written_{path.stem}.ply"
+            if not chem.convert_file(path, "ply", "ply", written):
+                report.mismatch(f"{path.name}: chem could not round-trip this fixture")
+                continue
+
+            ours = mesh_oracle.summarize(written)
+            problem = _mesh_disagreement(reference, ours)
+            if problem is not None:
+                report.mismatch(f"{path.name}: {problem}")
+            else:
+                report.ok()
+                if verbose:
+                    print(f"    ok         {path.name:<30} {ours.vertex_count}v {ours.face_count}f")
     return report
+
+
+def _mesh_disagreement(reference, ours) -> Optional[str]:
+    """The comparison `check_mesh` runs on both its generated and its
+    committed fixture, factored out so the two don't drift apart.
+    """
+    if ours is None:
+        return "trimesh cannot read what chem wrote"
+    if ours.vertex_count != reference.vertex_count:
+        return f"{reference.vertex_count} vertices in, {ours.vertex_count} out"
+    if ours.face_count != reference.face_count:
+        return f"{reference.face_count} faces in, {ours.face_count} out"
+    if abs(ours.volume - reference.volume) > MESH_TOLERANCE:
+        return f"volume disagrees — {reference.volume} vs {ours.volume}"
+    return None
 
 
 CHECKS = {

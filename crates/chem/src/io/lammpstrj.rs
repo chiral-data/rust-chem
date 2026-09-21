@@ -663,6 +663,41 @@ ITEM: ATOMS id type xs ys zs
     }
 
     #[test]
+    fn test_scaled_coordinates_in_a_triclinic_box_use_its_own_edge_vectors() {
+        // A committed fixture and its generator (#341), combining what
+        // `test_a_triclinic_box_matches_independently_verified_values`
+        // and `test_scaled_coordinates_convert_using_the_box` each hand-
+        // verify in isolation: a scaled coordinate's conversion genuinely
+        // depends on the box being triclinic, not just orthogonal --
+        // `real = origin + xs*a + ys*b + zs*c` over the triclinic edge
+        // vectors, not `real = origin + frac * (hi - lo)`. Same triclinic
+        // box both source tests already pin (lx=ly=lz=10, xy=2, xz=1,
+        // yz=0.5) and the same fractional position (0.5, 0.25, 0.1) the
+        // orthogonal-box test used; hand-derived here to
+        // `(5.6, 2.55, 1.0)` and cross-checked against MDAnalysis's
+        // `DumpReader` during this story's research. See
+        // `tests/corpus/lammpstrj/generate_triclinic_scaled.py`.
+        let text = include_str!("../../tests/corpus/lammpstrj/triclinic_scaled.lammpstrj");
+        let mut trajectory = as_trajectory(read_lammpstrj(text, &ReadOptions::default()));
+        let f0 = trajectory.frame(0).unwrap();
+        assert!(
+            (f0.positions[0].x - 5.6).abs() < 1e-6,
+            "{}",
+            f0.positions[0].x
+        );
+        assert!(
+            (f0.positions[0].y - 2.55).abs() < 1e-6,
+            "{}",
+            f0.positions[0].y
+        );
+        assert!(
+            (f0.positions[0].z - 1.0).abs() < 1e-6,
+            "{}",
+            f0.positions[0].z
+        );
+    }
+
+    #[test]
     fn test_unwrapped_coordinates_pass_through_directly() {
         let text = "\
 ITEM: TIMESTEP

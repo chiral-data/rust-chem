@@ -55,6 +55,43 @@ molecule against several and pass for the wrong reason.
 | `lammps/ambiguous_style.data` | A 6-column `Atoms` section with no style comment -- ambiguous between `charge` and `molecular`/`bond`/`angle` -- proving `AmbiguousAtomStyle` fires by default and `LammpsReadOptions::atom_style` is the escape hatch |
 | `lammps/coarse_grained.data` | A `Masses` entry stating `1.0`, a reduced-unit bead mass matching no real element -- proving this reads as `Element::UNKNOWN`, not a failure or a guess |
 | `lammps/triclinic.data` | A genuinely non-orthogonal box (`xy xz yz` all nonzero) -- pins the closed-form box-to-`UnitCell` conversion's shape, which a sign or swapped cosine would still "succeed" while getting wrong |
+| `dcd/big_endian_with_cell.dcd` | Big-endian and a unit cell at once (#341), the byte-swap path and the cell heuristic exercised together. Generated -- see "Fixtures we generate" below |
+| `ccp4/permuted_axes.ccp4` | A permuted `MAPC`/`MAPR`/`MAPS` order with a non-cubic cell (#341) -- proves the axis relabelling is honoured independently of file storage order. Generated |
+| `ply/binary_big_endian.ply` | The one PLY encoding this crate never writes (#341); `ascii`/`binary_little_endian` need no fixture at all, since round-tripping through this crate's own writer already covers them. Generated |
+| `lammpstrj/triclinic_scaled.lammpstrj` | Scaled coordinates *in* a triclinic box (#341) -- the conversion genuinely depends on the box's own edge vectors, not just its bounding lengths, unlike an orthogonal box |
+
+Two traps named alongside these four turned out to already be pinned:
+`prmtop/water.prmtop`'s stated charge already exercises the 18.2223 Amber
+scaling factor (#322, above), and `sdf/ethanol.mol` already has zero `$$$$`
+occurrences (#318, above). Neither needed new work for #341.
+
+## Fixtures we generate
+
+A fixture is easy to hand-author for a `.smi` line and hard for a
+big-endian DCD or a CCP4 map with permuted axes — nobody hand-types those
+bytes. The resolution that keeps this corpus's own "ours by construction"
+rule (above) without asking anyone to: a **script committed beside the
+fixture it produces** (`generate_*.py` next to the file it writes). The
+bytes are still ours, and reading the script is how you explain them,
+rather than either vendoring someone else's file or hand-transcribing a
+byte array into a test.
+
+Generators may use the same toolkits `tools/oracle/`'s Docker image
+already pins (MDAnalysis, gemmi, trimesh; `plyfile` is one exception, a
+second, generator-only pin — see `ply/generate_binary_big_endian.py` for
+why) — none of that makes a toolkit a dependency of `chem` itself, the
+same posture the oracle harness already takes. Where a needed capability
+doesn't exist in any pinned tool (no tool here can *write* a big-endian
+DCD, confirmed by survey), the generator hand-assembles the bytes
+directly instead, the same way a Rust test's own in-process builder would
+have — just committed, not thrown away after one run.
+
+There is no automated check that re-runs a generator and diffs its output
+against the committed file on every push; that would be real, but is a
+different, heavier story than this one. The discipline instead mirrors
+`--promote`'s own: if you touch a generator, re-run it, diff the result
+against what's committed, and commit both together, reviewed like any
+other change.
 
 ## Pinned gaps
 

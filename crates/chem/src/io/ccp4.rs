@@ -609,11 +609,19 @@ mod tests {
 
     #[test]
     fn test_a_permuted_axis_non_cubic_cell_matches_independently_computed_values() {
-        // Hand-derived, independent of this module's own code: MAPC=3
-        // (columns represent crystallographic c), MAPR=1 (rows -> a),
-        // MAPS=2 (sections -> b); NX=2,NY=1,NZ=3; cell (10,20,30,
+        // MAPC=3 (columns represent crystallographic c), MAPR=1 (rows ->
+        // a), MAPS=2 (sections -> b); NX=2,NY=1,NZ=3; cell (10,20,30,
         // orthogonal). File values, columns-fastest: 1,2,3,4,5,6 at
-        // (col,sec) = (0,0),(1,0),(0,1),(1,1),(0,2),(1,2).
+        // (col,sec) = (0,0),(1,0),(0,1),(1,1),(0,2),(1,2). A committed
+        // fixture and its generator (#341) rather than this module's own
+        // `orthogonal_header`/`append_f32_values` helpers -- gemmi (#340)
+        // genuinely writes a permuted MAPC/MAPR/MAPS (confirmed by
+        // survey: `Ccp4Map.set_header_i32` after `update_ccp4_header()`
+        // only relabels which already-fixed file dimension means which
+        // crystallographic axis, it never touches the value bytes), so
+        // this is authored by an independent tool rather than this
+        // module's own byte-assembly code. See
+        // `tests/corpus/ccp4/generate_permuted_axes.py`.
         //
         // Working through `VolumeGrid::from_source_order`'s own documented
         // index algebra by hand gives canonical dims [1,3,2] (X from rows,
@@ -621,10 +629,9 @@ mod tests {
         // grid.value(0,iy,iz) = [[1,3,5],[2,4,6]][iz][iy] -- i.e.
         // value(0,0,0)=1, value(0,1,0)=3, value(0,2,0)=5,
         // value(0,0,1)=2, value(0,1,1)=4, value(0,2,1)=6.
-        let mut bytes = orthogonal_header(2, 1, 3, 2, 3, 1, 2);
-        append_f32_values(&mut bytes, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], false);
+        let bytes: &[u8] = include_bytes!("../../tests/corpus/ccp4/permuted_axes.ccp4");
 
-        let grid = parse_ccp4(&bytes).expect("valid CCP4");
+        let grid = parse_ccp4(bytes).expect("valid CCP4");
         assert_eq!(grid.dims(), [1, 3, 2]);
         assert_eq!(grid.value(0, 0, 0), 1.0);
         assert_eq!(grid.value(0, 1, 0), 3.0);
