@@ -176,6 +176,38 @@ def read_commonchem(text: str) -> str | None:
     return result.stdout.split()[0]
 
 
+def convert_file(
+    input_path: Path, from_format: str, to_format: str, output_path: Path
+) -> bool:
+    """Runs `chem convert <input> --from <from> --to <to> -o <output>` on
+    real files, returning whether it succeeded.
+
+    Every other helper here pipes SMILES-shaped text through stdin/stdout
+    in text mode (`run`, above) -- wrong for the `Kind::Frames`/`Volume`/
+    `Mesh` formats #340 adds (XTC, TRR, DCD, NCTRAJ, CCP4, OBJ, PLY),
+    which are bytes, not text. Real paths in and out sidestep the whole
+    binary-vs-text subprocess question, and match how `chem convert`
+    already expects to read these kinds anyway (#338: always a whole
+    file, never a stream).
+    """
+    result = subprocess.run(
+        [
+            str(binary()),
+            "convert",
+            str(input_path),
+            "--from",
+            from_format,
+            "--to",
+            to_format,
+            "-o",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and output_path.exists()
+
+
 def fingerprint(smiles: str, radius: int, nbits: int) -> list[int] | None:
     """The set bits of a Morgan fingerprint.
 

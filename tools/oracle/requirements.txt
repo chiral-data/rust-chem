@@ -10,3 +10,11 @@ gemmi==0.7.5
 # runtime import: `import meeko` fails without it.
 meeko==0.8.0
 scipy==1.17.1
+# The trajectory oracle for XTC/TRR/DCD/NCTRAJ/LAMMPS-trajectory (#340).
+# scipy (above) is its hard NCDF dependency -- it tries netCDF4 for faster
+# writing and falls back to scipy.io.netcdf when that's absent, which is
+# fine for the small fixtures this harness writes.
+MDAnalysis==2.10.0
+# The geometry oracle for OBJ/PLY (#340). Pure Python + numpy, no system
+# libraries, chosen over meshio for its built-in volume/area primitives.
+trimesh==5.1.0
