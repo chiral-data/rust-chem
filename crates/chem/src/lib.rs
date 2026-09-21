@@ -1,35 +1,4 @@
-//! Cheminformatics in Rust: molecules, SMILES and SDF, fingerprints, similarity
-//! search, and 2D depiction.
-//!
-//! ```no_run
-//! use chem::io::smiles::parse_smiles;
-//! use chem::fp::morgan::MorganFingerprint;
-//!
-//! let mol = parse_smiles("c1ccccc1O")?;
-//! let fp = MorganFingerprint::get_fingerprint_as_bitvec(
-//!     &mol, 2, 2048, None, None, false, true, false,
-//! )?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! # Examples
-//!
-//! Six runnable examples ship with the crate, one idea each — building a
-//! molecule by hand, reading and converting a file, ranking by similarity,
-//! SMILES to SVG, and two for the GPU. `cargo run --example build_a_molecule`.
-//!
-//! # Features
-//!
-//! | feature | brings in |
-//! | --- | --- |
-//! | *(default)* | [`core`], [`io`], [`fp`], [`draw`], [`search`] — all CPU, no heavy dependencies |
-//! | `gpu` | [`gpu`], plus the GPU paths inside [`search`]. Pulls `wgpu`. |
-//! | `cli` | the `chem` binary. Implies `gpu`. |
-//!
-//! `gpu` is off by default because `wgpu` is a large tree and irrelevant to
-//! anyone parsing SMILES or fingerprinting on a CPU. Without it, `search` still
-//! offers its whole API — it simply never finds a device, and says so through
-//! [`search::FingerprintSearch::gpu_init_error`].
+#![doc = include_str!("../README.md")]
 //!
 //! # A note for contributors
 //!
