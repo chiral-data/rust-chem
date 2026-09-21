@@ -706,20 +706,46 @@ impl AppState {
     }
 
     pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) -> FileLoad {
-        let content = match String::from_utf8(bytes) {
-            Ok(content) => content,
-            Err(e) => {
-                self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
-                log::error!("Dataset load failed: {}", e);
-                return FileLoad::Refused {
-                    name,
-                    reason: "not valid UTF-8",
-                };
-            }
-        };
-
         let format = DatasetFormat::from_filename(&name);
-        let outcome = chem::io::reader::read(&content, format);
+
+        // #380, found by testing #342: a binary format's bytes were never
+        // meant to be decoded as UTF-8 at all -- this used to run
+        // unconditionally, before any format-aware dispatch, so it had never
+        // actually worked for any of XTC/TRR/DCD/NCTRAJ/CCP4/DSN6/DX/
+        // BinaryCIF. `Format::read_bytes` (#309) is the entry point every
+        // format is meant to go through: a binary format's own `reader_bytes`
+        // runs directly on the raw bytes, and a text format is UTF-8-decoded
+        // *internally*, where invalid UTF-8 already becomes a per-record
+        // `Skipped` entry rather than refusing the whole file.
+        let outcome = if format.encoding() == chem::io::format::Encoding::Binary {
+            match format.read_bytes(&bytes) {
+                Some(outcome) => outcome,
+                None => {
+                    self.dataset_status = format!("Failed to load '{name}': could not be read");
+                    log::error!(
+                        "Dataset load failed: {} declined its own bytes",
+                        format.label()
+                    );
+                    return FileLoad::Refused {
+                        name,
+                        reason: "could not be read",
+                    };
+                }
+            }
+        } else {
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(e) => {
+                    self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
+                    log::error!("Dataset load failed: {}", e);
+                    return FileLoad::Refused {
+                        name,
+                        reason: "not valid UTF-8",
+                    };
+                }
+            };
+            chem::io::reader::read(&content, format)
+        };
 
         // Records that failed used to be logged and never surfaced, so a file
         // that half-loaded looked like a file that fully loaded. Reading now
@@ -2143,6 +2169,57 @@ END
             state.dataset_status
         );
     }
+
+    #[test]
+    fn test_a_binary_trajectory_loads_instead_of_failing_as_invalid_utf8() {
+        // #380, found by testing #342: `apply_loaded_file_bytes` used to
+        // UTF-8-decode every loaded file before any format-aware dispatch,
+        // which meant it had never actually worked for a binary-encoded
+        // format at all. A real, already-committed fixture (#341) rather
+        // than hand-built bytes, since its correctness is already pinned
+        // elsewhere -- this test is only about whether it reaches the app.
+        let dcd: &[u8] = include_bytes!("../../chem/tests/corpus/dcd/big_endian_with_cell.dcd");
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("traj.dcd".to_string(), dcd.to_vec());
+
+        assert!(
+            !state.dataset_status.contains("not valid UTF-8"),
+            "{}",
+            state.dataset_status
+        );
+        assert!(
+            state.dataset_status.contains("trajectory"),
+            "{}",
+            state.dataset_status
+        );
+        let dataset = state.loaded_files.active_dataset();
+        assert!(dataset.non_molecule.is_some());
+    }
+
+    #[test]
+    fn test_a_binary_volume_loads_instead_of_failing_as_invalid_utf8() {
+        // #380, same bug as the trajectory case above, a different binary
+        // format (`Kind::Volume`) and encoding path (`reader_bytes` rather
+        // than a `Trajectory`-shaped one) to confirm the fix isn't specific
+        // to DCD.
+        let ccp4: &[u8] = include_bytes!("../../chem/tests/corpus/ccp4/permuted_axes.ccp4");
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("density.ccp4".to_string(), ccp4.to_vec());
+
+        assert!(
+            !state.dataset_status.contains("not valid UTF-8"),
+            "{}",
+            state.dataset_status
+        );
+        assert!(
+            state.dataset_status.contains("grid"),
+            "{}",
+            state.dataset_status
+        );
+        let dataset = state.loaded_files.active_dataset();
+        assert!(dataset.non_molecule.is_some());
+    }
+
     /// Two atoms and a CONECT, so it is a real PDB rather than something the
     /// reader would reject for having no atoms (#292).
     const WATER_PDB: &str = "\
