@@ -1,4 +1,12 @@
-"""gemmi as a structural oracle for mmCIF/PDB (#224).
+"""gemmi as a structural oracle for mmCIF, PDB, CIF-core (#320) and, as of
+#340, CCP4/MRC (#224 for the pattern).
+
+BinaryCIF was surveyed for #340 and stays out of scope: the pinned (and
+latest installable) `gemmi==0.7.5` raises on both `gemmi.cif.read` and
+`gemmi.read_structure` for the already-committed `bcif/*.bcif` fixtures
+(#319) -- confirmed directly, not assumed from the version number alone.
+The gap `crates/chem/tests/corpus/README.md` already discloses for
+BinaryCIF stands; nothing here reads it.
 
 Unlike RDKit/OpenBabel (see `oracles/__init__.py`), gemmi does not answer a
 SMILES-shaped question — there is no bare-SMILES `parses`/`identity` here, so
@@ -32,6 +40,8 @@ structure stores there.
 """
 
 from typing import Callable, NamedTuple, Optional
+
+import numpy as _np
 
 import gemmi as _gemmi
 
@@ -231,6 +241,57 @@ Si1 Si 0.4697 0.0000 0.3333 1.0
 """
 
 
+class VolumeSummary(NamedTuple):
+    """The structural facts [`check_ccp4`] compares against `chem`'s own
+    read of a CCP4/MRC map (#340) -- grid dimensions and cell exactly,
+    density values within a small `float32` tolerance, since that is the
+    map's own storage precision and not a claim either reader makes about
+    exactness.
+    """
+
+    dims: tuple[int, int, int]
+    cell: tuple[float, float, float, float, float, float]
+    values: tuple[float, ...]
+
+
+def summarize_ccp4(path) -> Optional[VolumeSummary]:
+    """Reads a CCP4/MRC map and summarises what gemmi saw, or `None` if
+    gemmi could not read it. A different entry point again
+    (`gemmi.read_ccp4_map`, not `read_structure_string`/
+    `make_small_structure_from_block`) -- CCP4 is a grid, not atoms, so
+    there is no structure to build here at all.
+    """
+    try:
+        m = _gemmi.read_ccp4_map(str(path))
+        m.setup(0.0)
+    except Exception:
+        return None
+    grid = m.grid
+    if grid.nu * grid.nv * grid.nw == 0:
+        return None
+    cell = grid.unit_cell
+    values = tuple(round(float(v), 4) for v in _np.asarray(grid.array).flatten())
+    return VolumeSummary(
+        (grid.nu, grid.nv, grid.nw),
+        (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma),
+        values,
+    )
+
+
+#: A tiny (2x2x2) but complete map -- non-cubic cell, non-constant values,
+#: so the sanity check cannot pass by accident the way an all-zero grid
+#: could.
+def write_ccp4_fixture(path) -> None:
+    grid = _gemmi.FloatGrid(2, 2, 2)
+    grid.set_unit_cell(_gemmi.UnitCell(4, 5, 6, 90, 90, 90))
+    grid.spacegroup = _gemmi.SpaceGroup("P1")
+    grid.array[:] = _np.arange(8, dtype=_np.float32).reshape(2, 2, 2)
+    m = _gemmi.Ccp4Map()
+    m.grid = grid
+    m.update_ccp4_header()
+    m.write_ccp4_map(str(path))
+
+
 def load_gemmi() -> Callable[..., Optional[Summary]]:
     """Confirms gemmi can read something, the same way `oracles.load()`
     confirms RDKit/OpenBabel can before trusting either. Returns
@@ -266,4 +327,19 @@ def load_gemmi() -> Callable[..., Optional[Summary]]:
             "is broken rather than strict — refusing to report its answers "
             "as findings"
         )
+    # The CCP4 path (#340) is a third gemmi entry point (`read_ccp4_map`) --
+    # gated the same way, over a real temp file since `read_ccp4_map` (unlike
+    # `read_structure_string`) has no in-memory-text overload.
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    with _tempfile.TemporaryDirectory() as _tmp:
+        _path = _Path(_tmp) / "sanity.ccp4"
+        write_ccp4_fixture(_path)
+        if summarize_ccp4(_path) is None:
+            raise RuntimeError(
+                "gemmi cannot read a trivial CCP4 map it just wrote itself, "
+                "so it is broken rather than strict — refusing to report "
+                "its answers as findings"
+            )
     return summarize

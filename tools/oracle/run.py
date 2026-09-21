@@ -27,6 +27,7 @@ produces a permanently red suite that tells you nothing.
 
 import argparse
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -892,6 +893,322 @@ def check_pdbqt(oracles: list[Oracle], verbose: bool) -> Report:
     return report
 
 
+def frame_tolerance(fmt: str) -> float:
+    """Mirrors `crates/chem/src/io/format.rs`'s own `frame_tolerance`
+    (#339) exactly, so the Rust and Python sides of "is this trajectory
+    close enough" never quietly diverge: `0.01` Angstrom for XTC's real
+    quantization step, `1e-3` elsewhere for `f32` rounding noise.
+    """
+    return 0.01 if fmt == "xtc" else 1e-3
+
+
+def positions_match(
+    a: tuple[tuple[float, float, float], ...],
+    b: tuple[tuple[float, float, float], ...],
+    tol: float,
+) -> bool:
+    """The Python counterpart of `format.rs`'s `positions_match` (#339):
+    per-axis absolute difference, not a vector norm, for the same reason
+    the Rust version chose it -- simpler to reason about at a boundary.
+    """
+    if len(a) != len(b):
+        return False
+    return all(
+        abs(x[0] - y[0]) <= tol and abs(x[1] - y[1]) <= tol and abs(x[2] - y[2]) <= tol
+        for x, y in zip(a, b)
+    )
+
+
+def boxes_match(
+    a: Optional[tuple[float, ...]], b: Optional[tuple[float, ...]], tol: float
+) -> bool:
+    """Cell lengths at `tol`, angles at a fixed, generous 0.1 degree --
+    angles are not subject to a format's own coordinate quantization the
+    way lengths are, so they get one tolerance regardless of `fmt`.
+    """
+    if a is None or b is None:
+        return a is b
+    lengths_ok = all(abs(a[i] - b[i]) <= tol for i in range(3))
+    angles_ok = all(abs(a[i] - b[i]) <= 0.1 for i in range(3, 6))
+    return lengths_ok and angles_ok
+
+
+#: One canonical (positions, box) pair every trajectory-format fixture in
+#: this section is authored from or graded against -- ten atoms, not two:
+#: `io::xtc`'s own coordinate block stores `size <= 9` atoms as raw,
+#: lossless floats (see its module doc) and only compresses above that
+#: threshold, so a two-atom fixture would never exercise XTC's real lossy
+#: path at all (the exact gap #339 found and fixed for the Rust-side
+#: fixture, reused here for the same reason). Positions are not
+#: grid-aligned (`i * 1.0033`, not `i * 1.0`) for the same reason: a round
+#: number sits exactly on XTC's 0.001nm quantization step and would never
+#: exercise real rounding error either.
+FIXTURE_POSITIONS = (
+    tuple((i * 1.0033, 0.0, 0.0) for i in range(10)),
+    tuple((i * 1.0033 + 0.5017, 0.0, 0.0) for i in range(10)),
+)
+FIXTURE_BOX = (20.0, 20.0, 20.0, 90.0, 90.0, 90.0)
+
+
+def _render_lammpstrj(
+    positions_per_frame: tuple[tuple[tuple[float, float, float], ...], ...],
+    box: tuple[float, float, float, float, float, float],
+) -> str:
+    """Builds a minimal LAMMPS dump text fixture from the same canonical
+    (positions, box) every other trajectory format's fixture is authored
+    from (#340). Generated, not hand-typed, so twenty numeric lines can
+    never silently drift from the tuple every comparison here is graded
+    against -- MDAnalysis has no LAMMPS-dump *writer* (confirmed by
+    survey: `DumpReader` exists, `DumpWriter` does not), so this is the
+    one trajectory format here `chem`, not an external tool, originates.
+    """
+    lines = []
+    for step, positions in enumerate(positions_per_frame):
+        lines += [
+            "ITEM: TIMESTEP",
+            str(step),
+            "ITEM: NUMBER OF ATOMS",
+            str(len(positions)),
+            "ITEM: BOX BOUNDS pp pp pp",
+            f"0.0 {box[0]}",
+            f"0.0 {box[1]}",
+            f"0.0 {box[2]}",
+            "ITEM: ATOMS id type x y z",
+        ]
+        lines += [
+            f"{i + 1} 1 {x:.6f} {y:.6f} {z:.6f}" for i, (x, y, z) in enumerate(positions)
+        ]
+    return "\n".join(lines) + "\n"
+
+
+LAMMPSTRJ_FIXTURE = _render_lammpstrj(FIXTURE_POSITIONS, FIXTURE_BOX)
+
+TRAJECTORY_FORMATS = ("xtc", "trr", "dcd", "nctraj", "lammpstrj")
+
+
+def check_trajectory(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does chem's `Kind::Frames` round trip agree with MDAnalysis, within
+    each format's own real precision (#340)?
+
+    Ignores `oracles` entirely (kept only so it fits `main()`'s generic
+    dispatch), the same posture `check_mmcif`/`check_cif_core` already
+    take for a structurally different oracle. Comparison is a numeric
+    positions/box check with tolerance, not identity -- the first check
+    in this harness that isn't, mirroring `format.rs`'s own
+    `frame_tolerance`/`positions_match` (#339).
+
+    Shape, for every format: an original fixture with known positions and
+    box (MDAnalysis-authored for xtc/trr/dcd/nctraj -- it can write all
+    four; a generated text literal for lammpstrj, since MDAnalysis's
+    `DumpReader` has no writer counterpart) is round-tripped through
+    `chem convert <fmt> --to <fmt>`, then MDAnalysis reads `chem`'s output
+    back and the result is compared to the original known values -- the
+    same "oracle authors, chem round-trips, oracle re-reads and compares"
+    shape `check_ccp4`/`check_mesh` use.
+    """
+    from oracles import mdanalysis as mda_oracle
+
+    mda_oracle.load_mdanalysis()
+    report = Report()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for fmt in TRAJECTORY_FORMATS:
+            source = tmp / f"source.{fmt}"
+            if fmt == "lammpstrj":
+                source.write_text(LAMMPSTRJ_FIXTURE)
+            else:
+                mda_oracle.write_fixture(source, fmt, FIXTURE_POSITIONS, FIXTURE_BOX)
+
+            written = tmp / f"written.{fmt}"
+            if not chem.convert_file(source, fmt, fmt, written):
+                report.mismatch(f"{fmt}: chem could not round-trip its own format")
+                continue
+
+            back = mda_oracle.read_frames(written, fmt)
+            if back is None:
+                report.mismatch(f"{fmt}: MDAnalysis could not read what chem wrote back")
+                continue
+
+            tol = frame_tolerance(fmt)
+            if len(back.positions) != len(FIXTURE_POSITIONS):
+                report.mismatch(
+                    f"{fmt}: {len(FIXTURE_POSITIONS)} frames in, {len(back.positions)} out"
+                )
+            elif not all(
+                positions_match(expected, got, tol)
+                for expected, got in zip(FIXTURE_POSITIONS, back.positions)
+            ):
+                report.mismatch(f"{fmt}: positions moved by more than {tol} Angstrom")
+            elif not boxes_match(FIXTURE_BOX, back.box, tol):
+                report.mismatch(f"{fmt}: box disagrees — {FIXTURE_BOX} vs {back.box}")
+            else:
+                report.ok()
+                if verbose:
+                    print(f"    ok         {fmt:<10} {len(back.positions)} frames")
+    return report
+
+
+def check_nctraj_reference(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does Amber's own tool accept what `chem` writes as NCTRAJ, and read
+    back the same coordinates (#340)?
+
+    A different question than `check_trajectory` asks of NCTRAJ, which is
+    why it is a separate check rather than a sixth branch there: this one
+    is validity, not agreement with a second implementation. cpptraj is
+    "the definition of whether a file is a valid Amber trajectory," the
+    same status RDKit had for commonchem in #229 -- so the interesting
+    failure here is cpptraj refusing the file outright, not a numeric
+    disagreement.
+    """
+    from oracles import cpptraj as cpptraj_oracle
+
+    cpptraj_oracle.load_cpptraj()
+    report = Report()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        source = tmp / "source.lammpstrj"
+        source.write_text(LAMMPSTRJ_FIXTURE)
+        written = tmp / "written.nctraj"
+        if not chem.convert_file(source, "lammpstrj", "nctraj", written):
+            report.mismatch("nctraj: chem could not write NCTRAJ from the fixture")
+            return report
+
+        n_atoms = len(FIXTURE_POSITIONS[0])
+        back = cpptraj_oracle.read_frames(written, n_atoms)
+        if back is None:
+            report.mismatch(
+                "nctraj: cpptraj refused to read what chem wrote — not a valid "
+                "Amber trajectory by Amber's own tool"
+            )
+            return report
+
+        tol = frame_tolerance("nctraj")
+        if len(back.positions) != len(FIXTURE_POSITIONS):
+            report.mismatch(
+                f"nctraj: {len(FIXTURE_POSITIONS)} frames in, {len(back.positions)} "
+                "out of cpptraj"
+            )
+        elif not all(
+            positions_match(expected, got, tol)
+            for expected, got in zip(FIXTURE_POSITIONS, back.positions)
+        ):
+            report.mismatch(f"nctraj: cpptraj's read moved positions by more than {tol} Angstrom")
+        else:
+            report.ok()
+            if verbose:
+                print(f"    ok         nctraj     {len(back.positions)} frames, cpptraj-validated")
+    return report
+
+
+CCP4_TOLERANCE = 1e-3
+
+
+def check_ccp4(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does chem's CCP4/MRC round trip agree with gemmi's independent read
+    (#340)?
+
+    The same shape `check_mmcif` established for gemmi (#224): ignores
+    `oracles` entirely, drives gemmi directly on both sides of a round
+    trip gemmi itself authors. Grid dimensions and cell compared exactly;
+    density values within `CCP4_TOLERANCE`, since the map's own on-disk
+    storage is `float32` and neither reader makes an exactness claim
+    beyond that.
+    """
+    from oracles import gemmi as gemmi_oracle
+
+    gemmi_oracle.load_gemmi()
+    report = Report()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        source = tmp / "source.ccp4"
+        gemmi_oracle.write_ccp4_fixture(source)
+        reference = gemmi_oracle.summarize_ccp4(source)
+        if reference is None:
+            report.mismatch("ccp4: gemmi itself could not read its own fixture")
+            return report
+
+        written = tmp / "written.ccp4"
+        if not chem.convert_file(source, "ccp4", "ccp4", written):
+            report.mismatch("ccp4: chem could not round-trip this file")
+            return report
+
+        ours = gemmi_oracle.summarize_ccp4(written)
+        if ours is None:
+            report.mismatch("ccp4: gemmi cannot read what chem wrote back")
+        elif ours.dims != reference.dims:
+            report.mismatch(f"ccp4: dims disagree — {reference.dims} vs {ours.dims}")
+        elif not boxes_match(reference.cell, ours.cell, CCP4_TOLERANCE):
+            report.mismatch(f"ccp4: cell disagrees — {reference.cell} vs {ours.cell}")
+        elif not all(
+            abs(a - b) <= CCP4_TOLERANCE for a, b in zip(reference.values, ours.values)
+        ):
+            report.mismatch("ccp4: density values disagree beyond float32 tolerance")
+        else:
+            report.ok()
+            if verbose:
+                print(f"    ok         ccp4       dims={ours.dims}")
+    return report
+
+
+MESH_TOLERANCE = 1e-3
+
+
+def check_mesh(oracles: list[Oracle], verbose: bool) -> Report:
+    """Does chem's OBJ/PLY round trip agree with trimesh's independent
+    read (#340)?
+
+    The lowest bar the issue names for these two formats: "geometry
+    either matches or does not." trimesh authors a closed, watertight
+    fixture (a cube) once; chem round-trips it through both OBJ and PLY;
+    trimesh re-reads each and the result is compared to trimesh's own
+    read of the original, the same "oracle authors, chem round-trips,
+    oracle re-reads" shape `check_ccp4` uses.
+    """
+    from oracles import mesh as mesh_oracle
+
+    mesh_oracle.load_trimesh()
+    report = Report()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        source = tmp / "source.obj"
+        mesh_oracle.write_fixture(source)
+        reference = mesh_oracle.summarize(source)
+        if reference is None:
+            report.mismatch("mesh: trimesh itself could not read its own fixture")
+            return report
+
+        for fmt in ("obj", "ply"):
+            written = tmp / f"written.{fmt}"
+            if not chem.convert_file(source, "obj", fmt, written):
+                report.mismatch(f"{fmt}: chem could not write this format")
+                continue
+
+            ours = mesh_oracle.summarize(written)
+            if ours is None:
+                report.mismatch(f"{fmt}: trimesh cannot read what chem wrote")
+            elif ours.vertex_count != reference.vertex_count:
+                report.mismatch(
+                    f"{fmt}: {reference.vertex_count} vertices in, {ours.vertex_count} out"
+                )
+            elif ours.face_count != reference.face_count:
+                report.mismatch(
+                    f"{fmt}: {reference.face_count} faces in, {ours.face_count} out"
+                )
+            elif abs(ours.volume - reference.volume) > MESH_TOLERANCE:
+                report.mismatch(
+                    f"{fmt}: volume disagrees — {reference.volume} vs {ours.volume}"
+                )
+            else:
+                report.ok()
+                if verbose:
+                    print(f"    ok         {fmt:<10} {ours.vertex_count}v {ours.face_count}f")
+    return report
+
+
 CHECKS = {
     "parse": check_parse,
     "write": check_write,
@@ -902,6 +1219,10 @@ CHECKS = {
     "pdb": check_pdb,
     "pdbqt": check_pdbqt,
     "json": check_json,
+    "trajectory": check_trajectory,
+    "nctraj_reference": check_nctraj_reference,
+    "ccp4": check_ccp4,
+    "mesh": check_mesh,
 }
 
 
