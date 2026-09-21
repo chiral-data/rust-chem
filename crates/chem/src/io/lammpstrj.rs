@@ -585,6 +585,41 @@ mod tests {
     }
 
     #[test]
+    fn test_a_degenerate_cell_writes_a_finite_box_not_nan() {
+        // #376: exactly what a DCD reader hands back for MDAnalysis's
+        // zeroed "no periodic box" convention. `Frame::cell` never passes
+        // through `Molecule::set_cell`'s validation, so this reaches the
+        // writer whole.
+        let degenerate = UnitCell::new(0.0, 0.0, 0.0, 90.0, 90.0, 90.0);
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let mut trajectory = trajectory_from(vec![frame(
+            positions,
+            None,
+            None,
+            Some(0),
+            Some(degenerate),
+        )]);
+        let bytes = write_lammpstrj_bytes(&mut trajectory, &WriteOptions::default());
+        let text = std::str::from_utf8(&bytes).expect("valid UTF-8");
+        assert!(
+            !text.to_lowercase().contains("nan"),
+            "wrote a NaN box bound:\n{text}"
+        );
+
+        let outcome = read_lammpstrj(text, &ReadOptions::default());
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let mut back = as_trajectory(outcome);
+        let f0 = back.frame(0).unwrap();
+        for p in &f0.positions {
+            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        }
+    }
+
+    #[test]
     fn test_a_triclinic_box_matches_independently_verified_values() {
         // Hand-computed, and cross-checked against two real readers
         // (MDAnalysis's `DumpReader`, ASE's `read_lammps_dump_text`) during
