@@ -576,11 +576,18 @@ pub fn parse_lammps_data(text: &str, options: &LammpsReadOptions) -> Result<Mole
 /// Shared by [`write_lammps_data`] and [`crate::io::lammpstrj`]'s writer,
 /// which additionally forward-shifts these into the dump format's
 /// bounding-box convention only when triclinic.
+///
+/// A cell that fails [`UnitCell::validate`] -- zero-length edges, most often,
+/// since `Frame::cell` is set per-frame by a trajectory reader and never
+/// passes through [`crate::core::molecule::Molecule::set_cell`]'s own gate --
+/// is treated exactly like no cell at all, for the same reason
+/// [`ensure_nonzero_extent`] exists: the triclinic conversion below divides
+/// by a zero-length edge and would otherwise hand back `NaN` (#376).
 pub(crate) fn lammps_box_bounds(
     cell: Option<&UnitCell>,
     coords: &[Point3],
 ) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
-    match cell {
+    match cell.filter(|c| c.validate().is_ok()) {
         Some(cell) => {
             let (alpha, beta, gamma) = (
                 cell.alpha.to_radians(),
@@ -936,5 +943,42 @@ mod tests {
         let err =
             parse_lammps_data("comment\n\nAtoms\n\n1 1 0.0 0.0 0.0\n", &options()).unwrap_err();
         assert!(matches!(err, LammpsError::ParseError(_)), "{err}");
+    }
+
+    #[test]
+    fn test_a_degenerate_cell_falls_back_to_the_coordinate_bounding_box_instead_of_nan() {
+        // #376: a DCD cell record of all zeros -- what MDAnalysis writes for
+        // "no periodic box" -- decodes to exactly this UnitCell, and never
+        // passes through `Molecule::set_cell`'s validation because a
+        // trajectory carries its cell per-frame. The triclinic conversion's
+        // `0.0 / 0.0` used to hand back NaN here.
+        let degenerate = UnitCell::new(0.0, 0.0, 0.0, 90.0, 90.0, 90.0);
+        let coords = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 2.0, 3.0),
+            Point3::new(-1.0, 0.5, 4.0),
+        ];
+
+        let with_degenerate_cell = lammps_box_bounds(Some(&degenerate), &coords);
+        let with_no_cell = lammps_box_bounds(None, &coords);
+
+        let fields = [
+            with_degenerate_cell.0,
+            with_degenerate_cell.1,
+            with_degenerate_cell.2,
+            with_degenerate_cell.3,
+            with_degenerate_cell.4,
+            with_degenerate_cell.5,
+            with_degenerate_cell.6,
+            with_degenerate_cell.7,
+            with_degenerate_cell.8,
+        ];
+        for (i, value) in fields.iter().enumerate() {
+            assert!(value.is_finite(), "field {i} was {value}");
+        }
+        assert_eq!(
+            with_degenerate_cell, with_no_cell,
+            "an invalid cell should fall back to exactly the same bounding box as no cell"
+        );
     }
 }
