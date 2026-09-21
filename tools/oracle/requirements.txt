@@ -18,3 +18,10 @@ MDAnalysis==2.10.0
 # The geometry oracle for OBJ/PLY (#340). Pure Python + numpy, no system
 # libraries, chosen over meshio for its built-in volume/area primitives.
 trimesh==5.1.0
+# Used only by tests/corpus/ply/generate_binary_big_endian.py (#341) --
+# trimesh (above) cannot write binary_big_endian PLY at all (confirmed by
+# survey: its exporter's only encodings are ascii/binary/binary_little_
+# endian), and plyfile is the reference tool that originally produced this
+# fixture's bytes. GPL-3, the same "external tool in this image only,
+# never vendored into chem" posture OpenBabel (GPL-2) already established.
+plyfile==1.1.5

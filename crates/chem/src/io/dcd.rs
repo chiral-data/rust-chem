@@ -1093,17 +1093,17 @@ mod tests {
     fn test_a_hand_built_big_endian_file_with_a_unit_cell_reads_correctly() {
         // The issue's own named worst case: big-endian and a unit cell at
         // once, exercising the byte-swap path and the cell heuristic
-        // together.
-        let mut b = RawDcdBuilder::new(4);
-        b.big_endian = true;
-        b.has_cell = true;
-        // File-order [A, gamma, B, beta, alpha, C]; angles as cosines
-        // (all within [-1, 1]), the modern convention.
-        let cell_raw = [30.0, 0.0, 25.0, 0.0, 0.0, 20.0]; // all angles 90 degrees (cos=0)
+        // together. A committed fixture and its generator (#341) rather
+        // than an in-process `RawDcdBuilder` build -- no tool in this
+        // crate's oracle image can author big-endian DCD at all (confirmed
+        // by survey), so the generator hand-assembles bytes exactly the
+        // way `RawDcdBuilder` does here, just committed instead of thrown
+        // away after this one test runs. See
+        // `tests/corpus/dcd/generate_big_endian_with_cell.py`.
+        let bytes: &[u8] = include_bytes!("../../tests/corpus/dcd/big_endian_with_cell.dcd");
         let positions: Vec<[f32; 3]> = (0..4).map(|i| [i as f32, 0.0, 0.0]).collect();
-        let bytes = b.build(&[(positions.clone(), Some(cell_raw))]);
 
-        let outcome = read_dcd_bytes(&bytes, &ReadOptions::default());
+        let outcome = read_dcd_bytes(bytes, &ReadOptions::default());
         assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
         let mut trajectory = as_trajectory(outcome);
         let f = trajectory.frame(0).unwrap();
