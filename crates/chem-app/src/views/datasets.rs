@@ -50,7 +50,15 @@ impl DatasetsView {
                 ui.label(RichText::new(&summary).small().weak());
 
                 ui.horizontal(|ui| {
-                    if ui.button("📂 Load File").clicked() {
+                    // Disabled while a dialog is already open (#381) --
+                    // visible feedback instead of a click that silently does
+                    // nothing, which is what a second click used to do right
+                    // up until it instead crashed the whole wasm instance.
+                    let dialog_pending = state.is_load_dialog_pending();
+                    let load = ui
+                        .add_enabled(!dialog_pending, egui::Button::new("📂 Load File"))
+                        .on_disabled_hover_text("A file dialog is already open");
+                    if load.clicked() {
                         state.load_dataset_from_file();
                     }
                     if ui.button("📋 Load Examples").clicked() {

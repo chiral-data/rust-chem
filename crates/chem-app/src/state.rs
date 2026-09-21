@@ -21,6 +21,8 @@ use chem::io::aromaticity::detect_aromaticity;
 use chem::io::format;
 use chem::io::smiles::parse_smiles;
 use chem::search::{FingerprintSearch, SearchResult};
+#[cfg(target_arch = "wasm32")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -257,6 +259,11 @@ pub struct AppState {
     // picked up by the next `update()` poll.
     #[cfg(target_arch = "wasm32")]
     pending_file_load: PendingFileLoad,
+    // Whether a "Load File" dialog is already open (#381) -- refusing a
+    // second one while this is set is what keeps two overlapping `rfd`
+    // dialogs from racing on the same DOM cleanup and panicking.
+    #[cfg(target_arch = "wasm32")]
+    file_dialog_pending: Rc<Cell<bool>>,
     // GPU init can't happen inside `FingerprintSearch::new()` on wasm32 (see
     // its doc comment), so it's kicked off here instead and polled the same
     // way. Outer Option = has the attempt resolved yet; inner Option = did it
@@ -523,6 +530,8 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             pending_file_load: Rc::new(RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
+            file_dialog_pending: Rc::new(Cell::new(false)),
+            #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
             repaint: ctx.clone(),
         }
@@ -660,12 +669,27 @@ impl AppState {
     // Promise machinery, so blocking on it would deadlock the tab. Spawn the
     // dialog as a non-blocking task instead and hand its result to
     // `pending_file_load`, polled from `update()` on the next frame.
+    //
+    // Guarded against re-entrancy (#381): `rfd`'s wasm backend builds a fresh
+    // DOM overlay per call and unconditionally `unwrap()`s removing it again
+    // on cancel, so two dialogs open at once race on that removal and panic
+    // with `NotFoundError` -- which then bricks the whole wasm instance until
+    // reload, since a wasm panic traps the whole module. Refusing a second
+    // dialog while one is already open removes the trigger regardless of
+    // that race's exact internal cause.
     #[cfg(target_arch = "wasm32")]
     pub fn load_dataset_from_file(&mut self) {
+        if self.file_dialog_pending.get() {
+            return;
+        }
+        self.file_dialog_pending.set(true);
+
         let slot = self.pending_file_load.clone();
         let ctx = self.repaint.clone();
+        let pending = self.file_dialog_pending.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let files = molecule_file_dialog().pick_files().await;
+            pending.set(false);
             if let Some(files) = files {
                 let mut picked = Vec::with_capacity(files.len());
                 for file in files {
@@ -676,12 +700,29 @@ impl AppState {
                 // so a second pick before the next frame silently dropped the
                 // first (#296).
                 slot.borrow_mut().extend(picked);
-                // Closing the picker is not itself an input event the canvas
-                // sees, so without this the file stays unloaded until the user
-                // moves the mouse (#186).
-                ctx.request_repaint();
             }
+            // Closing the picker is not itself an input event the canvas
+            // sees, so without this the file stays unloaded until the user
+            // moves the mouse (#186). Requested on cancellation too, not just
+            // success (#381), so the button visibly re-enables promptly
+            // either way rather than waiting for an unrelated repaint.
+            ctx.request_repaint();
         });
+    }
+
+    /// Whether a "Load File" dialog is already open, on the platform where a
+    /// second one can start before the first resolves (#381). Always `false`
+    /// on native: `pollster::block_on` blocks the whole calling frame, so a
+    /// second click cannot land while the first is still open.
+    pub fn is_load_dialog_pending(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.file_dialog_pending.get()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            false
+        }
     }
 
     /// Whether any format this build can read claims this file's extension.
