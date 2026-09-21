@@ -1169,6 +1169,13 @@ fn print_format_listing(query: &str) -> Result<()> {
 /// spelled-out names would not fit a terminal. `C` is formal charge and `P`
 /// partial; `F` is the temperature factor, which is what the PDB spec calls
 /// the B-factor column.
+///
+/// The seven entries below `PROPERTIES` cover `Kind::Frames`/`Volume`/`Mesh`/
+/// `Table` (#339), picked from the letters the block above left free: `V`
+/// velocities, `N` forces (Newtons; `F` was already b_factor), `M` frame time
+/// (a moment; `T` was already topology), `L` a volume's sample values
+/// (levels), `E` mesh vertices (`V` was already velocities), `K` mesh faces,
+/// `Y` table columns (`C` was already formal charge).
 const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::TOPOLOGY, 'T', "topology"),
     (Carries::BONDS, 'B', "bonds"),
@@ -1186,17 +1193,37 @@ const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::OCCUPANCY, 'O', "occupancy"),
     (Carries::UNIT_CELL, 'U', "unit_cell"),
     (Carries::PROPERTIES, 'X', "properties"),
+    (Carries::VELOCITIES, 'V', "velocities"),
+    (Carries::FORCES, 'N', "forces"),
+    (Carries::FRAME_TIME, 'M', "frame_time"),
+    (Carries::SAMPLES, 'L', "samples"),
+    (Carries::VERTICES, 'E', "vertices"),
+    (Carries::FACES, 'K', "faces"),
+    (Carries::COLUMNS, 'Y', "columns"),
 ];
 
 /// `chem convert -L matrix` (#257) — what survives every registered conversion.
 ///
 /// A pure query, like the rest of `-L`: the cells come from the registry, not
 /// from running conversions. What makes them true is
-/// `test_every_format_pair_delivers_what_the_matrix_says`, which measures all
-/// 121 pairs against exactly this function.
+/// `test_every_format_pair_delivers_what_the_matrix_says`, which measures
+/// every pair `format::fidelity_pairs()` yields — 352 today (#339), same-kind
+/// pairs across all five kinds plus CUBE's 17 `Kind::Volume` -> `Kind::
+/// Molecules` cross-kind pairs — never the naive 29x29 = 841 full product.
 fn print_fidelity_matrix() {
     let formats: Vec<Format> = format::all().collect();
+    // Rows and columns still span every registered format (a format's own
+    // diagonal cell always applies), but a cell is only ever computed for a
+    // pair `fidelity_pairs()` actually yields -- otherwise blank. Without
+    // this, a cell like CSV x CUBE would render `format::fidelity`'s answer
+    // for a pair `kinds_compatible` itself refuses, the exact "growing to
+    // 812 pairs" #339 exists to close.
+    let valid_pairs: std::collections::HashSet<(Format, Format)> =
+        format::fidelity_pairs().collect();
     let cell = |source: Format, target: Format| -> String {
+        if !valid_pairs.contains(&(source, target)) {
+            return String::new();
+        }
         let delivered = format::fidelity(source, target);
         // Lowercase for an attribute the target's writer manufactures rather
         // than carries across. Without the distinction `smi -> pdb` reads as

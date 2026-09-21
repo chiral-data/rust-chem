@@ -2501,6 +2501,86 @@ fn test_l_matrix_prints_a_row_per_format_and_names_its_exceptions() {
 }
 
 #[test]
+fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cells() {
+    // #339: the matrix grew from 11 `Kind::Molecules` formats to 29 across
+    // five kinds. Every registered format still gets a row/column (a
+    // format's own diagonal cell always applies), but a cell is only ever
+    // computed for a pair `format::fidelity_pairs()` actually yields --
+    // otherwise the CLI would still be rendering nonsense fidelity() values
+    // for a pair like CSV x TRR, the exact "growing to 812 pairs" gap #339
+    // exists to close (`format::all()` fed the row/column list unfiltered
+    // before this story, and nothing caught it).
+    let r = run(&["convert", "-L", "matrix"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+
+    for code in [
+        "trr",
+        "xtc",
+        "dcd",
+        "nctraj",
+        "lammpstrj",
+        "cube",
+        "ccp4",
+        "dx",
+        "dsn6",
+        "obj",
+        "ply",
+        "csv",
+    ] {
+        assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
+    }
+
+    // CSV (`Kind::Table`) is unrelated to every other kind: its only real
+    // cell is its own diagonal, `Carries::COLUMNS`'s legend letter `Y`. A
+    // genuinely unrelated cross-kind pair -- CSV x TRR among them -- must
+    // never render, so the whole row's non-blank content is exactly that
+    // one letter, not a computed (and meaningless) fidelity answer.
+    let csv_line = r
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("csv"))
+        .unwrap_or_else(|| panic!("no csv row: {}", r.stdout));
+    let cells: String = csv_line
+        .trim_start_matches("csv")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        cells, "Y",
+        "csv row should render only its own diagonal cell: {csv_line}"
+    );
+
+    // The legend names every new flag, not just the original eleven.
+    for name in [
+        "velocities",
+        "forces",
+        "frame_time",
+        "samples",
+        "vertices",
+        "faces",
+        "columns",
+    ] {
+        assert!(
+            r.stdout.contains(name),
+            "legend missing {name}: {}",
+            r.stdout
+        );
+    }
+
+    // CUBE's dual nature (#338) is the one real cross-kind exception: its
+    // row carries real cells into the `Kind::Molecules` block.
+    let cube_line = r
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("cube"))
+        .unwrap_or_else(|| panic!("no cube row: {}", r.stdout));
+    assert!(
+        cube_line.contains("T3"),
+        "cube -> a Kind::Molecules target should carry topology+coords_3d: {cube_line}"
+    );
+}
+
+#[test]
 fn test_l_still_details_a_single_format() {
     // `matrix` is special-cased before the code lookup, the same shape as
     // `formats`. A format code must not be shadowed by it.
