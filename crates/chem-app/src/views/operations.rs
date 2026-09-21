@@ -100,10 +100,7 @@ impl OperationsView {
                 egui::ComboBox::from_id_salt("convert_target")
                     .selected_text(target.label())
                     .show_ui(ui, |ui| {
-                        // Writable only, the mirror of the load dialog's
-                        // readable-only rule (#266): offering a target that
-                        // cannot be written just fails later.
-                        for format in format::all().filter(|f| f.can_write()) {
+                        for format in convertible_targets(source) {
                             ui.selectable_value(&mut self.convert_target, format, format.label());
                         }
                     });
@@ -306,6 +303,22 @@ impl OperationsView {
     }
 }
 
+/// Every format Convert may offer as a target for `source`, given what's
+/// loaded (#342).
+///
+/// Writable only, the mirror of the load dialog's readable-only rule
+/// (#266): offering a target that cannot be written just fails later.
+/// Same-kind, or one of `kinds_compatible`'s named cross-kind exceptions --
+/// the exact gate `chem convert` itself already enforces, so nothing
+/// offered here is a conversion the CLI would refuse. Factored out of the
+/// combo box's own closure so it can be tested without driving a popup
+/// through the UI harness.
+fn convertible_targets(source: DatasetFormat) -> impl Iterator<Item = DatasetFormat> {
+    format::all().filter(move |f| {
+        f.can_write() && (f.kind() == source.kind() || format::kinds_compatible(source, *f).is_ok())
+    })
+}
+
 /// One operation: a collapsing header carrying its last outcome, and its
 /// controls inside.
 ///
@@ -341,4 +354,49 @@ fn section(
 /// borrows `AppState` mutably.
 fn outcome_line(outcome: &OperationOutcome) -> (String, bool) {
     (outcome.summary(), outcome.failed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_same_kind_target_is_offered() {
+        let targets: Vec<_> = convertible_targets(DatasetFormat::PDB).collect();
+        assert!(
+            targets.contains(&DatasetFormat::SDF),
+            "PDB -> SDF is same-kind and both are writable, so it must be offered"
+        );
+    }
+
+    #[test]
+    fn test_a_genuinely_cross_kind_target_is_not_offered() {
+        // Before #342, this loop had no kind check at all -- loading a PDB
+        // and opening Convert offered DCD (Kind::Frames) exactly as readily
+        // as SDF, a conversion `chem convert` itself refuses outright.
+        let targets: Vec<_> = convertible_targets(DatasetFormat::PDB).collect();
+        assert!(
+            !targets.contains(&DatasetFormat::DCD),
+            "PDB -> DCD crosses kinds with no exception and must not be offered"
+        );
+    }
+
+    #[test]
+    fn test_cubes_cross_kind_exception_is_offered_one_direction_only() {
+        // The one real cross-kind exception the registry names (#338):
+        // CUBE (Kind::Volume, genuinely carries atoms) into any
+        // Kind::Molecules target -- never the reverse, since a molecule has
+        // no grid to offer.
+        let from_cube: Vec<_> = convertible_targets(DatasetFormat::CUBE).collect();
+        assert!(
+            from_cube.contains(&DatasetFormat::PDB),
+            "CUBE -> PDB is the named exception and must be offered"
+        );
+
+        let from_pdb: Vec<_> = convertible_targets(DatasetFormat::PDB).collect();
+        assert!(
+            !from_pdb.contains(&DatasetFormat::CUBE),
+            "PDB -> CUBE is never valid, even though CUBE -> PDB is"
+        );
+    }
 }

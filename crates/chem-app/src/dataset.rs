@@ -1,6 +1,7 @@
 use chem::core::molecule::Molecule;
+use chem::core::trajectory::Trajectory;
 use chem::io::format::Carries;
-use chem::io::reader::{self, ReadOutcome};
+use chem::io::reader::{self, Payload, ReadOutcome, Record};
 use chem::io::smiles_writer::write_smiles_for_molecule_canonical;
 
 /// Which file format a loaded dataset came from.
@@ -10,7 +11,6 @@ use chem::io::smiles_writer::write_smiles_for_molecule_canonical;
 /// place for the app and the CLI to disagree about what `.txt` means.
 pub type DatasetFormat = reader::Format;
 
-#[derive(Clone)]
 pub struct MoleculeDataset {
     pub molecules: Vec<Molecule>,
     pub smiles: Vec<String>,
@@ -23,6 +23,61 @@ pub struct MoleculeDataset {
     /// does invent it -- so the app also says which ones, and the views mark
     /// them.
     pub generated: Vec<bool>,
+    /// What the loaded file held, when it wasn't molecules at all (#342).
+    ///
+    /// `None` for every `Kind::Molecules` format -- the four fields above
+    /// keep meaning exactly what they always have. `Some` means
+    /// `molecules`/`smiles`/`names`/`generated` are all empty not because
+    /// the file was empty, but because it held a trajectory, a volume, a
+    /// mesh or a table instead -- a fact a view must check before it
+    /// reports "0 molecules" for a 50MB DCD.
+    pub non_molecule: Option<NonMoleculeRecord>,
+}
+
+/// What a loaded record was, when it wasn't a molecule at all (#342).
+///
+/// Deliberately not a rendering: #307's own milestone-wide rule is that
+/// this wave makes a viewer's formats *readable*, not drawn. Every field
+/// here is a fact a view can print, never a picture -- the same "a dash,
+/// not a placeholder" honesty #283 already established for a molecule row
+/// with no bond model, generalised to a record with no molecule at all.
+pub enum NonMoleculeRecord {
+    /// One shared topology, many frames -- not `MoleculeDataset`-shaped at
+    /// all (a frame carries positions/velocities riding on one topology,
+    /// never its own bonds or elements), so this gets its own summary
+    /// rather than a row, or ten thousand of them.
+    Trajectory {
+        atom_count: usize,
+        frame_count: usize,
+        has_cell: bool,
+        /// Kept live, not just summarised, so a view's frame slider can
+        /// seek and show a specific frame's own facts on demand. Boxed:
+        /// `Trajectory` makes this variant far larger than the others
+        /// (`clippy::large_enum_variant`), and every other variant would
+        /// pay for that space regardless of which one is active.
+        trajectory: Box<Trajectory>,
+        /// The frame last sought to.
+        selected_frame: usize,
+        /// `describe_frame`'s text for `selected_frame`, cached rather than
+        /// recomputed on every repaint -- `Trajectory::frame` can mean real
+        /// I/O, and egui redraws far more often than the slider moves.
+        /// [`MoleculeDataset::seek_trajectory_frame`] is the only thing
+        /// that updates it.
+        current_frame_summary: String,
+    },
+    Volume {
+        dims: [usize; 3],
+        has_cell: bool,
+        has_atoms: bool,
+    },
+    Mesh {
+        vertex_count: usize,
+        face_count: usize,
+    },
+    Table {
+        row_count: usize,
+        columns: Vec<String>,
+    },
 }
 
 /// Whether a SMILES written from what this format's reader produced is
@@ -67,10 +122,54 @@ pub struct MoleculeDataset {
 /// column is for.
 const GENERATE_UP_TO_ATOMS: usize = 500;
 
+pub(crate) fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
 fn states_a_bond_model(format: DatasetFormat) -> bool {
     format
         .carries()
         .contains(Carries::BONDS.or(Carries::AROMATICITY))
+}
+
+/// The facts a trajectory's frame slider shows for whichever frame it last
+/// sought to (#342) -- step/time where the format states them, the frame's
+/// own cell, and a position bounding box, cheap to compute and the concrete
+/// evidence a seek actually moved rather than a redraw of the same frame.
+/// Never a picture, per #307's own "readable, not drawn" rule for this wave.
+fn describe_frame(frame: &chem::core::trajectory::Frame) -> String {
+    let mut parts = Vec::new();
+    if let Some(step) = frame.step {
+        parts.push(format!("step {step}"));
+    }
+    if let Some(time) = frame.time {
+        parts.push(format!("time {time:.3}"));
+    }
+    if let Some(cell) = &frame.cell {
+        parts.push(format!("cell {:.2}x{:.2}x{:.2} Å", cell.a, cell.b, cell.c));
+    }
+    if let Some((lo, hi)) = frame.positions.split_first().map(|(first, rest)| {
+        rest.iter().fold((*first, *first), |(lo, hi), p| {
+            (
+                chem::core::geometry::Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)),
+                chem::core::geometry::Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)),
+            )
+        })
+    }) {
+        parts.push(format!(
+            "bounding box ({:.2}, {:.2}, {:.2}) to ({:.2}, {:.2}, {:.2})",
+            lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+        ));
+    }
+    if parts.is_empty() {
+        "no per-frame facts stated".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 impl MoleculeDataset {
@@ -80,6 +179,7 @@ impl MoleculeDataset {
             smiles: Vec::new(),
             names: Vec::new(),
             generated: Vec::new(),
+            non_molecule: None,
         }
     }
 
@@ -87,25 +187,79 @@ impl MoleculeDataset {
     ///
     /// The parallel-vector shape is what the views consume; the skipped records
     /// are the caller's to report, which is why they are not swallowed here.
-    pub fn from_outcome(outcome: &ReadOutcome, format: DatasetFormat) -> Self {
+    ///
+    /// Takes `outcome` by value, not `&ReadOutcome`: a `Kind::Frames` record's
+    /// [`Trajectory`] has to be *moved* out of its `Payload` to stay seekable
+    /// afterwards (#342) -- the borrow-returning [`Record::trajectory`] can't
+    /// give that. A caller that still needs `outcome.skipped` afterwards reads
+    /// it before calling this, not after.
+    pub fn from_outcome(outcome: ReadOutcome, format: DatasetFormat) -> Self {
         let mut dataset = Self::new();
-        for record in &outcome.records {
-            // #310 widened `Record` to hold a payload that is not necessarily
-            // a molecule. `MoleculeDataset` itself is still molecule-shaped --
-            // teaching it to show a non-molecule row is #342's job -- so for
-            // now such a record is dropped, the same way a record `read`
-            // itself couldn't parse is: reported, not silently included.
-            // Every registered format is `Kind::Molecules` today, so this
-            // branch cannot fire yet.
-            let Some(molecule) = record.molecule() else {
-                log::warn!(
-                    "Dropped a non-molecule record '{}' from a {} dataset",
-                    record.name,
-                    format.label()
-                );
-                continue;
+        for record in outcome.records {
+            let Record {
+                payload,
+                name,
+                smiles,
+            } = record;
+            let molecule = match payload {
+                Payload::Molecule(m) => m,
+                // #310 widened `Record` to hold a payload that is not
+                // necessarily a molecule. `MoleculeDataset` itself stays
+                // molecule-shaped -- these four kinds get their own summary
+                // instead of a row (#342), the same "readable, not drawn"
+                // rule #307 states for the whole milestone.
+                Payload::Frames(mut trajectory) => {
+                    let atom_count = trajectory.num_atoms();
+                    let frame_count = trajectory.frame_count();
+                    let frame0 = trajectory.frame(0).ok();
+                    let has_cell = frame0.as_ref().is_some_and(|f| f.cell.is_some());
+                    let current_frame_summary = frame0
+                        .as_ref()
+                        .map(describe_frame)
+                        .unwrap_or_else(|| "frame 0 could not be read".to_string());
+                    dataset.non_molecule = Some(NonMoleculeRecord::Trajectory {
+                        atom_count,
+                        frame_count,
+                        has_cell,
+                        trajectory: Box::new(trajectory),
+                        selected_frame: 0,
+                        current_frame_summary,
+                    });
+                    continue;
+                }
+                Payload::Volume(grid) => {
+                    dataset.non_molecule = Some(NonMoleculeRecord::Volume {
+                        dims: grid.dims(),
+                        has_cell: grid.cell().is_some(),
+                        has_atoms: grid.atoms().is_some(),
+                    });
+                    continue;
+                }
+                Payload::Mesh(mesh) => {
+                    dataset.non_molecule = Some(NonMoleculeRecord::Mesh {
+                        vertex_count: mesh.num_vertices(),
+                        face_count: mesh.num_faces(),
+                    });
+                    continue;
+                }
+                Payload::Table(table) => {
+                    dataset.non_molecule = Some(NonMoleculeRecord::Table {
+                        row_count: table.num_rows(),
+                        columns: table.columns().iter().map(|c| c.name.clone()).collect(),
+                    });
+                    continue;
+                }
+                // `Payload` is `#[non_exhaustive]` from outside `chem` --
+                // a future fifth kind lands here until this match learns it,
+                // dropped the same honest way an unparseable record already is.
+                _ => {
+                    log::warn!(
+                        "Dropped a record of an unrecognised kind from a {} dataset",
+                        format.label()
+                    );
+                    continue;
+                }
             };
-            dataset.molecules.push(molecule.clone());
             // Most formats carry coordinates and connectivity rather than a
             // SMILES string, so the column needs something to say. Both the
             // generated string and the placeholder are display decisions, made
@@ -120,24 +274,92 @@ impl MoleculeDataset {
             // PDB and every row claimed to be an SDF record (#266).
             let write_one =
                 states_a_bond_model(format) && molecule.num_atoms() <= GENERATE_UP_TO_ATOMS;
-            let written = record.smiles.clone().or_else(|| {
+            let written = smiles.clone().or_else(|| {
                 // An atomless molecule writes an empty string, and four readers
                 // accept any text as exactly that (#268), so an empty result
                 // falls through to the placeholder -- an empty cell reads as a
                 // rendering fault.
                 write_one
-                    .then(|| write_smiles_for_molecule_canonical(molecule))
+                    .then(|| write_smiles_for_molecule_canonical(&molecule))
                     .filter(|smiles| !smiles.is_empty())
             });
             dataset
                 .generated
-                .push(record.smiles.is_none() && written.is_some());
+                .push(smiles.is_none() && written.is_some());
             dataset
                 .smiles
                 .push(written.unwrap_or_else(|| format!("({})", format.label())));
-            dataset.names.push(record.name.clone());
+            dataset.names.push(name);
+            dataset.molecules.push(molecule);
         }
         dataset
+    }
+
+    /// What this dataset actually holds, in a form the Files list and the
+    /// load status line both quote directly (#342).
+    ///
+    /// `"0 molecules"` for a 10,000-frame trajectory used to be this app's
+    /// only answer, because nothing checked `non_molecule` first -- reported
+    /// truthfully, indistinguishable from opening an actually-empty file.
+    pub fn describe(&self) -> String {
+        match &self.non_molecule {
+            None => format!(
+                "{} {}",
+                self.molecules.len(),
+                plural(self.molecules.len(), "molecule")
+            ),
+            Some(NonMoleculeRecord::Trajectory {
+                atom_count,
+                frame_count,
+                has_cell,
+                ..
+            }) => format!(
+                "1 trajectory ({atom_count} atoms, {frame_count} frames{})",
+                if *has_cell { ", has a cell" } else { "" }
+            ),
+            Some(NonMoleculeRecord::Volume {
+                dims,
+                has_cell,
+                has_atoms,
+            }) => format!(
+                "a {}x{}x{} grid{}{}",
+                dims[0],
+                dims[1],
+                dims[2],
+                if *has_cell { ", has a cell" } else { "" },
+                if *has_atoms { ", has atoms" } else { "" }
+            ),
+            Some(NonMoleculeRecord::Mesh {
+                vertex_count,
+                face_count,
+            }) => format!("a mesh ({vertex_count} vertices, {face_count} faces)"),
+            Some(NonMoleculeRecord::Table { row_count, columns }) => {
+                format!("a table ({row_count} rows, {} columns)", columns.len())
+            }
+        }
+    }
+
+    /// Seeks the active trajectory to `index`, refreshing its cached
+    /// per-frame summary. A no-op for every other kind (#342).
+    ///
+    /// `Trajectory::frame` needs `&mut self`, which a render pass reading
+    /// `non_molecule` immutably to draw the slider cannot also hold -- the
+    /// view calls this afterwards, once it knows the slider actually moved.
+    pub fn seek_trajectory_frame(&mut self, index: usize) {
+        let Some(NonMoleculeRecord::Trajectory {
+            trajectory,
+            selected_frame,
+            current_frame_summary,
+            ..
+        }) = &mut self.non_molecule
+        else {
+            return;
+        };
+        *selected_frame = index;
+        *current_frame_summary = match trajectory.frame(index) {
+            Ok(frame) => describe_frame(&frame),
+            Err(e) => format!("could not read frame {index}: {e}"),
+        };
     }
 
     pub fn len(&self) -> usize {
@@ -179,7 +401,7 @@ CC(C)(C)C Neopentane
                 skipped.error
             );
         }
-        Self::from_outcome(&outcome, DatasetFormat::SMILES)
+        Self::from_outcome(outcome, DatasetFormat::SMILES)
     }
 }
 
@@ -333,7 +555,7 @@ mod tests {
         let content = smiles.join("\n");
         let outcome = reader::read_smiles(&content);
         assert!(outcome.skipped.is_empty(), "fixture should parse cleanly");
-        MoleculeDataset::from_outcome(&outcome, DatasetFormat::SMILES)
+        MoleculeDataset::from_outcome(outcome, DatasetFormat::SMILES)
     }
 
     #[test]
@@ -504,20 +726,20 @@ mod tests {
     /// Writes a molecule in `format` and reads it back the way a loaded file
     /// is read, so the column under test is the one a user would see.
     ///
-    /// The outcome comes back too: whether the *reader* stated a SMILES is the
-    /// only honest way to check which strings the app wrote itself.
-    fn round_trip(
-        format: DatasetFormat,
-        name: &str,
-        smiles: &str,
-    ) -> (ReadOutcome, MoleculeDataset) {
+    /// Whether the *reader* stated a SMILES is the only honest way to check
+    /// which strings the app wrote itself -- read from the record before
+    /// `from_outcome` takes `outcome` by value, since it moves a non-molecule
+    /// payload's contents out (#342) and `ReadOutcome`/`Record` are not
+    /// `Clone`.
+    fn round_trip(format: DatasetFormat, name: &str, smiles: &str) -> (bool, MoleculeDataset) {
         let molecule = chem::io::smiles::parse_smiles(smiles).expect("valid SMILES");
         let text = format
             .write(&[(name.to_string(), molecule)])
             .unwrap_or_else(|| panic!("{} writes", format.label()));
         let outcome = reader::read(&text, format);
-        let dataset = MoleculeDataset::from_outcome(&outcome, format);
-        (outcome, dataset)
+        let stated = outcome.records[0].smiles.is_some();
+        let dataset = MoleculeDataset::from_outcome(outcome, format);
+        (stated, dataset)
     }
 
     #[test]
@@ -529,8 +751,7 @@ mod tests {
         // BinaryCIF (#319) is excluded: its canonical bytes are not text, so
         // `DatasetFormat::write` correctly answers `None` for it (same as
         // `chem::io::format::Format::write`) rather than the `round_trip`
-        // helper's text-only path applying. The app itself doesn't load or
-        // write binary formats yet -- that's #342, not this loop.
+        // helper's text-only path applying.
         //
         // `Kind::Frames` formats (TRR/XTC/DCD/NCTRAJ/LAMMPS Trajectory,
         // #325-#329) are excluded too, for the same reason regardless of
@@ -541,13 +762,16 @@ mod tests {
         // -- correctly has nothing to call for them. LAMMPS Trajectory is
         // the first of these that's also `Encoding::Text`, so the encoding
         // filter alone stopped being enough to exclude every non-Molecules
-        // format once it registered.
+        // format once it registered. The app now shows one of these as a
+        // `NonMoleculeRecord` summary instead of a molecule row (#342) --
+        // irrelevant here regardless, since this loop only exercises the
+        // `Molecule`-shaped writer/reader path `round_trip` calls.
         for format in chem::io::format::all()
             .filter(|f| f.can_read() && f.can_write())
             .filter(|f| f.encoding() == chem::io::format::Encoding::Text)
             .filter(|f| f.kind() == chem::io::format::Kind::Molecules)
         {
-            let (outcome, dataset) = round_trip(format, "benzene", "c1ccccc1");
+            let (stated, dataset) = round_trip(format, "benzene", "c1ccccc1");
             let cell = &dataset.smiles[0];
             let placeholder = *cell == format!("({})", format.label());
 
@@ -562,7 +786,6 @@ mod tests {
                 "{} shows {cell:?}",
                 format.label()
             );
-            let stated = outcome.records[0].smiles.is_some();
             assert_eq!(
                 dataset.generated[0],
                 !stated && !placeholder,
@@ -624,7 +847,7 @@ mod tests {
         let outcome = reader::read("not a molecule\n", DatasetFormat::MOL2);
         assert_eq!(outcome.skipped.len(), 1);
 
-        let dataset = MoleculeDataset::from_outcome(&outcome, DatasetFormat::MOL2);
+        let dataset = MoleculeDataset::from_outcome(outcome, DatasetFormat::MOL2);
         assert_eq!(dataset.len(), 0);
     }
 
