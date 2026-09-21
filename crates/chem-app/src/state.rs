@@ -11,7 +11,7 @@
 //! value, which row is expanded. Those live with the view that owns them, in
 //! [`crate::views`], and are handed to these operations as arguments.
 
-use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
+use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset, plural};
 use crate::task::Task;
 use bitvec::prelude::BitVec;
 use chem::core::layout::ensure_coords;
@@ -372,23 +372,33 @@ fn summarise_load(outcomes: &[FileLoad]) -> String {
     // Deduplicated by name, keeping the last: a file that replaced an entry of
     // the same name did not add one, and counting both would report "2 files, 3
     // molecules" for a Files list holding one entry of two.
-    let mut surviving: Vec<(&str, usize)> = Vec::new();
+    let mut surviving: Vec<(&str, usize, &str)> = Vec::new();
     for outcome in outcomes {
         if let FileLoad::Loaded {
-            name, molecules, ..
+            name,
+            molecules,
+            description,
+            ..
         } = outcome
         {
-            match surviving.iter_mut().find(|(seen, _)| *seen == name) {
-                Some(entry) => entry.1 = *molecules,
-                None => surviving.push((name, *molecules)),
+            match surviving.iter_mut().find(|(seen, ..)| *seen == name) {
+                Some(entry) => *entry = (name, *molecules, description),
+                None => surviving.push((name, *molecules, description)),
             }
         }
     }
-    let molecules: usize = surviving.iter().map(|(_, n)| n).sum();
+    let molecules: usize = surviving.iter().map(|(_, n, _)| n).sum();
 
     let mut summary = match surviving.len() {
         0 => "Loaded nothing".to_string(),
-        1 => format!("Loaded {molecules} {}", plural(molecules, "molecule")),
+        // A single file is what a file-dialog pick almost always is, and the
+        // one case where quoting its own `describe()` -- "1 trajectory (42
+        // atoms, 10,000 frames)" rather than "0 molecule" -- actually matters
+        // (#342). A multi-file batch keeps the plain molecule-count summary:
+        // precisely describing several files of possibly different kinds in
+        // one sentence is a different, bigger problem the Files list (each
+        // entry's own `describe()`) already solves per file.
+        1 => format!("Loaded {}", surviving[0].2),
         files => format!(
             "Loaded {files} files, {molecules} {}",
             plural(molecules, "molecule")
@@ -418,14 +428,6 @@ fn summarise_load(outcomes: &[FileLoad]) -> String {
     summary
 }
 
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
-    }
-}
-
 /// What became of one file in a load.
 ///
 /// [`AppState::apply_loaded_file_bytes`] used to return `()`, which was enough
@@ -440,6 +442,12 @@ pub enum FileLoad {
         /// Where it landed, so a batch can activate the first one it loaded.
         index: usize,
         molecules: usize,
+        /// What the file actually held, from [`MoleculeDataset::describe`]
+        /// (#342) -- "1 trajectory (42 atoms, 10,000 frames)" for the twelve
+        /// non-`Kind::Molecules` formats, `"{molecules} molecules"` otherwise.
+        /// `summarise_load` quotes this directly for a single-file batch,
+        /// which is what a real file-dialog pick almost always is.
+        description: String,
         skipped: usize,
         /// An entry of this name already existed and was replaced in place.
         /// Silent until now, and much easier to hit when several files arrive
@@ -712,27 +720,12 @@ impl AppState {
 
         let format = DatasetFormat::from_filename(&name);
         let outcome = chem::io::reader::read(&content, format);
-        let dataset = MoleculeDataset::from_outcome(&outcome, format);
 
         // Records that failed used to be logged and never surfaced, so a file
         // that half-loaded looked like a file that fully loaded. Reading now
-        // reports them, so the status line can too.
-        self.dataset_status = if outcome.skipped.is_empty() {
-            format!(
-                "Loaded {} molecules from '{}' ({})",
-                dataset.len(),
-                name,
-                format.label()
-            )
-        } else {
-            format!(
-                "Loaded {} molecules from '{}' ({}) — {} skipped",
-                dataset.len(),
-                name,
-                format.label(),
-                outcome.skipped.len()
-            )
-        };
+        // reports them, so the status line can too. Read before `from_outcome`
+        // takes `outcome` by value (#342) -- it moves a non-molecule payload's
+        // contents out, and `ReadOutcome` is not `Clone`.
         for skipped in &outcome.skipped {
             log::warn!(
                 "Skipped record {} in '{}': {}",
@@ -741,9 +734,31 @@ impl AppState {
                 skipped.error
             );
         }
+        let skipped_count = outcome.skipped.len();
+        let dataset = MoleculeDataset::from_outcome(outcome, format);
+
+        // #342: `dataset.describe()` says "1 trajectory (...)" instead of
+        // "0 molecules" for the twelve non-`Kind::Molecules` formats.
+        self.dataset_status = if skipped_count == 0 {
+            format!(
+                "Loaded {} from '{}' ({})",
+                dataset.describe(),
+                name,
+                format.label()
+            )
+        } else {
+            format!(
+                "Loaded {} from '{}' ({}) — {} skipped",
+                dataset.describe(),
+                name,
+                format.label(),
+                skipped_count
+            )
+        };
 
         let molecules = dataset.len();
-        let skipped = outcome.skipped.len();
+        let description = dataset.describe();
+        let skipped = skipped_count;
         let replaced = self.loaded_files.names().any(|existing| existing == name);
         self.loaded_files
             .add_and_activate(name.clone(), dataset, format);
@@ -752,6 +767,7 @@ impl AppState {
             name,
             index: self.loaded_files.active_index(),
             molecules,
+            description,
             skipped,
             replaced,
         }
@@ -1003,20 +1019,8 @@ impl AppState {
         let derived = derived_dataset_name(&source_name, target);
 
         let outcome = chem::io::reader::read(&text, target);
-        let converted = MoleculeDataset::from_outcome(&outcome, target);
-        let written = converted.len();
-
-        self.dataset_status = if outcome.skipped.is_empty() {
-            format!("Converted {written} molecules to {}", target.label())
-        } else {
-            // Our own output failing to read back is worth saying out loud
-            // rather than logging, the same as it is for a loaded file.
-            format!(
-                "Converted {written} molecules to {} — {} did not read back",
-                target.label(),
-                outcome.skipped.len()
-            )
-        };
+        // Read before `from_outcome` takes `outcome` by value (#342) -- see
+        // the identical note in `apply_loaded_file_bytes`.
         for skipped in &outcome.skipped {
             log::warn!(
                 "Conversion to {} produced record {} that did not read back: {}",
@@ -1025,7 +1029,22 @@ impl AppState {
                 skipped.error
             );
         }
+        let skipped_count = outcome.skipped.len();
+        let converted = MoleculeDataset::from_outcome(outcome, target);
 
+        self.dataset_status = if skipped_count == 0 {
+            format!("Converted {} to {}", converted.describe(), target.label())
+        } else {
+            // Our own output failing to read back is worth saying out loud
+            // rather than logging, the same as it is for a loaded file.
+            format!(
+                "Converted {} to {} — {skipped_count} did not read back",
+                converted.describe(),
+                target.label(),
+            )
+        };
+
+        let written = converted.describe();
         self.loaded_files
             .add_and_activate(derived, converted, target);
         // Before the outcome, not after: this resets `self.convert` along with
