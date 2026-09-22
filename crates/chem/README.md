@@ -6,7 +6,7 @@ kernels and a command-line tool.
 
 ```toml
 [dependencies]
-chem = "0.8"
+chem = "0.9"
 ```
 
 ```rust
@@ -57,7 +57,7 @@ anyone parsing SMILES or fingerprinting on a CPU, which is what every GPU-less
 machine and every WebAssembly build already do.
 
 ```toml
-chem = { version = "0.8", features = ["gpu"] }
+chem = { version = "0.9", features = ["gpu"] }
 ```
 
 Without it, `chem::search` still offers its whole API — it simply never finds a
