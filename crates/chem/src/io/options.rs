@@ -6,15 +6,136 @@
 //! the plan already recorded on those type aliases before any format needed
 //! a real option (#212).
 
-/// No options exist yet. A real field lands here the first time a reader
-/// needs one to configure, rather than being invented ahead of that need.
+/// One field per format that has a read option today (#324's `lammps` is
+/// the first). A real field lands here the first time a reader needs one
+/// to configure, rather than being invented ahead of that need.
+///
+/// No longer `Copy` since #337's `csv: CsvReadOptions` carries an
+/// `Option<String>` (naming a structure column) -- nothing in this crate
+/// ever needed `ReadOptions` to be `Copy` for its own sake, only every
+/// `*options` dereference in `io/supplier.rs` needed rewriting to
+/// `options.clone()`, the same shape `WriteOptions`'s own doc comment
+/// already describes for its own `Eq`-losing precedent (#325's `xtc`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub lammps: LammpsReadOptions,
+    pub xyz: XyzReadOptions,
+    pub pdb: PdbReadOptions,
+    pub pdbqt: PdbqtReadOptions,
+    pub gro: GroReadOptions,
+    pub csv: CsvReadOptions,
+}
+
+/// Whether a format that was already multi-frame (XYZ, PDB, PDBQT, GRO --
+/// #330) reads as several independent [`crate::io::reader::Payload::Molecule`]
+/// records (the default, and every existing caller's current behavior) or as
+/// one [`crate::io::reader::Payload::Frames`] [`crate::core::trajectory::Trajectory`]
+/// sharing a single topology.
+///
+/// `Molecules` is the honest default: `Kind::Molecules` describes what these
+/// formats return unless told otherwise, not a lie a read can silently
+/// contradict. `Frames` is the disclosed exception a caller opts into --
+/// the first frame's fully-parsed topology (atoms, bonds, residues, whatever
+/// it stated) becomes the trajectory's shared topology; a later frame's own
+/// bonds (a later `MODEL`'s `CONECT`, say) are never consulted, since a
+/// `Trajectory` holds exactly one topology.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReadOptions;
+pub enum MultiFrameMode {
+    #[default]
+    Molecules,
+    Frames,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XyzReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PdbReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PdbqtReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroReadOptions {
+    pub multi_frame: MultiFrameMode,
+}
+
+/// CSV's own read options (#337): whether row 0 is a header, and which
+/// column (if any) states a structure. `structure_column` is the whole
+/// resolution to "is this file a table or a set of molecules" -- an
+/// explicit name a caller states, never a heuristic (`SMILES`/`smiles`/
+/// `structure`/`canonical_smiles` are all real column-naming conventions,
+/// and guessing among them is exactly the hazard this option exists to
+/// avoid). `None` (the default) means: always a [`crate::core::table::Table`],
+/// the honest, always-safe reading -- the same "disclosed exception, safe
+/// default" shape [`MultiFrameMode`] already established for XYZ/PDB/PDBQT/
+/// GRO's own opt-in `Frames` reading.
+///
+/// `structure_column: Some(_)` combined with `has_header: false` is refused
+/// rather than silently ignored -- naming a column requires a header to
+/// name it against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsvReadOptions {
+    pub has_header: bool,
+    pub structure_column: Option<String>,
+}
+
+impl Default for CsvReadOptions {
+    fn default() -> Self {
+        Self {
+            has_header: true,
+            structure_column: None,
+        }
+    }
+}
+
+/// LAMMPS data's own read option: which `Atoms`-section column layout to
+/// assume when the section header carries no recognized `# style` comment
+/// and the column count alone is ambiguous (#324) -- `charge` and
+/// `molecular` (which also covers `bond`/`angle`'s identical shape) share
+/// a column count both with and without the optional image-flag triplet.
+/// `None` (the default) means: resolve from the comment or an unambiguous
+/// column count, refusing rather than guessing when neither settles it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LammpsReadOptions {
+    pub atom_style: Option<AtomStyle>,
+}
+
+/// A LAMMPS `atom_style`, restricted to the four column layouts this crate
+/// models (#324). `molecular`, `bond` and `angle` share one shape --
+/// `id, molecule-id, type, x, y, z` -- so `Molecular` covers all three;
+/// this crate never needs to tell them apart. Any other real style
+/// (`sphere`, `ellipsoid`, `electron`, ...) is a clear, refusing error
+/// rather than a guessed-at column layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomStyle {
+    /// `id, type, x, y, z`.
+    Atomic,
+    /// `id, type, charge, x, y, z`.
+    Charge,
+    /// `id, molecule-id, type, x, y, z` -- also `bond` and `angle`.
+    Molecular,
+    /// `id, molecule-id, type, charge, x, y, z`.
+    Full,
+}
 
 /// One field per format that has a write option today.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// No longer `Eq` since #325's `xtc: XtcWriteOptions` carries an `f32` --
+/// nothing in this crate ever needed `WriteOptions` as a hash key or in an
+/// exhaustive-equality context, only `assert_eq!`, which only needs
+/// `PartialEq`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WriteOptions {
     pub sdf: SdfWriteOptions,
+    pub xtc: XtcWriteOptions,
+    pub ply: PlyWriteOptions,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -33,6 +154,38 @@ pub enum MolfileVersion {
     V2000,
 }
 
+/// XTC's own write option: the coordinate precision, in inverse nanometres
+/// (#325) -- a position rounds to the nearest `1.0 / precision` nm. `1000.0`
+/// (0.001 nm resolution) is the real format's own documented default and
+/// what every GROMACS-written file uses unless told otherwise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XtcWriteOptions {
+    pub precision: f32,
+}
+
+impl Default for XtcWriteOptions {
+    fn default() -> Self {
+        Self { precision: 1000.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlyWriteOptions {
+    pub encoding: PlyWriteEncoding,
+}
+
+/// Which of PLY's wire encodings to write (#336). Only these two -- the
+/// issue's own scope is "binary little-endian is the sensible default...
+/// with ASCII available through a write option"; nothing asks for a
+/// big-endian *write* path, unlike the reader, which must accept a real
+/// file that states one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlyWriteEncoding {
+    #[default]
+    BinaryLittleEndian,
+    Ascii,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +193,10 @@ mod tests {
     #[test]
     fn test_default_write_options_pick_v2000() {
         assert_eq!(WriteOptions::default().sdf.version, MolfileVersion::V2000);
+    }
+
+    #[test]
+    fn test_default_xtc_precision_is_the_formats_own_documented_default() {
+        assert_eq!(WriteOptions::default().xtc.precision, 1000.0);
     }
 }

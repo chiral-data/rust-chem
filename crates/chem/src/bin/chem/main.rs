@@ -26,10 +26,10 @@ use anyhow::{Context, Result, bail};
 use backend::Backend;
 use chem::draw::structure::{StructureOptions, StructureTheme};
 use chem::draw::svg::structure_to_svg;
-use chem::io::format::{self, Carries};
+use chem::io::format::{self, Carries, Kind};
 use chem::io::open::{open_supplier_as, open_writer_as};
 use chem::io::options::{ReadOptions, WriteOptions};
-use chem::io::reader::Format;
+use chem::io::reader::{Format, Payload, Record};
 use chem::io::supplier::{Supplier, Writer};
 use clap::{Parser, Subcommand, ValueEnum};
 use emath::Vec2;
@@ -390,7 +390,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 .outcome
                 .records
                 .iter()
-                .map(|r| r.molecule.clone())
+                .filter_map(|r| stream::molecule_or_report(r, &read.label).cloned())
                 .collect();
 
             let started = Instant::now();
@@ -449,7 +449,10 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut changed = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
-                let mut molecule = record.molecule.clone();
+                let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+                    continue;
+                };
+                let mut molecule = molecule.clone();
                 let before = aromatic_atoms(&molecule);
                 chem::io::aromaticity::detect_aromaticity(&mut molecule);
                 if aromatic_atoms(&molecule) != before {
@@ -470,7 +473,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let format = resolve_output_format(out_format, Carries::empty(), output.as_deref());
             write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
-            stream::write_output(output.as_ref(), &write::render(format, &records))?;
+            stream::write_output(output.as_ref(), &write::render(format, &records)?)?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -502,7 +505,10 @@ fn run(cli: &Cli) -> Result<i32> {
             let mut flattened = 0;
             let mut records = Vec::with_capacity(read.outcome.records.len());
             for record in &read.outcome.records {
-                let mut molecule = record.molecule.clone();
+                let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+                    continue;
+                };
+                let mut molecule = molecule.clone();
                 let had = molecule.has_coords();
                 let ok = if *relayout {
                     chem::core::layout::layout(&mut molecule)
@@ -553,7 +559,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let format = resolve_output_format(out_format, Carries::COORDS_2D, output.as_deref());
             write::report_drops(format, &records, cli.explain_drops);
             eprintln!("writing {}", format.label());
-            stream::write_output(output.as_ref(), &write::render(format, &records))?;
+            stream::write_output(output.as_ref(), &write::render(format, &records)?)?;
 
             if cli.strict && !read.outcome.skipped.is_empty() {
                 return Ok(exit::PARTIAL);
@@ -590,48 +596,210 @@ fn run(cli: &Cli) -> Result<i32> {
             note_cpu_only(cli);
 
             let from_format = resolve_format_code(from.as_deref())?;
-            let (mut supplier, label, source_format): (Box<dyn Supplier>, String, Format) =
-                resolve_convert_input(input.as_deref(), literal.as_deref(), from_format)?;
-
             let to_format = resolve_format_code(to.as_deref())?;
             let format = resolve_convert_output_format(to_format, output.as_deref())?;
-            let mut writer = resolve_convert_output(format, output.as_deref())?;
 
-            let mut tracker = write::DropTracker::for_conversion(source_format, format);
-            let mut written = 0usize;
-            let mut skipped = 0usize;
-            for (i, item) in supplier.by_ref().enumerate() {
-                match item {
-                    Ok(record) => {
-                        tracker.record(&record.name, &record.molecule);
-                        writer.write_molecule(&record.name, &record.molecule)?;
-                        written += 1;
+            // The Kind gate (#338): both format identities resolved with no
+            // file opened on either side yet, so a genuine mismatch is
+            // refused before any bytes move -- never a silent empty result.
+            let source_kind_format =
+                resolve_convert_input_format(input.as_deref(), literal.as_deref(), from_format);
+            format::kinds_compatible(source_kind_format, format).map_err(|e| anyhow::anyhow!(e))?;
+
+            match (source_kind_format.kind(), format.kind()) {
+                (Kind::Molecules, Kind::Molecules) => {
+                    let (mut supplier, label, source_format): (Box<dyn Supplier>, String, Format) =
+                        resolve_convert_input(input.as_deref(), literal.as_deref(), from_format)?;
+                    let mut writer = resolve_convert_output(format, output.as_deref())?;
+
+                    let mut tracker = write::DropTracker::for_conversion(source_format, format);
+                    let mut written = 0usize;
+                    let mut skipped = 0usize;
+                    for (i, item) in supplier.by_ref().enumerate() {
+                        match item {
+                            Ok(record) => match record.molecule() {
+                                Some(molecule) => {
+                                    tracker.record(&record.name, molecule);
+                                    writer.write_molecule(&record.name, molecule)?;
+                                    written += 1;
+                                }
+                                None => {
+                                    eprintln!(
+                                        "skipping record {} of {label}: not a molecule",
+                                        i + 1
+                                    );
+                                    skipped += 1;
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("skipping record {} of {label}: {e}", i + 1);
+                                skipped += 1;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("skipping record {} of {label}: {e}", i + 1);
-                        skipped += 1;
+                    writer.finish()?;
+                    tracker.report(format.label(), cli.explain_drops);
+                    // Not part of the tracker: losing atoms is a fact about
+                    // the conversion rather than an attribute of a molecule,
+                    // and `Carries` has no flag for it -- `held` sets
+                    // TOPOLOGY on the atom count alone, so one atom of six
+                    // satisfies every mask (#259).
+                    if let Some(reason) = format::pair_gap(source_format, format) {
+                        eprintln!("{} also loses atoms: {reason}", format.label());
                     }
+                    eprintln!("converted {written}, skipped {skipped}");
+
+                    if written == 0 {
+                        eprintln!("nothing readable in {label}");
+                        return Ok(exit::NO_INPUT);
+                    }
+                    if cli.strict && skipped > 0 {
+                        return Ok(exit::PARTIAL);
+                    }
+                    Ok(exit::OK)
                 }
-            }
-            writer.finish()?;
-            tracker.report(format.label(), cli.explain_drops);
-            // Not part of the tracker: losing atoms is a fact about the
-            // conversion rather than an attribute of a molecule, and `Carries`
-            // has no flag for it -- `held` sets TOPOLOGY on the atom count
-            // alone, so one atom of six satisfies every mask (#259).
-            if let Some(reason) = format::pair_gap(source_format, format) {
-                eprintln!("{} also loses atoms: {reason}", format.label());
-            }
-            eprintln!("converted {written}, skipped {skipped}");
 
-            if written == 0 {
-                eprintln!("nothing readable in {label}");
-                return Ok(exit::NO_INPUT);
+                (Kind::Volume, Kind::Molecules) => {
+                    // CUBE's own dual nature (#338) -- the only cross-Kind
+                    // pair the gate allows. Keep the atoms, drop the grid,
+                    // disclose it, then reuse the ordinary molecule-writing
+                    // machinery for the single resulting record.
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::Volume(grid) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce a volume",
+                            source_kind_format.name()
+                        );
+                    };
+                    let Some(molecule) = grid.atoms() else {
+                        bail!(
+                            "{} claims atoms (Carries::TOPOLOGY) but this file states none",
+                            source_kind_format.name()
+                        );
+                    };
+
+                    let mut writer = resolve_convert_output(format, output.as_deref())?;
+                    let mut tracker =
+                        write::DropTracker::for_conversion(source_kind_format, format);
+                    tracker.record(&record.name, molecule);
+                    writer.write_molecule(&record.name, molecule)?;
+                    writer.finish()?;
+                    tracker.report(format.label(), cli.explain_drops);
+                    // Not something `Carries` can express at all -- SAMPLES
+                    // belongs to the Volume family, disjoint from a
+                    // molecule's own attribute flags, so this is always true
+                    // for this one exceptional path and stated directly
+                    // rather than forced through the bitmask machinery.
+                    eprintln!(
+                        "{} discards {}'s density grid (Carries::SAMPLES)",
+                        format.label(),
+                        source_kind_format.label()
+                    );
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
+                (Kind::Frames, Kind::Frames) => {
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::Frames(mut trajectory) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce a trajectory",
+                            source_kind_format.name()
+                        );
+                    };
+                    let held = format::held_from_trajectory(&mut trajectory)?;
+                    let bytes =
+                        format
+                            .write_trajectory_bytes(&mut trajectory)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("{} cannot be written, only read", format.name())
+                            })?;
+                    write_all_bytes(&bytes, output.as_deref())?;
+                    write::report_kind_drop(format, held);
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
+                (Kind::Volume, Kind::Volume) => {
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::Volume(grid) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce a volume",
+                            source_kind_format.name()
+                        );
+                    };
+                    let held = format::held_from_volume(&grid);
+                    let bytes = format.write_volume_bytes(&grid).ok_or_else(|| {
+                        anyhow::anyhow!("{} cannot be written, only read", format.name())
+                    })?;
+                    write_all_bytes(&bytes, output.as_deref())?;
+                    write::report_kind_drop(format, held);
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
+                (Kind::Mesh, Kind::Mesh) => {
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::Mesh(mesh) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce a mesh",
+                            source_kind_format.name()
+                        );
+                    };
+                    let bytes = format.write_mesh_bytes(&mesh).ok_or_else(|| {
+                        anyhow::anyhow!("{} cannot be written, only read", format.name())
+                    })?;
+                    write_all_bytes(&bytes, output.as_deref())?;
+                    // Neither registered Mesh format has any optional
+                    // Carries flag beyond VERTICES/FACES to lose (#338) --
+                    // nothing to disclose is honest, not a gap.
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
+                (Kind::Table, Kind::Table) => {
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::Table(table) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce a table",
+                            source_kind_format.name()
+                        );
+                    };
+                    let bytes = format.write_table_bytes(&table).ok_or_else(|| {
+                        anyhow::anyhow!("{} cannot be written, only read", format.name())
+                    })?;
+                    write_all_bytes(&bytes, output.as_deref())?;
+                    // The one registered Table format has no optional
+                    // Carries flag beyond COLUMNS to lose (#338).
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
+                (source_kind, target_kind) => bail!(
+                    "internal error: kinds_compatible allowed {source_kind:?} -> {target_kind:?}, \
+                     which has no dispatch arm"
+                ),
             }
-            if cli.strict && skipped > 0 {
-                return Ok(exit::PARTIAL);
-            }
-            Ok(exit::OK)
         }
 
         Command::Draw {
@@ -667,30 +835,38 @@ fn run(cli: &Cli) -> Result<i32> {
             let size = Vec2::new(*width, *height);
 
             let mut generated = 0;
-            let mut rendered = Vec::with_capacity(read.outcome.len());
+            // Named alongside its rendering, not derived from `read.outcome`
+            // again afterward: a name list built separately from the records
+            // actually drawn would silently misalign with `rendered` the
+            // moment a record here is skipped (#310) -- unreachable today,
+            // since every registered format is `Kind::Molecules`, but wrong
+            // to leave for whichever format makes it reachable first.
+            let mut drawn: Vec<(String, String)> = Vec::with_capacity(read.outcome.len());
             for record in &read.outcome.records {
-                let mut molecule = record.molecule.clone();
+                let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+                    continue;
+                };
+                let mut molecule = molecule.clone();
                 if !molecule.has_coords() {
                     chem::core::layout::layout(&mut molecule);
                     generated += 1;
                 }
-                rendered.push(structure_to_svg(&molecule, size, &options, &palette));
+                drawn.push((
+                    record.name.clone(),
+                    structure_to_svg(&molecule, size, &options, &palette),
+                ));
             }
             if generated > 0 {
                 eprintln!(
                     "generated coordinates for {generated} of {} molecules (use `chem coords` to do this explicitly)",
-                    rendered.len()
+                    drawn.len()
                 );
             }
 
             match outdir {
                 Some(dir) => {
-                    let names: Vec<String> = read
-                        .outcome
-                        .records
-                        .iter()
-                        .map(|r| r.name.clone())
-                        .collect();
+                    let names: Vec<String> = drawn.iter().map(|(name, _)| name.clone()).collect();
+                    let rendered: Vec<String> = drawn.into_iter().map(|(_, svg)| svg).collect();
                     let filenames = export::unique_filenames(&names);
                     let renamed = filenames
                         .iter()
@@ -708,7 +884,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     }
                 }
                 None => {
-                    stream::write_output(output.as_ref(), &rendered[0])?;
+                    stream::write_output(output.as_ref(), &drawn[0].1)?;
                 }
             }
 
@@ -821,7 +997,10 @@ fn resolve_convert_input(
     if let Some(text) = literal {
         let format = from.unwrap_or(Format::SMILES);
         let supplier = format
-            .supplier(Cursor::new(text.as_bytes().to_vec()), &ReadOptions)
+            .supplier(
+                Cursor::new(text.as_bytes().to_vec()),
+                &ReadOptions::default(),
+            )
             .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
         return Ok((supplier, "<literal>".to_string(), format));
     }
@@ -830,15 +1009,15 @@ fn resolve_convert_input(
         Some(path) => {
             let format = from.unwrap_or_else(|| chem::io::open::format_for_path(path));
             let supplier = match from {
-                Some(format) => open_supplier_as(path, format, &ReadOptions)?,
-                None => chem::io::open::open_supplier(path, &ReadOptions)?,
+                Some(format) => open_supplier_as(path, format, &ReadOptions::default())?,
+                None => chem::io::open::open_supplier(path, &ReadOptions::default())?,
             };
             Ok((supplier, path.display().to_string(), format))
         }
         None => {
             let format = from.unwrap_or(Format::SMILES);
             let supplier = format
-                .supplier(std::io::stdin().lock(), &ReadOptions)
+                .supplier(std::io::stdin().lock(), &ReadOptions::default())
                 .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", format.name()))?;
             Ok((supplier, "-".to_string(), format))
         }
@@ -872,6 +1051,87 @@ fn resolve_convert_output(format: Format, output: Option<&Path>) -> Result<Box<d
         None => format
             .writer_stream(std::io::stdout().lock(), &WriteOptions::default())
             .ok_or_else(|| anyhow::anyhow!("{} cannot be written, only read", format.name())),
+    }
+}
+
+/// Resolves `chem convert`'s effective source format identity with no I/O at
+/// all -- the exact decision `resolve_convert_input` makes internally
+/// (explicit `--from`, else the path's extension, else SMILES), pulled out
+/// standalone so the `Kind` gate (#338) can run before any file is opened,
+/// not after `resolve_convert_input` has already read one.
+fn resolve_convert_input_format(
+    input: Option<&Path>,
+    literal: Option<&str>,
+    from: Option<Format>,
+) -> Format {
+    if literal.is_some() {
+        return from.unwrap_or(Format::SMILES);
+    }
+    match input.filter(|p| p.as_os_str() != "-") {
+        Some(path) => from.unwrap_or_else(|| chem::io::open::format_for_path(path)),
+        None => from.unwrap_or(Format::SMILES),
+    }
+}
+
+/// Reads the whole of `chem convert`'s input into memory -- what every
+/// `Kind::Frames`/`Volume`/`Mesh`/`Table` conversion path needs (#338),
+/// since each of those payload types is read via [`Format::read_bytes`] over
+/// a whole buffer, unlike `Kind::Molecules`'s per-record streaming
+/// [`Supplier`].
+fn read_all_bytes(input: Option<&Path>, literal: Option<&str>) -> Result<(Vec<u8>, String)> {
+    if let Some(text) = literal {
+        return Ok((text.as_bytes().to_vec(), "<literal>".to_string()));
+    }
+    match input.filter(|p| p.as_os_str() != "-") {
+        Some(path) => {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            Ok((bytes, path.display().to_string()))
+        }
+        None => {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes)
+                .context("reading standard input")?;
+            Ok((bytes, "-".to_string()))
+        }
+    }
+}
+
+/// Writes `bytes` to `chem convert`'s output -- the non-streaming
+/// counterpart to [`resolve_convert_output`]'s `Box<dyn Writer>` (#338).
+fn write_all_bytes(bytes: &[u8], output: Option<&Path>) -> Result<()> {
+    match output.filter(|p| p.as_os_str() != "-") {
+        Some(path) => {
+            std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+        }
+        None => std::io::Write::write_all(&mut std::io::stdout().lock(), bytes)
+            .context("writing standard output"),
+    }
+}
+
+/// Reads exactly one record for `chem convert`'s non-streaming `Kind` paths
+/// (#338) -- every one of `Kind::Frames`/`Volume`/`Mesh`/`Table` is always
+/// exactly one record per file, never a stream of many. `Ok(None)` means
+/// nothing readable (already reported on stderr); the caller returns
+/// `exit::NO_INPUT`.
+fn read_one_record(
+    source_format: Format,
+    input: Option<&Path>,
+    literal: Option<&str>,
+) -> Result<Option<Record>> {
+    let (bytes, label) = read_all_bytes(input, literal)?;
+    let outcome = source_format
+        .read_bytes(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("{} cannot be read, only written", source_format.name()))?;
+    for s in &outcome.skipped {
+        eprintln!("skipping record in {label}: {}", s.error);
+    }
+    match outcome.records.into_iter().next() {
+        Some(record) => Ok(Some(record)),
+        None => {
+            eprintln!("nothing readable in {label}");
+            Ok(None)
+        }
     }
 }
 
@@ -909,6 +1169,13 @@ fn print_format_listing(query: &str) -> Result<()> {
 /// spelled-out names would not fit a terminal. `C` is formal charge and `P`
 /// partial; `F` is the temperature factor, which is what the PDB spec calls
 /// the B-factor column.
+///
+/// The seven entries below `PROPERTIES` cover `Kind::Frames`/`Volume`/`Mesh`/
+/// `Table` (#339), picked from the letters the block above left free: `V`
+/// velocities, `N` forces (Newtons; `F` was already b_factor), `M` frame time
+/// (a moment; `T` was already topology), `L` a volume's sample values
+/// (levels), `E` mesh vertices (`V` was already velocities), `K` mesh faces,
+/// `Y` table columns (`C` was already formal charge).
 const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::TOPOLOGY, 'T', "topology"),
     (Carries::BONDS, 'B', "bonds"),
@@ -926,17 +1193,37 @@ const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::OCCUPANCY, 'O', "occupancy"),
     (Carries::UNIT_CELL, 'U', "unit_cell"),
     (Carries::PROPERTIES, 'X', "properties"),
+    (Carries::VELOCITIES, 'V', "velocities"),
+    (Carries::FORCES, 'N', "forces"),
+    (Carries::FRAME_TIME, 'M', "frame_time"),
+    (Carries::SAMPLES, 'L', "samples"),
+    (Carries::VERTICES, 'E', "vertices"),
+    (Carries::FACES, 'K', "faces"),
+    (Carries::COLUMNS, 'Y', "columns"),
 ];
 
 /// `chem convert -L matrix` (#257) — what survives every registered conversion.
 ///
 /// A pure query, like the rest of `-L`: the cells come from the registry, not
 /// from running conversions. What makes them true is
-/// `test_every_format_pair_delivers_what_the_matrix_says`, which measures all
-/// 121 pairs against exactly this function.
+/// `test_every_format_pair_delivers_what_the_matrix_says`, which measures
+/// every pair `format::fidelity_pairs()` yields — 352 today (#339), same-kind
+/// pairs across all five kinds plus CUBE's 17 `Kind::Volume` -> `Kind::
+/// Molecules` cross-kind pairs — never the naive 29x29 = 841 full product.
 fn print_fidelity_matrix() {
     let formats: Vec<Format> = format::all().collect();
+    // Rows and columns still span every registered format (a format's own
+    // diagonal cell always applies), but a cell is only ever computed for a
+    // pair `fidelity_pairs()` actually yields -- otherwise blank. Without
+    // this, a cell like CSV x CUBE would render `format::fidelity`'s answer
+    // for a pair `kinds_compatible` itself refuses, the exact "growing to
+    // 812 pairs" #339 exists to close.
+    let valid_pairs: std::collections::HashSet<(Format, Format)> =
+        format::fidelity_pairs().collect();
     let cell = |source: Format, target: Format| -> String {
+        if !valid_pairs.contains(&(source, target)) {
+            return String::new();
+        }
         let delivered = format::fidelity(source, target);
         // Lowercase for an attribute the target's writer manufactures rather
         // than carries across. Without the distinction `smi -> pdb` reads as
@@ -1105,7 +1392,9 @@ fn describe(read: &stream::Input) -> String {
     // anyone is actually asking.
     let mut out = String::from("name\tatoms\tbonds\tcoords2d\tcoords3d\n");
     for record in &read.outcome.records {
-        let molecule = &record.molecule;
+        let Some(molecule) = stream::molecule_or_report(record, &read.label) else {
+            continue;
+        };
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n",
             record.name,

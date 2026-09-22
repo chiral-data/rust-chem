@@ -2,6 +2,77 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.0] - 2026-09-22
+
+**The registry outgrew molecules.** v0.8.0 shipped eleven formats, and every one of them was a
+molecule in a text file. This release adds eighteen more, and most of them are neither: seven are
+binary, four carry no atoms at all, and a trajectory is not a list of molecules in any
+representation this crate could express before now. `FormatDescriptor` grows an encoding and a
+`Kind` alongside the format it already described, and two invariants that used to assume every
+format holds atoms are kind-aware instead of simply relaxed (#309, #310).
+
+The correctness claim grew with the registry rather than being asserted over it. #339 measures
+every pair the widened matrix can meaningfully ask about — within-kind pairs, plus the cross-kind
+conversions #338 decided deliberately — rather than all 812 ordered pairs 29² would otherwise
+imply. #340 widens the differential harness with MDAnalysis (trajectories), cpptraj (the
+Amber-native formats) and trimesh (meshes), on top of the RDKit/OpenBabel/gemmi comparisons v0.8.0
+already ran. #341 commits the binary fixtures those checks need as a generator script plus its
+output, rather than vendoring files nobody in this repo can explain.
+
+`chem-app` caught up in the same cycle (#342): a trajectory now shows its frame count and a
+frame-index slider; a volume, mesh or table shows its own shape, none of it silently reported as
+"0 molecules." Its own live testing found two further defects, fixed on the same PR: every binary
+format had in fact been failing to load at all, mis-reported as invalid UTF-8 (#380), and rapid
+re-clicks of the file dialog could crash the whole wasm instance (#381).
+
+The roadmap that planned this milestone moved out of a closed issue and into the README before any
+of it shipped (#308) — and the README needed a second pass at the end of it: it still described
+v0.6, and its own crate-level doc comment in `lib.rs` turned out to be a second, independently
+drifting copy of the same text (#343).
+
+### Features
+
+- **The registry's second axis**: `Kind` (Molecules, Frames, Volume, Mesh, Table), `Encoding`
+  (Text/Binary) and a shared byte-level read entry point so a binary format can register at all
+  (#309, #310)
+- **`Trajectory`** — one topology, many frames, `Read + Seek` with a frame index rather than
+  `mmap`, since the app ships a wasm build (#311)
+- **`VolumeGrid`**, **`Mesh`** and **`Table`** — a sampled scalar field, vertices/normals/faces, and
+  typed columns, the three non-molecular shapes the eighteen new formats needed somewhere to land
+  (#312, #313, #314)
+- **`ForceFieldTopology`** — atom types, masses, angles, dihedrals, impropers and exclusions, so a
+  PRMTOP round trip doesn't quietly delete the force field it carries (#315)
+- **Content sniffed before falling back to SMILES** — harmless for a stray `.txt`, expensive for a
+  2 GB DCD with the wrong extension (#317)
+- **Structural formats**: BinaryCIF (#319), CIF core (#320), PSF (#321), PRMTOP (#322), TOP (#323)
+  and LAMMPS data (#324)
+- **Trajectory formats**: XTC (#325), TRR (#326), DCD (#327), NCTRAJ — with a hand-rolled
+  NetCDF-3 classic layer, since the `netcdf` crate is a `-sys` crate the CI purity gate already
+  rejects (#328) — and LAMMPS trajectory (#329); multi-frame text formats a molecule's `Kind` can
+  now reflect on content rather than format alone (#330)
+- **Volumetric formats**: CUBE (#331), CCP4/MRC (#332), DX (#333) and DSN6 (#334)
+- **Mesh and tabular formats**: OBJ (#335), PLY (#336) and CSV (#337)
+- **`chem convert` across kinds** — the refusal is the feature for most pairs, except the ones
+  enumerated deliberately, such as CUBE's grid-and-atoms dual carry (#338)
+- **The fidelity matrix at 29 formats**, scoped to within-kind pairs plus the deliberate cross-kind
+  exceptions, with a tolerance comparison for XTC's lossy compression (#339)
+
+### Fixed
+
+- **The crate README described v0.6** while the crate was three releases past it, and separately
+  claimed SDF doesn't write charges, isotopes, chirality or bond stereo — false since #197. Merged
+  into `lib.rs`'s own doc comment via `include_str!` so there is one copy instead of two drifting
+  independently, plus a test asserting the version string and every example stay in step (#343)
+- **`chem-app` failed to load every binary format**, reporting each as "not valid UTF-8" — the
+  loader decoded every file as UTF-8 before dispatching on format, a pre-existing gap #342's own
+  live testing exposed rather than introduced (#380)
+- **Rapid re-clicks of "Load File" on the web build could crash the whole wasm instance**, an
+  upstream `rfd` DOM-cleanup race with no re-entrancy guard in front of it (#381)
+- **The LAMMPS trajectory writer emitted `NaN` box bounds for a degenerate unit cell** — a DCD cell
+  record of all zeros, MDAnalysis's convention for "no periodic box," reached the triclinic
+  conversion's `0.0 / 0.0` because a trajectory's per-frame cell never passes through
+  `Molecule::set_cell`'s own validation gate (#376)
+
 ## [0.8.0] - 2026-09-08
 
 **Two formats became eleven, and every conversion now says what it costs.** v0.7.0 built the data

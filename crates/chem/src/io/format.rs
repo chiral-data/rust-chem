@@ -6,7 +6,12 @@ use std::ops::{BitAnd, BitOr, Not};
 
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
+use crate::core::geometry::Point3;
+use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
+use crate::core::table::Table;
+use crate::core::trajectory::{Trajectory, TrajectoryError};
+use crate::core::volume::VolumeGrid;
 use crate::io::options::{ReadOptions, WriteOptions};
 use crate::io::reader::ReadOutcome;
 use crate::io::supplier::{Supplier, Writer};
@@ -80,6 +85,64 @@ impl Carries {
     /// claim was never testable. Appended rather than inserted so the existing
     /// bit numbering stays put; the report order is a separate table.
     pub const BONDS: Carries = Carries(1 << 16);
+    /// A force-field atom type name (`"CT"`, `"OW"`), from
+    /// [`crate::core::force_field::ForceFieldAtom::atom_type`]. PSF and TOP
+    /// state one per atom; PRMTOP does too, in `AMBER_ATOM_TYPE`.
+    pub const ATOM_TYPE: Carries = Carries(1 << 17);
+    /// A force-field atomic mass, from
+    /// [`crate::core::force_field::ForceFieldAtom::mass`]. All three of PSF,
+    /// TOP and PRMTOP state one per atom.
+    pub const MASS: Carries = Carries(1 << 18);
+    /// Three-atom angle terms, from
+    /// [`crate::core::force_field::ForceFieldTopology::angles`].
+    pub const ANGLES: Carries = Carries(1 << 19);
+    /// Four-atom proper-torsion terms, from
+    /// [`crate::core::force_field::ForceFieldTopology::dihedrals`].
+    pub const DIHEDRALS: Carries = Carries(1 << 20);
+    /// Four-atom improper (out-of-plane) torsion terms, from
+    /// [`crate::core::force_field::ForceFieldTopology::impropers`].
+    pub const IMPROPERS: Carries = Carries(1 << 21);
+    /// Nonbonded-exclusion atom pairs, from
+    /// [`crate::core::force_field::ForceFieldTopology::exclusions`].
+    pub const EXCLUSIONS: Carries = Carries(1 << 22);
+    /// Per-atom velocities, from [`crate::core::trajectory::Frame::velocities`].
+    /// TRR carries these; XTC never does.
+    pub const VELOCITIES: Carries = Carries(1 << 23);
+    /// Per-atom forces, from [`crate::core::trajectory::Frame::forces`].
+    pub const FORCES: Carries = Carries(1 << 24);
+    /// A frame's simulation time, from
+    /// [`crate::core::trajectory::Frame::time`]. Named `FRAME_TIME` rather
+    /// than `TIME` to stay unambiguous next to
+    /// [`Category::KineticsAndThermodynamics`], a category nothing in this
+    /// type otherwise names.
+    pub const FRAME_TIME: Carries = Carries(1 << 25);
+    /// A grid's sampled scalar values, from
+    /// [`crate::core::volume::VolumeGrid::values`] — the one thing every
+    /// volumetric format holds, the same role [`Carries::TOPOLOGY`] plays
+    /// for a molecule.
+    pub const SAMPLES: Carries = Carries(1 << 26);
+    /// A mesh's vertex positions, from [`crate::core::mesh::Mesh::vertices`]
+    /// — the one thing every mesh format holds; see [`Carries::FACES`] for
+    /// why the faces are a separate flag.
+    pub const VERTICES: Carries = Carries(1 << 27);
+    /// A mesh's faces, separate from [`Carries::VERTICES`] the same reason
+    /// [`Carries::BONDS`] is separate from [`Carries::TOPOLOGY`]: a format
+    /// could in principle carry vertex positions with no face list at all
+    /// (a point cloud).
+    pub const FACES: Carries = Carries(1 << 28);
+    /// A table's columns, from [`crate::core::table::Table::columns`] — the
+    /// one thing every tabular format holds.
+    pub const COLUMNS: Carries = Carries(1 << 29);
+    /// Hydrogen-bond donor pairs, from
+    /// [`crate::core::force_field::ForceFieldTopology::donors`]. PSF is the
+    /// first format to state these (#321).
+    pub const DONORS: Carries = Carries(1 << 30);
+    /// Hydrogen-bond acceptor pairs, from
+    /// [`crate::core::force_field::ForceFieldTopology::acceptors`]. PSF is
+    /// the first format to state these (#321). The last bit this `u32` has
+    /// room for — a 33rd flag needs a wider representation, not this one's
+    /// problem.
+    pub const ACCEPTORS: Carries = Carries(1 << 31);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -100,6 +163,25 @@ impl Carries {
         (Carries::PROPERTIES, "properties"),
         (Carries::QUERY, "query"),
         (Carries::STEREO_GROUP, "stereo_group"),
+        // Force-field attributes (#315), grouped together here even though
+        // their bits were appended at the end of the numeric list above.
+        (Carries::ATOM_TYPE, "atom_type"),
+        (Carries::MASS, "mass"),
+        (Carries::ANGLES, "angles"),
+        (Carries::DIHEDRALS, "dihedrals"),
+        (Carries::IMPROPERS, "impropers"),
+        (Carries::EXCLUSIONS, "exclusions"),
+        (Carries::DONORS, "donors"),
+        (Carries::ACCEPTORS, "acceptors"),
+        // Non-molecule kinds (#316): a trajectory's frames, a volume grid's
+        // samples, a mesh's surface, a table's columns.
+        (Carries::VELOCITIES, "velocities"),
+        (Carries::FORCES, "forces"),
+        (Carries::FRAME_TIME, "frame_time"),
+        (Carries::SAMPLES, "samples"),
+        (Carries::VERTICES, "vertices"),
+        (Carries::FACES, "faces"),
+        (Carries::COLUMNS, "columns"),
     ];
 
     pub const fn empty() -> Carries {
@@ -258,6 +340,45 @@ pub fn held(molecule: &Molecule) -> Carries {
         }
     }
 
+    if let Some(force_field) = molecule.force_field() {
+        if let Some(atoms) = &force_field.atoms {
+            for atom in atoms {
+                if atom.atom_type.is_some() {
+                    carries = carries | Carries::ATOM_TYPE;
+                }
+                if atom.mass.is_some() {
+                    carries = carries | Carries::MASS;
+                }
+                // Ors into the same flag the `sites` loop above already
+                // sets -- a Mol2 charge and an Amber charge are different
+                // provenances for the same fact, and the mask only claims
+                // that a partial charge survives, not which table it lives
+                // in.
+                if atom.partial_charge.is_some() {
+                    carries = carries | Carries::PARTIAL_CHARGE;
+                }
+            }
+        }
+        if !force_field.angles.is_empty() {
+            carries = carries | Carries::ANGLES;
+        }
+        if !force_field.dihedrals.is_empty() {
+            carries = carries | Carries::DIHEDRALS;
+        }
+        if !force_field.impropers.is_empty() {
+            carries = carries | Carries::IMPROPERS;
+        }
+        if !force_field.exclusions.is_empty() {
+            carries = carries | Carries::EXCLUSIONS;
+        }
+        if !force_field.donors.is_empty() {
+            carries = carries | Carries::DONORS;
+        }
+        if !force_field.acceptors.is_empty() {
+            carries = carries | Carries::ACCEPTORS;
+        }
+    }
+
     carries
 }
 
@@ -285,6 +406,11 @@ pub enum Category {
     KineticsAndThermodynamics,
     MolecularDynamicsAndDocking,
     VolumeData,
+    /// A triangulated surface, no chemistry at all -- OBJ (#335), PLY
+    /// (#336).
+    MeshData,
+    /// Named columns and rows, no structure implied -- CSV (#337).
+    TabularData,
     Json,
     Miscellaneous,
     BiologicalData,
@@ -307,6 +433,8 @@ impl Category {
             Category::KineticsAndThermodynamics => "Kinetics and Thermodynamics formats",
             Category::MolecularDynamicsAndDocking => "Molecular dynamics and docking formats",
             Category::VolumeData => "Volume data formats",
+            Category::MeshData => "Mesh data formats",
+            Category::TabularData => "Tabular data formats",
             Category::Json => "JSON formats",
             Category::Miscellaneous => "Miscellaneous formats",
             Category::BiologicalData => "Biological data formats",
@@ -315,11 +443,110 @@ impl Category {
     }
 }
 
+/// Whether a format's canonical bytes are UTF-8 text or an arbitrary binary
+/// layout.
+///
+/// Introduced by #309 so the registry can widen to binary formats (XTC, DCD,
+/// CCP4, ...) without repointing the eleven existing text `reader`/`writer`
+/// function pointers, which stay exactly as typed and shaped as they are
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Text,
+    Binary,
+}
+
+/// What a format's records *are*.
+///
+/// `test_every_registered_format_is_well_formed`'s `Carries::TOPOLOGY`
+/// assertion used to be unconditional -- a fair typo-catcher while every
+/// registered format was a molecule format. #310 is the first format-shaped
+/// story where that stops being true: a density map, a mesh and a table have
+/// no atoms to declare, so the invariant has to know which formats are
+/// making a claim about atoms at all before it can enforce one.
+///
+/// `#[non_exhaustive]`, like [`Category`]: a variant added later (this enum
+/// names all five kinds the v0.9.0 milestone needs, and as of #314 every one
+/// has a container type -- but no format is registered as anything but
+/// `Molecules` yet) forces every exhaustive match inside this crate to be
+/// revisited rather than silently compiling with a wrong assumption.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// One conformer, one topology -- what every format registered before
+    /// #310 already is.
+    Molecules,
+    /// One topology, many conformers -- a trajectory
+    /// ([`crate::core::trajectory::Trajectory`], #311). No format is
+    /// registered as this yet; the first will be #329 (LAMMPS trajectory) or
+    /// #326 (TRR).
+    Frames,
+    /// A scalar field on a grid -- a density map
+    /// ([`crate::core::volume::VolumeGrid`], #312). No format is registered
+    /// as this yet; the first will be #331 (CUBE).
+    Volume,
+    /// Vertices, normals, faces -- no chemistry at all
+    /// ([`crate::core::mesh::Mesh`], #313). No format is registered as this
+    /// yet; the first will be #335 (OBJ) or #336 (PLY).
+    Mesh,
+    /// Typed columns, no structure implied ([`crate::core::table::Table`],
+    /// #314). No format is registered as this yet; the first will be #337
+    /// (CSV).
+    Table,
+}
+
 /// Parses a whole file into molecules.
 pub(crate) type ReadFn = fn(&str, &ReadOptions) -> ReadOutcome;
 
 /// Serialises named molecules into one file's worth of text.
 pub(crate) type WriteFn = fn(&[(String, Molecule)], &WriteOptions) -> String;
+
+/// Parses a whole file into molecules, from raw bytes rather than decoded
+/// text — what a binary format's reader is shaped like (#309).
+pub(crate) type ByteReadFn = fn(&[u8], &ReadOptions) -> ReadOutcome;
+
+/// Serialises named molecules into one file's worth of bytes — what a binary
+/// format's writer is shaped like (#309).
+pub(crate) type ByteWriteFn = fn(&[(String, Molecule)], &WriteOptions) -> Vec<u8>;
+
+/// Serialises a whole trajectory into one file's worth of bytes (#326) —
+/// singular, unlike [`ByteWriteFn`]'s `&[(String, Molecule)]` list, since one
+/// trajectory file holds exactly one trajectory, not a list of named
+/// records. A new, parallel field rather than a widened `WriteFn`/
+/// `ByteWriteFn`: those are fundamentally shaped for `Molecule`, and
+/// generalising them to be payload-polymorphic is separate, larger work
+/// this format does not need (see [`crate::io::trr`]'s module doc).
+pub(crate) type ByteWriteTrajectoryFn = fn(&mut Trajectory, &WriteOptions) -> Vec<u8>;
+
+/// Serialises a whole [`VolumeGrid`] into one file's worth of bytes (#331) —
+/// the same "new, parallel field" reasoning [`ByteWriteTrajectoryFn`] already
+/// documents, since a grid is neither a `Molecule` list nor a `Trajectory`.
+/// Byte-returning like that field too, so a later binary volumetric format
+/// (CCP4/DSN6, #332-#333) reuses this same field rather than needing a
+/// second one just because CUBE happened to be text.
+pub(crate) type ByteWriteVolumeFn = fn(&VolumeGrid, &WriteOptions) -> Vec<u8>;
+
+/// Serialises a whole [`Mesh`] into one file's worth of bytes (#335) — the
+/// same "new, parallel field" reasoning [`ByteWriteVolumeFn`] already
+/// documents, since a mesh is neither a `Molecule` list nor a `VolumeGrid`.
+pub(crate) type ByteWriteMeshFn = fn(&Mesh, &WriteOptions) -> Vec<u8>;
+
+/// Serialises a whole [`Table`] into one file's worth of bytes (#337) — the
+/// same "new, parallel field" reasoning [`ByteWriteMeshFn`] already
+/// documents, since a table is neither a `Molecule` list nor any of the
+/// other three payload shapes.
+pub(crate) type ByteWriteTableFn = fn(&Table, &WriteOptions) -> Vec<u8>;
+
+/// A byte pattern identifying a format's content, independent of any
+/// filename: the exact bytes expected starting at `offset` (#317).
+///
+/// CCP4's `MAP ` sits at byte 208, not byte 0 — the offset is part of the
+/// signature, not always zero the way gzip's `\x1f\x8b` is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Signature {
+    pub offset: usize,
+    pub bytes: &'static [u8],
+}
 
 /// Builds a streaming [`Supplier`] over a boxed reader (#213).
 pub(crate) type SupplierCtor = fn(Box<dyn BufRead>, &ReadOptions) -> Box<dyn Supplier>;
@@ -348,11 +575,46 @@ pub struct FormatDescriptor {
     /// today — see [`Carries`] on why that is not the same as what the
     /// specification allows.
     pub carries: Carries,
+    /// Whether this format's canonical bytes are UTF-8 text or binary.
+    pub encoding: Encoding,
+    /// What this format's records *are* -- see [`Kind`].
+    pub kind: Kind,
+    /// Content signatures identifying this format independent of its
+    /// filename — checked by `crate::io::open::open_supplier` only when
+    /// nothing claims the file's extension, before falling back to SMILES
+    /// (#317). Empty for every format registered today; a binary format
+    /// story (#319, #325-#337) is what will populate this.
+    pub(crate) magic: &'static [Signature],
 
     pub(crate) reader: Option<ReadFn>,
     pub(crate) writer: Option<WriteFn>,
+    /// Set only for a format whose canonical reader takes raw bytes (#309) —
+    /// `None` for every text format, including all eleven registered today.
+    pub(crate) reader_bytes: Option<ByteReadFn>,
+    /// Set only for a format whose canonical writer produces raw bytes
+    /// (#309) — `None` for every text format, including all eleven
+    /// registered today.
+    pub(crate) writer_bytes: Option<ByteWriteFn>,
     pub(crate) supplier: Option<SupplierCtor>,
     pub(crate) writer_stream: Option<WriterCtor>,
+    /// Set only for a format whose writer takes a whole [`Trajectory`]
+    /// rather than a `&[(String, Molecule)]` list (#326) — `None` for every
+    /// `Kind::Molecules` format, including all seventeen registered before
+    /// TRR.
+    pub(crate) writer_trajectory: Option<ByteWriteTrajectoryFn>,
+    /// Set only for a format whose writer takes a whole [`VolumeGrid`]
+    /// (#331) — `None` for every format registered before CUBE.
+    pub(crate) writer_volume: Option<ByteWriteVolumeFn>,
+    /// Set only for a format whose writer takes a whole [`Mesh`] (#335) —
+    /// `None` for every format registered before OBJ.
+    pub(crate) writer_mesh: Option<ByteWriteMeshFn>,
+    /// Set only for a format whose writer takes a whole [`Table`] (#337) —
+    /// `None` for every format registered before CSV. Unlike
+    /// `writer_volume`/`writer_mesh`, this can be populated *alongside* an
+    /// ordinary `writer`/`writer_bytes` on the same descriptor: CSV writes
+    /// both a `Table` (its declared kind) and, as a disclosed opt-in, a
+    /// molecule list with a `smiles` column.
+    pub(crate) writer_table: Option<ByteWriteTableFn>,
 }
 
 /// Every format compiled into this build.
@@ -384,11 +646,24 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_smiles_records),
         supplier: Some(smiles_supplier),
         writer_stream: Some(smiles_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
         codes: &["sdf", "sd", "mol", "mdl"],
-        extensions: &["sdf"],
+        // `mol` is also a code (`-imol` already worked), but was missing
+        // here -- a `.mol` file, the more common name for a single-molecule
+        // molfile than `.sdf`, silently read as SMILES with every line
+        // skipped (#318).
+        extensions: &["sdf", "mol"],
         category: Category::CommonCheminformatics,
         // An atom block holds one set of positions, and the program line's
         // dimensional code says which. Charges, isotopes, chirality and bond
@@ -422,6 +697,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_sdf_records),
         supplier: Some(sdf_supplier),
         writer_stream: Some(sdf_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -454,6 +738,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_cxsmiles_records),
         supplier: Some(cxsmiles_supplier),
         writer_stream: Some(cxsmiles_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -475,6 +768,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_xyz_records),
         supplier: Some(xyz_supplier),
         writer_stream: Some(xyz_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -499,6 +801,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_pdb_records),
         supplier: Some(pdb_supplier),
         writer_stream: Some(pdb_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -520,6 +831,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_mmcif_records),
         supplier: Some(mmcif_supplier),
         writer_stream: Some(mmcif_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -546,6 +866,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_mol2_records),
         supplier: Some(mol2_supplier),
         writer_stream: Some(mol2_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -568,6 +897,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_pdbqt_records),
         supplier: Some(pdbqt_supplier),
         writer_stream: Some(pdbqt_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -586,6 +924,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_gro_records),
         supplier: Some(gro_supplier),
         writer_stream: Some(gro_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -609,6 +956,15 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_cml_records),
         supplier: Some(cml_supplier),
         writer_stream: Some(cml_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -640,6 +996,649 @@ static FORMATS: &[FormatDescriptor] = &[
         writer: Some(write_commonchem_records),
         supplier: Some(commonchem_supplier),
         writer_stream: Some(commonchem_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "BinaryCIF",
+        codes: &["bcif", "binarycif"],
+        extensions: &["bcif"],
+        category: Category::BiologicalData,
+        // Same mask as mmCIF, and for the same reasons -- see `io/mmcif.rs`'s
+        // module doc. Both formats go through the same
+        // `cif_model::build_molecule`/`build_rows` (#319), so what survives
+        // a round trip is identical by construction.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::RESIDUES)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(bcif_supplier),
+        writer_stream: Some(bcif_writer_stream),
+        encoding: Encoding::Binary,
+        kind: Kind::Molecules,
+        // MessagePack has no fixed leading bytes -- its first byte encodes
+        // the top-level value's own type and length, so there is nothing
+        // to sniff. Resolved by extension only, same as every format
+        // registered before #317 added `magic` at all.
+        magic: &[],
+        reader_bytes: Some(crate::io::bcif::read_bcif_with_options),
+        writer_bytes: Some(crate::io::bcif::write_bcif_records),
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "CIF core",
+        // Not "cif" -- mmCIF's descriptor already claims that code
+        // (`codes: &["mmcif", "cif"]` above), and codes must be unique
+        // (`test_every_registered_format_is_well_formed`). Extensions are
+        // not required to be unique, which is exactly what lets this share
+        // `.cif` with mmCIF at all -- content, not the name, decides which
+        // one a `.cif` file resolves to (#320, see `cif_core::
+        // is_small_molecule_cif` and its two call sites in `io::open` and
+        // `bin::chem::stream`).
+        codes: &["cif-core"],
+        extensions: &["cif"],
+        category: Category::Crystallography,
+        // No BONDS, no RESIDUES: this dictionary has no bond loop and no
+        // chain/residue notion at all (no `label_asym_id`/`auth_seq_id`
+        // machinery) -- see `io/cif_core.rs`'s module doc.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::OCCUPANCY)
+            .or(Carries::B_FACTOR)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_cif_core_with_options),
+        writer: Some(write_cif_core_records),
+        supplier: Some(cif_core_supplier),
+        writer_stream: Some(cif_core_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `data_` text, same as mmCIF -- nothing fixed-offset to
+        // sniff; the `.cif` dispatch special case does its own scan
+        // instead of going through this mechanism, see the module doc.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "PSF",
+        codes: &["psf"],
+        extensions: &["psf"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Deliberately no COORDS_2D/COORDS_3D -- PSF states no coordinates
+        // at all, the same "topology-only, zero geometry" shape SMILES
+        // already establishes as legitimate. The first real user of
+        // `ForceFieldTopology` (#315), and of its DONORS/ACCEPTORS flags
+        // (#321) -- see `io/psf.rs`'s module doc.
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::RESIDUES)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::EXCLUSIONS)
+            .or(Carries::DONORS)
+            .or(Carries::ACCEPTORS),
+        reader: Some(crate::io::reader::read_psf_with_options),
+        writer: Some(write_psf_records),
+        supplier: Some(psf_supplier),
+        writer_stream: Some(psf_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `PSF` text -- nothing fixed-offset to sniff, and no
+        // extension ambiguity to resolve (`.psf` is claimed by nothing
+        // else), so `magic` buys nothing here.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "PRMTOP",
+        codes: &["prmtop"],
+        // `"top"` included deliberately (#323): AMBER topologies are
+        // sometimes saved under `.top` too, alongside the native
+        // `prmtop`/`parm7`. `Format::from_filename_checked` resolves a bare
+        // `.top` to whichever format is registered first -- this one, so
+        // no behavior change for anyone already relying on it -- and
+        // `io::open::resolve_format`/`bin/chem/stream.rs`'s own copy
+        // override to `Format::TOP` by content when `top::is_gromacs_top`
+        // says so, the same shape `.cif`'s mmCIF/CIF-core disambiguation
+        // already uses.
+        extensions: &["prmtop", "parm7", "top"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Topology only (#322) -- PRMTOP states substantially more of the
+        // force field than PSF does (force constants, equilibrium values,
+        // Lennard-Jones coefficients), but those have no home in
+        // `ForceFieldTopology`, which already frames them as out of scope
+        // for this milestone, and `Carries` is completely full at 32/32
+        // bits. Same topology mask PSF uses, minus DONORS/ACCEPTORS --
+        // PRMTOP has no donor/acceptor section at all.
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::RESIDUES)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::EXCLUSIONS),
+        reader: Some(crate::io::reader::read_prmtop_with_options),
+        writer: Some(write_prmtop_records),
+        supplier: Some(prmtop_supplier),
+        writer_stream: Some(prmtop_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `%VERSION` text -- nothing fixed-offset to sniff, and no
+        // extension ambiguity to resolve (`.prmtop`/`.parm7` are claimed by
+        // nothing else), so `magic` buys nothing here.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "TOP",
+        codes: &["top"],
+        // Shares `.top` with PRMTOP -- see PRMTOP's own `extensions`
+        // comment for the disambiguation story (#323).
+        extensions: &["top"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Topology only, same reasoning as PRMTOP: force constants,
+        // equilibrium values and the `[ *types ]` tables that carry them
+        // have no home in `ForceFieldTopology`, and `Carries` is
+        // completely full at 32/32 bits. Same mask PSF/PRMTOP use, minus
+        // DONORS/ACCEPTORS -- GROMACS has no such section either.
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::RESIDUES)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::EXCLUSIONS),
+        reader: Some(crate::io::reader::read_top_with_options),
+        writer: Some(write_top_records),
+        supplier: Some(top_supplier),
+        writer_stream: Some(top_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII `[ section ]` text -- nothing fixed-offset to sniff, and
+        // the one extension ambiguity that exists (`.top`, with PRMTOP) is
+        // resolved by `is_gromacs_top` at the `io::open`/CLI entry points,
+        // not through this mechanism.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "LAMMPS Data",
+        codes: &["lammps"],
+        // No reliable extension convention really exists for this format
+        // (confirmed by research -- real files are often named
+        // `data.<system>` with no suffix at all); these are a reasonable,
+        // non-colliding default, not a claim of authority (#324).
+        extensions: &["lammps", "lmp", "data"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The first force-field-topology format that also states
+        // coordinates -- see `io/lammps.rs`'s module doc. Topology only,
+        // same reasoning as PSF/PRMTOP/TOP. No RESIDUES (a molecule-id
+        // column exists but is a bare integer, no name to build a residue
+        // from) and no EXCLUSIONS (LAMMPS has no such section at all --
+        // exclusions are an input-script `special_bonds` setting, not
+        // file data).
+        carries: Carries::TOPOLOGY
+            .or(Carries::BONDS)
+            .or(Carries::ATOM_TYPE)
+            .or(Carries::MASS)
+            .or(Carries::PARTIAL_CHARGE)
+            .or(Carries::ANGLES)
+            .or(Carries::DIHEDRALS)
+            .or(Carries::IMPROPERS)
+            .or(Carries::COORDS_3D)
+            .or(Carries::UNIT_CELL),
+        reader: Some(crate::io::reader::read_lammps_data_with_options),
+        writer: Some(write_lammps_data_records),
+        supplier: Some(lammps_data_supplier),
+        writer_stream: Some(lammps_data_writer_stream),
+        encoding: Encoding::Text,
+        kind: Kind::Molecules,
+        // ASCII text with an arbitrary first line -- nothing fixed-offset
+        // to sniff, and no extension ambiguity to resolve (nothing else
+        // claims `lammps`/`lmp`/`data`).
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "TRR",
+        codes: &["trr"],
+        extensions: &["trr"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The first `Kind::Frames` format -- topology (a bare atom count,
+        // see `io/trr.rs`'s module doc), positions, and whatever a given
+        // frame happened to also state: velocities, forces, simulation
+        // time, a box. No RESIDUES/ATOM_TYPE/MASS/BONDS -- TRR states none
+        // of a molecule's identity, only its trajectory.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::VELOCITIES)
+            .or(Carries::FORCES)
+            .or(Carries::FRAME_TIME)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(trr_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // GROMACS's own fixed magic number, big-endian -- the first real,
+        // populated signature in this crate (#317 built the mechanism;
+        // #319/#325-#337 are what populate it for a real format).
+        magic: &[Signature {
+            offset: 0,
+            bytes: &[0x00, 0x00, 0x07, 0xC9],
+        }],
+        reader_bytes: Some(crate::io::trr::read_trr_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::trr::write_trr_bytes),
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "XTC",
+        codes: &["xtc"],
+        extensions: &["xtc"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The second `Kind::Frames` format -- same shared topology
+        // (`Element::UNKNOWN`) as TRR, but no VELOCITIES/FORCES at all:
+        // XTC's compressed coordinate block only ever carries positions.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::FRAME_TIME)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(xtc_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // GROMACS's own fixed magic number, big-endian -- distinct from
+        // TRR's `1993` by exactly 2 (#325).
+        magic: &[Signature {
+            offset: 0,
+            bytes: &[0x00, 0x00, 0x07, 0xCB],
+        }],
+        reader_bytes: Some(crate::io::xtc::read_xtc_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::xtc::write_xtc_bytes),
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "DCD",
+        codes: &["dcd"],
+        extensions: &["dcd"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The third `Kind::Frames` format -- same shared topology
+        // (`Element::UNKNOWN`) as TRR/XTC, no VELOCITIES/FORCES: DCD never
+        // carries either.
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::FRAME_TIME)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(dcd_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // "CORD" at byte 4, not byte 0 -- the leading four bytes are a
+        // Fortran record-length marker whose own byte order depends on
+        // the file's endianness, but "CORD" itself is plain ASCII and
+        // endianness-independent (#327).
+        magic: &[Signature {
+            offset: 4,
+            bytes: b"CORD",
+        }],
+        reader_bytes: Some(crate::io::dcd::read_dcd_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::dcd::write_dcd_bytes),
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "NCTRAJ",
+        codes: &["nctraj"],
+        extensions: &["nc"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The fourth `Kind::Frames` format -- same shared topology
+        // (`Element::UNKNOWN`) as TRR/XTC/DCD. Unlike XTC/DCD, this format
+        // genuinely can carry velocities (like TRR); unlike TRR, it has no
+        // per-frame time/step at all -- `time`/`forces` are both out of
+        // scope for this story (#328).
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::VELOCITIES)
+            .or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(nctraj_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Frames,
+        // Every NetCDF-3 file starts with "CDF" then a version byte (`1`
+        // classic, `2` 64-bit offset) -- this only proves "a NetCDF-3
+        // file", not specifically an Amber one; the `Conventions ==
+        // "AMBER"` check happens one layer up, in `io::nctraj` itself.
+        magic: &[
+            Signature {
+                offset: 0,
+                bytes: b"CDF\x01",
+            },
+            Signature {
+                offset: 0,
+                bytes: b"CDF\x02",
+            },
+        ],
+        reader_bytes: Some(crate::io::nctraj::read_nctraj_bytes),
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::nctraj::write_nctraj_bytes),
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "LAMMPS Trajectory",
+        codes: &["lammpstrj"],
+        extensions: &["lammpstrj", "dump"],
+        category: Category::MolecularDynamicsAndDocking,
+        // The fifth `Kind::Frames` format, and the first that's text: same
+        // shared topology (`Element::UNKNOWN`) as TRR/XTC/DCD/NCTRAJ. The
+        // `ATOMS` column list can name `vx/vy/vz`/`fx/fy/fz`, so the mask
+        // states what the format is *capable* of carrying, the same
+        // always-on posture TRR's own VELOCITIES|FORCES already
+        // established -- not every file states them. No FRAME_TIME: a
+        // dump's TIMESTEP is a step count, not a time (#329).
+        carries: Carries::TOPOLOGY
+            .or(Carries::COORDS_3D)
+            .or(Carries::VELOCITIES)
+            .or(Carries::FORCES)
+            .or(Carries::UNIT_CELL),
+        // Plain text, so this uses `reader` (the `&str` entry point) rather
+        // than `reader_bytes` -- keeps `Format::encoding` and the presence
+        // of a byte reader in agreement, the same invariant every
+        // `Kind::Molecules` text format already satisfies. Writing a
+        // trajectory has only one registry field at all
+        // (`writer_trajectory`, always byte-returning), so the writer
+        // stays there regardless of encoding.
+        reader: Some(crate::io::lammpstrj::read_lammpstrj),
+        writer: None,
+        supplier: Some(lammpstrj_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Frames,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture LAMMPS Data already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: Some(crate::io::lammpstrj::write_lammpstrj_bytes),
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "CUBE",
+        codes: &["cube"],
+        extensions: &["cube", "cub"],
+        category: Category::VolumeData,
+        // The first `Kind::Volume` format, and the first to carry
+        // `TOPOLOGY`/`COORDS_3D` alongside `SAMPLES` -- CUBE genuinely
+        // states both a grid and the atoms that produced it
+        // (`VolumeGrid::atoms`, #331). No UNIT_CELL: CUBE states a
+        // sampling box, not a separate crystallographic cell.
+        carries: Carries::SAMPLES
+            .or(Carries::TOPOLOGY)
+            .or(Carries::COORDS_3D),
+        reader: Some(crate::io::cube::read_cube_with_options),
+        writer: None,
+        supplier: Some(cube_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Volume,
+        // Text, no magic bytes -- two free-text comment lines up front,
+        // resolved by extension only, the same posture every other text
+        // format in this crate already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::cube::write_cube_bytes),
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "CCP4/MRC",
+        codes: &["ccp4", "mrc"],
+        extensions: &["ccp4", "mrc", "map"],
+        category: Category::VolumeData,
+        // The second `Kind::Volume` format, and the first to carry a real
+        // crystallographic UNIT_CELL alongside SAMPLES -- CCP4 states one
+        // directly, unlike CUBE's atoms-shaped TOPOLOGY/COORDS_3D. No
+        // atoms at all here.
+        carries: Carries::SAMPLES.or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(ccp4_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Volume,
+        // "MAP " at byte 208, confirmed directly against a real file this
+        // story built with `gemmi` -- proves "this is a CCP4/MRC-shaped
+        // file", not that it's well-formed past that (see io::ccp4).
+        magic: &[Signature {
+            offset: 208,
+            bytes: b"MAP ",
+        }],
+        reader_bytes: Some(crate::io::ccp4::read_ccp4_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "DX",
+        codes: &["dx"],
+        extensions: &["dx"],
+        category: Category::VolumeData,
+        // The third `Kind::Volume` format, and the simplest -- no atoms,
+        // no axis permutation, no endianness. Deliberately no UNIT_CELL:
+        // DX states no crystallographic cell at all, so a CCP4-to-DX
+        // round trip loses it, and this absence is exactly how that loss
+        // is declared (#333).
+        carries: Carries::SAMPLES,
+        // Plain text, so this uses `reader` (the `&str` entry point)
+        // rather than `reader_bytes` -- keeps `Format::encoding` and the
+        // presence of a byte reader in agreement, the same posture CUBE
+        // and LAMMPS Trajectory already established.
+        reader: Some(crate::io::dx::read_dx_with_options),
+        writer: None,
+        supplier: Some(dx_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Volume,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture CUBE already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::dx::write_dx_bytes),
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "DSN6",
+        codes: &["dsn6"],
+        extensions: &["dsn6", "omap"],
+        category: Category::VolumeData,
+        // The fourth and last `Kind::Volume` format -- always carries a
+        // real crystallographic cell (like CCP4, unlike DX), but with no
+        // axis permutation at all (a fixed c=X, r=Y, s=Z mapping) and no
+        // atoms (#334).
+        carries: Carries::SAMPLES.or(Carries::UNIT_CELL),
+        reader: None,
+        writer: None,
+        supplier: Some(dsn6_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Volume,
+        // No fixed byte signature at all -- the closest thing DSN6 has is a
+        // documented constant word, checked in io::dsn6's own reader, not a
+        // byte pattern this table can express. Resolved by extension only.
+        magic: &[],
+        reader_bytes: Some(crate::io::dsn6::read_dsn6_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: Some(crate::io::dsn6::write_dsn6_bytes),
+        writer_mesh: None,
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "OBJ",
+        codes: &["obj"],
+        extensions: &["obj"],
+        category: Category::MeshData,
+        // The first `Kind::Mesh` format, and the first registered format
+        // with no chemistry at all. Always carries vertex positions and a
+        // face list -- OBJ's own `f` lines are what a mesh format is for
+        // (#335).
+        carries: Carries::VERTICES.or(Carries::FACES),
+        // Plain text, so this uses `reader` (the `&str` entry point)
+        // rather than `reader_bytes` -- the same posture CUBE/DX already
+        // established.
+        reader: Some(crate::io::obj::read_obj_with_options),
+        writer: None,
+        supplier: Some(obj_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Mesh,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture every other text format already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: Some(crate::io::obj::write_obj_bytes),
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "PLY",
+        codes: &["ply"],
+        extensions: &["ply"],
+        category: Category::MeshData,
+        // The second and last `Kind::Mesh` format -- same defining mask as
+        // OBJ (#336).
+        carries: Carries::VERTICES.or(Carries::FACES),
+        reader: None,
+        writer: None,
+        supplier: Some(ply_supplier),
+        writer_stream: None,
+        // Binary, since two of PLY's three wire encodings (declared in its
+        // own header, sniffed by io::ply's reader) are raw bytes -- the
+        // ASCII variant is still read/written correctly through the same
+        // byte-based entry points, the same posture CCP4/DSN6 already take.
+        encoding: Encoding::Binary,
+        kind: Kind::Mesh,
+        // "ply\n" is byte-identical across all three encodings -- a real,
+        // reliable fixed signature, unlike OBJ/DX's extension-only
+        // resolution.
+        magic: &[Signature {
+            offset: 0,
+            bytes: b"ply\n",
+        }],
+        reader_bytes: Some(crate::io::ply::read_ply_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: Some(crate::io::ply::write_ply_bytes),
+        writer_table: None,
+    },
+    FormatDescriptor {
+        name: "CSV",
+        codes: &["csv"],
+        extensions: &["csv"],
+        category: Category::TabularData,
+        // The declared kind is Table -- the honest, always-safe default. A
+        // structure column is a disclosed, explicit read-option opt-in
+        // (io::csv::CsvReadOptions), the same "declared kind stays fixed,
+        // an option flips the produced Payload" mechanism #330 already
+        // proved safe for XYZ/PDB/PDBQT/GRO's own opt-in Frames reading
+        // (#337).
+        carries: Carries::COLUMNS,
+        reader: Some(crate::io::csv::read_csv_with_options),
+        // The opt-in molecule-list write shape -- a `smiles` column plus
+        // one column per distinct molecule property. Populated *alongside*
+        // `writer_table` below, a first for this registry: every other
+        // format with a writer_volume/writer_mesh leaves `writer` `None`.
+        writer: Some(crate::io::csv::write_csv_records),
+        supplier: Some(csv_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Table,
+        // Text, no magic bytes -- resolved by extension only, the same
+        // posture every other text format already takes.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        // The declared/primary write shape.
+        writer_table: Some(crate::io::csv::write_csv_table_bytes),
     },
 ];
 
@@ -667,6 +1666,28 @@ fn mmcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Su
     Box::new(crate::io::supplier::MmcifSupplier::new(reader, options))
 }
 
+fn psf_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::PsfSupplier::new(reader, options))
+}
+
+fn prmtop_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::PrmtopSupplier::new(reader, options))
+}
+
+fn lammps_data_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::LammpsDataSupplier::new(
+        reader, options,
+    ))
+}
+
+fn top_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::TopSupplier::new(reader, options))
+}
+
+fn cif_core_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::supplier::CifCoreSupplier::new(reader, options))
+}
+
 fn mol2_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::Mol2Supplier::new(reader, options))
 }
@@ -687,6 +1708,60 @@ fn commonchem_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<d
 
 fn cml_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::supplier::CmlSupplier::new(reader, options))
+}
+
+fn bcif_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::bcif::BcifSupplier::new(reader, options))
+}
+
+fn trr_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::trr::TrrSupplier::new(reader, options))
+}
+
+fn xtc_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::xtc::XtcSupplier::new(reader, options))
+}
+
+fn dcd_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::dcd::DcdSupplier::new(reader, options))
+}
+
+fn nctraj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::nctraj::NctrajSupplier::new(reader, options))
+}
+
+fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::lammpstrj::LammpstrjSupplier::new(
+        reader, options,
+    ))
+}
+
+fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::csv::CsvSupplier::new(reader, options))
+}
+
+fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::cube::CubeSupplier::new(reader, options))
+}
+
+fn ccp4_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::ccp4::Ccp4Supplier::new(reader, options))
+}
+
+fn dx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::dx::DxSupplier::new(reader, options))
+}
+
+fn obj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::obj::ObjSupplier::new(reader, options))
+}
+
+fn ply_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::ply::PlySupplier::new(reader, options))
+}
+
+fn dsn6_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::dsn6::Dsn6Supplier::new(reader, options))
 }
 
 fn smiles_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
@@ -713,6 +1788,26 @@ fn mmcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dy
     Box::new(crate::io::supplier::MmcifWriter::new(writer, options))
 }
 
+fn psf_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::PsfWriter::new(writer, options))
+}
+
+fn prmtop_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::PrmtopWriter::new(writer, options))
+}
+
+fn lammps_data_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::LammpsDataWriter::new(writer, options))
+}
+
+fn top_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::TopWriter::new(writer, options))
+}
+
+fn cif_core_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::supplier::CifCoreWriter::new(writer, options))
+}
+
 fn mol2_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::Mol2Writer::new(writer, options))
 }
@@ -731,6 +1826,10 @@ fn commonchem_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> B
 
 fn cml_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
     Box::new(crate::io::supplier::CmlWriter::new(writer, options))
+}
+
+fn bcif_writer_stream(writer: Box<dyn Write>, options: &WriteOptions) -> Box<dyn Writer> {
+    Box::new(crate::io::bcif::BcifWriter::new(writer, options))
 }
 
 fn write_smiles_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
@@ -805,6 +1904,54 @@ fn write_mmcif_records(records: &[(String, Molecule)], _options: &WriteOptions) 
     let mut out = String::new();
     for (_, molecule) in records {
         out.push_str(&crate::io::mmcif::write_mmcif(molecule));
+    }
+    out
+}
+
+fn write_psf_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `PsfWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::psf::write_psf(molecule));
+    }
+    out
+}
+
+fn write_prmtop_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `PrmtopWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::prmtop::write_prmtop(molecule));
+    }
+    out
+}
+
+fn write_lammps_data_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `LammpsDataWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::lammps::write_lammps_data(molecule));
+    }
+    out
+}
+
+fn write_top_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // Unlike PSF/PRMTOP (looping and concatenating), this one takes all
+    // records at once, the same reason `write_commonchem_records` does --
+    // see `TopWriter`'s own doc comment: the `[ system ]`/`[ molecules ]`
+    // footer can only be written once every record has arrived.
+    crate::io::top::write_top(records)
+}
+
+fn write_cif_core_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
+    // No write options today, and no per-record name to thread through --
+    // see `CifCoreWriter`'s own doc comment.
+    let mut out = String::new();
+    for (_, molecule) in records {
+        out.push_str(&crate::io::cif_core::write_cif_core(molecule));
     }
     out
 }
@@ -912,6 +2059,149 @@ impl Format {
     /// the ruling #184 closed with — see `Cargo.toml`'s `serde_json`
     /// dependency comment.
     pub const COMMONCHEM: Format = Format(10);
+    /// BinaryCIF (#319) — MessagePack-encoded mmCIF, the same
+    /// `cif_model::build_molecule`/`build_rows` mmCIF text goes through,
+    /// see [`crate::io::bcif`]. The first format to use `Encoding::Binary`,
+    /// `reader_bytes`/`writer_bytes` (#309's plumbing, unused until now),
+    /// and a hand-rolled codec ([`crate::io::msgpack`]) rather than a
+    /// dependency — the crate's existing style for a small, bounded
+    /// surface, the same reasoning `Carries` is hand-rolled instead of
+    /// depending on `bitflags`.
+    pub const BCIF: Format = Format(11);
+    /// CIF core (#320) — the small-molecule crystallography dictionary,
+    /// old-style flat tags and fractional coordinates rather than mmCIF's
+    /// dot-namespace and Cartesian ones, see [`crate::io::cif_core`]. Reads
+    /// and writes only the asymmetric unit a file states, no symmetry
+    /// expansion. Shares the `.cif` extension with mmCIF — the first
+    /// format registered that does — disambiguated by content, not name,
+    /// in [`crate::io::open`] and the CLI's own input path.
+    pub const CIF_CORE: Format = Format(12);
+    /// PSF (#321) — CHARMM/NAMD's topology format, see [`crate::io::psf`].
+    /// The first real consumer of
+    /// [`crate::core::force_field::ForceFieldTopology`] (#315, built for
+    /// exactly this but never wired to a format until now). No coordinates
+    /// at all — a PSF is paired with a DCD or a PDB for geometry.
+    pub const PSF: Format = Format(13);
+    /// PRMTOP (#322) -- AMBER's topology format, also named `.parm7`, see
+    /// [`crate::io::prmtop`]. Topology only: PRMTOP states substantially
+    /// more of the force field than PSF does, but the actual parameters
+    /// (force constants, equilibrium values, Lennard-Jones coefficients)
+    /// have no home in `ForceFieldTopology` and are parsed-and-discarded.
+    pub const PRMTOP: Format = Format(14);
+    /// GROMACS topology (#323), see [`crate::io::top`]. Topology only, same
+    /// scope as PSF/PRMTOP. Shares the `.top` extension with PRMTOP,
+    /// disambiguated by content (`top::is_gromacs_top`) at the `io::open`/
+    /// CLI entry points, the same way `.cif` disambiguates mmCIF from CIF
+    /// core. One `Molecule` per `[ moleculetype ]` block, unlike PSF/PRMTOP
+    /// which hold exactly one topology each.
+    pub const TOP: Format = Format(15);
+    /// LAMMPS data (#324), see [`crate::io::lammps`]. The first
+    /// force-field-topology format that also states coordinates -- PSF/
+    /// PRMTOP/TOP never touch `coords3`, but LAMMPS combines topology and
+    /// geometry in one file. Every atom reads as
+    /// [`crate::core::atom::Element::UNKNOWN`] -- this format states a
+    /// numeric type and mass, never a name, and inventing an element from
+    /// mass would fail outright for coarse-grained/reduced-unit systems.
+    pub const LAMMPS_DATA: Format = Format(16);
+    /// TRR (#326), see [`crate::io::trr`]. The first format registered as
+    /// [`Kind::Frames`] rather than [`Kind::Molecules`] -- a shared topology
+    /// (every atom [`crate::core::atom::Element::UNKNOWN`], TRR states no
+    /// chemical identity at all) plus lazily-read frames, each carrying
+    /// positions and whatever else it happened to state: velocities,
+    /// forces, a box. The first format with a real, populated `magic`
+    /// signature, and the first with a trajectory writer (this format
+    /// descriptor's own `writer_trajectory` field) rather than a
+    /// `&[(String, Molecule)]`-shaped one.
+    pub const TRR: Format = Format(17);
+    /// XTC (#325), see [`crate::io::xtc`]. GROMACS's compressed trajectory
+    /// format -- the same shared-topology `Kind::Frames` shape TRR
+    /// established, wrapped around a genuine lossy coordinate compressor
+    /// (a full, faithful port of GROMACS's own encoder heuristic, not a
+    /// simplified always-absolute variant). No velocities or forces at
+    /// all -- only positions, time, step and a box.
+    pub const XTC: Format = Format(18);
+    /// DCD (#327), see [`crate::io::dcd`]. CHARMM/NAMD's binary trajectory,
+    /// and the oldest format in the milestone -- Fortran unformatted
+    /// records, a per-file endianness this crate detects rather than
+    /// assumes, and a header dialect flag governing both the timestep's
+    /// storage type and whether a unit cell can be present at all. No
+    /// velocities or forces, same as XTC.
+    pub const DCD: Format = Format(19);
+    /// NCTRAJ (#328), see [`crate::io::nctraj`]. Amber's NetCDF trajectory
+    /// -- the Amber convention layered on a hand-rolled, generic NetCDF-3
+    /// classic container ([`crate::io::netcdf3`]), the only route
+    /// available since the real `netcdf` crate is a `-sys` crate this
+    /// repo's own CI purity gate refuses. Coordinates are already Å, no
+    /// unit conversion. Can carry velocities, like TRR; unlike TRR, no
+    /// per-frame time or step at all.
+    pub const NCTRAJ: Format = Format(20);
+    /// LAMMPS Trajectory (#329), see [`crate::io::lammpstrj`]. The dump
+    /// format's `ITEM:`-delimited sections, one set per frame -- the first
+    /// [`Kind::Frames`] format that's text rather than binary. The column
+    /// list is read fresh every frame, never cached, and a coordinate
+    /// convention (unscaled/scaled/unwrapped) is resolved the same way.
+    /// Can carry velocities and forces, like TRR; no per-frame time, only
+    /// a step count, same reasoning DCD/XTC/NCTRAJ already settled for
+    /// whichever of the two their own format states.
+    pub const LAMMPS_TRAJECTORY: Format = Format(21);
+    /// CUBE (#331), see [`crate::io::cube`]. Gaussian's volumetric format --
+    /// the first ever registered as [`Kind::Volume`], and the first to
+    /// carry both a grid (`Carries::SAMPLES`) and the atoms that produced
+    /// it (`TOPOLOGY`/`COORDS_3D`, via [`crate::core::volume::VolumeGrid::atoms`]).
+    pub const CUBE: Format = Format(22);
+    /// CCP4/MRC (#332), see [`crate::io::ccp4`]. The standard electron-
+    /// density/cryo-EM map format -- a real crystallographic `UnitCell`
+    /// this time (unlike CUBE), and no atoms. Endianness comes from a
+    /// direct machine-stamp byte-pattern match (no DCD-style guessing);
+    /// `MAPC`/`MAPR`/`MAPS` permute which canonical axis each file
+    /// dimension is, the second real exercise of
+    /// [`crate::core::volume::VolumeGrid::from_source_order`].
+    pub const CCP4: Format = Format(23);
+    /// DX (#333), see [`crate::io::dx`]. OpenDX's grid format -- the
+    /// simplest of the four volumetric formats: no atoms, no cell, no axis
+    /// permutation. Confirms [`crate::core::volume::VolumeGrid::axes`]
+    /// genuinely stores three full vectors, not three scalars -- DX's own
+    /// deltas need not be axis-aligned.
+    pub const DX: Format = Format(24);
+    /// DSN6 (#334), see [`crate::io::dsn6`]. Frodo/O's bricked,
+    /// byte-quantized electron-density format -- the last of the four
+    /// volumetric formats, and the one with no live oracle available
+    /// anywhere in this environment to verify against. A real
+    /// crystallographic `UnitCell` (like CCP4), but a fixed axis mapping
+    /// (no `MAPC`/`MAPR`/`MAPS`-style permutation) and density values
+    /// quantized to a single byte per voxel via a `prod`/`plus` linear
+    /// scale.
+    pub const DSN6: Format = Format(25);
+    /// OBJ (#335), see [`crate::io::obj`]. Wavefront's plain-text mesh
+    /// format, first story of Phase 5 and the first registered format with
+    /// no chemistry at all -- [`Kind::Mesh`], not `Kind::Molecules`. Faces
+    /// are fan-triangulated into [`crate::core::mesh::Mesh`]'s
+    /// triangles-only shape, and a vertex referenced with two different
+    /// normals across faces (a hard edge) is split into two output
+    /// vertices, since that type's normals are per-vertex, not per-face-
+    /// corner like OBJ's own `v/vt/vn` indexing.
+    pub const OBJ: Format = Format(26);
+    /// PLY (#336), see [`crate::io::ply`]. The Stanford polygon format --
+    /// second and last mesh story, and the first format whose header is a
+    /// genuine schema (`element`/`property` lines) rather than a fixed
+    /// field layout, the same class of work as PRMTOP's `%FORMAT` lines.
+    /// One descriptor covers all three of its wire encodings (`ascii`,
+    /// `binary_little_endian`, `binary_big_endian`), sniffed internally
+    /// from the header's own `format` line -- this crate's first "ASCII or
+    /// binary, both handled by one reader" format, unlike CCP4's
+    /// little/big-endian-only sniff.
+    pub const PLY: Format = Format(27);
+    /// CSV (#337), see [`crate::io::csv`]. The tabular format, last story of
+    /// Phase 5 -- declared [`Kind::Table`], with molecule production as an
+    /// explicit, disclosed read option (`structure_column`) rather than a
+    /// column-name heuristic, mirroring the exact "declared kind stays
+    /// fixed, an option flips the produced payload" mechanism #330 already
+    /// proved safe for XYZ/PDB/PDBQT/GRO's own opt-in `Frames` reading.
+    /// Parses via [`crate::core::table::Table::from_csv`] (#314) directly,
+    /// not a second RFC4180 parser. The first format to populate both
+    /// `writer` (an opt-in molecule-list shape) and `writer_table` (its
+    /// declared/primary shape) on the same descriptor.
+    pub const CSV: Format = Format(28);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -943,9 +2233,17 @@ impl Format {
     /// times: here, again for output paths in the CLI's writer, and a third
     /// time as a stdin special case.
     pub fn from_filename(name: &str) -> Format {
+        Self::from_filename_checked(name).unwrap_or(Format::SMILES)
+    }
+
+    /// Like [`Self::from_filename`], but `None` rather than the SMILES
+    /// default when nothing claims the extension — what a caller that wants
+    /// to try something else first (content-sniffing, in
+    /// `crate::io::open::open_supplier`, #317) needs instead of the default
+    /// already baked in.
+    pub fn from_filename_checked(name: &str) -> Option<Format> {
         name.rsplit_once('.')
             .and_then(|(_, extension)| Format::from_extension(extension))
-            .unwrap_or(Format::SMILES)
     }
 
     pub fn name(&self) -> &'static str {
@@ -979,20 +2277,68 @@ impl Format {
         self.descriptor().carries
     }
 
+    /// Whether this format's canonical bytes are UTF-8 text or binary.
+    pub fn encoding(&self) -> Encoding {
+        self.descriptor().encoding
+    }
+
+    /// What this format's records are — see [`Kind`].
+    pub fn kind(&self) -> Kind {
+        self.descriptor().kind
+    }
+
     pub fn can_read(&self) -> bool {
-        self.descriptor().reader.is_some()
+        let d = self.descriptor();
+        d.reader.is_some() || d.reader_bytes.is_some()
     }
 
     pub fn can_write(&self) -> bool {
-        self.descriptor().writer.is_some()
+        let d = self.descriptor();
+        d.writer.is_some()
+            || d.writer_bytes.is_some()
+            || d.writer_trajectory.is_some()
+            || d.writer_volume.is_some()
+            || d.writer_mesh.is_some()
+            || d.writer_table.is_some()
     }
 
-    pub(crate) fn reader(&self) -> Option<ReadFn> {
-        self.descriptor().reader
+    /// Parses a whole file into molecules, from raw bytes (#309) — the
+    /// canonical read path every format goes through, text or binary, or
+    /// `None` if the format cannot be read.
+    ///
+    /// A binary format's `reader_bytes` is called directly. A text format
+    /// has none, so the bytes are decoded as UTF-8 first; invalid UTF-8
+    /// becomes a `Skipped` entry rather than a panic, matching the rest of
+    /// this crate's "reading a file cannot fail as a whole" contract.
+    pub fn read_bytes(&self, bytes: &[u8]) -> Option<ReadOutcome> {
+        self.read_bytes_with_options(bytes, &ReadOptions::default())
+    }
+
+    /// [`Self::read_bytes`], with explicit per-format options.
+    pub fn read_bytes_with_options(
+        &self,
+        bytes: &[u8],
+        options: &ReadOptions,
+    ) -> Option<ReadOutcome> {
+        let d = self.descriptor();
+        if let Some(reader_bytes) = d.reader_bytes {
+            return Some(reader_bytes(bytes, options));
+        }
+        d.reader.map(|reader| match std::str::from_utf8(bytes) {
+            Ok(text) => reader(text, options),
+            Err(e) => ReadOutcome {
+                records: Vec::new(),
+                skipped: vec![crate::io::reader::Skipped {
+                    position: 1,
+                    input: String::new(),
+                    error: format!("{} is not valid UTF-8: {e}", self.name()),
+                }],
+            },
+        })
     }
 
     /// Serialises molecules in this format with default options, carrying
-    /// their names, or `None` if the format cannot be written.
+    /// their names, or `None` if the format cannot be written as text.
     ///
     /// The public way to reach a writer. The function pointer itself stays
     /// private — the binary is a separate crate, so `pub(crate)` would not
@@ -1008,9 +2354,105 @@ impl Format {
         records: &[(String, Molecule)],
         options: &WriteOptions,
     ) -> Option<String> {
-        self.descriptor()
-            .writer
-            .map(|writer| writer(records, options))
+        // `None` for a binary format (BinaryCIF, #319, the first one) rather
+        // than forcing its bytes through `from_utf8` -- they are not text,
+        // and were never going to decode as any. `write_bytes`/
+        // `write_bytes_with_options` is the canonical path for a caller that
+        // wants a binary format's own bytes.
+        if self.encoding() == Encoding::Binary {
+            return None;
+        }
+        self.write_bytes_with_options(records, options)
+            .map(|bytes| String::from_utf8(bytes).expect("text writer produced valid UTF-8"))
+    }
+
+    /// Serialises molecules in this format into raw bytes (#309) — the
+    /// canonical write path every format goes through, text or binary, or
+    /// `None` if the format cannot be written.
+    pub fn write_bytes(&self, records: &[(String, Molecule)]) -> Option<Vec<u8>> {
+        self.write_bytes_with_options(records, &WriteOptions::default())
+    }
+
+    /// [`Self::write_bytes`], with explicit per-format options.
+    pub fn write_bytes_with_options(
+        &self,
+        records: &[(String, Molecule)],
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let d = self.descriptor();
+        if let Some(writer_bytes) = d.writer_bytes {
+            return Some(writer_bytes(records, options));
+        }
+        d.writer.map(|writer| writer(records, options).into_bytes())
+    }
+
+    /// Serialises a whole trajectory into raw bytes (#326), or `None` if
+    /// this format has no trajectory writer — every `Kind::Molecules`
+    /// format, and any `Kind::Frames` format that has not implemented one.
+    pub fn write_trajectory_bytes(&self, trajectory: &mut Trajectory) -> Option<Vec<u8>> {
+        self.write_trajectory_bytes_with_options(trajectory, &WriteOptions::default())
+    }
+
+    /// [`Self::write_trajectory_bytes`], with explicit per-format options.
+    pub fn write_trajectory_bytes_with_options(
+        &self,
+        trajectory: &mut Trajectory,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_trajectory = self.descriptor().writer_trajectory?;
+        Some(writer_trajectory(trajectory, options))
+    }
+
+    /// Serialises a whole [`VolumeGrid`] into raw bytes (#331), or `None` if
+    /// this format has no volume writer — every `Kind::Molecules`/
+    /// `Kind::Frames` format, and any `Kind::Volume` format that has not
+    /// implemented one.
+    pub fn write_volume_bytes(&self, grid: &VolumeGrid) -> Option<Vec<u8>> {
+        self.write_volume_bytes_with_options(grid, &WriteOptions::default())
+    }
+
+    /// [`Self::write_volume_bytes`], with explicit per-format options.
+    pub fn write_volume_bytes_with_options(
+        &self,
+        grid: &VolumeGrid,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_volume = self.descriptor().writer_volume?;
+        Some(writer_volume(grid, options))
+    }
+
+    /// Serialises a whole [`Mesh`] into raw bytes (#335), or `None` if this
+    /// format has no mesh writer — every `Kind::Molecules`/`Kind::Frames`/
+    /// `Kind::Volume` format, and any `Kind::Mesh` format that has not
+    /// implemented one.
+    pub fn write_mesh_bytes(&self, mesh: &Mesh) -> Option<Vec<u8>> {
+        self.write_mesh_bytes_with_options(mesh, &WriteOptions::default())
+    }
+
+    /// [`Self::write_mesh_bytes`], with explicit per-format options.
+    pub fn write_mesh_bytes_with_options(
+        &self,
+        mesh: &Mesh,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_mesh = self.descriptor().writer_mesh?;
+        Some(writer_mesh(mesh, options))
+    }
+
+    /// Serialises a whole [`Table`] into raw bytes (#337), or `None` if this
+    /// format has no table writer — every format other than CSV today.
+    pub fn write_table_bytes(&self, table: &Table) -> Option<Vec<u8>> {
+        self.write_table_bytes_with_options(table, &WriteOptions::default())
+    }
+
+    /// [`Self::write_table_bytes`], with explicit per-format options.
+    pub fn write_table_bytes_with_options(
+        &self,
+        table: &Table,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_table = self.descriptor().writer_table?;
+        Some(writer_table(table, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -1080,6 +2522,14 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         "every atom line names a residue; absent input writes UNK",
     ),
     (
+        // Same reason as MMCIF, verbatim: both go through
+        // `cif_model::build_rows` (#319), so what one supplies, the other
+        // does too, by construction.
+        Format::BCIF,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
         Format::MOL2,
         Carries::RESIDUES,
         "every atom line names a substructure; absent input writes UNK",
@@ -1094,6 +2544,63 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Carries::RESIDUES,
         "every atom line names a residue; absent input writes LIG",
     ),
+    (
+        Format::PSF,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
+        // `write_prmtop` (#322) always states a residue label, the same
+        // reason PSF does.
+        Format::PRMTOP,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    (
+        // `write_top` (#323) always states a residue name, the same
+        // reason PSF/PRMTOP do.
+        Format::TOP,
+        Carries::RESIDUES,
+        "every atom line names a residue; absent input writes UNK",
+    ),
+    // PSF's atom-type and mass columns are required fields in every real
+    // file, the same "must state something" shape as the columns below --
+    // absent input falls back to the element symbol and its standard
+    // atomic weight.
+    (
+        Format::PSF,
+        Carries::ATOM_TYPE,
+        "fixed column; absent input writes the element symbol",
+    ),
+    (
+        Format::PSF,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
+    // PRMTOP's AMBER_ATOM_TYPE/MASS sections are equally required fields
+    // in every real file, the same shape as PSF's own columns above.
+    (
+        Format::PRMTOP,
+        Carries::ATOM_TYPE,
+        "fixed column; absent input writes the element symbol",
+    ),
+    (
+        Format::PRMTOP,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
+    // GROMACS TOP's `type`/`mass` columns are equally required fields in
+    // every real file, the same shape as PSF/PRMTOP's own columns above.
+    (
+        Format::TOP,
+        Carries::ATOM_TYPE,
+        "fixed column; absent input writes the element symbol",
+    ),
+    (
+        Format::TOP,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
     // The PDB family's fixed occupancy and temperature-factor columns.
     (
         Format::PDB,
@@ -1106,7 +2613,20 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         "fixed column; absent input writes 1.00",
     ),
     (
+        // Same reason as MMCIF -- shares `cif_model::build_rows` (#319).
+        Format::BCIF,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
         Format::PDBQT,
+        Carries::OCCUPANCY,
+        "fixed column; absent input writes 1.00",
+    ),
+    (
+        // `write_cif_core` (#320) defaults occupancy to 1.00 the same way
+        // mmCIF's writer does, for the same reason.
+        Format::CIF_CORE,
         Carries::OCCUPANCY,
         "fixed column; absent input writes 1.00",
     ),
@@ -1121,7 +2641,20 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         "fixed column; absent input writes 0.00",
     ),
     (
+        // Same reason as MMCIF -- shares `cif_model::build_rows` (#319).
+        Format::BCIF,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    (
         Format::PDBQT,
+        Carries::B_FACTOR,
+        "fixed column; absent input writes 0.00",
+    ),
+    (
+        // `write_cif_core` (#320) defaults B-factor to 0.00 the same way
+        // mmCIF's writer does, for the same reason.
+        Format::CIF_CORE,
         Carries::B_FACTOR,
         "fixed column; absent input writes 0.00",
     ),
@@ -1135,6 +2668,133 @@ static SUPPLIED: &[(Format, Carries, &str)] = &[
         Format::PDBQT,
         Carries::PARTIAL_CHARGE,
         "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_psf` (#321) always states a charge, the same reason Mol2
+        // and PDBQT do.
+        Format::PSF,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_prmtop` (#322) always states a charge, the same reason
+        // PSF does.
+        Format::PRMTOP,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_top` (#323) always states a charge, the same reason
+        // PSF/PRMTOP do.
+        Format::TOP,
+        Carries::PARTIAL_CHARGE,
+        "per-atom charge column; absent input writes 0.000",
+    ),
+    (
+        // `write_lammps_data` (#324) always states a position, even for a
+        // source with no coordinates at all -- the origin, the same
+        // "something has to go here" reasoning `cif_core`'s own
+        // cell-less-molecule writer already uses.
+        Format::LAMMPS_DATA,
+        Carries::COORDS_3D,
+        "every atom line states a position; absent input writes 0.0 0.0 0.0",
+    ),
+    (
+        // Every atom's LAMMPS type/mass is synthesized on write, whether
+        // or not the source stated one -- the same shape PSF/PRMTOP/TOP's
+        // own atom-type/mass columns already have.
+        Format::LAMMPS_DATA,
+        Carries::ATOM_TYPE,
+        "a type is always synthesized; absent input still gets one",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Carries::MASS,
+        "fixed column; absent input writes the standard atomic weight",
+    ),
+    (
+        // Box bounds are mandatory in every real LAMMPS data file; a
+        // source with no periodic cell at all still gets a placeholder
+        // box (a bounding box of its coordinates, padded to be
+        // non-degenerate -- see `write_lammps_data`'s own doc comment).
+        Format::LAMMPS_DATA,
+        Carries::UNIT_CELL,
+        "box bounds are mandatory; absent input gets a placeholder box",
+    ),
+    (
+        // TRR's own binary layout has no way to represent "no time" at
+        // all -- confirmed directly (`io::trr::write_trr_frame`): the
+        // field is always written, `frame.time.unwrap_or(0.0)`, and the
+        // reader always reads it back as `Some`. Found by #339's own new
+        // Kind::Frames pair check, the first time TRR was ever exercised
+        // as a write target with no stated time.
+        Format::TRR,
+        Carries::FRAME_TIME,
+        "every frame states a time; absent input writes 0.0",
+    ),
+    (
+        // Same shape as TRR just above: XTC's own `write_frame` always
+        // writes `frame.time.unwrap_or(0.0)` and its reader always
+        // returns `Some(time as f64)` -- confirmed directly in
+        // `io::xtc.rs`. A second, independent GROMACS binary trajectory
+        // format with the identical gap, found the same way.
+        Format::XTC,
+        Carries::FRAME_TIME,
+        "every frame states a time; absent input writes 0.0",
+    ),
+    (
+        // A third, differently-shaped instance of the same fact: DCD has
+        // no per-frame time field at all -- confirmed directly
+        // (`io::dcd::write_dcd_bytes`/`DcdFrameSource::frame_inner`).
+        // Time is always *derived*, `header.delta * step`, and the
+        // reader always returns `Some(time)`; when the input states no
+        // time, the writer falls back to `delta = 1.0`.
+        Format::DCD,
+        Carries::FRAME_TIME,
+        "time is derived from istart/nsavc/delta; absent input defaults delta to 1.0",
+    ),
+    (
+        // The module's own doc comment already names this pattern
+        // (`io::ccp4`'s header comment: "the same disclosed no-cell
+        // fallback `io::lammps`'s own data-file writer already
+        // established") but never got the matching table row --
+        // confirmed directly (`write_ccp4`): a grid with no stated
+        // `VolumeGrid::cell` gets a synthesized orthogonal "cell equals
+        // box" one. Found by #339's new Kind::Volume pair check, the
+        // first time CCP4/MRC was exercised as a write target with no
+        // stated cell.
+        Format::CCP4,
+        Carries::UNIT_CELL,
+        "every map states a cell; absent input synthesizes cell equals box",
+    ),
+    (
+        // Same fallback as CCP4/MRC just above, confirmed directly
+        // (`io::dsn6::write_dsn6`): identical `grid.cell().unwrap_or_else`
+        // synthesizing cell-equals-box.
+        Format::DSN6,
+        Carries::UNIT_CELL,
+        "every map states a cell; absent input synthesizes cell equals box",
+    ),
+    (
+        // Already named in `io::cube`'s own doc comment ("[`VolumeGrid::
+        // atoms`] always set (even to an empty [`Molecule`] for `natoms
+        // == 0`) -- CUBE always states this block, unlike CCP4/DSN6/DX"),
+        // just missing the matching table row. `held_from_volume` treats
+        // `grid.atoms().is_some()` as TOPOLOGY, and CUBE's own reader
+        // always returns `Some`, even an empty one, for a source with no
+        // atoms at all.
+        Format::CUBE,
+        Carries::TOPOLOGY,
+        "always states an atom block; absent input writes zero atoms",
+    ),
+    (
+        // Same root cause as the TOPOLOGY row just above -- `held_from_
+        // volume` ORs COORDS_3D in on the identical `grid.atoms().is_
+        // some()` condition, so CUBE's always-present (possibly empty)
+        // atom block trips both flags together.
+        Format::CUBE,
+        Carries::COORDS_3D,
+        "always states an atom block; absent input writes zero atoms",
     ),
 ];
 
@@ -1202,7 +2862,7 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
 /// no per-format mask can express it -- and `held` sets `TOPOLOGY` on the atom
 /// count alone, so one atom of six satisfies every claim a mask makes.
 static PAIR_GAPS: &[(Format, Format, &str)] = &[
-    // Empty since #259. PDBQT's writer kept only the largest connected
+    // Empty from #259 to #324. PDBQT's writer kept only the largest connected
     // component, so a source carrying no bonds arrived as N one-atom fragments
     // and left as one atom -- four pairs, `pdbqt -> pdbqt` among them, which is
     // why the A -> A diagonal could not see it. The writer now writes every
@@ -1210,6 +2870,83 @@ static PAIR_GAPS: &[(Format, Format, &str)] = &[
     //
     // The mechanism stays: this is the only way to express a loss no mask can,
     // and it took a milestone to notice the first one.
+    //
+    // LAMMPS data (#324) states no element at all, only a numeric type --
+    // every atom reads back as `Element::UNKNOWN`, whose symbol is the empty
+    // string. Every format below needs a real atomic symbol to write an atom
+    // at all, so a LAMMPS-sourced molecule fails to round-trip through any of
+    // them. Not a bug on either side: the format genuinely never stated what
+    // these targets need to recover.
+    (
+        Format::LAMMPS_DATA,
+        Format::SMILES,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::SDF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::CXSMILES,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::XYZ,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::PDB,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::MMCIF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::MOL2,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::PDBQT,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::GRO,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::CML,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::BCIF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::CIF_CORE,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::PSF,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
+    (
+        Format::LAMMPS_DATA,
+        Format::TOP,
+        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
+    ),
 ];
 
 /// Everything `target`'s writer manufactures when the input has none.
@@ -1294,6 +3031,219 @@ pub fn fidelity(source: Format, target: Format) -> Carries {
     (both | manufactured | pair_extra(source, target)) & !pair_loss(source, target)
 }
 
+/// A short, human phrase for what a `Kind`'s records *are* — used only in
+/// [`kinds_compatible`]'s own refusal message.
+fn kind_description(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Molecules => "a set of molecules",
+        Kind::Frames => "a trajectory",
+        Kind::Volume => "a volumetric grid",
+        Kind::Mesh => "a mesh",
+        Kind::Table => "a table",
+    }
+}
+
+/// Whether `source` can feed `target` at all — the "refuse before reading
+/// any bytes" gate `chem convert` needs now that the registry has five
+/// `Kind`s (#338).
+///
+/// `Ok(())` for a same-`Kind` pair, and exactly one deliberately enumerated
+/// exception: a `Kind::Volume` source that also states real atoms
+/// (`Carries::TOPOLOGY`) can feed a `Kind::Molecules` target — CUBE's own
+/// dual nature (#331), and the *only* one in the whole registry, confirmed
+/// directly against every other `Kind::Volume`/`Mesh`/`Table` format's own
+/// mask before writing this. Never the reverse direction: no format can
+/// synthesize real grid samples from a bare molecule.
+///
+/// Every other cross-`Kind` pair is a genuine mismatch, refused by name
+/// rather than left to degrade into a per-record "not a molecule" skip and
+/// a generic empty-output exit — which is what every one of these pairs did
+/// before this function existed.
+pub fn kinds_compatible(source: Format, target: Format) -> Result<(), String> {
+    if source.kind() == target.kind() {
+        return Ok(());
+    }
+    if source.kind() == Kind::Volume
+        && source.carries().contains(Carries::TOPOLOGY)
+        && target.kind() == Kind::Molecules
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{} holds {}, {} holds {} -- there is no conversion between them",
+        source.name(),
+        kind_description(source.kind()),
+        target.name(),
+        kind_description(target.kind()),
+    ))
+}
+
+/// What a trajectory actually holds, the same "inspect the real instance,
+/// not the format's declared mask" discipline [`held`] already follows for
+/// a molecule (#338).
+///
+/// `TOPOLOGY`/`COORDS_3D` unconditionally — a trajectory with no positions
+/// is not a trajectory. `VELOCITIES`/`FORCES`/`FRAME_TIME`/`UNIT_CELL` only
+/// if frame 0 actually states them, since [`crate::core::trajectory::Frame`]
+/// keeps every one of those fields independently `Option` (TRR carries
+/// velocities and forces, XTC never does) and this crate's own binary
+/// trajectory formats never vary that per frame within one file.
+///
+/// Also folds in `held(trajectory.topology())` (#339): every registered
+/// `Kind::Frames` format's own shared topology is bare (atoms and bonds
+/// only), so this changes nothing for them, but a trajectory built by
+/// hand from a real topology (PSF's own residues/atom types/masses paired
+/// with a DCD's frames, say) has to show that richness here too, or a
+/// drop report -- or a fidelity check -- would miss it entirely.
+///
+/// # Errors
+/// Whatever reading frame 0 itself can fail with.
+pub fn held_from_trajectory(trajectory: &mut Trajectory) -> Result<Carries, TrajectoryError> {
+    let mut carries = Carries::TOPOLOGY
+        .or(Carries::COORDS_3D)
+        .or(held(trajectory.topology()));
+    if trajectory.frame_count() > 0 {
+        let frame = trajectory.frame(0)?;
+        if frame.velocities.is_some() {
+            carries = carries.or(Carries::VELOCITIES);
+        }
+        if frame.forces.is_some() {
+            carries = carries.or(Carries::FORCES);
+        }
+        if frame.time.is_some() {
+            carries = carries.or(Carries::FRAME_TIME);
+        }
+        if frame.cell.is_some() {
+            carries = carries.or(Carries::UNIT_CELL);
+        }
+    }
+    Ok(carries)
+}
+
+/// What a volume grid actually holds, the same discipline [`held`]/
+/// [`held_from_trajectory`] already follow (#338). `SAMPLES` unconditionally
+/// — a grid with no values is not a grid — plus `UNIT_CELL`/`TOPOLOGY.or(
+/// COORDS_3D)` only if this specific grid actually states a cell/atoms
+/// ([`VolumeGrid::cell`]/[`VolumeGrid::atoms`] — CUBE states atoms,
+/// CCP4/DSN6 state a cell but no atoms, DX states neither).
+pub fn held_from_volume(grid: &VolumeGrid) -> Carries {
+    let mut carries = Carries::SAMPLES;
+    if grid.cell().is_some() {
+        carries = carries.or(Carries::UNIT_CELL);
+    }
+    if grid.atoms().is_some() {
+        carries = carries.or(Carries::TOPOLOGY).or(Carries::COORDS_3D);
+    }
+    carries
+}
+
+/// Every ordered `(source, target)` pair sharing a `Kind` (#339) -- every
+/// kind now, not just `Kind::Molecules`: `one_per_attribute` (test-only) and
+/// its four siblings each shape a fixture set for their own kind, so nothing
+/// here needs to single one out any more. Promoted out of this module's own
+/// test code because `chem convert -L matrix` (`bin/chem/main.rs`) needs
+/// the exact same pair list a test would check, not a second one that
+/// could drift from it.
+pub fn pairs_within_kind() -> impl Iterator<Item = (Format, Format)> {
+    all().flat_map(|source| {
+        all()
+            .filter(move |target| target.kind() == source.kind())
+            .map(move |target| (source, target))
+    })
+}
+
+/// Every ordered cross-`Kind` pair the registry actually allows (#339) --
+/// derived *from* [`kinds_compatible`] itself, by trying every pair that
+/// doesn't already share a `Kind`, rather than a second, hand-maintained
+/// list that could silently drift out of sync with the gate that actually
+/// governs `chem convert`. Today this is exactly the 17 CUBE-to-
+/// `Kind::Molecules` pairs `kinds_compatible`'s own doc comment names as
+/// the only exception in the whole registry.
+pub fn cross_kind_pairs() -> impl Iterator<Item = (Format, Format)> {
+    all().flat_map(|source| {
+        all()
+            .filter(move |target| {
+                target.kind() != source.kind() && kinds_compatible(source, *target).is_ok()
+            })
+            .map(move |target| (source, target))
+    })
+}
+
+/// Every pair the fidelity matrix has anything meaningful to say about
+/// (#339): same-`Kind` pairs plus the enumerated cross-`Kind` exceptions --
+/// the one list both `chem convert -L matrix` and this module's own
+/// pair-level tests iterate, so the two can never disagree about scope.
+pub fn fidelity_pairs() -> impl Iterator<Item = (Format, Format)> {
+    pairs_within_kind().chain(cross_kind_pairs())
+}
+
+/// How far a `Kind::Frames` format's own binary encoding can move a
+/// position and still call the round trip faithful (#339).
+///
+/// `0.01` Å for XTC specifically -- its own real, documented quantization
+/// step at the default `precision = 1000.0` (`1.0 / 1000.0` nm = 0.01 Å,
+/// confirmed against [`crate::io::options::XtcWriteOptions`]'s own doc
+/// comment), the same value `io::xtc`'s own tests already settled on ad
+/// hoc, centralized here rather than copied a second time. `1e-3` Å for
+/// every other binary trajectory format -- `f32` rounding noise, not a
+/// deliberate compressor, the same tolerance `io::trr`'s own tests already
+/// use.
+pub fn frame_tolerance(format: Format) -> f64 {
+    if format == Format::XTC { 0.01 } else { 1e-3 }
+}
+
+/// Whether every position in `a` matches its counterpart in `b` within
+/// `tol` on each axis (#339) -- the value-level check the presence-only
+/// `Carries` machinery above cannot express, and the reason a `Kind::Frames`
+/// pair needs more than [`held_from_trajectory`] to be proven faithful.
+pub fn positions_match(a: &[Point3], b: &[Point3], tol: f64) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            (x.x - y.x).abs() <= tol && (x.y - y.y).abs() <= tol && (x.z - y.z).abs() <= tol
+        })
+}
+
+/// Whether `bytes` contains `pattern` starting at `offset` — never panics on
+/// a buffer shorter than `offset + pattern.len()`, since `slice::get` on an
+/// out-of-range range answers `None` rather than indexing (#317).
+fn has_magic_at(bytes: &[u8], offset: usize, pattern: &[u8]) -> bool {
+    bytes.get(offset..offset + pattern.len()) == Some(pattern)
+}
+
+/// The dispatch [`sniff`] runs, factored out so it can be proven against a
+/// hand-built candidate list rather than the real registry (#317) — a
+/// `Format` is always a real, registered handle (see its own doc comment),
+/// so there is no way to hand this a fake one the way a bare
+/// [`FormatDescriptor`] could stand in for an unregistered `Kind` in #310's
+/// own tests. Pairing a *real* `Format` with a *made-up* signature list
+/// sidesteps that: the matching logic under test is identical either way.
+fn find_signature(
+    bytes: &[u8],
+    candidates: impl Iterator<Item = (Format, &'static [Signature])>,
+) -> Option<Format> {
+    candidates
+        .filter(|(_, sigs)| {
+            sigs.iter()
+                .any(|sig| has_magic_at(bytes, sig.offset, sig.bytes))
+        })
+        .map(|(format, _)| format)
+        .next()
+}
+
+/// Matches `bytes` against every registered format's content signature, or
+/// `None` if nothing recognizes it (#317).
+///
+/// The last resort `crate::io::open::open_supplier` reaches for before
+/// `Format::from_filename`'s SMILES default, and only when the file's own
+/// extension claimed nothing. Every registered format's `magic` is empty
+/// today — #309 built the byte-reading path a binary format needs, but none
+/// has registered a signature yet (#319, #325-#337) — so this always
+/// answers `None`, the same "the mechanism lands now, a later story
+/// populates it" shape every Phase-1 story since #311 has followed.
+pub(crate) fn sniff(bytes: &[u8]) -> Option<Format> {
+    find_signature(bytes, all().map(|f| (f, f.descriptor().magic)))
+}
+
 impl fmt::Debug for Format {
     /// The name, not the whole descriptor — a `Format` inside a larger `{:?}`
     /// should not print two slices and two function pointers.
@@ -1311,6 +3261,7 @@ impl fmt::Display for Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::reader::{Payload, Record};
 
     #[test]
     fn test_lookup_by_code_finds_every_alias() {
@@ -1346,6 +3297,10 @@ mod tests {
         // no PDB format was registered. #223 registered one, so this changed
         // -- exactly the point the old comment here was making.
         assert_eq!(Format::from_filename("a.pdb"), Format::PDB);
+        // Another case that used to fall back: `.mol` files register `mol`
+        // as a code (`-imol` already worked) but not as an extension, so
+        // every line of a real molfile silently skipped. #318 added it.
+        assert_eq!(Format::from_filename("a.mol"), Format::SDF);
     }
 
     /// One minimal molecule per attribute, each holding that attribute and as
@@ -1359,6 +3314,7 @@ mod tests {
     /// whose claim is wrong.
     fn one_per_attribute() -> Vec<(Carries, Molecule)> {
         use crate::core::cell::UnitCell;
+        use crate::core::force_field::{ForceFieldAtom, ForceFieldTopology};
         use crate::core::geometry::{Point2, Point3};
         use crate::core::residue::{Chain, Residue};
         use crate::core::site::AtomSite;
@@ -1436,6 +3392,76 @@ mod tests {
             .expect("valid stereo groups");
             m
         };
+        let with_force_field_atom = |mutate: fn(&mut ForceFieldAtom)| {
+            let mut m = ethane();
+            let mut atom = ForceFieldAtom::empty();
+            mutate(&mut atom);
+            m.set_force_field(ForceFieldTopology {
+                atoms: Some(vec![atom, ForceFieldAtom::empty()]),
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        // Three and four atoms respectively -- ethane's two aren't enough
+        // for an angle or a dihedral/improper term. Propane and butane's
+        // real, linear connectivity is exactly the shape an angle and a
+        // proper torsion need; isobutane's branch point is the shape an
+        // improper needs (a central atom plus three substituents).
+        let with_angle = {
+            let mut m = parse_smiles("CCC").expect("valid SMILES");
+            m.set_force_field(ForceFieldTopology {
+                angles: vec![[0, 1, 2]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_dihedral = {
+            let mut m = parse_smiles("CCCC").expect("valid SMILES");
+            m.set_force_field(ForceFieldTopology {
+                dihedrals: vec![[0, 1, 2, 3]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_improper = {
+            let mut m = parse_smiles("CC(C)C").expect("valid SMILES");
+            m.set_force_field(ForceFieldTopology {
+                impropers: vec![[0, 1, 2, 3]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_exclusion = {
+            let mut m = ethane();
+            m.set_force_field(ForceFieldTopology {
+                exclusions: vec![[0, 1]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_donor = {
+            let mut m = ethane();
+            m.set_force_field(ForceFieldTopology {
+                donors: vec![[0, 1]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
+        let with_acceptor = {
+            let mut m = ethane();
+            m.set_force_field(ForceFieldTopology {
+                acceptors: vec![[0, 1]],
+                ..ForceFieldTopology::default()
+            })
+            .expect("valid force field");
+            m
+        };
 
         vec![
             (Carries::TOPOLOGY, ethane()),
@@ -1469,7 +3495,225 @@ mod tests {
             (Carries::PROPERTIES, with_properties),
             (Carries::RESIDUES, with_residues),
             (Carries::STEREO_GROUP, with_stereo_group),
+            (
+                Carries::ATOM_TYPE,
+                with_force_field_atom(|a| a.atom_type = Some("CT".to_string())),
+            ),
+            (
+                Carries::MASS,
+                with_force_field_atom(|a| a.mass = Some(12.011)),
+            ),
+            (Carries::ANGLES, with_angle),
+            (Carries::DIHEDRALS, with_dihedral),
+            (Carries::IMPROPERS, with_improper),
+            (Carries::EXCLUSIONS, with_exclusion),
+            (Carries::DONORS, with_donor),
+            (Carries::ACCEPTORS, with_acceptor),
         ]
+    }
+
+    /// A `FrameSource` over exactly one, already-built [`Frame`] -- the
+    /// smallest possible test double, reused by every `Kind::Frames`
+    /// fixture below and by [`convert_trajectory`].
+    #[derive(Clone)]
+    struct OneFrame(crate::core::trajectory::Frame);
+
+    impl crate::core::trajectory::FrameSource for OneFrame {
+        fn frame_count(&self) -> usize {
+            1
+        }
+        fn num_atoms(&self) -> usize {
+            self.0.num_atoms()
+        }
+        fn frame(&mut self, _index: usize) -> std::io::Result<crate::core::trajectory::Frame> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// One minimal trajectory per `Kind::Frames`-relevant attribute (#339) --
+    /// the same "one flag, as little else as possible" discipline
+    /// [`one_per_attribute`] already established, sized to what this crate's
+    /// registered `Kind::Frames` formats actually draw from
+    /// ([`held_from_trajectory`]'s own flag list). Returns the shared
+    /// topology and the one frame separately, both `Clone`, rather than a
+    /// pre-built [`Trajectory`] (which cannot be cloned) -- callers build a
+    /// fresh one per use via [`build_trajectory`].
+    fn one_per_attribute_frames() -> Vec<(Carries, Molecule, crate::core::trajectory::Frame)> {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::cell::UnitCell;
+        use crate::core::trajectory::Frame;
+
+        // Ten atoms, not two: `io::xtc`'s own coordinate block stores
+        // `size <= 9` atoms as raw, lossless floats and only compresses
+        // above that threshold (see its module doc) -- a two-atom fixture
+        // never touches XTC's real lossy path at all, which is exactly
+        // what a deliberate-failure probe on `frame_tolerance` caught
+        // (#339): tightening XTC's tolerance below its real precision
+        // produced no failure, because there was never any real rounding
+        // error to catch. Ten is the smallest count XTC actually compresses.
+        //
+        // Non-grid-aligned positions for the same reason: `i as f64 *
+        // 1.0033` never lands on a multiple of XTC's 0.001nm quantization
+        // step, so the compression this fixture now reaches genuinely
+        // rounds every coordinate rather than passing a suspiciously exact
+        // one through unchanged.
+        let topology = || {
+            let mut m = Molecule::new();
+            for _ in 0..10 {
+                m.add_atom(Atom::new(Element::carbon()));
+            }
+            m
+        };
+        let positions = || {
+            (0..10)
+                .map(|i| Point3::new(i as f64 * 1.0033, 0.0, 0.0))
+                .collect::<Vec<_>>()
+        };
+        let bare = Frame {
+            positions: positions(),
+            velocities: None,
+            forces: None,
+            time: None,
+            step: None,
+            cell: None,
+        };
+
+        vec![
+            (Carries::TOPOLOGY, topology(), bare.clone()),
+            (Carries::COORDS_3D, topology(), bare.clone()),
+            (
+                Carries::VELOCITIES,
+                topology(),
+                Frame {
+                    velocities: Some(positions()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                Carries::FORCES,
+                topology(),
+                Frame {
+                    forces: Some(positions()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                Carries::FRAME_TIME,
+                topology(),
+                Frame {
+                    time: Some(1.5),
+                    ..bare.clone()
+                },
+            ),
+            (
+                Carries::UNIT_CELL,
+                topology(),
+                Frame {
+                    cell: Some(UnitCell::cubic(10.0)),
+                    ..bare.clone()
+                },
+            ),
+        ]
+    }
+
+    /// Builds a fresh, one-frame [`Trajectory`] from a fixture's own
+    /// topology/frame pair (#339).
+    fn build_trajectory(topology: &Molecule, frame: &crate::core::trajectory::Frame) -> Trajectory {
+        Trajectory::new(topology.clone(), Box::new(OneFrame(frame.clone())))
+            .expect("valid trajectory")
+    }
+
+    /// The `Kind::Frames` counterpart to [`convert`] (#339): writes `source`,
+    /// reads it back, writes `target`, reads that back -- the same two-hop
+    /// shape, over the whole-buffer `Trajectory` entry points every
+    /// `Kind::Frames` format actually uses (#325-#329) rather than the
+    /// per-record streaming a `Kind::Molecules` format's `Supplier` does.
+    fn convert_trajectory(
+        source: Format,
+        target: Format,
+        topology: &Molecule,
+        frame: &crate::core::trajectory::Frame,
+    ) -> Option<Trajectory> {
+        let mut trajectory = build_trajectory(topology, frame);
+        let as_source = source.write_trajectory_bytes(&mut trajectory)?;
+        let outcome = source.read_bytes(&as_source)?;
+        let crate::io::reader::Payload::Frames(mut intermediate) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+
+        let as_target = target.write_trajectory_bytes(&mut intermediate)?;
+        let outcome = target.read_bytes(&as_target)?;
+        let crate::io::reader::Payload::Frames(result) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+        Some(result)
+    }
+
+    /// One minimal volume grid per `Kind::Volume`-relevant attribute (#339),
+    /// the same discipline as [`one_per_attribute`]/[`one_per_attribute_frames`],
+    /// sized to [`held_from_volume`]'s own flag list. [`VolumeGrid`] is
+    /// `Clone`, so this returns the grids directly rather than needing a
+    /// rebuild-per-use helper.
+    fn one_per_attribute_volume() -> Vec<(Carries, VolumeGrid)> {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::cell::UnitCell;
+
+        let axes = [
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
+        ];
+        let bare = || {
+            VolumeGrid::new([1, 1, 1], Point3::ORIGIN, axes, vec![0.0], None).expect("valid grid")
+        };
+        let with_cell = VolumeGrid::new(
+            [1, 1, 1],
+            Point3::ORIGIN,
+            axes,
+            vec![0.0],
+            Some(UnitCell::cubic(10.0)),
+        )
+        .expect("valid grid");
+        let with_atoms = {
+            let mut g = bare();
+            let mut mol = Molecule::new();
+            mol.add_atom(Atom::new(Element::carbon()));
+            g.set_atoms(mol);
+            g
+        };
+
+        vec![
+            (Carries::SAMPLES, bare()),
+            (Carries::UNIT_CELL, with_cell),
+            (Carries::TOPOLOGY, with_atoms.clone()),
+            (Carries::COORDS_3D, with_atoms),
+        ]
+    }
+
+    /// The `Kind::Volume` counterpart to [`convert`]/[`convert_trajectory`]
+    /// (#339), over the whole-buffer [`VolumeGrid`] entry points every
+    /// `Kind::Volume` format actually uses (#331-#334).
+    fn convert_volume(source: Format, target: Format, grid: &VolumeGrid) -> Option<VolumeGrid> {
+        let as_source = source.write_volume_bytes(grid)?;
+        let outcome = source.read_bytes(&as_source)?;
+        let crate::io::reader::Payload::Volume(intermediate) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+
+        let as_target = target.write_volume_bytes(&intermediate)?;
+        let outcome = target.read_bytes(&as_target)?;
+        let crate::io::reader::Payload::Volume(result) =
+            outcome.records.into_iter().next()?.payload
+        else {
+            return None;
+        };
+        Some(result)
     }
 
     #[test]
@@ -1489,31 +3733,148 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_charge_is_detected_from_a_force_field_alone() {
+        // `PARTIAL_CHARGE` already has a fixture via `AtomSite` above; this
+        // is the other source (#315) -- proving the `OR` in `held` actually
+        // fires, not just that it compiles, by using a molecule with no
+        // site data at all.
+        use crate::core::force_field::{ForceFieldAtom, ForceFieldTopology};
+        use crate::io::smiles::parse_smiles;
+
+        let mut m = parse_smiles("CC").expect("valid SMILES");
+        assert!(m.sites().is_none());
+        m.set_force_field(ForceFieldTopology {
+            atoms: Some(vec![
+                ForceFieldAtom {
+                    partial_charge: Some(-0.1),
+                    ..ForceFieldAtom::default()
+                },
+                ForceFieldAtom::empty(),
+            ]),
+            ..ForceFieldTopology::default()
+        })
+        .expect("valid force field");
+
+        assert!(held(&m).contains(Carries::PARTIAL_CHARGE));
+    }
+
+    #[test]
     fn test_declared_masks_match_what_actually_survives() {
         // The masks were derived by reading the writers, which is exactly the
         // kind of claim that rots. So they are checked against reality: a mask
         // that overstates makes the drop report lie about the very data it
         // exists to protect.
+        //
+        // Every module's own test suite already proves its parse/write
+        // functions agree with each other (#325-#337) -- this test proves a
+        // different, narrower thing per kind: the *registry's own dispatch*
+        // (`Format::write_*_bytes`/`read_bytes`) is honest, the same class
+        // of gap `can_write()` had for `writer_mesh`/`writer_table` before
+        // #335/#337 fixed it. `Kind::Mesh`/`Table` get a simpler check
+        // (#339): neither kind's registered formats have any optional flag
+        // beyond their own single defining one, so there is nothing to sweep
+        // per-attribute -- only "does the registry's own writer/reader pair
+        // actually deliver a real grid/mesh/table at all."
         for format in all() {
             if !format.can_write() || !format.can_read() {
                 continue;
             }
-            for (flag, molecule) in one_per_attribute() {
-                let records = vec![("probe".to_string(), molecule)];
-                let text = format.write(&records).expect("can_write said so");
-                let outcome = crate::io::reader::read(&text, format);
-                let Some(back) = outcome.records.first() else {
-                    panic!("{format:?} wrote nothing readable for {flag:?}");
-                };
-                let survived = held(&back.molecule).contains(flag);
-                let claimed = format.carries().contains(flag);
+            match format.kind() {
+                Kind::Molecules => {
+                    for (flag, molecule) in one_per_attribute() {
+                        let records = vec![("probe".to_string(), molecule)];
+                        let bytes = format.write_bytes(&records).expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(back) = outcome.records.first() else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived =
+                            held(back.molecule().expect("fixture format is Kind::Molecules"))
+                                .contains(flag);
+                        let claimed = format.carries().contains(flag);
 
-                assert_eq!(
-                    claimed,
-                    survived,
-                    "{} claims {flag:?}={claimed} but a round trip gives {survived}",
-                    format.name()
-                );
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::Frames => {
+                    for (flag, topology, frame) in one_per_attribute_frames() {
+                        let mut trajectory = build_trajectory(&topology, &frame);
+                        let bytes = format
+                            .write_trajectory_bytes(&mut trajectory)
+                            .expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(Payload::Frames(mut back)) =
+                            outcome.records.into_iter().next().map(|r| r.payload)
+                        else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived = held_from_trajectory(&mut back)
+                            .expect("frame 0 is readable")
+                            .contains(flag);
+                        let claimed = format.carries().contains(flag);
+
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::Volume => {
+                    for (flag, grid) in one_per_attribute_volume() {
+                        let bytes = format.write_volume_bytes(&grid).expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(Payload::Volume(back)) =
+                            outcome.records.into_iter().next().map(|r| r.payload)
+                        else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived = held_from_volume(&back).contains(flag);
+                        let claimed = format.carries().contains(flag);
+
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::Mesh => {
+                    let mesh = Mesh::new(
+                        vec![
+                            Point3::new(0.0, 0.0, 0.0),
+                            Point3::new(1.0, 0.0, 0.0),
+                            Point3::new(0.0, 1.0, 0.0),
+                        ],
+                        None,
+                        None,
+                        vec![[0, 1, 2]],
+                    )
+                    .expect("valid mesh");
+                    let bytes = format.write_mesh_bytes(&mesh).expect("can_write said so");
+                    let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                    let Some(back) = outcome.records.first().and_then(Record::mesh) else {
+                        panic!("{format:?} wrote nothing readable");
+                    };
+                    assert!(!back.vertices().is_empty(), "{}", format.name());
+                    assert!(!back.faces().is_empty(), "{}", format.name());
+                }
+                Kind::Table => {
+                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
+                    let bytes = format.write_table_bytes(&table).expect("can_write said so");
+                    let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                    let Some(back) = outcome.records.first().and_then(Record::table) else {
+                        panic!("{format:?} wrote nothing readable");
+                    };
+                    assert!(back.num_columns() > 0, "{}", format.name());
+                }
             }
         }
     }
@@ -1521,18 +3882,34 @@ mod tests {
     /// One conversion, exactly as `chem convert` performs it: read the source
     /// file, write the target, read it back.
     ///
+    /// Goes through `write_bytes`/`read_bytes` rather than the text-only
+    /// `write`/`reader::read` -- the canonical path every format goes
+    /// through regardless of encoding (#309), and the only one BinaryCIF
+    /// (#319) can use at all, since its bytes are not valid UTF-8.
+    ///
     /// Returns `None` when a format writes something it cannot read back,
     /// which is a failure rather than a loss and is reported as one.
     fn convert(source: Format, target: Format, molecule: &Molecule) -> Option<Molecule> {
         let records = vec![("probe".to_string(), molecule.clone())];
-        let as_source = source.write(&records).expect("can_write said so");
-        let read_source = crate::io::reader::read(&as_source, source);
-        let intermediate = &read_source.records.first()?.molecule;
+        let as_source = source.write_bytes(&records)?;
+        let read_source = source.read_bytes(&as_source)?;
+        let intermediate = read_source
+            .records
+            .first()?
+            .molecule()
+            .expect("fixture format is Kind::Molecules");
 
         let records = vec![("probe".to_string(), intermediate.clone())];
-        let as_target = target.write(&records).expect("can_write said so");
-        let read_target = crate::io::reader::read(&as_target, target);
-        Some(read_target.records.first()?.molecule.clone())
+        let as_target = target.write_bytes(&records)?;
+        let read_target = target.read_bytes(&as_target)?;
+        Some(
+            read_target
+                .records
+                .first()?
+                .molecule()
+                .expect("fixture format is Kind::Molecules")
+                .clone(),
+        )
     }
 
     #[test]
@@ -1543,26 +3920,236 @@ mod tests {
         // nothing checked it, because
         // `test_declared_masks_match_what_actually_survives` only walks the
         // diagonal.
-        let fixtures = one_per_attribute();
-        for source in all() {
-            for target in all() {
-                let predicted_mask = fidelity(source, target);
-                for (flag, molecule) in &fixtures {
-                    let back = convert(source, target, molecule).unwrap_or_else(|| {
-                        panic!("{source:?} -> {target:?} wrote nothing readable")
-                    });
+        //
+        // `fidelity()` itself is pure `Carries` bitwise arithmetic with no
+        // notion of `Kind` at all, so it already predicts every one of the
+        // kinds below correctly without any change (#339): a `Kind::Volume`
+        // source's `SAMPLES` bit is simply never present in any
+        // `Kind::Molecules` target's mask, so the cross-kind CUBE pairs
+        // predict "the grid is always lost" for free, the same arithmetic
+        // that predicts XTC losing TRR's velocities.
+        let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
+        // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
+        // 1x1 (Table) same-kind, plus the 17 CUBE -> Molecules cross-kind
+        // pairs `cross_kind_pairs()` derives from `kinds_compatible` -- a
+        // count this crate re-derives and pins, not one asserted from
+        // memory (#339).
+        assert_eq!(pairs.len(), 352);
+        for (source, target) in pairs {
+            let predicted_mask = fidelity(source, target);
+            match (source.kind(), target.kind()) {
+                (Kind::Molecules, Kind::Molecules) => {
+                    for (flag, molecule) in one_per_attribute() {
+                        let back = match convert(source, target, &molecule) {
+                            Some(back) => back,
+                            // A pair pinned in `PAIR_GAPS` may fail to
+                            // produce anything readable at all, not just
+                            // lose an attribute -- LAMMPS's
+                            // `Element::UNKNOWN` has no atomic symbol for
+                            // a target that requires one. Any other pair
+                            // failing here is a real bug, not a known
+                            // gap, so it still panics.
+                            None => {
+                                assert!(
+                                    pair_gap(source, target).is_some(),
+                                    "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                                    source.name(),
+                                    target.name()
+                                );
+                                continue;
+                            }
+                        };
 
-                    let predicted = predicted_mask.contains(*flag);
-                    let survived = held(&back).contains(*flag);
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = held(&back).contains(flag);
 
-                    assert_eq!(
-                        predicted,
-                        survived,
-                        "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+                    }
+                }
+                (Kind::Frames, Kind::Frames) => {
+                    for (flag, topology, frame) in one_per_attribute_frames() {
+                        let Some(mut back) = convert_trajectory(source, target, &topology, &frame)
+                        else {
+                            assert!(
+                                pair_gap(source, target).is_some(),
+                                "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                                source.name(),
+                                target.name()
+                            );
+                            continue;
+                        };
+
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = held_from_trajectory(&mut back)
+                            .expect("frame 0 is readable")
+                            .contains(flag);
+
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+
+                        // The new capability #339 adds: presence alone
+                        // cannot see a position silently corrupted within
+                        // its own claimed precision -- XTC's lossy
+                        // compression is exactly the case that needs this.
+                        if predicted_mask.contains(Carries::COORDS_3D) {
+                            let tol = frame_tolerance(source).max(frame_tolerance(target));
+                            let back_frame = back.frame(0).expect("frame 0 is readable");
+                            assert!(
+                                positions_match(&frame.positions, &back_frame.positions, tol),
+                                "{} -> {}: positions moved by more than {tol} -- {:?} vs {:?}",
+                                source.name(),
+                                target.name(),
+                                frame.positions,
+                                back_frame.positions
+                            );
+                        }
+                    }
+                }
+                (Kind::Volume, Kind::Volume) => {
+                    for (flag, grid) in one_per_attribute_volume() {
+                        let Some(back) = convert_volume(source, target, &grid) else {
+                            assert!(
+                                pair_gap(source, target).is_some(),
+                                "{} -> {} wrote nothing readable and is not pinned in PAIR_GAPS",
+                                source.name(),
+                                target.name()
+                            );
+                            continue;
+                        };
+
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = held_from_volume(&back).contains(flag);
+
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+                    }
+                }
+                (Kind::Mesh, Kind::Mesh) => {
+                    let mesh = Mesh::new(
+                        vec![
+                            Point3::new(0.0, 0.0, 0.0),
+                            Point3::new(1.0, 0.0, 0.0),
+                            Point3::new(0.0, 1.0, 0.0),
+                        ],
+                        None,
+                        None,
+                        vec![[0, 1, 2]],
+                    )
+                    .expect("valid mesh");
+                    let as_source = source.write_mesh_bytes(&mesh).expect("can_write said so");
+                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                    let intermediate = outcome
+                        .records
+                        .first()
+                        .and_then(Record::mesh)
+                        .expect("valid mesh readback")
+                        .clone();
+                    let as_target = target
+                        .write_mesh_bytes(&intermediate)
+                        .expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::mesh)
+                        .expect("valid mesh readback");
+                    assert!(
+                        !back.vertices().is_empty(),
+                        "{} -> {}",
+                        source.name(),
+                        target.name()
+                    );
+                    assert!(
+                        !back.faces().is_empty(),
+                        "{} -> {}",
                         source.name(),
                         target.name()
                     );
                 }
+                (Kind::Table, Kind::Table) => {
+                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
+                    let as_source = source.write_table_bytes(&table).expect("can_write said so");
+                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                    let intermediate = outcome
+                        .records
+                        .first()
+                        .and_then(Record::table)
+                        .expect("valid table readback")
+                        .clone();
+                    let as_target = target
+                        .write_table_bytes(&intermediate)
+                        .expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::table)
+                        .expect("valid table readback");
+                    assert!(
+                        back.num_columns() > 0,
+                        "{} -> {}",
+                        source.name(),
+                        target.name()
+                    );
+                }
+                (Kind::Volume, Kind::Molecules) => {
+                    // CUBE's own dual nature (#338/#339) -- the only
+                    // cross-Kind pair this registry allows. `SAMPLES` is
+                    // never claimed by any `Kind::Molecules` target's own
+                    // mask, so `fidelity()`'s plain bitwise arithmetic
+                    // already predicts the grid is always lost here, same
+                    // as it predicts any other loss -- nothing hard-coded
+                    // beyond which fixture to use.
+                    let grid = one_per_attribute_volume()
+                        .into_iter()
+                        .find(|(flag, _)| *flag == Carries::TOPOLOGY)
+                        .expect("a with-atoms fixture exists")
+                        .1;
+                    let molecule = grid.atoms().expect("this fixture states atoms").clone();
+                    let records = vec![("probe".to_string(), molecule)];
+                    let as_target = target.write_bytes(&records).expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::molecule)
+                        .expect("valid molecule readback");
+
+                    let predicted = predicted_mask.contains(Carries::TOPOLOGY);
+                    let survived = held(back).contains(Carries::TOPOLOGY);
+                    assert_eq!(
+                        predicted,
+                        survived,
+                        "{} -> {}: the matrix says TOPOLOGY={predicted} but the conversion gives {survived}",
+                        source.name(),
+                        target.name()
+                    );
+                    assert!(
+                        !predicted_mask.contains(Carries::SAMPLES),
+                        "{} -> {}: a Kind::Molecules target must never claim SAMPLES",
+                        source.name(),
+                        target.name()
+                    );
+                }
+                (source_kind, target_kind) => unreachable!(
+                    "fidelity_pairs() only yields same-kind or CUBE-exception pairs, got {source_kind:?} -> {target_kind:?}"
+                ),
             }
         }
     }
@@ -1581,13 +4168,25 @@ mod tests {
         let records: Vec<(String, Molecule)> = outcome
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
 
-        for format in all() {
-            let text = format.write(&records).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
-            let mut molecule = back.records[0].molecule.clone();
+        for format in all().filter(|f| f.kind() == Kind::Molecules) {
+            let bytes = format.write_bytes(&records).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
+            let mut molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules")
+                .clone();
             crate::core::layout::ensure_coords(&mut molecule);
 
             let coords = molecule.coords().expect("a layout, computed or read");
@@ -1614,15 +4213,46 @@ mod tests {
         // does not actually manufacture, or a loss that stopped happening,
         // would otherwise sit in the table describing a crate that moved on.
         let fixtures = one_per_attribute();
+        let frame_fixtures = one_per_attribute_frames();
+        let volume_fixtures = one_per_attribute_volume();
 
         for (target, flag, why) in SUPPLIED {
-            let fires = all().any(|source| {
-                !source.carries().contains(*flag)
-                    && fixtures.iter().any(|(_, molecule)| {
-                        convert(source, *target, molecule)
-                            .is_some_and(|back| held(&back).contains(*flag))
-                    })
-            });
+            // Kind-aware (#339): a `SUPPLIED` row can now name a
+            // `Kind::Frames`/`Volume` target (TRR/XTC/DCD's manufactured
+            // time, CCP4/DSN6's synthesized cell, CUBE's always-present
+            // atom block), each re-derived through that kind's own
+            // fixtures and `held_*` function rather than the
+            // `Kind::Molecules`-only `convert`/`held` pair.
+            let fires = match target.kind() {
+                Kind::Molecules => all().any(|source| {
+                    !source.carries().contains(*flag)
+                        && fixtures.iter().any(|(_, molecule)| {
+                            convert(source, *target, molecule)
+                                .is_some_and(|back| held(&back).contains(*flag))
+                        })
+                }),
+                Kind::Frames => all().filter(|f| f.kind() == Kind::Frames).any(|source| {
+                    !source.carries().contains(*flag)
+                        && frame_fixtures.iter().any(|(_, topology, frame)| {
+                            convert_trajectory(source, *target, topology, frame).is_some_and(
+                                |mut back| {
+                                    held_from_trajectory(&mut back)
+                                        .is_ok_and(|carries| carries.contains(*flag))
+                                },
+                            )
+                        })
+                }),
+                Kind::Volume => all().filter(|f| f.kind() == Kind::Volume).any(|source| {
+                    !source.carries().contains(*flag)
+                        && volume_fixtures.iter().any(|(_, grid)| {
+                            convert_volume(source, *target, grid)
+                                .is_some_and(|back| held_from_volume(&back).contains(*flag))
+                        })
+                }),
+                Kind::Mesh | Kind::Table => {
+                    unreachable!("SUPPLIED has no Mesh/Table entries (#339)")
+                }
+            };
             assert!(
                 fires,
                 "{} is pinned as supplying {flag:?} ({why:?}) but never does -- delete the line",
@@ -1647,6 +4277,36 @@ mod tests {
                 target.name()
             );
         }
+
+        // The cross-kind exception list is not a hand-maintained table --
+        // `cross_kind_pairs()` derives it live from `kinds_compatible`
+        // (#339) -- but the *assumption* that makes it exactly 17 pairs
+        // (CUBE, and only CUBE, feeding every `Kind::Molecules` format)
+        // is still a claim worth re-deriving rather than trusting from
+        // memory, the same discipline as every table row above.
+        let volume_topology_sources: Vec<Format> = all()
+            .filter(|f| f.kind() == Kind::Volume && f.carries().contains(Carries::TOPOLOGY))
+            .collect();
+        assert_eq!(
+            volume_topology_sources,
+            vec![Format::CUBE],
+            "cross_kind_pairs() assumes CUBE is the only Kind::Volume format carrying \
+             Carries::TOPOLOGY; found {volume_topology_sources:?} -- update cross_kind_pairs() \
+             and this assertion together"
+        );
+        let cross_kind: Vec<(Format, Format)> = cross_kind_pairs().collect();
+        let molecules_count = all().filter(|f| f.kind() == Kind::Molecules).count();
+        assert_eq!(
+            cross_kind.len(),
+            molecules_count,
+            "cross_kind_pairs() should yield exactly one CUBE pair per Kind::Molecules target"
+        );
+        assert!(
+            cross_kind
+                .iter()
+                .all(|(source, target)| *source == Format::CUBE && target.kind() == Kind::Molecules),
+            "cross_kind_pairs() yielded a pair other than CUBE -> Kind::Molecules: {cross_kind:?}"
+        );
     }
 
     #[test]
@@ -1663,13 +4323,24 @@ mod tests {
         let records: Vec<(String, Molecule)> = outcome
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
 
-        for format in all() {
-            let text = format.write(&records).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
-            let molecule = &back.records[0].molecule;
+        for format in all().filter(|f| f.kind() == Kind::Molecules) {
+            let bytes = format.write_bytes(&records).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
+            let molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules");
 
             let aromatic_atoms = molecule.atoms().iter().filter(|a| a.is_aromatic()).count();
             let flagged = molecule.bonds().iter().filter(|b| b.is_aromatic()).count();
@@ -1749,20 +4420,39 @@ mod tests {
         let bonded: Vec<(String, Molecule)> = bonded
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
         // Two atoms, no bond between them, each stating it has no hydrogens.
         let lone = crate::io::reader::read("[C].[Cl] lone\n", Format::SMILES);
         let lone: Vec<(String, Molecule)> = lone
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
 
-        for format in all().filter(|f| f.can_read() && f.can_write()) {
-            let text = format.write(&bonded).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
-            let molecule = &back.records[0].molecule;
+        for format in all().filter(|f| f.kind() == Kind::Molecules && f.can_read() && f.can_write())
+        {
+            let bytes = format.write_bytes(&bonded).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
+            let molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules");
 
             let mut bonded_atoms = 0;
             for index in 0..molecule.num_atoms() {
@@ -1784,9 +4474,13 @@ mod tests {
                 format.name()
             );
 
-            let text = format.write(&lone).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
-            let molecule = &back.records[0].molecule;
+            let bytes = format.write_bytes(&lone).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
+            let molecule = back.records[0]
+                .molecule()
+                .expect("fixture format is Kind::Molecules");
 
             for index in 0..molecule.num_atoms() {
                 assert!(
@@ -1818,13 +4512,22 @@ mod tests {
         let records: Vec<(String, Molecule)> = outcome
             .records
             .iter()
-            .map(|r| (r.name.clone(), r.molecule.clone()))
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.molecule()
+                        .expect("fixture format is Kind::Molecules")
+                        .clone(),
+                )
+            })
             .collect();
         assert_eq!(records.len(), 3, "the fixture must be multi-record");
 
-        for format in all() {
-            let text = format.write(&records).expect("every format writes");
-            let back = crate::io::reader::read(&text, format);
+        for format in all().filter(|f| f.kind() == Kind::Molecules) {
+            let bytes = format.write_bytes(&records).expect("every format writes");
+            let back = format
+                .read_bytes(&bytes)
+                .expect("every format reads its own bytes");
             assert_eq!(
                 back.records.len(),
                 records.len(),
@@ -1846,15 +4549,17 @@ mod tests {
         let fixtures = one_per_attribute();
         let mut found: Vec<(Format, Format)> = Vec::new();
 
-        for source in all() {
-            for target in all() {
-                let lost = fixtures.iter().any(|(_, molecule)| {
-                    convert(source, target, molecule)
-                        .is_none_or(|back| back.num_atoms() != molecule.num_atoms())
-                });
-                if lost {
-                    found.push((source, target));
-                }
+        // `num_atoms()` is a `Molecule`-only notion (#339): `pairs_within_
+        // kind()` now covers every kind, but the atom-loss question this
+        // test asks only makes sense for `Kind::Molecules` pairs, the
+        // same scope `PAIR_GAPS` has always been pinned against.
+        for (source, target) in pairs_within_kind().filter(|(s, _)| s.kind() == Kind::Molecules) {
+            let lost = fixtures.iter().any(|(_, molecule)| {
+                convert(source, target, molecule)
+                    .is_none_or(|back| back.num_atoms() != molecule.num_atoms())
+            });
+            if lost {
+                found.push((source, target));
             }
         }
 
@@ -1904,13 +4609,313 @@ mod tests {
                 format.can_read() || format.can_write(),
                 "{format:?} can do neither"
             );
-            // An empty mask means the entry was added without one, which would
-            // silently report every molecule as losing everything.
+            // An empty mask means the entry was added without a defining
+            // flag, which would silently report every record as losing
+            // everything. Every kind gets exactly one mandatory "you exist"
+            // flag (#316) -- TOPOLOGY for a molecule, SAMPLES for a grid,
+            // VERTICES for a mesh, COLUMNS for a table -- mirroring how
+            // BONDS/FACES are separate, optional facts once the mandatory
+            // one is satisfied.
+            match format.kind() {
+                Kind::Molecules | Kind::Frames => {
+                    assert!(
+                        format.carries().contains(Carries::TOPOLOGY),
+                        "{format:?} declares no topology, so its mask is missing"
+                    );
+                }
+                Kind::Volume => {
+                    assert!(
+                        format.carries().contains(Carries::SAMPLES),
+                        "{format:?} declares no samples, so its mask is missing"
+                    );
+                }
+                Kind::Mesh => {
+                    assert!(
+                        format.carries().contains(Carries::VERTICES),
+                        "{format:?} declares no vertices, so its mask is missing"
+                    );
+                }
+                Kind::Table => {
+                    assert!(
+                        format.carries().contains(Carries::COLUMNS),
+                        "{format:?} declares no columns, so its mask is missing"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_topology_invariant_is_kind_aware_not_disabled() {
+        // `test_every_registered_format_is_well_formed`'s relaxation above,
+        // exercised against real `FormatDescriptor` values that never enter
+        // `FORMATS` -- none of `Kind::Volume`/`Mesh`/`Table` has a real
+        // container type yet (#311-#314), so this is the only way to prove
+        // the relaxation works for the kinds it targets without waiting on
+        // them. Same condition as the real test, applied directly to a
+        // descriptor's own fields rather than duplicated in a helper.
+        fn bare(kind: Kind) -> FormatDescriptor {
+            FormatDescriptor {
+                name: "probe",
+                codes: &["probe"],
+                extensions: &["probe"],
+                category: Category::Miscellaneous,
+                carries: Carries::empty(),
+                encoding: Encoding::Text,
+                kind,
+                magic: &[],
+                reader: None,
+                writer: None,
+                reader_bytes: None,
+                writer_bytes: None,
+                supplier: None,
+                writer_stream: None,
+                writer_trajectory: None,
+                writer_volume: None,
+                writer_mesh: None,
+                writer_table: None,
+            }
+        }
+
+        let requires_topology =
+            |d: &FormatDescriptor| matches!(d.kind, Kind::Molecules | Kind::Frames);
+
+        // A volume descriptor with nothing declared: the relaxed check
+        // accepts it -- an empty mask is meaningless for this kind.
+        assert!(!requires_topology(&bare(Kind::Volume)));
+        assert!(!requires_topology(&bare(Kind::Mesh)));
+        assert!(!requires_topology(&bare(Kind::Table)));
+        // A molecule/frames descriptor with nothing declared: still flagged
+        // -- the relaxation did not turn the check off for the kinds that
+        // need it.
+        assert!(requires_topology(&bare(Kind::Molecules)));
+        assert!(requires_topology(&bare(Kind::Frames)));
+    }
+
+    #[test]
+    fn test_every_kind_requires_its_own_defining_flag() {
+        // #316's half of the same proof, for the three kinds that gained a
+        // real container type (#312-#314) but no registered format yet --
+        // SAMPLES/VERTICES/COLUMNS are each kind's own "you exist" flag, the
+        // role TOPOLOGY plays for a molecule. The predicate here is written
+        // out independently of the real match in
+        // `test_every_registered_format_is_well_formed` rather than sharing
+        // it, the same discipline `requires_topology` above already follows
+        // -- a test that calls the function it is meant to catch bugs in
+        // proves nothing.
+        fn bare(kind: Kind, carries: Carries) -> FormatDescriptor {
+            FormatDescriptor {
+                name: "probe",
+                codes: &["probe"],
+                extensions: &["probe"],
+                category: Category::Miscellaneous,
+                carries,
+                encoding: Encoding::Text,
+                kind,
+                magic: &[],
+                reader: None,
+                writer: None,
+                reader_bytes: None,
+                writer_bytes: None,
+                supplier: None,
+                writer_stream: None,
+                writer_trajectory: None,
+                writer_volume: None,
+                writer_mesh: None,
+                writer_table: None,
+            }
+        }
+
+        fn passes(d: &FormatDescriptor) -> bool {
+            match d.kind {
+                Kind::Molecules | Kind::Frames => d.carries.contains(Carries::TOPOLOGY),
+                Kind::Volume => d.carries.contains(Carries::SAMPLES),
+                Kind::Mesh => d.carries.contains(Carries::VERTICES),
+                Kind::Table => d.carries.contains(Carries::COLUMNS),
+            }
+        }
+
+        // Each kind's own defining flag satisfies it ...
+        assert!(passes(&bare(Kind::Volume, Carries::SAMPLES)));
+        assert!(passes(&bare(Kind::Mesh, Carries::VERTICES)));
+        assert!(passes(&bare(Kind::Table, Carries::COLUMNS)));
+
+        // ... an empty mask does not -- the loophole the issue opens with.
+        assert!(!passes(&bare(Kind::Volume, Carries::empty())));
+        assert!(!passes(&bare(Kind::Mesh, Carries::empty())));
+        assert!(!passes(&bare(Kind::Table, Carries::empty())));
+
+        // ... and declaring a different kind's defining flag does not
+        // satisfy this one -- the flags are not interchangeable.
+        assert!(!passes(&bare(Kind::Volume, Carries::VERTICES)));
+        assert!(!passes(&bare(Kind::Mesh, Carries::COLUMNS)));
+        assert!(!passes(&bare(Kind::Table, Carries::SAMPLES)));
+    }
+
+    #[test]
+    fn test_has_magic_at_matches_and_never_panics_on_short_input() {
+        assert!(has_magic_at(b"\x1f\x8bxxxx", 0, b"\x1f\x8b"));
+        assert!(!has_magic_at(b"nope", 0, b"\x1f\x8b"));
+        // CCP4's `MAP ` sits at byte 208, not byte 0 -- a signature is not
+        // always anchored at the start of the file.
+        let mut buf = vec![0u8; 212];
+        buf[208..212].copy_from_slice(b"MAP ");
+        assert!(has_magic_at(&buf, 208, b"MAP "));
+        // Too short to hold the pattern at that offset at all -- must not
+        // panic, only answer false.
+        assert!(!has_magic_at(b"MA", 208, b"MAP "));
+        assert!(!has_magic_at(b"", 0, b"\x1f\x8b"));
+    }
+
+    #[test]
+    fn test_find_signature_matches_the_right_candidate() {
+        // `Format` is always a real, registered handle (see its own doc
+        // comment), so there is no way to hand this a fake one -- pairing a
+        // real `Format` with a made-up signature list proves the same
+        // matching/dispatch logic `sniff` uses without waiting on a real
+        // binary format to register one (#317).
+        let candidates: Vec<(Format, &'static [Signature])> = vec![
+            (
+                Format::SMILES,
+                &[Signature {
+                    offset: 0,
+                    bytes: b"AA",
+                }],
+            ),
+            (
+                Format::SDF,
+                &[Signature {
+                    offset: 2,
+                    bytes: b"BB",
+                }],
+            ),
+        ];
+
+        assert_eq!(
+            find_signature(b"AAxx", candidates.iter().copied()),
+            Some(Format::SMILES)
+        );
+        assert_eq!(
+            find_signature(b"xxBB", candidates.iter().copied()),
+            Some(Format::SDF)
+        );
+        assert_eq!(find_signature(b"zzzz", candidates.iter().copied()), None);
+    }
+
+    #[test]
+    fn test_sniff_resolves_every_binary_formats_real_signature_and_nothing_else_has_one_yet() {
+        // TRR (#326) was the first format to populate `magic` for real --
+        // #309 built the byte-reading path a binary format needs, and
+        // #317 built this matching mechanism -- XTC (#325) is the second,
+        // DCD (#327) the third, NCTRAJ (#328) the fourth, CCP4 (#332) the
+        // fifth -- the first outside `Kind::Frames` -- and PLY (#336) the
+        // sixth -- the first outside `Kind::Volume` too, and the first
+        // `Kind::Mesh` format with a real fixed signature at all (OBJ has
+        // none). Every other format leaves `magic` empty. Pinned explicitly
+        // rather than trusted silently, the same discipline #316's
+        // `pairs_within_kind` count assertion follows.
+        for format in all() {
+            if format == Format::TRR
+                || format == Format::XTC
+                || format == Format::DCD
+                || format == Format::NCTRAJ
+                || format == Format::CCP4
+                || format == Format::PLY
+            {
+                continue;
+            }
             assert!(
-                format.carries().contains(Carries::TOPOLOGY),
-                "{format:?} declares no topology, so its mask is missing"
+                format.descriptor().magic.is_empty(),
+                "{format:?} already has a signature"
             );
         }
+        assert!(sniff(b"\x1f\x8b\x08\x00").is_none());
+        assert!(sniff(b"CORD").is_none());
+        assert!(sniff(b"").is_none());
+
+        // GROMACS's own fixed magic numbers, big-endian, 2 apart.
+        assert_eq!(sniff(b"\x00\x00\x07\xc9REST"), Some(Format::TRR));
+        assert_eq!(sniff(b"\x00\x00\x07\xcbREST"), Some(Format::XTC));
+        // DCD's "CORD" sits at byte 4, after the leading Fortran record
+        // marker (whatever it is) -- not byte 0.
+        assert_eq!(sniff(b"\x54\x00\x00\x00CORD"), Some(Format::DCD));
+        // Every NetCDF-3 file, classic or 64-bit offset -- this alone
+        // doesn't prove it's an Amber trajectory, just a NetCDF-3 file.
+        assert_eq!(sniff(b"CDF\x01REST"), Some(Format::NCTRAJ));
+        assert_eq!(sniff(b"CDF\x02REST"), Some(Format::NCTRAJ));
+        // CCP4/MRC's "MAP " sits at byte 208, not byte 0.
+        let mut ccp4_like = vec![0u8; 212];
+        ccp4_like[208..212].copy_from_slice(b"MAP ");
+        assert_eq!(sniff(&ccp4_like), Some(Format::CCP4));
+        // PLY's "ply\n" is byte-identical across all three of its wire
+        // encodings, at byte 0.
+        assert_eq!(sniff(b"ply\nformat ascii 1.0\n"), Some(Format::PLY));
+    }
+
+    #[test]
+    fn test_every_text_format_stays_text_encoded() {
+        // #309 added the byte-level path; #319 (BinaryCIF) and #326 (TRR)
+        // are the formats that actually use it -- skipped here by their
+        // `Encoding`, not by name, since every *other* format must still be
+        // plain text with no binary reader/writer wired in.
+        for format in all() {
+            if format.encoding() == Encoding::Binary {
+                continue;
+            }
+            let d = format.descriptor();
+            assert_eq!(
+                d.encoding,
+                Encoding::Text,
+                "{format:?} is not registered as text"
+            );
+            assert!(
+                d.reader_bytes.is_none(),
+                "{format:?} has a byte reader already"
+            );
+            assert!(
+                d.writer_bytes.is_none(),
+                "{format:?} has a byte writer already"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_bytes_agrees_with_read() {
+        // Proves `read`/`read_with_options` genuinely delegate to
+        // `read_bytes_with_options` (#309) rather than sitting next to it as
+        // dead code: the same input through either path must yield the same
+        // records.
+        let sdf = "ethanol-ish\n  -ish-\n\nM  END\n$$$$\n";
+        let via_read = crate::io::reader::read(sdf, Format::SDF);
+        let via_bytes = Format::SDF
+            .read_bytes(sdf.as_bytes())
+            .expect("SDF can be read");
+        assert_eq!(via_read.records.len(), via_bytes.records.len());
+        assert_eq!(via_read.skipped.len(), via_bytes.skipped.len());
+    }
+
+    #[test]
+    fn test_read_bytes_reports_invalid_utf8_as_skipped_not_a_panic() {
+        let invalid = [b'C', 0xff, 0xfe];
+        let outcome = Format::SMILES
+            .read_bytes(&invalid)
+            .expect("SMILES can be read");
+        assert!(outcome.records.is_empty());
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.skipped[0].error.contains("UTF-8"));
+    }
+
+    #[test]
+    fn test_write_bytes_agrees_with_write() {
+        use crate::core::prelude::*;
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        let records = vec![("m".to_string(), mol)];
+
+        let via_write = Format::SDF.write(&records).expect("SDF writes");
+        let via_bytes = Format::SDF.write_bytes(&records).expect("SDF writes bytes");
+        assert_eq!(via_write.into_bytes(), via_bytes);
     }
 
     #[test]
@@ -1980,9 +4985,230 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 11);
+        assert_eq!(all().count(), 29);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
+    }
+
+    #[test]
+    fn test_kinds_compatible_allows_a_same_kind_pair() {
+        assert!(kinds_compatible(Format::TRR, Format::XTC).is_ok());
+        assert!(kinds_compatible(Format::CCP4, Format::DX).is_ok());
+        assert!(kinds_compatible(Format::OBJ, Format::PLY).is_ok());
+        assert!(kinds_compatible(Format::CSV, Format::CSV).is_ok());
+    }
+
+    #[test]
+    fn test_kinds_compatible_allows_cubes_own_dual_nature_one_direction_only() {
+        // CUBE genuinely carries atoms (Carries::TOPOLOGY) alongside its
+        // grid -- the one deliberately enumerated exception.
+        assert!(kinds_compatible(Format::CUBE, Format::PDB).is_ok());
+        // Never the reverse: a molecule has no grid samples to offer.
+        let err = kinds_compatible(Format::PDB, Format::CUBE).unwrap_err();
+        assert!(err.contains("PDB"), "{err}");
+        assert!(err.contains("CUBE"), "{err}");
+    }
+
+    #[test]
+    fn test_kinds_compatible_refuses_a_genuine_cross_kind_pair_naming_both() {
+        let err = kinds_compatible(Format::CSV, Format::DCD).unwrap_err();
+        assert!(err.contains("CSV"), "{err}");
+        assert!(err.contains("DCD"), "{err}");
+        assert!(err.contains("table"), "{err}");
+        assert!(err.contains("trajectory"), "{err}");
+    }
+
+    #[test]
+    fn test_kinds_compatible_refuses_a_volume_format_with_no_atoms_into_molecules() {
+        // CCP4 is Kind::Volume but declares no Carries::TOPOLOGY -- unlike
+        // CUBE, it never has real atoms to offer, so it gets no exception.
+        let err = kinds_compatible(Format::CCP4, Format::PDB).unwrap_err();
+        assert!(err.contains("CCP4"), "{err}");
+        assert!(err.contains("PDB"), "{err}");
+    }
+
+    #[test]
+    fn test_held_from_volume_reports_only_what_this_specific_grid_states() {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::cell::UnitCell;
+        use crate::core::geometry::Point3;
+        use crate::core::molecule::Molecule;
+        use crate::core::volume::VolumeGrid;
+
+        // No cell, no atoms -- DX's own shape.
+        let bare = VolumeGrid::new(
+            [1, 1, 1],
+            Point3::ORIGIN,
+            [
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 1.0),
+            ],
+            vec![0.0],
+            None,
+        )
+        .unwrap();
+        assert_eq!(held_from_volume(&bare), Carries::SAMPLES);
+
+        // A cell but no atoms -- CCP4/DSN6's own shape.
+        let with_cell = VolumeGrid::new(
+            [1, 1, 1],
+            Point3::ORIGIN,
+            [
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 1.0),
+            ],
+            vec![0.0],
+            Some(UnitCell::cubic(10.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            held_from_volume(&with_cell),
+            Carries::SAMPLES.or(Carries::UNIT_CELL)
+        );
+
+        // Atoms but no cell -- CUBE's own shape.
+        let mut with_atoms = bare.clone();
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+        with_atoms.set_atoms(mol);
+        assert_eq!(
+            held_from_volume(&with_atoms),
+            Carries::SAMPLES
+                .or(Carries::TOPOLOGY)
+                .or(Carries::COORDS_3D)
+        );
+    }
+
+    #[test]
+    fn test_held_from_trajectory_reports_only_what_frame_zero_states() {
+        use crate::core::atom::{Atom, Element};
+        use crate::core::geometry::Point3;
+        use crate::core::molecule::Molecule;
+        use crate::core::trajectory::{Frame, FrameSource};
+
+        struct OneFrame(Frame);
+        impl FrameSource for OneFrame {
+            fn frame_count(&self) -> usize {
+                1
+            }
+            fn num_atoms(&self) -> usize {
+                self.0.num_atoms()
+            }
+            fn frame(&mut self, _index: usize) -> std::io::Result<Frame> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(Element::carbon()));
+
+        // XTC's own shape: positions only.
+        let bare_frame = Frame {
+            positions: vec![Point3::ORIGIN],
+            velocities: None,
+            forces: None,
+            time: None,
+            step: None,
+            cell: None,
+        };
+        let mut bare = Trajectory::new(mol.clone(), Box::new(OneFrame(bare_frame))).unwrap();
+        assert_eq!(
+            held_from_trajectory(&mut bare).unwrap(),
+            Carries::TOPOLOGY.or(Carries::COORDS_3D)
+        );
+
+        // TRR's own shape: velocities and forces too.
+        let full_frame = Frame {
+            positions: vec![Point3::ORIGIN],
+            velocities: Some(vec![Point3::ORIGIN]),
+            forces: Some(vec![Point3::ORIGIN]),
+            time: Some(0.0),
+            step: None,
+            cell: None,
+        };
+        let mut full = Trajectory::new(mol, Box::new(OneFrame(full_frame))).unwrap();
+        assert_eq!(
+            held_from_trajectory(&mut full).unwrap(),
+            Carries::TOPOLOGY
+                .or(Carries::COORDS_3D)
+                .or(Carries::VELOCITIES)
+                .or(Carries::FORCES)
+                .or(Carries::FRAME_TIME)
+        );
+    }
+
+    #[test]
+    fn test_psf_topology_combines_with_a_dcd_frame_source_into_one_trajectory() {
+        // PSF+DCD (#339): not a `(source, target)` pair at all, but two
+        // *sources* combining into one `Trajectory` neither format alone
+        // produces -- PSF's real topology (residues, atom types, masses)
+        // and DCD's positions. `Trajectory::new` is already generic
+        // enough to accept them together; the only missing piece was a
+        // way to obtain a DCD `FrameSource` from outside `io::dcd`, fixed
+        // by the small `pub(crate)` bump on `DcdFrameSource::open`.
+        use crate::core::atom::{Atom, Element};
+        use crate::core::trajectory::{Frame, FrameSource};
+        use crate::io::dcd::DcdFrameSource;
+        use crate::io::psf::parse_psf;
+
+        let psf_topology =
+            parse_psf(include_str!("../../tests/corpus/psf/water.psf")).expect("valid PSF");
+        assert_eq!(psf_topology.num_atoms(), 3);
+        // PSF alone never states coordinates -- confirmed directly in
+        // `io::psf` (`test_no_coordinates_are_ever_invented`) -- so this
+        // is proof the combine below is genuine, not vacuous.
+        assert!(!held(&psf_topology).contains(Carries::COORDS_3D));
+
+        // A bare 3-atom trajectory -- just positions, matching water's
+        // atom count -- to become real DCD bytes via the format's own
+        // writer, exactly what `chem convert` would produce.
+        struct OneFrame(Frame);
+        impl FrameSource for OneFrame {
+            fn frame_count(&self) -> usize {
+                1
+            }
+            fn num_atoms(&self) -> usize {
+                self.0.num_atoms()
+            }
+            fn frame(&mut self, _index: usize) -> std::io::Result<Frame> {
+                Ok(self.0.clone())
+            }
+        }
+        let mut bare_topology = Molecule::new();
+        for _ in 0..3 {
+            bare_topology.add_atom(Atom::new(Element::carbon()));
+        }
+        let frame = Frame {
+            positions: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            velocities: None,
+            forces: None,
+            time: None,
+            step: None,
+            cell: None,
+        };
+        let mut source_trajectory =
+            Trajectory::new(bare_topology, Box::new(OneFrame(frame))).expect("valid trajectory");
+        let dcd_bytes = Format::DCD
+            .write_trajectory_bytes(&mut source_trajectory)
+            .expect("DCD can write");
+
+        let dcd_source = DcdFrameSource::open(dcd_bytes).expect("valid DCD bytes");
+        let mut combined = Trajectory::new(psf_topology, Box::new(dcd_source))
+            .expect("PSF and DCD agree on atom count");
+
+        let combined_mask = held_from_trajectory(&mut combined).expect("frame 0 is readable");
+        // What DCD alone can never state -- PSF's real topology facts.
+        assert!(combined_mask.contains(Carries::RESIDUES));
+        assert!(combined_mask.contains(Carries::ATOM_TYPE));
+        assert!(combined_mask.contains(Carries::MASS));
+        // What PSF alone can never state -- real coordinates from a trajectory.
+        assert!(combined_mask.contains(Carries::COORDS_3D));
     }
 }

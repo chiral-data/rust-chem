@@ -1,4 +1,12 @@
-"""gemmi as a structural oracle for mmCIF/PDB (#224).
+"""gemmi as a structural oracle for mmCIF, PDB, CIF-core (#320) and, as of
+#340, CCP4/MRC (#224 for the pattern).
+
+BinaryCIF was surveyed for #340 and stays out of scope: the pinned (and
+latest installable) `gemmi==0.7.5` raises on both `gemmi.cif.read` and
+`gemmi.read_structure` for the already-committed `bcif/*.bcif` fixtures
+(#319) -- confirmed directly, not assumed from the version number alone.
+The gap `crates/chem/tests/corpus/README.md` already discloses for
+BinaryCIF stands; nothing here reads it.
 
 Unlike RDKit/OpenBabel (see `oracles/__init__.py`), gemmi does not answer a
 SMILES-shaped question — there is no bare-SMILES `parses`/`identity` here, so
@@ -32,6 +40,8 @@ structure stores there.
 """
 
 from typing import Callable, NamedTuple, Optional
+
+import numpy as _np
 
 import gemmi as _gemmi
 
@@ -161,6 +171,127 @@ END
 """
 
 
+class SmallMoleculeSummary(NamedTuple):
+    """The structural facts [`check_cif_core`] compares against `chem`'s own
+    read of the small-molecule dictionary (#320) -- fractional sites rather
+    than [`Summary`]'s Cartesian ones, and no chain/residue concept at all in
+    this dictionary.
+    """
+
+    cell: Optional[tuple[float, float, float, float, float, float]]
+    spacegroup_hm: Optional[str]
+    sites: tuple[tuple[str, str, float, float, float, float, Optional[float]], ...]
+
+
+def summarize_small_molecule(text: str) -> Optional[SmallMoleculeSummary]:
+    """The CIF-core counterpart of [`summarize`] (#320) -- a different gemmi
+    entry point entirely (`make_small_structure_from_block`, not
+    `read_structure_string`), since this is a different dictionary, not a
+    parameter variant of mmCIF/PDB reading.
+    """
+    try:
+        doc = _gemmi.cif.Document()
+        doc.parse_string(text)
+        block = doc.sole_block()
+        st = _gemmi.make_small_structure_from_block(block)
+    except Exception:
+        return None
+    if len(st.sites) == 0:
+        return None
+
+    cell = (
+        (st.cell.a, st.cell.b, st.cell.c, st.cell.alpha, st.cell.beta, st.cell.gamma)
+        if st.cell.a > 0
+        else None
+    )
+    sites = tuple(
+        (
+            site.label,
+            site.type_symbol,
+            round(site.fract.x, 4),
+            round(site.fract.y, 4),
+            round(site.fract.z, 4),
+            round(site.occ, 2),
+            round(site.u_iso, 4) if site.u_iso else None,
+        )
+        for site in st.sites
+    )
+    return SmallMoleculeSummary(cell, st.spacegroup_hm or None, sites)
+
+
+#: A minimal but complete small-molecule CIF -- one atom, a cell, a space
+#: group, esd on a cell length, so the sanity check exercises the same three
+#: things `check_cif_core` actually relies on.
+SANITY_CIF_CORE = """data_sanity
+_cell_length_a 4.9134(2)
+_cell_length_b 4.9134
+_cell_length_c 5.4052
+_cell_angle_alpha 90.00
+_cell_angle_beta 90.00
+_cell_angle_gamma 120.00
+_symmetry_space_group_name_H-M 'P 32 2 1'
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+Si1 Si 0.4697 0.0000 0.3333 1.0
+"""
+
+
+class VolumeSummary(NamedTuple):
+    """The structural facts [`check_ccp4`] compares against `chem`'s own
+    read of a CCP4/MRC map (#340) -- grid dimensions and cell exactly,
+    density values within a small `float32` tolerance, since that is the
+    map's own storage precision and not a claim either reader makes about
+    exactness.
+    """
+
+    dims: tuple[int, int, int]
+    cell: tuple[float, float, float, float, float, float]
+    values: tuple[float, ...]
+
+
+def summarize_ccp4(path) -> Optional[VolumeSummary]:
+    """Reads a CCP4/MRC map and summarises what gemmi saw, or `None` if
+    gemmi could not read it. A different entry point again
+    (`gemmi.read_ccp4_map`, not `read_structure_string`/
+    `make_small_structure_from_block`) -- CCP4 is a grid, not atoms, so
+    there is no structure to build here at all.
+    """
+    try:
+        m = _gemmi.read_ccp4_map(str(path))
+        m.setup(0.0)
+    except Exception:
+        return None
+    grid = m.grid
+    if grid.nu * grid.nv * grid.nw == 0:
+        return None
+    cell = grid.unit_cell
+    values = tuple(round(float(v), 4) for v in _np.asarray(grid.array).flatten())
+    return VolumeSummary(
+        (grid.nu, grid.nv, grid.nw),
+        (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma),
+        values,
+    )
+
+
+#: A tiny (2x2x2) but complete map -- non-cubic cell, non-constant values,
+#: so the sanity check cannot pass by accident the way an all-zero grid
+#: could.
+def write_ccp4_fixture(path) -> None:
+    grid = _gemmi.FloatGrid(2, 2, 2)
+    grid.set_unit_cell(_gemmi.UnitCell(4, 5, 6, 90, 90, 90))
+    grid.spacegroup = _gemmi.SpaceGroup("P1")
+    grid.array[:] = _np.arange(8, dtype=_np.float32).reshape(2, 2, 2)
+    m = _gemmi.Ccp4Map()
+    m.grid = grid
+    m.update_ccp4_header()
+    m.write_ccp4_map(str(path))
+
+
 def load_gemmi() -> Callable[..., Optional[Summary]]:
     """Confirms gemmi can read something, the same way `oracles.load()`
     confirms RDKit/OpenBabel can before trusting either. Returns
@@ -187,4 +318,28 @@ def load_gemmi() -> Callable[..., Optional[Summary]]:
             f"gemmi reports {measured} for a fixture stating 0.80/42.50, so its "
             "per-atom values cannot be trusted as a reference"
         )
+    # The small-molecule path (#320) is a different gemmi entry point
+    # entirely (`make_small_structure_from_block`) -- gated the same way the
+    # PDB path is, so a `check_cif_core` failure is unambiguously about chem.
+    if summarize_small_molecule(SANITY_CIF_CORE) is None:
+        raise RuntimeError(
+            "gemmi cannot read a trivial small-molecule CIF fixture, so it "
+            "is broken rather than strict — refusing to report its answers "
+            "as findings"
+        )
+    # The CCP4 path (#340) is a third gemmi entry point (`read_ccp4_map`) --
+    # gated the same way, over a real temp file since `read_ccp4_map` (unlike
+    # `read_structure_string`) has no in-memory-text overload.
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    with _tempfile.TemporaryDirectory() as _tmp:
+        _path = _Path(_tmp) / "sanity.ccp4"
+        write_ccp4_fixture(_path)
+        if summarize_ccp4(_path) is None:
+            raise RuntimeError(
+                "gemmi cannot read a trivial CCP4 map it just wrote itself, "
+                "so it is broken rather than strict — refusing to report "
+                "its answers as findings"
+            )
     return summarize

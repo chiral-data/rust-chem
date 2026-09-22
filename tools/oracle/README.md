@@ -7,6 +7,14 @@ and PDB specifically, where neither RDKit (no support at all) nor OpenBabel
 (a different, incompatible mmCIF dialect) can judge the result — see
 "Adding an oracle" below for why it isn't a third `Oracle` implementation.
 
+v0.9.0 (#340) added four more: MDAnalysis for the five trajectory formats,
+gemmi again for CCP4/MRC, trimesh for OBJ/PLY, and cpptraj — Amber's own
+tool, not a second opinion — as NCTRAJ's reference oracle specifically. None
+of RDKit/OpenBabel/gemmi/Meeko can read any of these; without new oracles
+they would ship on self-consistency alone, exactly the standard #173
+rejected. See "Tolerance, not identity" below for what's different about
+judging a trajectory.
+
 ```sh
 docker build -t chem-oracle -f tools/oracle/Dockerfile .
 docker run --rm chem-oracle                                           # every check
@@ -17,7 +25,7 @@ Nothing here is a workspace member, a dev-dependency, or named in `Cargo.toml`.
 It drives `target/release/chem` as a subprocess, so a developer with neither
 Python nor a toolkit installed still runs the whole `cargo` gate.
 
-## The six checks
+## The checks
 
 | Check | Question |
 |---|---|
@@ -26,13 +34,28 @@ Python nor a toolkit installed still runs the whole `cargo` gate.
 | `sdf` | Does a molecule survive `chem coords` to SDF and back? |
 | `fp` | Do our fingerprints rank molecules the way RDKit's do? |
 | `mmcif` | Does `chem`'s mmCIF round trip agree with gemmi's independent read? |
+| `cif_core` | Does `chem`'s CIF-core round trip agree with gemmi's independent read? |
+| `pdb` | Does `chem`'s PDB round trip agree with gemmi, including per-atom occupancy/B-factor? |
+| `pdbqt` | Does `chem` read what OpenBabel and Meeko each write as PDBQT? |
 | `json` | Does commonchem JSON agree with RDKit, which defines the format? |
+| `trajectory` | Does chem's XTC/TRR/DCD/NCTRAJ/LAMMPS-trajectory round trip agree with MDAnalysis, within each format's own real precision? |
+| `nctraj_reference` | Does Amber's own tool accept what `chem` writes as NCTRAJ, and read back the same coordinates? |
+| `ccp4` | Does chem's CCP4/MRC round trip agree with gemmi's independent read? |
+| `mesh` | Does chem's OBJ/PLY round trip agree with trimesh's independent read? |
 
 `json` (#229) is the only check whose oracle is the format's *reference
 implementation* rather than a second opinion, so it runs both directions: what
 `chem` writes must read back as the same molecule, and what RDKit writes (in
 its own `rdkitjson` dialect, which `chem` accepts and never emits) must survive
-being read.
+being read. `nctraj_reference` (#340) is the same shape for a different
+reason: it is not a second opinion at all, but a validity question — is this
+a file Amber's own tool accepts — so the interesting failure there is cpptraj
+refusing the file outright, not a numeric disagreement.
+
+BinaryCIF was surveyed for #340 and has no check: the pinned (and latest
+installable) `gemmi==0.7.5` cannot read it at all, confirmed directly against
+the already-committed `bcif/*.bcif` fixtures (#319). The gap
+`crates/chem/tests/corpus/README.md` already discloses stands.
 
 ## Identity, not strings
 
@@ -61,6 +84,41 @@ which is what caught #240.
 particular hash, and ours differ from RDKit's (#192) — that check compares
 nearest-neighbour agreement instead, which holds for any chemically equivalent
 fingerprint.
+
+## Tolerance, not identity
+
+Every check above compares by identity: two things either produce the same
+InChI, the same structural summary, the same set of atoms, or they don't.
+`trajectory`, `nctraj_reference` and `ccp4` (#340) are the first checks that
+can't be — a trajectory format's own stored precision is real, not a defect,
+so a byte- or even float-identical round trip is the wrong question to ask.
+
+The tolerance is not invented per check. `crates/chem/src/io/format.rs`
+already solved this exact problem for its own internal fidelity matrix
+(`frame_tolerance`/`positions_match`, #339): `0.01` Angstrom for XTC's real
+quantization step, `1e-3` elsewhere for `f32` rounding noise. `run.py`'s
+`frame_tolerance`/`positions_match` are the Python side of the same two
+numbers, so "is this trajectory close enough" can't quietly answer
+differently depending on which language is asking. `ccp4` uses a plain
+`1e-3` float32 tolerance for density values, for the same reason: the map's
+own on-disk storage is `float32`, and neither reader claims exactness beyond
+that.
+
+## Fixtures authored by the oracle, not committed
+
+None of `trajectory`/`nctraj_reference`/`ccp4`/`mesh`'s eight format families
+have a real fixture in `crates/chem/tests/corpus/` today — #341 ("Binary
+fixtures we can still explain") is the later story about committing real,
+explainable binaries there. Rather than wait for it or duplicate it, every
+one of these checks authors its own small fixture at run time, using the
+oracle tool itself as the author wherever it can write one (MDAnalysis for
+XTC/TRR/DCD/NCTRAJ, gemmi for CCP4, trimesh for OBJ/PLY) — which has the
+added benefit of making the fixture's origin genuinely independent of
+`chem`, so `chem` reading it back is a real test of the reader rather than a
+circular one. The one exception is LAMMPS trajectory: MDAnalysis's
+`DumpReader` is read-only (no `DumpWriter` exists), so that one fixture is
+generated as a plain text literal instead, from the same canonical
+positions every other trajectory format's fixture uses.
 
 ## What fails a run, and what does not
 
@@ -119,3 +177,14 @@ exactly that when a system library is missing — its plugin loader aborts, ever
 format silently fails to register, and it reports that no molecule on earth
 parses. It answers every question confidently and wrongly, which produced 31
 false mismatches the first time this ran.
+
+`oracles/mdanalysis.py` and `oracles/mesh.py` (#340) follow gemmi's path, not
+`load()`'s: neither answers a SMILES-shaped question, so each is its own
+module with its own `load_*` gate (`load_mdanalysis`, `load_trimesh`),
+sanity-checked by writing and reading back its own trivial fixture before
+its answers are trusted.
+
+`oracles/cpptraj.py` (#340) is a third shape again: cpptraj is a CLI tool,
+not a Python library, so `load_cpptraj` runs `cpptraj --version` as a
+subprocess rather than importing anything — the same discipline as every
+other `load_*` gate, adapted to how this one oracle is actually reached.

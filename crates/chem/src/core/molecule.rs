@@ -2,6 +2,7 @@ use crate::core::atom::Atom;
 use crate::core::bond::Bond;
 use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ATOMIC_MASSES;
+use crate::core::force_field::ForceFieldTopology;
 use crate::core::geometry::{Point2, Point3};
 use crate::core::graph::MoleculeGraph;
 use crate::core::residue::{Chain, Residue};
@@ -40,6 +41,14 @@ pub enum MoleculeError {
 
     #[error("Expected {expected} atom sites (one per atom), got {got}")]
     SiteCountMismatch { expected: usize, got: usize },
+
+    #[error("Expected {expected} force field atoms (one per atom), got {got}")]
+    ForceFieldAtomCountMismatch { expected: usize, got: usize },
+
+    /// Stringly-typed for the same reason as [`Self::InvalidTopology`]: a
+    /// force-field term has several unrelated ways to be wrong.
+    #[error("Invalid force field topology: {0}")]
+    InvalidForceFieldTopology(String),
 
     /// A single variant rather than one per failure mode: topology has five
     /// distinct ways to be wrong and structured variants for each would be
@@ -136,6 +145,15 @@ pub struct Molecule {
     /// with `atoms`, so there is no natural absent value to distinguish from
     /// empty.
     stereo_groups: Vec<StereoGroup>,
+    /// Force-field data: per-atom types/masses/charges and the angle/
+    /// dihedral/improper/exclusion lists PSF, TOP and PRMTOP state. `None`
+    /// for every molecule that did not come from a force field, which is
+    /// most of them.
+    ///
+    /// A side table for the same reason `sites` is one: `Atom` derives `Eq`,
+    /// and masses and charges are floats. Dropped on [`Molecule::add_atom`]
+    /// like `sites`, for the same reason.
+    force_field: Option<ForceFieldTopology>,
 }
 
 impl Molecule {
@@ -154,6 +172,7 @@ impl Molecule {
             cell: None,
             space_group: None,
             stereo_groups: Vec::new(),
+            force_field: None,
         }
     }
 
@@ -172,6 +191,7 @@ impl Molecule {
             cell: None,
             space_group: None,
             stereo_groups: Vec::new(),
+            force_field: None,
         }
     }
 
@@ -194,10 +214,14 @@ impl Molecule {
         // reason, and there is no way to invent a position for the new atom.
         // The site table is dropped on the same grounds: it is indexed in
         // parallel with `atoms` too, and a file supplied it for a set of atoms
-        // this is no longer.
+        // this is no longer. Force-field data goes too, for the same reason
+        // -- its own per-atom list is indexed in parallel with `atoms`, and a
+        // half-consistent table (valid term indices, a stale per-atom list)
+        // is worse than starting over.
         self.coords = None;
         self.coords3 = None;
         self.sites = None;
+        self.force_field = None;
 
         // Topology goes too. Appending does not strictly invalidate the
         // existing ranges — indices 0..n keep their meaning — but it produces
@@ -421,6 +445,85 @@ impl Molecule {
     /// [`Self::set_sites`] to establish it first.
     pub fn sites_mut(&mut self) -> Option<&mut [AtomSite]> {
         self.sites.as_deref_mut()
+    }
+
+    /// This molecule's force-field data, or `None` if it carries none.
+    pub fn force_field(&self) -> Option<&ForceFieldTopology> {
+        self.force_field.as_ref()
+    }
+
+    pub fn has_force_field(&self) -> bool {
+        self.force_field.is_some()
+    }
+
+    /// Sets this molecule's force-field topology.
+    ///
+    /// # Errors
+    /// [`MoleculeError::ForceFieldAtomCountMismatch`] if `force_field.atoms`
+    /// is `Some` and its length isn't exactly one per atom — the same
+    /// all-or-nothing rule [`Self::set_sites`] enforces, and for the same
+    /// reason. [`MoleculeError::InvalidForceFieldTopology`] if any stated
+    /// mass is not finite and positive, or if any angle/dihedral/improper/
+    /// exclusion term names an atom index out of range or repeats one
+    /// within itself.
+    pub fn set_force_field(
+        &mut self,
+        force_field: ForceFieldTopology,
+    ) -> Result<(), MoleculeError> {
+        let num_atoms = self.atoms.len();
+
+        if let Some(atoms) = &force_field.atoms {
+            if atoms.len() != num_atoms {
+                return Err(MoleculeError::ForceFieldAtomCountMismatch {
+                    expected: num_atoms,
+                    got: atoms.len(),
+                });
+            }
+            for atom in atoms {
+                if let Some(mass) = atom.mass
+                    && (!mass.is_finite() || mass <= 0.0)
+                {
+                    return Err(MoleculeError::InvalidForceFieldTopology(format!(
+                        "mass must be finite and positive, got {mass}"
+                    )));
+                }
+            }
+        }
+
+        for (ix, angle) in force_field.angles.iter().enumerate() {
+            check_force_field_term("angle", ix, angle, num_atoms)?;
+        }
+        for (ix, dihedral) in force_field.dihedrals.iter().enumerate() {
+            check_force_field_term("dihedral", ix, dihedral, num_atoms)?;
+        }
+        for (ix, improper) in force_field.impropers.iter().enumerate() {
+            check_force_field_term("improper", ix, improper, num_atoms)?;
+        }
+        for (ix, exclusion) in force_field.exclusions.iter().enumerate() {
+            check_force_field_term("exclusion", ix, exclusion, num_atoms)?;
+        }
+        for (ix, donor) in force_field.donors.iter().enumerate() {
+            check_force_field_term("donor", ix, donor, num_atoms)?;
+        }
+        for (ix, acceptor) in force_field.acceptors.iter().enumerate() {
+            check_force_field_term("acceptor", ix, acceptor, num_atoms)?;
+        }
+
+        self.force_field = Some(force_field);
+        Ok(())
+    }
+
+    /// Discards any force-field data.
+    pub fn clear_force_field(&mut self) {
+        self.force_field = None;
+    }
+
+    /// Mutable access to the force-field topology, for a pass filling in a
+    /// term the reader could not. `None` if this molecule has no
+    /// force-field data yet — use [`Self::set_force_field`] to establish it
+    /// first.
+    pub fn force_field_mut(&mut self) -> Option<&mut ForceFieldTopology> {
+        self.force_field.as_mut()
     }
 
     /// This molecule's chains, in file order. Empty if it carries no topology.
@@ -874,6 +977,33 @@ impl Molecule {
     }
 }
 
+/// Validates one force-field term's atom indices against `num_atoms`:
+/// every index in range, and no index repeated within the same term. Shared
+/// across angles, dihedrals, impropers and exclusions, which all have
+/// exactly this shape and nothing else to check.
+fn check_force_field_term(
+    label: &str,
+    index: usize,
+    atoms: &[usize],
+    num_atoms: usize,
+) -> Result<(), MoleculeError> {
+    for &atom_idx in atoms {
+        if atom_idx >= num_atoms {
+            return Err(MoleculeError::InvalidForceFieldTopology(format!(
+                "{label} {index} names atom {atom_idx} but the molecule has {num_atoms}"
+            )));
+        }
+    }
+    let mut sorted = atoms.to_vec();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err(MoleculeError::InvalidForceFieldTopology(format!(
+            "{label} {index} repeats an atom index: {atoms:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for Molecule {
     fn default() -> Self {
         Self::new()
@@ -901,6 +1031,7 @@ mod tests {
     use super::*;
     use crate::core::atom::Element;
     use crate::core::bond::BondOrder;
+    use crate::core::force_field::ForceFieldAtom;
     use std::ops::Range;
 
     #[test]
@@ -1376,6 +1507,141 @@ mod tests {
             })
         ));
         assert!(!mol.has_sites());
+    }
+
+    // ---- force field topology -------------------------------------------
+
+    fn propane() -> Molecule {
+        crate::io::smiles::parse_smiles("CCC").expect("valid SMILES")
+    }
+
+    #[test]
+    fn test_set_force_field_round_trips() {
+        let mut mol = two_atom_molecule();
+        assert!(!mol.has_force_field());
+        assert!(mol.force_field().is_none());
+
+        let force_field = ForceFieldTopology {
+            atoms: Some(vec![
+                ForceFieldAtom {
+                    atom_type: Some("CT".to_string()),
+                    mass: Some(12.011),
+                    partial_charge: Some(-0.1),
+                },
+                ForceFieldAtom::empty(),
+            ]),
+            exclusions: vec![[0, 1]],
+            donors: vec![[0, 1]],
+            acceptors: vec![[1, 0]],
+            ..ForceFieldTopology::default()
+        };
+        mol.set_force_field(force_field).expect("valid force field");
+
+        assert!(mol.has_force_field());
+        let back = mol.force_field().unwrap();
+        assert_eq!(
+            back.atoms.as_ref().unwrap()[0].atom_type.as_deref(),
+            Some("CT")
+        );
+        assert_eq!(back.exclusions, vec![[0, 1]]);
+        assert_eq!(back.donors, vec![[0, 1]]);
+        assert_eq!(back.acceptors, vec![[1, 0]]);
+
+        // Independent of the site/coordinate tables, the same as they are of
+        // each other.
+        mol.set_sites(vec![AtomSite::empty(), AtomSite::empty()])
+            .unwrap();
+        assert!(mol.has_force_field());
+        mol.clear_sites();
+        assert!(mol.has_force_field());
+
+        mol.clear_force_field();
+        assert!(!mol.has_force_field());
+    }
+
+    #[test]
+    fn test_force_field_atom_count_mismatch_is_refused() {
+        let mut mol = two_atom_molecule();
+        let force_field = ForceFieldTopology {
+            atoms: Some(vec![ForceFieldAtom::empty()]),
+            ..ForceFieldTopology::default()
+        };
+        assert!(matches!(
+            mol.set_force_field(force_field),
+            Err(MoleculeError::ForceFieldAtomCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert!(!mol.has_force_field());
+    }
+
+    #[test]
+    fn test_an_out_of_range_term_atom_is_refused() {
+        // One representative term kind; angles, dihedrals, impropers,
+        // exclusions, donors and acceptors all funnel through the same
+        // `check_force_field_term` (#321).
+        let mut mol = propane();
+        let force_field = ForceFieldTopology {
+            angles: vec![[0, 1, 9]],
+            ..ForceFieldTopology::default()
+        };
+        assert!(matches!(
+            mol.set_force_field(force_field),
+            Err(MoleculeError::InvalidForceFieldTopology(_))
+        ));
+        assert!(!mol.has_force_field());
+    }
+
+    #[test]
+    fn test_a_term_repeating_an_atom_is_refused() {
+        let mut mol = propane();
+        let force_field = ForceFieldTopology {
+            angles: vec![[0, 1, 1]],
+            ..ForceFieldTopology::default()
+        };
+        assert!(matches!(
+            mol.set_force_field(force_field),
+            Err(MoleculeError::InvalidForceFieldTopology(_))
+        ));
+    }
+
+    #[test]
+    fn test_a_nonsensical_mass_is_refused() {
+        let mut mol = two_atom_molecule();
+        for bad_mass in [0.0, -12.0, f64::NAN, f64::INFINITY] {
+            let force_field = ForceFieldTopology {
+                atoms: Some(vec![
+                    ForceFieldAtom {
+                        mass: Some(bad_mass),
+                        ..ForceFieldAtom::default()
+                    },
+                    ForceFieldAtom::empty(),
+                ]),
+                ..ForceFieldTopology::default()
+            };
+            assert!(
+                matches!(
+                    mol.set_force_field(force_field),
+                    Err(MoleculeError::InvalidForceFieldTopology(_))
+                ),
+                "{bad_mass} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_atom_clears_force_field() {
+        let mut mol = two_atom_molecule();
+        mol.set_force_field(ForceFieldTopology {
+            exclusions: vec![[0, 1]],
+            ..ForceFieldTopology::default()
+        })
+        .unwrap();
+        assert!(mol.has_force_field());
+
+        mol.add_atom(Atom::new(Element::carbon()));
+        assert!(!mol.has_force_field());
     }
 
     // ---- residue and chain topology ------------------------------------

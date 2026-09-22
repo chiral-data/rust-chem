@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 use crate::core::molecule::Molecule;
 use crate::io::errors::ReadError;
 use crate::io::options::{ReadOptions, WriteOptions};
-use crate::io::reader::Record;
+use crate::io::reader::{Payload, Record};
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
@@ -54,7 +54,7 @@ impl<R: BufRead> SmilesSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -95,7 +95,7 @@ impl<R: BufRead> Iterator for SmilesSupplier<R> {
             return Some(
                 parse_smiles(smiles)
                     .map(|molecule| Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: Some(smiles.to_owned()),
                     })
@@ -123,7 +123,7 @@ impl<R: BufRead> CxSmilesSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -163,7 +163,7 @@ impl<R: BufRead> Iterator for CxSmilesSupplier<R> {
             return Some(
                 crate::io::cxsmiles::parse_cxsmiles(smiles, block)
                     .map(|molecule| Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: Some(smiles.to_owned()),
                     })
@@ -190,7 +190,7 @@ impl<R: BufRead> SdfSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -240,7 +240,7 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -268,7 +268,7 @@ impl<R: BufRead> PdbSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -294,7 +294,7 @@ impl<R: BufRead> MmcifSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -348,10 +348,344 @@ impl<R: BufRead> Iterator for MmcifSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// One molecule per `data_` block (#320). Mirrors [`MmcifSupplier`]'s own
+/// shape exactly -- `data_` is a *start* marker here too, so the same
+/// one-line lookahead applies.
+pub struct CifCoreSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> CifCoreSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            _options: options.clone(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for CifCoreSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim_start().to_ascii_lowercase().starts_with("data_");
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::cif_core::parse_cif_core(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        payload: Payload::Molecule(molecule),
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// One topology per `PSF` block (#321). Mirrors [`MmcifSupplier`]'s own
+/// shape exactly -- `PSF` is a *start* marker here too, so the same
+/// one-line lookahead applies. A real PSF is always exactly one topology;
+/// this exists so a *file this crate wrote* concatenating several still
+/// reads back as many records as it was given (#267), the same invariant
+/// every other format satisfies.
+pub struct PsfSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> PsfSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            _options: options.clone(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for PsfSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim() == "PSF";
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::psf::parse_psf(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        payload: Payload::Molecule(molecule),
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// One topology per `%VERSION` block (#322). Mirrors [`PsfSupplier`]'s own
+/// shape exactly -- `%VERSION` is a *start* marker here too, so the same
+/// one-line lookahead applies. Unlike PSF's bare `PSF` line, a real
+/// `%VERSION` line carries trailing content (`VERSION_STAMP = ...`), so the
+/// marker check is a prefix match, not an exact one.
+pub struct PrmtopSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    _options: ReadOptions,
+}
+
+impl<R: BufRead> PrmtopSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            _options: options.clone(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for PrmtopSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim_start().starts_with("%VERSION");
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::prmtop::parse_prmtop(&buffer)
+                .map(|molecule| {
+                    let name = molecule
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Molecule_{position}"));
+                    Record {
+                        payload: Payload::Molecule(molecule),
+                        name,
+                        smiles: None,
+                    }
+                })
+                .map_err(|e| ReadError::Parse {
+                    position,
+                    message: e.to_string(),
+                }),
+        )
+    }
+}
+
+/// One topology per `"Written by chem"` block (#324). Mirrors
+/// [`PrmtopSupplier`]'s own shape exactly, but the marker is this crate's
+/// own writer's fixed title line, not something a real file states -- see
+/// `read_lammps_data_with_options`'s own doc comment for why that's still
+/// correct for a genuine third-party file (its arbitrary title only ever
+/// appears once, so it never triggers a split).
+pub struct LammpsDataSupplier<R> {
+    lines: std::io::Lines<R>,
+    position: usize,
+    pending: Option<String>,
+    options: ReadOptions,
+}
+
+impl<R: BufRead> LammpsDataSupplier<R> {
+    pub fn new(reader: R, options: &ReadOptions) -> Self {
+        Self {
+            lines: reader.lines(),
+            position: 0,
+            pending: None,
+            options: options.clone(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for LammpsDataSupplier<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buffer = String::new();
+        let mut got_any_line = false;
+
+        if let Some(line) = self.pending.take() {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            got_any_line = true;
+        }
+
+        loop {
+            let raw = match self.lines.next() {
+                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(source)) => {
+                    self.position += 1;
+                    return Some(Err(ReadError::Io {
+                        position: self.position,
+                        source,
+                    }));
+                }
+            };
+            let starts_new_block = raw.trim() == "Written by chem";
+            if starts_new_block && got_any_line {
+                self.pending = Some(raw);
+                break;
+            }
+            got_any_line = true;
+            buffer.push_str(&raw);
+            buffer.push('\n');
+        }
+
+        if !got_any_line || buffer.trim().is_empty() {
+            return None;
+        }
+
+        self.position += 1;
+        let position = self.position;
+        Some(
+            crate::io::lammps::parse_lammps_data(&buffer, &self.options.lammps)
+                .map(|molecule| Record {
+                    payload: Payload::Molecule(molecule),
+                    name: format!("Molecule_{position}"),
+                    smiles: None,
                 })
                 .map_err(|e| ReadError::Parse {
                     position,
@@ -377,7 +711,7 @@ impl<R: BufRead> Mol2Supplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -431,7 +765,7 @@ impl<R: BufRead> Iterator for Mol2Supplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -489,7 +823,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -517,7 +851,7 @@ impl<R: BufRead> XyzSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -587,7 +921,7 @@ impl<R: BufRead> Iterator for XyzSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -792,6 +1126,111 @@ impl<W: Write> Writer for MmcifWriter<W> {
     }
 }
 
+/// Streams CIF core out, one `data_` block per molecule (#320). No
+/// per-record name threaded through, same reasoning as [`MmcifWriter`].
+pub struct CifCoreWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> CifCoreWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for CifCoreWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::cif_core::write_cif_core(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams PSF out, one `PSF` block per molecule (#321). No per-record name
+/// threaded through -- PSF has no title-line concept for a record's name,
+/// same reasoning as [`PdbWriter`]. Each call writes a complete,
+/// self-delimited block, so unlike [`CommonchemWriter`] this needs no
+/// buffering at all: a second molecule just means a second `PSF` header
+/// later in the stream, which [`PsfSupplier`] already knows to split on.
+pub struct PsfWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> PsfWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for PsfWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::psf::write_psf(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams PRMTOP out, one `%VERSION` block per molecule (#322). No
+/// per-record name threaded through -- PRMTOP has no title-line concept
+/// for a record's name, same reasoning as [`PsfWriter`]. Each call writes
+/// a complete, self-delimited block, so this needs no buffering either: a
+/// second molecule just means a second `%VERSION` header later in the
+/// stream, which [`PrmtopSupplier`] already knows to split on.
+pub struct PrmtopWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> PrmtopWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for PrmtopWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::prmtop::write_prmtop(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Streams LAMMPS data out, one `"Written by chem"` block per molecule
+/// (#324). No per-record name threaded through -- LAMMPS has no
+/// title-line concept for a record's name either, same reasoning as
+/// [`PsfWriter`]/[`PrmtopWriter`]. Each call writes a complete,
+/// self-delimited block, so this needs no buffering: a second molecule
+/// just means a second fixed title line later in the stream, which
+/// [`LammpsDataSupplier`] already knows to split on.
+pub struct LammpsDataWriter<W> {
+    writer: W,
+}
+
+impl<W: Write> LammpsDataWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Writer for LammpsDataWriter<W> {
+    fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.writer
+            .write_all(crate::io::lammps::write_lammps_data(molecule).as_bytes())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Streams Mol2 out, one `@<TRIPOS>MOLECULE` block per molecule (#225). No
 /// per-record name threaded through -- `write_mol2` already takes the
 /// molecule's own name for the block's title line, same as it would for a
@@ -833,7 +1272,7 @@ impl<R: BufRead> PdbqtSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -881,7 +1320,7 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -972,7 +1411,7 @@ impl<R: BufRead> GroSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -1058,7 +1497,7 @@ impl<R: BufRead> Iterator for GroSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -1115,7 +1554,7 @@ impl<R: BufRead> CmlSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: *options,
+            _options: options.clone(),
         }
     }
 }
@@ -1203,7 +1642,7 @@ impl<R: BufRead> Iterator for CmlSupplier<R> {
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Molecule_{position}"));
                     Record {
-                        molecule,
+                        payload: Payload::Molecule(molecule),
                         name,
                         smiles: None,
                     }
@@ -1283,7 +1722,7 @@ impl CommonchemSupplier {
                     .into_iter()
                     .map(|(name, molecule)| {
                         Ok(Record {
-                            molecule,
+                            payload: Payload::Molecule(molecule),
                             name,
                             smiles: None,
                         })
@@ -1341,6 +1780,87 @@ impl<W: Write> Writer for CommonchemWriter<W> {
     }
 }
 
+/// GROMACS TOP's `[ moleculetype ]` blocks, one at a time (#323).
+///
+/// **Not streamable, and this type satisfies the trait rather than
+/// exploiting it** -- the same shape as [`CommonchemSupplier`]. Real
+/// topologies mix `#include`/`#ifdef` preprocessing with parameter-level
+/// and system-level sections that span the whole buffer, so there is no
+/// per-record boundary a byte-stream scan could find; the whole input is
+/// read and parsed once in `new`, and this iterator walks the result.
+pub struct TopSupplier {
+    records: std::vec::IntoIter<Result<Record, ReadError>>,
+}
+
+impl TopSupplier {
+    pub fn new<R: BufRead>(mut reader: R, _options: &ReadOptions) -> Self {
+        let mut text = String::new();
+        let records = match reader.read_to_string(&mut text) {
+            Err(source) => vec![Err(ReadError::Io {
+                position: 1,
+                source,
+            })],
+            Ok(_) => match crate::io::top::parse_top(&text) {
+                Ok(molecules) => molecules
+                    .into_iter()
+                    .map(|(name, molecule)| {
+                        Ok(Record {
+                            payload: Payload::Molecule(molecule),
+                            name,
+                            smiles: None,
+                        })
+                    })
+                    .collect(),
+                Err(e) => vec![Err(ReadError::Parse {
+                    position: 1,
+                    message: e.to_string(),
+                })],
+            },
+        };
+        Self {
+            records: records.into_iter(),
+        }
+    }
+}
+
+impl Iterator for TopSupplier {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.next()
+    }
+}
+
+/// Buffers every molecule and emits the whole file in [`Writer::finish`] --
+/// the same shape as [`CommonchemWriter`], since GROMACS TOP's own
+/// `[ system ]`/`[ molecules ]` footer can only be written once every
+/// record has arrived.
+pub struct TopWriter<W> {
+    writer: W,
+    records: Vec<(String, Molecule)>,
+}
+
+impl<W: Write> TopWriter<W> {
+    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+        Self {
+            writer,
+            records: Vec::new(),
+        }
+    }
+}
+
+impl<W: Write> Writer for TopWriter<W> {
+    fn write_molecule(&mut self, name: &str, molecule: &Molecule) -> std::io::Result<()> {
+        self.records.push((name.to_string(), molecule.clone()));
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        let text = crate::io::top::write_top(&self.records);
+        self.writer.write_all(text.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,7 +1868,7 @@ mod tests {
     use std::io::Cursor;
 
     fn options() -> ReadOptions {
-        ReadOptions
+        ReadOptions::default()
     }
 
     #[test]
@@ -1365,12 +1885,12 @@ mod tests {
         let streamed_ok: Vec<_> = streamed
             .iter()
             .filter_map(|r| r.as_ref().ok())
-            .map(|r| (r.molecule.formula(), r.name.clone()))
+            .map(|r| (r.molecule().unwrap().formula(), r.name.clone()))
             .collect();
         let one_shot_ok: Vec<_> = one_shot
             .records
             .iter()
-            .map(|r| (r.molecule.formula(), r.name.clone()))
+            .map(|r| (r.molecule().unwrap().formula(), r.name.clone()))
             .collect();
         assert_eq!(streamed_ok, one_shot_ok);
 
@@ -1406,7 +1926,10 @@ mod tests {
         assert_eq!(streamed.len(), one_shot.records.len());
         for (streamed, one_shot) in streamed.iter().zip(one_shot.records.iter()) {
             let streamed = streamed.as_ref().unwrap();
-            assert_eq!(streamed.molecule.num_atoms(), one_shot.molecule.num_atoms());
+            assert_eq!(
+                streamed.molecule().unwrap().num_atoms(),
+                one_shot.molecule().unwrap().num_atoms()
+            );
             assert_eq!(streamed.name, one_shot.name);
         }
         assert_eq!(one_shot.records[0].name, "my-molecule");
@@ -1437,7 +1960,7 @@ mod tests {
             writer.write_molecule("ethanol", &mol).unwrap();
         }
         let text = String::from_utf8(out).unwrap();
-        let read_back = read_smiles_with_options(&text, &ReadOptions);
+        let read_back = read_smiles_with_options(&text, &ReadOptions::default());
         assert_eq!(read_back.records.len(), 1);
         assert_eq!(read_back.records[0].name, "ethanol");
     }
@@ -1451,7 +1974,7 @@ mod tests {
             writer.write_molecule("ethanol", &mol).unwrap();
         }
         let text = String::from_utf8(out).unwrap();
-        let read_back = read_sdf_with_options(&text, &ReadOptions);
+        let read_back = read_sdf_with_options(&text, &ReadOptions::default());
         assert_eq!(read_back.records.len(), 1);
         assert_eq!(read_back.records[0].name, "ethanol");
     }

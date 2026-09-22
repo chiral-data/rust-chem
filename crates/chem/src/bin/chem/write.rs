@@ -185,16 +185,35 @@ pub fn report_drops(format: Format, records: &[(String, Molecule)], explain: boo
     tracker.report(format.label(), explain);
 }
 
+/// Says on stderr what a same-`Kind` `Frames`/`Volume` conversion drops
+/// (#338) — the one-shot counterpart to [`DropTracker`] for a `chem
+/// convert` shape that is always exactly one record, never a stream of
+/// many, so there is nothing to accumulate. Silent when nothing is lost,
+/// the same posture [`DropTracker::report`] already takes.
+pub fn report_kind_drop(target: Format, held: Carries) {
+    let dropped = held.difference(target.carries());
+    if dropped.is_empty() {
+        return;
+    }
+    let summary = dropped.names().collect::<Vec<_>>().join(", ");
+    eprintln!("{} cannot carry: {summary}", target.label());
+}
+
 /// Serialises molecules, carrying their names.
 ///
 /// The serialisation itself lives on the format descriptor now, so this is a
 /// lookup rather than a `match` that grows a arm per format. Every registered
-/// format writes today; `expect` documents that rather than hiding a `None`
-/// the caller cannot act on.
-pub fn render(format: Format, records: &[(String, Molecule)]) -> String {
-    format
-        .write(records)
-        .unwrap_or_else(|| panic!("{} has no writer", format.name()))
+/// format writes *as text* today except BinaryCIF (#319) -- a real error
+/// now, not the hard panic this used to be: `chem aromatic --to bcif` is a
+/// plausible thing to type, and only `chem convert` (which goes through the
+/// byte-canonical path, not this one) can actually produce it.
+pub fn render(format: Format, records: &[(String, Molecule)]) -> Result<String> {
+    format.write(records).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} cannot be written as text here -- use `chem convert` for a binary format",
+            format.name()
+        )
+    })
 }
 
 /// Refuses to write over the file being read.

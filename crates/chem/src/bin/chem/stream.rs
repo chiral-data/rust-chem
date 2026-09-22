@@ -10,7 +10,8 @@
 //! keeps the tool composable.
 
 use anyhow::{Context, Result};
-use chem::io::reader::{self, Format, ReadOutcome};
+use chem::core::molecule::Molecule;
+use chem::io::reader::{self, Format, ReadOutcome, Record};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -33,12 +34,36 @@ pub fn read_input(path: Option<&Path>, format: Option<Format>) -> Result<Input> 
     // `from_filename` already answers SMILES for a name nothing claims — the
     // branch that used to be here was restating the fallback, in a second
     // place where it could drift from it.
-    let format = format.unwrap_or_else(|| Format::from_filename(&label));
+    let format = format.unwrap_or_else(|| resolve_format_from_content(&label, &content));
     Ok(Input {
         outcome: reader::read(&content, format),
         format,
         label,
     })
+}
+
+/// [`Format::from_filename`], plus two additions that function doesn't make
+/// on its own: `.cif` resolves to mmCIF *or* CIF core (#320) depending on
+/// content, since the two dictionaries share that extension, and `.top`
+/// resolves to PRMTOP *or* GROMACS TOP (#323) the same way. Mirrors
+/// `chem::io::open::resolve_format`'s own special cases for the file-path
+/// entry point.
+fn resolve_format_from_content(label: &str, content: &str) -> Format {
+    let format = Format::from_filename(label);
+    let extension = label.rsplit_once('.').map(|(_, ext)| ext);
+    let has_extension =
+        |wanted: &str| extension.is_some_and(|ext| ext.eq_ignore_ascii_case(wanted));
+
+    if format == Format::MMCIF
+        && has_extension("cif")
+        && chem::io::cif_core::is_small_molecule_cif(content)
+    {
+        return Format::CIF_CORE;
+    }
+    if format == Format::PRMTOP && has_extension("top") && chem::io::top::is_gromacs_top(content) {
+        return Format::TOP;
+    }
+    format
 }
 
 /// Reads a named file, or stdin when the path is absent or `-`.
@@ -76,6 +101,27 @@ pub fn write_output(path: Option<&PathBuf>, contents: &str) -> Result<()> {
             lock.write_all(contents.as_bytes())
                 .context("writing to standard output")?;
             lock.flush().context("flushing standard output")
+        }
+    }
+}
+
+/// The molecule in `record`, or `None` after reporting it as skipped.
+///
+/// #310 widened [`Record`] to allow a payload that is not a molecule. Every
+/// registered format is `Kind::Molecules` today, so this cannot fire yet --
+/// it exists so a molecule-only subcommand reports a future non-molecule
+/// record the same way [`report`] already reports a parse failure, on
+/// stderr and naming the record, rather than panicking on an `unwrap` or
+/// silently dropping it.
+pub fn molecule_or_report<'a>(record: &'a Record, label: &str) -> Option<&'a Molecule> {
+    match record.molecule() {
+        Some(molecule) => Some(molecule),
+        None => {
+            eprintln!(
+                "  skipped record '{}' in {label}: not a molecule",
+                record.name
+            );
+            None
         }
     }
 }

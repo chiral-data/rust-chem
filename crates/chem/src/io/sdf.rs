@@ -536,13 +536,18 @@ fn parse_properties(mol: &mut Molecule, lines: &[&str]) -> Result<(), SdfError> 
 ///
 /// # What is not written
 ///
-/// Charges, isotopes, chirality and bond stereo. The atom block emits the
-/// zero-valued fields the spec expects in their place, so the record is
-/// structurally complete and a reader that wants them finds defaults rather
-/// than absent columns. Aromatic bonds are written as type 4, which round-trips
-/// through [`parse_sdf`] but is a query bond type in strict molfile — a Kekulé
-/// form would be more portable and needs a Kekulisation pass that does not
-/// exist yet.
+/// Data fields parsed from a source SDF's block after `M  END` are not written
+/// back — this writer only emits what a [`Molecule`] itself carries, not
+/// arbitrary properties. Aromatic bonds are written as type 4, which
+/// round-trips through [`parse_sdf`] but is a query bond type in strict
+/// molfile — a Kekulé form would be more portable and needs a Kekulisation
+/// pass that does not exist yet.
+///
+/// Charges and isotopes ride on `M  CHG`/`M  ISO` lines, chirality on the atom
+/// parity column and a wedge bond, and double-bond stereo is recovered by a
+/// reader from the drawn geometry (V2000 has no field for it) — all widened in
+/// #197/#198, when this writer stopped emitting the smallest record that would
+/// parse.
 ///
 /// Geometry is written from whichever coordinate set the molecule carries: a
 /// conformer goes out as x/y/z with the header's dimensional code set to `3D`,
@@ -1350,7 +1355,12 @@ mod tests {
         // radical. This is #247's guard doing its work one layer down.
         let cif = include_str!("../../tests/corpus/mmcif/dipeptide-with-ligand.cif");
         let outcome = crate::io::reader::read_mmcif(cif);
-        let mol = &outcome.records.first().expect("one record").molecule;
+        let mol = outcome
+            .records
+            .first()
+            .expect("one record")
+            .molecule()
+            .expect("mmCIF fixture is a molecule record");
         let text = write_sdf(mol);
         let columns = valence_columns(&text);
         assert!(!columns.is_empty(), "the fixture should have atoms");
@@ -1420,8 +1430,9 @@ mod tests {
         assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
         assert_eq!(outcome.len(), 3);
         for (read, original) in outcome.records.iter().zip(&molecules) {
-            assert_eq!(read.molecule.num_atoms(), original.num_atoms());
-            assert!(read.molecule.has_coords());
+            let read_molecule = read.molecule().expect("SDF fixture is a molecule record");
+            assert_eq!(read_molecule.num_atoms(), original.num_atoms());
+            assert!(read_molecule.has_coords());
         }
     }
 

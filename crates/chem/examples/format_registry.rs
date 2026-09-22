@@ -60,17 +60,27 @@ fn main() {
     let records: Vec<(String, Molecule)> = outcome
         .records
         .iter()
-        .map(|r| (r.name.clone(), r.molecule.clone()))
+        .map(|r| {
+            (
+                r.name.clone(),
+                r.molecule().expect("SMILES is Kind::Molecules").clone(),
+            )
+        })
         .collect();
     for f in format::all() {
-        let text = f
-            .write(&records)
+        // `write_bytes`, not `write` -- BinaryCIF's (#319) canonical bytes
+        // are not text, and `f.write(&records)` correctly answers `None`
+        // for it rather than forcing an invalid UTF-8 decode.
+        let bytes = f
+            .write_bytes(&records)
             .expect("every registered format writes today");
-        let back = reader::read(&text, f);
+        let back = f
+            .read_bytes(&bytes)
+            .expect("every registered format reads its own bytes");
         println!(
             "  {:<6} {:>6} bytes -> {} molecules back",
             f.label(),
-            text.len(),
+            bytes.len(),
             back.len()
         );
     }
@@ -79,7 +89,10 @@ fn main() {
     assert_eq!(Format::from_code("mol"), Some(Format::SDF));
     assert_eq!(Format::SMILES.label(), "SMILES");
     assert_eq!(Format::SDF.name(), "MDL MOL format");
-    // `mol` is a *code*, not an extension — so a `.mol` file still reads as SMILES.
-    assert_eq!(Format::from_filename("a.mol"), Format::SMILES);
+    // `mol` used to be a code but not an extension, so a `.mol` file fell
+    // back to SMILES with every line skipped. #318 added it as an
+    // extension too -- it's the more common name for a single-molecule
+    // molfile than `.sdf`.
+    assert_eq!(Format::from_filename("a.mol"), Format::SDF);
     println!("\nall assertions held");
 }

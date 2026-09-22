@@ -60,9 +60,8 @@ use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
+use crate::core::units::NM_TO_ANGSTROM;
 use crate::io::errors::GroError;
-
-const NM_TO_ANGSTROM: f64 = 10.0;
 
 fn element_from_symbol(sym: &str) -> Option<Element> {
     let sym = sym.trim();

@@ -11,7 +11,7 @@
 //! value, which row is expanded. Those live with the view that owns them, in
 //! [`crate::views`], and are handed to these operations as arguments.
 
-use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset};
+use crate::dataset::{DatasetFormat, LoadedFiles, MoleculeDataset, plural};
 use crate::task::Task;
 use bitvec::prelude::BitVec;
 use chem::core::layout::ensure_coords;
@@ -21,6 +21,8 @@ use chem::io::aromaticity::detect_aromaticity;
 use chem::io::format;
 use chem::io::smiles::parse_smiles;
 use chem::search::{FingerprintSearch, SearchResult};
+#[cfg(target_arch = "wasm32")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -257,6 +259,11 @@ pub struct AppState {
     // picked up by the next `update()` poll.
     #[cfg(target_arch = "wasm32")]
     pending_file_load: PendingFileLoad,
+    // Whether a "Load File" dialog is already open (#381) -- refusing a
+    // second one while this is set is what keeps two overlapping `rfd`
+    // dialogs from racing on the same DOM cleanup and panicking.
+    #[cfg(target_arch = "wasm32")]
+    file_dialog_pending: Rc<Cell<bool>>,
     // GPU init can't happen inside `FingerprintSearch::new()` on wasm32 (see
     // its doc comment), so it's kicked off here instead and polled the same
     // way. Outer Option = has the attempt resolved yet; inner Option = did it
@@ -372,23 +379,33 @@ fn summarise_load(outcomes: &[FileLoad]) -> String {
     // Deduplicated by name, keeping the last: a file that replaced an entry of
     // the same name did not add one, and counting both would report "2 files, 3
     // molecules" for a Files list holding one entry of two.
-    let mut surviving: Vec<(&str, usize)> = Vec::new();
+    let mut surviving: Vec<(&str, usize, &str)> = Vec::new();
     for outcome in outcomes {
         if let FileLoad::Loaded {
-            name, molecules, ..
+            name,
+            molecules,
+            description,
+            ..
         } = outcome
         {
-            match surviving.iter_mut().find(|(seen, _)| *seen == name) {
-                Some(entry) => entry.1 = *molecules,
-                None => surviving.push((name, *molecules)),
+            match surviving.iter_mut().find(|(seen, ..)| *seen == name) {
+                Some(entry) => *entry = (name, *molecules, description),
+                None => surviving.push((name, *molecules, description)),
             }
         }
     }
-    let molecules: usize = surviving.iter().map(|(_, n)| n).sum();
+    let molecules: usize = surviving.iter().map(|(_, n, _)| n).sum();
 
     let mut summary = match surviving.len() {
         0 => "Loaded nothing".to_string(),
-        1 => format!("Loaded {molecules} {}", plural(molecules, "molecule")),
+        // A single file is what a file-dialog pick almost always is, and the
+        // one case where quoting its own `describe()` -- "1 trajectory (42
+        // atoms, 10,000 frames)" rather than "0 molecule" -- actually matters
+        // (#342). A multi-file batch keeps the plain molecule-count summary:
+        // precisely describing several files of possibly different kinds in
+        // one sentence is a different, bigger problem the Files list (each
+        // entry's own `describe()`) already solves per file.
+        1 => format!("Loaded {}", surviving[0].2),
         files => format!(
             "Loaded {files} files, {molecules} {}",
             plural(molecules, "molecule")
@@ -418,14 +435,6 @@ fn summarise_load(outcomes: &[FileLoad]) -> String {
     summary
 }
 
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
-    }
-}
-
 /// What became of one file in a load.
 ///
 /// [`AppState::apply_loaded_file_bytes`] used to return `()`, which was enough
@@ -440,6 +449,12 @@ pub enum FileLoad {
         /// Where it landed, so a batch can activate the first one it loaded.
         index: usize,
         molecules: usize,
+        /// What the file actually held, from [`MoleculeDataset::describe`]
+        /// (#342) -- "1 trajectory (42 atoms, 10,000 frames)" for the twelve
+        /// non-`Kind::Molecules` formats, `"{molecules} molecules"` otherwise.
+        /// `summarise_load` quotes this directly for a single-file batch,
+        /// which is what a real file-dialog pick almost always is.
+        description: String,
         skipped: usize,
         /// An entry of this name already existed and was replaced in place.
         /// Silent until now, and much easier to hit when several files arrive
@@ -514,6 +529,8 @@ impl AppState {
             search_task: Task::new(),
             #[cfg(target_arch = "wasm32")]
             pending_file_load: Rc::new(RefCell::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            file_dialog_pending: Rc::new(Cell::new(false)),
             #[cfg(target_arch = "wasm32")]
             pending_gpu_init,
             repaint: ctx.clone(),
@@ -652,12 +669,27 @@ impl AppState {
     // Promise machinery, so blocking on it would deadlock the tab. Spawn the
     // dialog as a non-blocking task instead and hand its result to
     // `pending_file_load`, polled from `update()` on the next frame.
+    //
+    // Guarded against re-entrancy (#381): `rfd`'s wasm backend builds a fresh
+    // DOM overlay per call and unconditionally `unwrap()`s removing it again
+    // on cancel, so two dialogs open at once race on that removal and panic
+    // with `NotFoundError` -- which then bricks the whole wasm instance until
+    // reload, since a wasm panic traps the whole module. Refusing a second
+    // dialog while one is already open removes the trigger regardless of
+    // that race's exact internal cause.
     #[cfg(target_arch = "wasm32")]
     pub fn load_dataset_from_file(&mut self) {
+        if self.file_dialog_pending.get() {
+            return;
+        }
+        self.file_dialog_pending.set(true);
+
         let slot = self.pending_file_load.clone();
         let ctx = self.repaint.clone();
+        let pending = self.file_dialog_pending.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let files = molecule_file_dialog().pick_files().await;
+            pending.set(false);
             if let Some(files) = files {
                 let mut picked = Vec::with_capacity(files.len());
                 for file in files {
@@ -668,12 +700,29 @@ impl AppState {
                 // so a second pick before the next frame silently dropped the
                 // first (#296).
                 slot.borrow_mut().extend(picked);
-                // Closing the picker is not itself an input event the canvas
-                // sees, so without this the file stays unloaded until the user
-                // moves the mouse (#186).
-                ctx.request_repaint();
             }
+            // Closing the picker is not itself an input event the canvas
+            // sees, so without this the file stays unloaded until the user
+            // moves the mouse (#186). Requested on cancellation too, not just
+            // success (#381), so the button visibly re-enables promptly
+            // either way rather than waiting for an unrelated repaint.
+            ctx.request_repaint();
         });
+    }
+
+    /// Whether a "Load File" dialog is already open, on the platform where a
+    /// second one can start before the first resolves (#381). Always `false`
+    /// on native: `pollster::block_on` blocks the whole calling frame, so a
+    /// second click cannot land while the first is still open.
+    pub fn is_load_dialog_pending(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.file_dialog_pending.get()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            false
+        }
     }
 
     /// Whether any format this build can read claims this file's extension.
@@ -698,41 +747,52 @@ impl AppState {
     }
 
     pub fn apply_loaded_file_bytes(&mut self, name: String, bytes: Vec<u8>) -> FileLoad {
-        let content = match String::from_utf8(bytes) {
-            Ok(content) => content,
-            Err(e) => {
-                self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
-                log::error!("Dataset load failed: {}", e);
-                return FileLoad::Refused {
-                    name,
-                    reason: "not valid UTF-8",
-                };
-            }
-        };
-
         let format = DatasetFormat::from_filename(&name);
-        let outcome = chem::io::reader::read(&content, format);
-        let dataset = MoleculeDataset::from_outcome(&outcome, format);
+
+        // #380, found by testing #342: a binary format's bytes were never
+        // meant to be decoded as UTF-8 at all -- this used to run
+        // unconditionally, before any format-aware dispatch, so it had never
+        // actually worked for any of XTC/TRR/DCD/NCTRAJ/CCP4/DSN6/DX/
+        // BinaryCIF. `Format::read_bytes` (#309) is the entry point every
+        // format is meant to go through: a binary format's own `reader_bytes`
+        // runs directly on the raw bytes, and a text format is UTF-8-decoded
+        // *internally*, where invalid UTF-8 already becomes a per-record
+        // `Skipped` entry rather than refusing the whole file.
+        let outcome = if format.encoding() == chem::io::format::Encoding::Binary {
+            match format.read_bytes(&bytes) {
+                Some(outcome) => outcome,
+                None => {
+                    self.dataset_status = format!("Failed to load '{name}': could not be read");
+                    log::error!(
+                        "Dataset load failed: {} declined its own bytes",
+                        format.label()
+                    );
+                    return FileLoad::Refused {
+                        name,
+                        reason: "could not be read",
+                    };
+                }
+            }
+        } else {
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(e) => {
+                    self.dataset_status = "Failed to load file: not valid UTF-8".to_string();
+                    log::error!("Dataset load failed: {}", e);
+                    return FileLoad::Refused {
+                        name,
+                        reason: "not valid UTF-8",
+                    };
+                }
+            };
+            chem::io::reader::read(&content, format)
+        };
 
         // Records that failed used to be logged and never surfaced, so a file
         // that half-loaded looked like a file that fully loaded. Reading now
-        // reports them, so the status line can too.
-        self.dataset_status = if outcome.skipped.is_empty() {
-            format!(
-                "Loaded {} molecules from '{}' ({})",
-                dataset.len(),
-                name,
-                format.label()
-            )
-        } else {
-            format!(
-                "Loaded {} molecules from '{}' ({}) — {} skipped",
-                dataset.len(),
-                name,
-                format.label(),
-                outcome.skipped.len()
-            )
-        };
+        // reports them, so the status line can too. Read before `from_outcome`
+        // takes `outcome` by value (#342) -- it moves a non-molecule payload's
+        // contents out, and `ReadOutcome` is not `Clone`.
         for skipped in &outcome.skipped {
             log::warn!(
                 "Skipped record {} in '{}': {}",
@@ -741,9 +801,31 @@ impl AppState {
                 skipped.error
             );
         }
+        let skipped_count = outcome.skipped.len();
+        let dataset = MoleculeDataset::from_outcome(outcome, format);
+
+        // #342: `dataset.describe()` says "1 trajectory (...)" instead of
+        // "0 molecules" for the twelve non-`Kind::Molecules` formats.
+        self.dataset_status = if skipped_count == 0 {
+            format!(
+                "Loaded {} from '{}' ({})",
+                dataset.describe(),
+                name,
+                format.label()
+            )
+        } else {
+            format!(
+                "Loaded {} from '{}' ({}) — {} skipped",
+                dataset.describe(),
+                name,
+                format.label(),
+                skipped_count
+            )
+        };
 
         let molecules = dataset.len();
-        let skipped = outcome.skipped.len();
+        let description = dataset.describe();
+        let skipped = skipped_count;
         let replaced = self.loaded_files.names().any(|existing| existing == name);
         self.loaded_files
             .add_and_activate(name.clone(), dataset, format);
@@ -752,6 +834,7 @@ impl AppState {
             name,
             index: self.loaded_files.active_index(),
             molecules,
+            description,
             skipped,
             replaced,
         }
@@ -1003,20 +1086,8 @@ impl AppState {
         let derived = derived_dataset_name(&source_name, target);
 
         let outcome = chem::io::reader::read(&text, target);
-        let converted = MoleculeDataset::from_outcome(&outcome, target);
-        let written = converted.len();
-
-        self.dataset_status = if outcome.skipped.is_empty() {
-            format!("Converted {written} molecules to {}", target.label())
-        } else {
-            // Our own output failing to read back is worth saying out loud
-            // rather than logging, the same as it is for a loaded file.
-            format!(
-                "Converted {written} molecules to {} — {} did not read back",
-                target.label(),
-                outcome.skipped.len()
-            )
-        };
+        // Read before `from_outcome` takes `outcome` by value (#342) -- see
+        // the identical note in `apply_loaded_file_bytes`.
         for skipped in &outcome.skipped {
             log::warn!(
                 "Conversion to {} produced record {} that did not read back: {}",
@@ -1025,7 +1096,22 @@ impl AppState {
                 skipped.error
             );
         }
+        let skipped_count = outcome.skipped.len();
+        let converted = MoleculeDataset::from_outcome(outcome, target);
 
+        self.dataset_status = if skipped_count == 0 {
+            format!("Converted {} to {}", converted.describe(), target.label())
+        } else {
+            // Our own output failing to read back is worth saying out loud
+            // rather than logging, the same as it is for a loaded file.
+            format!(
+                "Converted {} to {} — {skipped_count} did not read back",
+                converted.describe(),
+                target.label(),
+            )
+        };
+
+        let written = converted.describe();
         self.loaded_files
             .add_and_activate(derived, converted, target);
         // Before the outcome, not after: this resets `self.convert` along with
@@ -2124,6 +2210,57 @@ END
             state.dataset_status
         );
     }
+
+    #[test]
+    fn test_a_binary_trajectory_loads_instead_of_failing_as_invalid_utf8() {
+        // #380, found by testing #342: `apply_loaded_file_bytes` used to
+        // UTF-8-decode every loaded file before any format-aware dispatch,
+        // which meant it had never actually worked for a binary-encoded
+        // format at all. A real, already-committed fixture (#341) rather
+        // than hand-built bytes, since its correctness is already pinned
+        // elsewhere -- this test is only about whether it reaches the app.
+        let dcd: &[u8] = include_bytes!("../../chem/tests/corpus/dcd/big_endian_with_cell.dcd");
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("traj.dcd".to_string(), dcd.to_vec());
+
+        assert!(
+            !state.dataset_status.contains("not valid UTF-8"),
+            "{}",
+            state.dataset_status
+        );
+        assert!(
+            state.dataset_status.contains("trajectory"),
+            "{}",
+            state.dataset_status
+        );
+        let dataset = state.loaded_files.active_dataset();
+        assert!(dataset.non_molecule.is_some());
+    }
+
+    #[test]
+    fn test_a_binary_volume_loads_instead_of_failing_as_invalid_utf8() {
+        // #380, same bug as the trajectory case above, a different binary
+        // format (`Kind::Volume`) and encoding path (`reader_bytes` rather
+        // than a `Trajectory`-shaped one) to confirm the fix isn't specific
+        // to DCD.
+        let ccp4: &[u8] = include_bytes!("../../chem/tests/corpus/ccp4/permuted_axes.ccp4");
+        let mut state = AppState::cpu_only();
+        state.apply_loaded_file_bytes("density.ccp4".to_string(), ccp4.to_vec());
+
+        assert!(
+            !state.dataset_status.contains("not valid UTF-8"),
+            "{}",
+            state.dataset_status
+        );
+        assert!(
+            state.dataset_status.contains("grid"),
+            "{}",
+            state.dataset_status
+        );
+        let dataset = state.loaded_files.active_dataset();
+        assert!(dataset.non_molecule.is_some());
+    }
+
     /// Two atoms and a CONECT, so it is a real PDB rather than something the
     /// reader would reject for having no atoms (#292).
     const WATER_PDB: &str = "\

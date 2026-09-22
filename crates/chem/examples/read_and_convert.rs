@@ -35,7 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut molecules = Vec::new();
     let mut newly_aromatic = 0;
     for record in &outcome.records {
-        let mut molecule = record.molecule.clone();
+        let Some(molecule) = record.molecule() else {
+            println!("  skipping '{}': not a molecule", record.name);
+            continue;
+        };
+        let mut molecule = molecule.clone();
 
         // Kekulé input — explicit alternating double bonds — carries no
         // aromatic flags until something perceives them. Input already written

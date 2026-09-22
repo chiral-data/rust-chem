@@ -124,6 +124,18 @@ def convert_mmcif(text: str, to_format: str) -> str | None:
     return result.stdout if result.code == 0 and result.stdout.strip() else None
 
 
+def convert_cif_core(text: str, to_format: str) -> str | None:
+    """Round-trips CIF-core text through `chem convert` (#320).
+
+    `--from cif-core` names the format explicitly by code rather than
+    relying on content-sniffing — the same reason `convert_mmcif` passes
+    `--from mmcif` rather than letting `.cif` (which both dictionaries
+    share) be guessed from a filename stdin doesn't have.
+    """
+    result = run(["convert", "-", "--from", "cif-core", "--to", to_format], stdin=text)
+    return result.stdout if result.code == 0 and result.stdout.strip() else None
+
+
 def convert_pdb(text: str, to_format: str) -> str | None:
     """Round-trips PDB text through `chem convert`, returning what it wrote.
 
@@ -162,6 +174,38 @@ def read_commonchem(text: str) -> str | None:
     if result.code != 0 or not result.stdout.strip():
         return None
     return result.stdout.split()[0]
+
+
+def convert_file(
+    input_path: Path, from_format: str, to_format: str, output_path: Path
+) -> bool:
+    """Runs `chem convert <input> --from <from> --to <to> -o <output>` on
+    real files, returning whether it succeeded.
+
+    Every other helper here pipes SMILES-shaped text through stdin/stdout
+    in text mode (`run`, above) -- wrong for the `Kind::Frames`/`Volume`/
+    `Mesh` formats #340 adds (XTC, TRR, DCD, NCTRAJ, CCP4, OBJ, PLY),
+    which are bytes, not text. Real paths in and out sidestep the whole
+    binary-vs-text subprocess question, and match how `chem convert`
+    already expects to read these kinds anyway (#338: always a whole
+    file, never a stream).
+    """
+    result = subprocess.run(
+        [
+            str(binary()),
+            "convert",
+            str(input_path),
+            "--from",
+            from_format,
+            "--to",
+            to_format,
+            "-o",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and output_path.exists()
 
 
 def fingerprint(smiles: str, radius: int, nbits: int) -> list[int] | None:
