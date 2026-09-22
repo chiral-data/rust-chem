@@ -28,34 +28,27 @@ before changing anything under `crates/chem/src/gpu` or `crates/chem/src/search`
 
 ## Roadmap
 
-Format coverage in waves, each one a release and a GitHub milestone. The order
-follows what the next thing built on `chem` needs to open, not the catalogue's.
-The registry holds **11** formats today; `chem convert -L formats` is always the
-authoritative list. Detail and reasoning:
-[#173](https://github.com/chiral-data/rust-chem/issues/173).
-
 | Wave | Release | Delivers | New |
 | --- | --- | --- | --- |
-| 1 — the IR and the registry | v0.7.0 ✅ | The data model, the format registry, the oracle harness | 2 |
-| 1, remainder — the conversion surface | v0.8.0 ✅ | `chem convert`, option bags, `Supplier`/`Writer`, `-L`/`-H` | 9 |
-| 2 — records that are not molecules | v0.9.0 | Binary encodings, and record kinds beyond the molecule: trajectories, volume grids, force-field topologies, meshes, tabular | 18 |
+| IR and the registry | v0.7.0 ✅ | The data model, the format registry, the oracle harness | 2 |
+| Conversion surface | v0.8.0 ✅ | `chem convert`, option bags, `Supplier`/`Writer`, `-L`/`-H` | 9 |
+| Records that are not molecules | v0.9.0 ✅ | Binary encodings, and record kinds beyond the molecule: trajectories, volume grids, force-field topologies, meshes, tabular | 18 |
 | 3 — crystals and comp-chem input | v0.10.0 | Crystallography and the comp-chem input writers — templated text | ~35 |
 | 4 — comp-chem output parsers | v0.11.0 | The log scrapers, and the auto-detecting "Generic Output" dispatcher | ~25 |
 | 5 — reactions, biopolymers, 2D drawing | v0.12.0 | Reactions, query molecules, the binary ChemDraw parsers | ~40 |
 | 6 — parity certification | v1.0.0 | Multithreaded parse, the published fidelity matrix, fingerprint formats | ~10 |
 
-Every format is pure Rust. OpenBabel and RDKit are used as test oracles only and
-never appear in the dependency graph — a format we cannot parse is an error
-naming the format, never a delegation.
-
-InChI, InChIKey and RInChI are deferred past v1.0.0: the IUPAC C library *is* the
-normative definition, so the constraint above means writing and validating a
-native canonicalisation rather than wrapping one.
-
 ## Inspiration
 
 [sdfrust](https://github.com/pdbabin/sdfrust) ·
-[smilesDrawer](https://github.com/reymond-group/smilesDrawer)
+[smilesDrawer](https://github.com/reymond-group/smilesDrawer)  ·
+[RDKit](https://github.com/rdkit/rdkit) ·
+[OpenBabel](https://github.com/openbabel/openbabel) ·
+[gemmi](https://github.com/project-gemmi/gemmi) ·
+[Meeko](https://github.com/forlilab/Meeko) ·
+[MDAnalysis](https://github.com/MDAnalysis/mdanalysis) ·
+[cpptraj](https://github.com/Amber-MD/cpptraj) ·
+[trimesh](https://github.com/mikedh/trimesh)
 
 ## Licence
 
