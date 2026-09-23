@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::core::elements::{ELEMENT_NAMES, ELEMENT_SYMBOLS};
+use crate::core::elements::{
+    COVALENT_RADII, CPK_COLORS, ELEMENT_NAMES, ELEMENT_SYMBOLS, VDW_RADII,
+};
 
 /// Represents a chemical element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +34,27 @@ impl Element {
 
     pub const fn name(&self) -> &'static str {
         ELEMENT_NAMES[self.atomic_number as usize]
+    }
+
+    /// Van der Waals radius in Å: Bondi 1964 with Mantina et al. 2009's
+    /// main-group values, as OpenBabel ships them — so hydrogen is 1.10, not
+    /// the older 1.20 RDKit reports. `None` where the source has no value
+    /// (Co, Ni, Cu, Rh, Os, Ir, Ac, Pa, Np onward, [`Self::UNKNOWN`]).
+    pub const fn vdw_radius(&self) -> Option<f64> {
+        VDW_RADII[self.atomic_number as usize]
+    }
+
+    /// Covalent (single-bond) radius in Å, Cordero et al. 2008. `None` past
+    /// curium, where that table stops, and for [`Self::UNKNOWN`].
+    pub const fn covalent_radius(&self) -> Option<f64> {
+        COVALENT_RADII[self.atomic_number as usize]
+    }
+
+    /// Jmol's CPK colour as plain RGB, for 3D models where carbon needs a
+    /// colour of its own — unlike `draw`'s 2D label palette. Elements past
+    /// meitnerium, and [`Self::UNKNOWN`], get Jmol's unknown-element pink.
+    pub const fn cpk_color(&self) -> [u8; 3] {
+        CPK_COLORS[self.atomic_number as usize]
     }
 
     pub const fn typical_valence(&self) -> u8 {
@@ -281,6 +304,75 @@ impl fmt::Display for Atom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn el(z: u8) -> Element {
+        Element::new(z).unwrap()
+    }
+
+    #[test]
+    fn test_radii_match_their_sources_at_known_elements() {
+        // #388. Cordero 2008 covalent; Bondi/Mantina vdW as OpenBabel 3.1.1.
+        assert_eq!(el(1).covalent_radius(), Some(0.31));
+        assert_eq!(el(1).vdw_radius(), Some(1.1));
+        assert_eq!(el(6).covalent_radius(), Some(0.76));
+        assert_eq!(el(6).vdw_radius(), Some(1.7));
+        assert_eq!(el(7).vdw_radius(), Some(1.55));
+        assert_eq!(el(26).covalent_radius(), Some(1.32));
+        assert_eq!(el(96).covalent_radius(), Some(1.69));
+    }
+
+    #[test]
+    fn test_a_radius_the_source_lacks_is_none_not_a_placeholder() {
+        for z in 97..=118 {
+            assert_eq!(el(z).covalent_radius(), None, "Z={z}");
+        }
+        for z in [27, 28, 29, 118] {
+            assert_eq!(el(z).vdw_radius(), None, "Z={z}");
+        }
+        assert_eq!(Element::UNKNOWN.covalent_radius(), None);
+        assert_eq!(Element::UNKNOWN.vdw_radius(), None);
+    }
+
+    #[test]
+    fn test_every_radius_is_physically_plausible() {
+        // Catches a unit slip (pm, nm) or a shifted column on regeneration.
+        for z in 1..=118 {
+            for r in [el(z).covalent_radius(), el(z).vdw_radius()]
+                .into_iter()
+                .flatten()
+            {
+                assert!(r > 0.2 && r < 3.5, "Z={z} radius {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_covalent_radii_sum_to_real_bond_lengths() {
+        let bond =
+            |a: u8, b: u8| el(a).covalent_radius().unwrap() + el(b).covalent_radius().unwrap();
+        assert!((bond(6, 6) - 1.54).abs() < 0.05, "C-C");
+        assert!((bond(6, 1) - 1.09).abs() < 0.05, "C-H");
+        assert!((bond(8, 1) - 0.96).abs() < 0.05, "O-H");
+    }
+
+    #[test]
+    fn test_cpk_colours_are_jmols() {
+        assert_eq!(el(1).cpk_color(), [0xFF, 0xFF, 0xFF]);
+        assert_eq!(el(6).cpk_color(), [0x90, 0x90, 0x90]);
+        assert_eq!(el(7).cpk_color(), [0x30, 0x50, 0xF8]);
+        assert_eq!(el(8).cpk_color(), [0xFF, 0x0D, 0x0D]);
+        assert_eq!(el(16).cpk_color(), [0xFF, 0xFF, 0x30]);
+        assert_eq!(el(26).cpk_color(), [0xE0, 0x66, 0x33]);
+        assert_eq!(el(109).cpk_color(), [0xEB, 0x00, 0x26]);
+    }
+
+    #[test]
+    fn test_an_element_jmol_does_not_colour_gets_its_unknown_pink() {
+        let pink = [0xFF, 0x14, 0x93];
+        assert_eq!(Element::UNKNOWN.cpk_color(), pink);
+        assert_eq!(el(110).cpk_color(), pink);
+        assert_eq!(el(118).cpk_color(), pink);
+    }
 
     #[test]
     fn test_element_creation() {

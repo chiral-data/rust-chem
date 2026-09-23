@@ -48,7 +48,8 @@ before changing anything under `crates/chem/src/gpu` or `crates/chem/src/search`
 [Meeko](https://github.com/forlilab/Meeko) ·
 [MDAnalysis](https://github.com/MDAnalysis/mdanalysis) ·
 [cpptraj](https://github.com/Amber-MD/cpptraj) ·
-[trimesh](https://github.com/mikedh/trimesh)
+[trimesh](https://github.com/mikedh/trimesh) ·
+[Jmol](https://jmol.sourceforge.net/)
 
 ## Licence
 
