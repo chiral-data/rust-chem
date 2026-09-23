@@ -27,7 +27,9 @@
 //! element at all (`Zn`). An atom that still resolves to nothing is
 //! [`Element::UNKNOWN`] rather than an error that loses the whole frame.
 //! An ion under a differently named residue (`ION NA`) still reads by its
-//! first letter.
+//! first letter. The name itself is kept as [`AtomSite::name`] and written
+//! back, so `OW`/`HW1` survive a round trip; a name that would not read
+//! back as its atom's element writes the element symbol instead.
 //!
 //! **A molecule with no unit cell writes an all-zero box line** (`0.0 0.0
 //! 0.0`) rather than inventing one — reading it back correctly produces
@@ -63,6 +65,7 @@ use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
+use crate::core::site::AtomSite;
 use crate::core::units::NM_TO_ANGSTROM;
 use crate::io::errors::GroError;
 
@@ -213,6 +216,7 @@ pub fn parse_gro(text: &str) -> Result<Molecule, GroError> {
 
     let mut coords = Vec::with_capacity(count);
     let mut keys = Vec::with_capacity(count);
+    let mut sites = Vec::with_capacity(count);
     for _ in 0..count {
         let line = lines
             .next()
@@ -243,6 +247,10 @@ pub fn parse_gro(text: &str) -> Result<Molecule, GroError> {
 
         let element = element_from_atom_name(&atom_name, &res_name);
         mol.add_atom(Atom::new(element));
+        sites.push(AtomSite {
+            name: (!atom_name.is_empty()).then_some(atom_name),
+            ..AtomSite::empty()
+        });
         coords.push(Point3::new(
             x * NM_TO_ANGSTROM,
             y * NM_TO_ANGSTROM,
@@ -273,6 +281,8 @@ pub fn parse_gro(text: &str) -> Result<Molecule, GroError> {
     let (chains, residues) = group_into_chain_and_residues(&keys);
     mol.set_topology(chains, residues)
         .map_err(|e| GroError::ParseError(e.to_string()))?;
+    mol.set_sites(sites)
+        .map_err(|e| GroError::ParseError(e.to_string()))?;
 
     if !box_values.is_empty() && box_values.iter().any(|&v| v != 0.0) {
         // An all-zero box line is the convention this crate's own writer
@@ -300,7 +310,13 @@ pub fn write_gro(mol: &Molecule) -> String {
         let residue = mol.residue_of(i);
         let res_seq = residue.map(|r| r.sequence).unwrap_or(1);
         let res_name = residue.map(|r| r.name.as_str()).unwrap_or("UNK");
-        let atom_name = atom.element().symbol();
+        // The file's own name when it fits and reads back as this atom's
+        // element; a name from another format could otherwise change it.
+        let atom_name = mol
+            .site(i)
+            .and_then(|s| s.name.as_deref())
+            .filter(|n| n.len() <= 5 && element_from_atom_name(n, res_name) == atom.element())
+            .unwrap_or(atom.element().symbol());
         let p = mol.coord3(i).unwrap_or(Point3::ORIGIN);
         out.push_str(&format!(
             "{res_seq:>5}{res_name:<5}{atom_name:>5}{serial:>5}{x:>8.3}{y:>8.3}{z:>8.3}\n",
@@ -504,6 +520,93 @@ with velocities
         mol.set_coords3(vec![Point3::new(1.0, 2.0, 3.0)]).unwrap();
         let back = parse_gro(&write_gro(&mol)).expect("round trips");
         assert_eq!(back.atoms()[0].element().symbol(), "Zn");
+    }
+
+    fn names(mol: &Molecule) -> Vec<Option<&str>> {
+        (0..mol.num_atoms())
+            .map(|i| mol.site(i).and_then(|s| s.name.as_deref()))
+            .collect()
+    }
+
+    fn one_named_atom(element: &str, name: &str) -> Molecule {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(element_from_symbol(element).unwrap()));
+        mol.set_coords3(vec![Point3::new(1.0, 2.0, 3.0)]).unwrap();
+        mol.set_sites(vec![AtomSite {
+            name: Some(name.to_string()),
+            ..AtomSite::empty()
+        }])
+        .unwrap();
+        mol
+    }
+
+    #[test]
+    fn test_the_atom_name_is_kept_as_a_site() {
+        // #387: the name used to be dropped once it had implied an element.
+        let mol = parse_gro(WATER_GRO).expect("valid GRO");
+        assert_eq!(names(&mol), [Some("OW"), Some("HW1"), Some("HW2")]);
+    }
+
+    #[test]
+    fn test_atom_names_survive_a_round_trip() {
+        let mol = parse_gro(WATER_GRO).expect("valid GRO");
+        let written = write_gro(&mol);
+        let names_col: Vec<&str> = written
+            .lines()
+            .skip(2)
+            .take(3)
+            .map(|l| l[10..15].trim())
+            .collect();
+        assert_eq!(names_col, ["OW", "HW1", "HW2"]);
+        let back = parse_gro(&written).expect("round trips");
+        assert_eq!(names(&back), names(&mol));
+        let elements = |m: &Molecule| m.atoms().iter().map(|a| a.element()).collect::<Vec<_>>();
+        assert_eq!(elements(&back), elements(&mol));
+    }
+
+    #[test]
+    fn test_a_molecule_without_sites_still_writes_element_symbols() {
+        use crate::io::smiles::parse_smiles;
+
+        let mol = parse_smiles("CO").expect("valid SMILES");
+        assert!(mol.sites().is_none());
+        let written = write_gro(&mol);
+        let names_col: Vec<&str> = written
+            .lines()
+            .skip(2)
+            .take(2)
+            .map(|l| l[10..15].trim())
+            .collect();
+        assert_eq!(names_col, ["C", "O"]);
+    }
+
+    #[test]
+    fn test_a_name_that_would_misread_its_element_writes_the_symbol() {
+        // `Z1` reads back as UNKNOWN, so keeping it would lose the zinc.
+        let written = write_gro(&one_named_atom("Zn", "Z1"));
+        assert_eq!(written.lines().nth(2).unwrap()[10..15].trim(), "Zn");
+        let back = parse_gro(&written).expect("round trips");
+        assert_eq!(back.atoms()[0].element().symbol(), "Zn");
+    }
+
+    #[test]
+    fn test_a_safe_ion_name_is_kept() {
+        let text = one_atom("CA", "CA");
+        let mol = parse_gro(&text).expect("valid GRO");
+        assert_eq!(mol.atoms()[0].element().symbol(), "Ca");
+        let written = write_gro(&mol);
+        assert_eq!(written.lines().nth(2).unwrap()[10..15].trim(), "CA");
+        let back = parse_gro(&written).expect("round trips");
+        assert_eq!(back.atoms()[0].element().symbol(), "Ca");
+    }
+
+    #[test]
+    fn test_a_name_wider_than_the_column_writes_the_symbol() {
+        let written = write_gro(&one_named_atom("C", "CARBON1"));
+        let line = written.lines().nth(2).unwrap();
+        assert_eq!(line[10..15].trim(), "C");
+        let back = parse_gro(&written).expect("columns stay intact");
+        assert_eq!(back.coord3(0).unwrap(), Point3::new(1.0, 2.0, 3.0));
     }
 
     #[test]
