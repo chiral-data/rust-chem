@@ -2919,11 +2919,6 @@ static PAIR_GAPS: &[(Format, Format, &str)] = &[
     ),
     (
         Format::LAMMPS_DATA,
-        Format::GRO,
-        "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
-    ),
-    (
-        Format::LAMMPS_DATA,
         Format::CML,
         "LAMMPS states no element, only a numeric type; Element::UNKNOWN has no atomic symbol to write",
     ),
