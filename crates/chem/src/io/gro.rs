@@ -16,15 +16,18 @@
 //!
 //! **No dedicated element column exists in this format at all** — the
 //! atom name is all there is, and this module resolves an element from
-//! that name's first letter only, never a two-letter match. Real
+//! that name's first letter, not a two-letter match. Real
 //! protein/nucleic MD topology naming (this format's actual pipeline
 //! usage) puts the element there and treats the rest as positional
 //! labelling (`CA`/`CB`/`CG`, `ND1`/`OD1`) — trying a two-letter match
 //! first would misread the single most common atom name in any protein
-//! GRO file, `CA`, as calcium rather than carbon. The real cost is a
-//! two-letter-only element named as a plain ion residue (`NA`, `MG`,
-//! `ZN`, `CL`) resolving to whatever its first letter is instead — a
-//! known, stated limitation.
+//! GRO file, `CA`, as calcium rather than carbon. Two exceptions read the
+//! two-letter symbol instead: a monatomic ion, whose residue name repeats
+//! its atom name (`NA NA`, `ZN ZN`), and a name whose first letter is no
+//! element at all (`Zn`). An atom that still resolves to nothing is
+//! [`Element::UNKNOWN`] rather than an error that loses the whole frame.
+//! An ion under a differently named residue (`ION NA`) still reads by its
+//! first letter.
 //!
 //! **A molecule with no unit cell writes an all-zero box line** (`0.0 0.0
 //! 0.0`) rather than inventing one — reading it back correctly produces
@@ -79,33 +82,41 @@ fn element_from_symbol(sym: &str) -> Option<Element> {
         .and_then(|n| Element::new(n as u8))
 }
 
-/// Resolves an atom's element from its GRO atom name (there is no
-/// dedicated element column in this format) — strips leading digits
-/// (common in MD atom naming, e.g. `1HB`) then takes the leading
+/// Resolves an atom's element from its GRO atom name and residue name
+/// (there is no dedicated element column in this format) — strips leading
+/// digits (common in MD atom naming, e.g. `1HB`) then takes the leading
 /// alphabetic run.
 ///
-/// **Prefers the single first letter, never a two-letter match** — real
-/// protein/nucleic MD topology naming (this format's actual pipeline
-/// usage) puts the element in that first letter alone and everything
-/// after it is positional labelling: `CA`/`CB`/`CG` (alpha/beta/gamma
-/// carbon), `ND1`/`NE2`, `OD1`/`OG`, `HA`/`HB1`. Trying a two-letter match
-/// first would read the single most common atom name in any protein GRO
-/// file, `CA`, as calcium rather than carbon. The cost is real but rarer:
-/// two-letter-only elements named as a plain ion residue (`NA`, `MG`,
-/// `ZN`, `CL`) resolve to whatever their first letter is instead (`N`,
-/// unresolvable, unresolvable, `C`) — a known, stated limitation, not a
-/// silent one.
-fn element_from_atom_name(name: &str) -> Option<Element> {
+/// **Prefers the single first letter** — protein/nucleic naming puts the
+/// element there (`CA`/`CB`, `ND1`, `HB1`), so `CA` must stay carbon. The
+/// two-letter symbol wins only for a monatomic ion, whose residue name is
+/// its atom name (`NA NA` → sodium, never nitrogen), or when the first
+/// letter is no element (`ZN`, `MG`), which was otherwise unresolvable.
+/// Anything left is [`Element::UNKNOWN`], so one odd atom never costs the
+/// frame.
+fn element_from_atom_name(name: &str, res_name: &str) -> Element {
     let letters: String = name
         .trim()
         .chars()
         .skip_while(|c| c.is_ascii_digit())
         .take_while(|c| c.is_ascii_alphabetic())
         .collect();
+    let two_letter = || {
+        (letters.len() == 2)
+            .then(|| element_from_symbol(&letters))
+            .flatten()
+    };
+    if letters.eq_ignore_ascii_case(res_name.trim())
+        && let Some(ion) = two_letter()
+    {
+        return ion;
+    }
     letters
         .chars()
         .next()
         .and_then(|c| element_from_symbol(&c.to_string()))
+        .or_else(two_letter)
+        .unwrap_or(Element::UNKNOWN)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -230,8 +241,7 @@ pub fn parse_gro(text: &str) -> Result<Molecule, GroError> {
         // Velocity columns, if present, run from byte 44 onward -- not
         // read, see the module doc.
 
-        let element = element_from_atom_name(&atom_name)
-            .ok_or_else(|| GroError::InvalidElement(atom_name.clone()))?;
+        let element = element_from_atom_name(&atom_name, &res_name);
         mol.add_atom(Atom::new(element));
         coords.push(Point3::new(
             x * NM_TO_ANGSTROM,
@@ -445,11 +455,64 @@ with velocities
         assert!(matches!(err, GroError::AtomCountMismatch { .. }), "{err}");
     }
 
+    fn one_atom(res_name: &str, atom_name: &str) -> String {
+        format!(
+            "ion\n    1\n    1{res_name:<5}{atom_name:>5}    1   0.000   0.000   0.000\n   1.0   1.0   1.0\n"
+        )
+    }
+
+    fn element_of(res_name: &str, atom_name: &str) -> String {
+        let mol = parse_gro(&one_atom(res_name, atom_name)).expect("valid GRO");
+        mol.atoms()[0].element().symbol().to_string()
+    }
+
     #[test]
-    fn test_an_unrecognised_element_is_a_clear_error() {
-        let text = "bad\n    1\n    1UNK     Zq    1   0.000   0.000   0.000\n   1.0   1.0   1.0\n";
-        let err = parse_gro(text).unwrap_err();
-        assert!(matches!(err, GroError::InvalidElement(_)), "{err}");
+    fn test_an_unrecognised_element_is_unknown_and_keeps_the_frame() {
+        let text = "bad\n    2\n    1UNK     Zq    1   0.000   0.000   0.000\n    2SOL     OW    2   0.100   0.000   0.000\n   1.0   1.0   1.0\n";
+        let mol = parse_gro(text).expect("one odd atom does not cost the frame");
+        assert_eq!(mol.num_atoms(), 2);
+        assert_eq!(mol.atoms()[0].element(), Element::UNKNOWN);
+        assert_eq!(mol.atoms()[1].element().symbol(), "O");
+    }
+
+    #[test]
+    fn test_a_monatomic_ion_reads_its_two_letter_element() {
+        // #386: ZN/MG used to abort the frame, NA/CL silently read as N/C.
+        assert_eq!(element_of("ZN", "ZN"), "Zn");
+        assert_eq!(element_of("MG", "MG"), "Mg");
+        assert_eq!(element_of("NA", "NA"), "Na");
+        assert_eq!(element_of("CL", "CL"), "Cl");
+    }
+
+    #[test]
+    fn test_a_name_whose_first_letter_is_no_element_falls_back_to_two_letters() {
+        assert_eq!(element_of("UNK", "Zn"), "Zn");
+        assert_eq!(element_of("UNK", "MG"), "Mg");
+    }
+
+    #[test]
+    fn test_an_ion_under_a_different_residue_name_still_reads_its_first_letter() {
+        // The stated remaining cost: without the residue repeating the
+        // name, `NA` is indistinguishable from a nitrogen label.
+        assert_eq!(element_of("ION", "NA"), "N");
+    }
+
+    #[test]
+    fn test_a_written_zinc_atom_reads_back_as_zinc() {
+        let mut mol = Molecule::new();
+        mol.add_atom(Atom::new(element_from_symbol("Zn").unwrap()));
+        mol.set_coords3(vec![Point3::new(1.0, 2.0, 3.0)]).unwrap();
+        let back = parse_gro(&write_gro(&mol)).expect("round trips");
+        assert_eq!(back.atoms()[0].element().symbol(), "Zn");
+    }
+
+    #[test]
+    fn test_the_reader_yields_a_zinc_file_as_a_record_not_a_skip() {
+        use crate::io::format::Format;
+        let out = crate::io::reader::read(&one_atom("ZN", "ZN"), Format::GRO);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        let mol = out.records[0].molecule().expect("a molecule record");
+        assert_eq!(mol.atoms()[0].element().symbol(), "Zn");
     }
 
     #[test]
