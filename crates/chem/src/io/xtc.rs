@@ -796,7 +796,7 @@ fn scan_offsets(bytes: &[u8]) -> Result<(Vec<u64>, usize), XtcError> {
 }
 
 pub(crate) struct XtcFrameSource {
-    cursor: std::io::Cursor<Vec<u8>>,
+    bytes: Vec<u8>,
     offsets: Vec<u64>,
     natoms: usize,
 }
@@ -805,10 +805,21 @@ impl XtcFrameSource {
     fn open(bytes: Vec<u8>) -> Result<Self, XtcError> {
         let (offsets, natoms) = scan_offsets(&bytes)?;
         Ok(Self {
-            cursor: std::io::Cursor::new(bytes),
+            bytes,
             offsets,
             natoms,
         })
+    }
+
+    /// Frame `index`'s own bytes, borrowed in place: a fetch touches only its
+    /// frame, never the rest of the file (#385).
+    fn frame_bytes(&self, index: usize) -> &[u8] {
+        let start = self.offsets[index] as usize;
+        let end = self
+            .offsets
+            .get(index + 1)
+            .map_or(self.bytes.len(), |&next| next as usize);
+        &self.bytes[start..end]
     }
 }
 
@@ -822,11 +833,7 @@ impl FrameSource for XtcFrameSource {
     }
 
     fn frame(&mut self, index: usize) -> std::io::Result<Frame> {
-        use std::io::{Read, Seek, SeekFrom};
-        self.cursor.seek(SeekFrom::Start(self.offsets[index]))?;
-        let mut buf = Vec::new();
-        self.cursor.read_to_end(&mut buf)?;
-        parse_frame(&buf).map_err(std::io::Error::other)
+        parse_frame(self.frame_bytes(index)).map_err(std::io::Error::other)
     }
 }
 
@@ -1157,6 +1164,39 @@ mod tests {
         assert!((last.positions[0].x - 40.0).abs() < 0.01);
         let first = back.frame(0).unwrap();
         assert!((first.positions[0].x - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_a_frame_fetch_touches_only_its_own_bytes() {
+        // #385: `frame` used to copy from the frame's offset to EOF, so a
+        // sequential walk touched ~n^2/2 frames' worth of bytes.
+        let frames: Vec<Frame> = (0..4)
+            .map(|f| {
+                // Spread grows per frame, so the compressed frames differ in size.
+                let positions: Vec<Point3> = (0..11)
+                    .map(|i| Point3::new((i * (f + 1) * 13) as f64, i as f64, 0.0))
+                    .collect();
+                frame_no_cell(positions, f as f64, f as u64)
+            })
+            .collect();
+        let mut trajectory = trajectory_from(frames);
+        let bytes = write_xtc_bytes(&mut trajectory, &WriteOptions::default());
+        let source = XtcFrameSource::open(bytes.clone()).expect("valid XTC");
+
+        let slices: Vec<&[u8]> = (0..source.frame_count())
+            .map(|i| source.frame_bytes(i))
+            .collect();
+        assert_eq!(slices.iter().map(|s| s.len()).sum::<usize>(), bytes.len());
+        assert_ne!(
+            slices[0].len(),
+            slices[3].len(),
+            "fixture frames differ in size"
+        );
+        for (i, slice) in slices.iter().enumerate() {
+            let start = source.offsets[i] as usize;
+            assert_eq!(*slice, &bytes[start..start + slice.len()], "frame {i}");
+            parse_frame(slice).expect("each frame parses from exactly its own bytes");
+        }
     }
 
     #[test]
