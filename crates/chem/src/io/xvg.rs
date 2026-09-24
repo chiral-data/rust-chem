@@ -66,7 +66,8 @@ pub fn dropped_columns(table: &Table) -> Vec<&str> {
         .collect()
 }
 
-fn is_numeric(column: &Column) -> bool {
+/// Whether every cell of `column` is a number -- what XVG and EDR can hold.
+pub(crate) fn is_numeric(column: &Column) -> bool {
     column
         .values
         .iter()

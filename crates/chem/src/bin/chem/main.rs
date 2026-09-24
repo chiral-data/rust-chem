@@ -791,10 +791,21 @@ fn run(cli: &Cli) -> Result<i32> {
                     write_all_bytes(&bytes, output.as_deref())?;
                     // TABLE_METADATA (#398) is the one optional flag, and it
                     // goes through the same report as every other kind's.
-                    // MDP and XVG also write only some columns, so the rest
-                    // are named (#395, #398).
+                    // A pinned pair loss is named too: XVG and EDR both claim
+                    // metadata but not each other's (#399). MDP, XVG and EDR
+                    // also write only some columns, so the rest are named.
                     write::report_kind_drop(format, format::held_from_table(&table));
-                    if format == Format::XVG {
+                    let lost = format::pair_loss(source_kind_format, format)
+                        & format::held_from_table(&table);
+                    if !lost.is_empty() {
+                        eprintln!(
+                            "{} also loses {}: {}",
+                            format.label(),
+                            lost.names().collect::<Vec<_>>().join(", "),
+                            format::pair_loss_reason(source_kind_format, format).unwrap_or("")
+                        );
+                    }
+                    if format == Format::XVG || format == Format::EDR {
                         let dropped = chem::io::xvg::dropped_columns(&table);
                         if !dropped.is_empty() {
                             eprintln!(

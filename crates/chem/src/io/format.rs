@@ -1762,6 +1762,33 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_table: Some(crate::io::xvg::write_xvg_table_bytes),
         writer_index_groups: None,
     },
+    FormatDescriptor {
+        name: "GROMACS energy",
+        codes: &["edr"],
+        extensions: &["edr"],
+        category: Category::MolecularDynamicsAndDocking,
+        // A time series of named terms, with each term's unit as metadata
+        // (#399) -- the same shape XVG reads as.
+        carries: Carries::COLUMNS.or(Carries::TABLE_METADATA),
+        reader: None,
+        writer: None,
+        supplier: Some(edr_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Table,
+        // The names block's own magic, -55555.
+        magic: &[Signature {
+            offset: 0,
+            bytes: &[0xFF, 0xFF, 0x26, 0xFD],
+        }],
+        reader_bytes: Some(crate::io::edr::read_edr_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: Some(crate::io::edr::write_edr_table_bytes),
+        writer_index_groups: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1864,6 +1891,10 @@ fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn mdp_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::mdp::MdpSupplier::new(reader, options))
+}
+
+fn edr_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::edr::EdrSupplier::new(reader, options))
 }
 
 fn xvg_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2350,6 +2381,10 @@ impl Format {
     /// [`Carries::TABLE_METADATA`]: its title and axis labels, where the
     /// units live.
     pub const XVG: Format = Format(31);
+    /// GROMACS energy files (#399), see [`crate::io::edr`]. Version 5 only,
+    /// read into the same `x`-plus-terms table XVG reads into, with each
+    /// term's unit in [`Carries::TABLE_METADATA`].
+    pub const EDR: Format = Format(32);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3033,6 +3068,32 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
         Format::MDP,
         Carries::COLUMNS,
         "XVG has no key column, so MDP writes no parameters",
+    ),
+    // EDR is numbers too (#399), and its metadata is units where XVG's is a
+    // title and axis labels: neither side has anywhere for the other's.
+    (
+        Format::MDP,
+        Format::EDR,
+        Carries::COLUMNS,
+        "MDP's columns are text; EDR writes only numeric columns",
+    ),
+    (
+        Format::EDR,
+        Format::MDP,
+        Carries::COLUMNS,
+        "EDR has no key column, so MDP writes no parameters",
+    ),
+    (
+        Format::EDR,
+        Format::XVG,
+        Carries::TABLE_METADATA,
+        "XVG keeps a title and axis labels, not EDR's per-term units",
+    ),
+    (
+        Format::XVG,
+        Format::EDR,
+        Carries::TABLE_METADATA,
+        "EDR keeps per-term units, not XVG's title or axis labels",
     ),
 ];
 
@@ -3846,8 +3907,9 @@ mod tests {
     /// `Clone`, so this returns the grids directly rather than needing a
     /// rebuild-per-use helper.
     /// One table per `Kind::Table` flag, shaped so `format` can hold it:
-    /// MDP holds only its `key`/`value`/`comment` text, XVG only numbers,
-    /// and CSV either (#398).
+    /// MDP holds only its `key`/`value`/`comment` text, XVG and EDR only
+    /// numbers, and CSV either (#398). The metadata is each format's own
+    /// kind: a title for XVG, a unit for EDR (#399).
     fn one_per_attribute_table(format: Format) -> Vec<(Carries, Table)> {
         let base = if format == Format::MDP {
             Table::from_csv("key,value,comment\ndt,0.002,ps\n")
@@ -3855,9 +3917,12 @@ mod tests {
             Table::from_csv("x,Potential\n0,1.5\n")
         }
         .expect("valid table");
-        let with_metadata = base
-            .clone()
-            .with_metadata(vec![("title".to_string(), "probe".to_string())]);
+        let metadata = if format == Format::EDR {
+            ("unit:Potential".to_string(), "kJ/mol".to_string())
+        } else {
+            ("title".to_string(), "probe".to_string())
+        };
+        let with_metadata = base.clone().with_metadata(vec![metadata]);
         vec![
             (Carries::COLUMNS, base),
             (Carries::TABLE_METADATA, with_metadata),
@@ -3866,8 +3931,9 @@ mod tests {
 
     /// What of `fixture` reached `back`: `COLUMNS` only if every cell arrived
     /// under its own column name -- compared as text, since CSV infers `0.002`
-    /// as a float where MDP keeps it as written -- and `TABLE_METADATA` if
-    /// any metadata did.
+    /// as a float where MDP keeps it as written -- and `TABLE_METADATA` only
+    /// if every one of the fixture's own entries did. EDR adds metadata of
+    /// its own on every read, so "any metadata" would prove nothing.
     fn table_held(fixture: &Table, back: &Table) -> Carries {
         let text = |t: &Table, name: &str, row: usize| {
             t.column(name)
@@ -3882,7 +3948,12 @@ mod tests {
         if cells {
             held = held.or(Carries::COLUMNS);
         }
-        if !back.metadata().is_empty() {
+        if !fixture.metadata().is_empty()
+            && fixture
+                .metadata()
+                .iter()
+                .all(|(k, v)| back.metadata_value(k) == Some(v.as_str()))
+        {
             held = held.or(Carries::TABLE_METADATA);
         }
         held
@@ -4183,11 +4254,11 @@ mod tests {
         // that predicts XTC losing TRR's velocities.
         let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
         // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
-        // 3x3 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
+        // 4x4 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
         // Molecules cross-kind pairs `cross_kind_pairs()` derives from
         // `kinds_compatible` -- a count this crate re-derives and pins, not
         // one asserted from memory (#339).
-        assert_eq!(pairs.len(), 361);
+        assert_eq!(pairs.len(), 368);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             match (source.kind(), target.kind()) {
@@ -5122,7 +5193,8 @@ mod tests {
         // fifth -- the first outside `Kind::Frames` -- and PLY (#336) the
         // sixth -- the first outside `Kind::Volume` too, and the first
         // `Kind::Mesh` format with a real fixed signature at all (OBJ has
-        // none). Every other format leaves `magic` empty. Pinned explicitly
+        // none) -- and EDR (#399) the seventh, the first `Kind::Table` one.
+        // Every other format leaves `magic` empty. Pinned explicitly
         // rather than trusted silently, the same discipline #316's
         // `pairs_within_kind` count assertion follows.
         for format in all() {
@@ -5132,6 +5204,7 @@ mod tests {
                 || format == Format::NCTRAJ
                 || format == Format::CCP4
                 || format == Format::PLY
+                || format == Format::EDR
             {
                 continue;
             }
@@ -5147,6 +5220,11 @@ mod tests {
         // GROMACS's own fixed magic numbers, big-endian, 2 apart.
         assert_eq!(sniff(b"\x00\x00\x07\xc9REST"), Some(Format::TRR));
         assert_eq!(sniff(b"\x00\x00\x07\xcbREST"), Some(Format::XTC));
+        // EDR's names block opens with -55555.
+        assert_eq!(
+            sniff(b"\xff\xff\x26\xfd\x00\x00\x00\x05"),
+            Some(Format::EDR)
+        );
         // DCD's "CORD" sits at byte 4, after the leading Fortran record
         // marker (whatever it is) -- not byte 0.
         assert_eq!(sniff(b"\x54\x00\x00\x00CORD"), Some(Format::DCD));
@@ -5296,7 +5374,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 32);
+        assert_eq!(all().count(), 33);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
