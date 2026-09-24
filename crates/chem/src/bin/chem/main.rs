@@ -795,6 +795,27 @@ fn run(cli: &Cli) -> Result<i32> {
                     Ok(exit::OK)
                 }
 
+                (Kind::IndexGroups, Kind::IndexGroups) => {
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::IndexGroups(groups) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce index groups",
+                            source_kind_format.name()
+                        );
+                    };
+                    let bytes = format.write_index_groups_bytes(&groups).ok_or_else(|| {
+                        anyhow::anyhow!("{} cannot be written, only read", format.name())
+                    })?;
+                    write_all_bytes(&bytes, output.as_deref())?;
+                    // NDX has no optional Carries flag beyond GROUPS to lose.
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
                 (source_kind, target_kind) => bail!(
                     "internal error: kinds_compatible allowed {source_kind:?} -> {target_kind:?}, \
                      which has no dispatch arm"
@@ -1175,7 +1196,8 @@ fn print_format_listing(query: &str) -> Result<()> {
 /// velocities, `N` forces (Newtons; `F` was already b_factor), `M` frame time
 /// (a moment; `T` was already topology), `L` a volume's sample values
 /// (levels), `E` mesh vertices (`V` was already velocities), `K` mesh faces,
-/// `Y` table columns (`C` was already formal charge).
+/// `Y` table columns (`C` was already formal charge). `J` is an index file's
+/// groups (#394); `G` was already stereo_group.
 const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::TOPOLOGY, 'T', "topology"),
     (Carries::BONDS, 'B', "bonds"),
@@ -1200,6 +1222,7 @@ const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::VERTICES, 'E', "vertices"),
     (Carries::FACES, 'K', "faces"),
     (Carries::COLUMNS, 'Y', "columns"),
+    (Carries::GROUPS, 'J', "groups"),
 ];
 
 /// `chem convert -L matrix` (#257) — what survives every registered conversion.

@@ -1530,6 +1530,67 @@ fn test_convert_csv_to_csv_round_trips_a_table_for_the_first_time() {
 }
 
 #[test]
+fn test_convert_ndx_to_ndx_keeps_one_based_indices_and_duplicate_groups() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "[ X ]\n1 2 3\n[ X ]\n",
+            "--from",
+            "ndx",
+            "--to",
+            "ndx",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "[ X ]\n   1    2    3\n[ X ]\n");
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_refuses_ndx_to_a_molecule_format_and_a_zero_index() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "[ X ]\n1\n",
+            "--from",
+            "ndx",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("there is no conversion between them"),
+        "{:?}",
+        r.stderr
+    );
+
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "[ X ]\n0\n",
+            "--from",
+            "ndx",
+            "--to",
+            "ndx",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(r.stdout.is_empty(), "{:?}", r.stdout);
+    assert!(r.stderr.contains("1-based atom index"), "{:?}", r.stderr);
+}
+
+#[test]
 fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
     let path = fixture(
         "trajectory.xyz",
@@ -2526,6 +2587,7 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "obj",
         "ply",
         "csv",
+        "ndx",
     ] {
         assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
     }
@@ -2550,6 +2612,22 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "csv row should render only its own diagonal cell: {csv_line}"
     );
 
+    // NDX (`Kind::IndexGroups`, #394) is the same shape: one diagonal cell.
+    let ndx_line = r
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("ndx"))
+        .unwrap_or_else(|| panic!("no ndx row: {}", r.stdout));
+    let cells: String = ndx_line
+        .trim_start_matches("ndx")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        cells, "J",
+        "ndx row should render only its own diagonal cell: {ndx_line}"
+    );
+
     // The legend names every new flag, not just the original eleven.
     for name in [
         "velocities",
@@ -2559,6 +2637,7 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "vertices",
         "faces",
         "columns",
+        "groups",
     ] {
         assert!(
             r.stdout.contains(name),
