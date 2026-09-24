@@ -7,6 +7,7 @@ use std::ops::{BitAnd, BitOr, Not};
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::geometry::Point3;
+use crate::core::index_groups::IndexGroups;
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::table::Table;
@@ -40,7 +41,7 @@ use crate::io::supplier::{Supplier, Writer};
 /// dependency, the lean build's tree is a pinned property, and the surface
 /// needed here is four operators and an iterator.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Carries(u32);
+pub struct Carries(u64);
 
 impl Carries {
     /// Atoms and their elements — the one thing every molecular format holds,
@@ -139,10 +140,13 @@ impl Carries {
     pub const DONORS: Carries = Carries(1 << 30);
     /// Hydrogen-bond acceptor pairs, from
     /// [`crate::core::force_field::ForceFieldTopology::acceptors`]. PSF is
-    /// the first format to state these (#321). The last bit this `u32` has
-    /// room for — a 33rd flag needs a wider representation, not this one's
-    /// problem.
+    /// the first format to state these (#321).
     pub const ACCEPTORS: Carries = Carries(1 << 31);
+    /// An index file's named atom groups, from
+    /// [`crate::core::index_groups::IndexGroups::groups`] — the one thing
+    /// every index format holds (#394). The first bit past `u32`, which is
+    /// why the mask widened to `u64`.
+    pub const GROUPS: Carries = Carries(1 << 32);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -182,6 +186,7 @@ impl Carries {
         (Carries::VERTICES, "vertices"),
         (Carries::FACES, "faces"),
         (Carries::COLUMNS, "columns"),
+        (Carries::GROUPS, "groups"),
     ];
 
     pub const fn empty() -> Carries {
@@ -493,6 +498,9 @@ pub enum Kind {
     /// #314). No format is registered as this yet; the first will be #337
     /// (CSV).
     Table,
+    /// Named groups of atom indices, no structure implied
+    /// ([`crate::core::index_groups::IndexGroups`], #394) -- NDX.
+    IndexGroups,
 }
 
 /// Parses a whole file into molecules.
@@ -536,6 +544,10 @@ pub(crate) type ByteWriteMeshFn = fn(&Mesh, &WriteOptions) -> Vec<u8>;
 /// documents, since a table is neither a `Molecule` list nor any of the
 /// other three payload shapes.
 pub(crate) type ByteWriteTableFn = fn(&Table, &WriteOptions) -> Vec<u8>;
+
+/// Serialises a whole [`IndexGroups`] into one file's worth of bytes (#394) —
+/// the same "new, parallel field" reasoning [`ByteWriteTableFn`] documents.
+pub(crate) type ByteWriteIndexGroupsFn = fn(&IndexGroups, &WriteOptions) -> Vec<u8>;
 
 /// A byte pattern identifying a format's content, independent of any
 /// filename: the exact bytes expected starting at `offset` (#317).
@@ -615,6 +627,9 @@ pub struct FormatDescriptor {
     /// both a `Table` (its declared kind) and, as a disclosed opt-in, a
     /// molecule list with a `smiles` column.
     pub(crate) writer_table: Option<ByteWriteTableFn>,
+    /// Set only for a format whose writer takes a whole [`IndexGroups`]
+    /// (#394) — `None` for every format but NDX.
+    pub(crate) writer_index_groups: Option<ByteWriteIndexGroupsFn>,
 }
 
 /// Every format compiled into this build.
@@ -655,6 +670,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -706,6 +722,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -747,6 +764,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -777,6 +795,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -810,6 +829,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -840,6 +860,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -875,6 +896,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -906,6 +928,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -933,6 +956,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -965,6 +989,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -1005,6 +1030,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "BinaryCIF",
@@ -1038,6 +1064,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CIF core",
@@ -1076,6 +1103,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PSF",
@@ -1115,6 +1143,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PRMTOP",
@@ -1163,6 +1192,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "TOP",
@@ -1203,6 +1233,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "LAMMPS Data",
@@ -1246,6 +1277,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "TRR",
@@ -1282,6 +1314,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "XTC",
@@ -1313,6 +1346,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "DCD",
@@ -1346,6 +1380,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "NCTRAJ",
@@ -1387,6 +1422,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "LAMMPS Trajectory",
@@ -1427,6 +1463,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CUBE",
@@ -1457,6 +1494,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::cube::write_cube_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CCP4/MRC",
@@ -1487,6 +1525,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "DX",
@@ -1518,6 +1557,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::dx::write_dx_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "DSN6",
@@ -1545,6 +1585,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::dsn6::write_dsn6_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "OBJ",
@@ -1574,6 +1615,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: Some(crate::io::obj::write_obj_bytes),
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PLY",
@@ -1606,6 +1648,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: Some(crate::io::ply::write_ply_bytes),
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CSV",
@@ -1639,6 +1682,31 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_mesh: None,
         // The declared/primary write shape.
         writer_table: Some(crate::io::csv::write_csv_table_bytes),
+        writer_index_groups: None,
+    },
+    FormatDescriptor {
+        name: "GROMACS index",
+        codes: &["ndx"],
+        extensions: &["ndx"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Groups only: an index file names no structure, so it carries no
+        // atoms of its own to declare (#394).
+        carries: Carries::GROUPS,
+        reader: Some(crate::io::ndx::read_ndx_with_options),
+        writer: None,
+        supplier: Some(ndx_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::IndexGroups,
+        // Text, no magic bytes -- resolved by extension only.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+        writer_index_groups: Some(crate::io::ndx::write_ndx_bytes),
     },
 ];
 
@@ -1738,6 +1806,10 @@ fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dy
 
 fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::csv::CsvSupplier::new(reader, options))
+}
+
+fn ndx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::ndx::NdxSupplier::new(reader, options))
 }
 
 fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2202,6 +2274,11 @@ impl Format {
     /// `writer` (an opt-in molecule-list shape) and `writer_table` (its
     /// declared/primary shape) on the same descriptor.
     pub const CSV: Format = Format(28);
+    /// GROMACS index groups (#394), see [`crate::io::ndx`]. Declared
+    /// [`Kind::IndexGroups`]: ragged named groups of 1-based atom indices,
+    /// which [`Table`]'s equal-length columns cannot hold without losing the
+    /// grouping.
+    pub const NDX: Format = Format(29);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -2300,6 +2377,7 @@ impl Format {
             || d.writer_volume.is_some()
             || d.writer_mesh.is_some()
             || d.writer_table.is_some()
+            || d.writer_index_groups.is_some()
     }
 
     /// Parses a whole file into molecules, from raw bytes (#309) — the
@@ -2453,6 +2531,22 @@ impl Format {
     ) -> Option<Vec<u8>> {
         let writer_table = self.descriptor().writer_table?;
         Some(writer_table(table, options))
+    }
+
+    /// Serialises a whole [`IndexGroups`] into raw bytes (#394), or `None` if
+    /// this format has no index-group writer — every format other than NDX.
+    pub fn write_index_groups_bytes(&self, groups: &IndexGroups) -> Option<Vec<u8>> {
+        self.write_index_groups_bytes_with_options(groups, &WriteOptions::default())
+    }
+
+    /// [`Self::write_index_groups_bytes`], with explicit per-format options.
+    pub fn write_index_groups_bytes_with_options(
+        &self,
+        groups: &IndexGroups,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_index_groups = self.descriptor().writer_index_groups?;
+        Some(writer_index_groups(groups, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -3035,6 +3129,7 @@ fn kind_description(kind: Kind) -> &'static str {
         Kind::Volume => "a volumetric grid",
         Kind::Mesh => "a mesh",
         Kind::Table => "a table",
+        Kind::IndexGroups => "index groups",
     }
 }
 
@@ -3256,6 +3351,7 @@ impl fmt::Display for Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::index_groups::IndexGroup;
     use crate::io::reader::{Payload, Record};
 
     #[test]
@@ -3870,6 +3966,20 @@ mod tests {
                     };
                     assert!(back.num_columns() > 0, "{}", format.name());
                 }
+                Kind::IndexGroups => {
+                    let groups = IndexGroups::new(vec![IndexGroup {
+                        name: "probe".to_string(),
+                        atoms: vec![0, 4],
+                    }]);
+                    let bytes = format
+                        .write_index_groups_bytes(&groups)
+                        .expect("can_write said so");
+                    let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                    let Some(back) = outcome.records.first().and_then(Record::index_groups) else {
+                        panic!("{format:?} wrote nothing readable");
+                    };
+                    assert_eq!(back, &groups, "{}", format.name());
+                }
             }
         }
     }
@@ -3925,11 +4035,11 @@ mod tests {
         // that predicts XTC losing TRR's velocities.
         let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
         // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
-        // 1x1 (Table) same-kind, plus the 17 CUBE -> Molecules cross-kind
-        // pairs `cross_kind_pairs()` derives from `kinds_compatible` -- a
-        // count this crate re-derives and pins, not one asserted from
-        // memory (#339).
-        assert_eq!(pairs.len(), 352);
+        // 1x1 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
+        // Molecules cross-kind pairs `cross_kind_pairs()` derives from
+        // `kinds_compatible` -- a count this crate re-derives and pins, not
+        // one asserted from memory (#339).
+        assert_eq!(pairs.len(), 353);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             match (source.kind(), target.kind()) {
@@ -4142,6 +4252,38 @@ mod tests {
                         target.name()
                     );
                 }
+                (Kind::IndexGroups, Kind::IndexGroups) => {
+                    let groups = IndexGroups::new(vec![
+                        IndexGroup {
+                            name: "a".to_string(),
+                            atoms: vec![2, 2, 0],
+                        },
+                        IndexGroup {
+                            name: "a".to_string(),
+                            atoms: vec![],
+                        },
+                    ]);
+                    let as_source = source
+                        .write_index_groups_bytes(&groups)
+                        .expect("can_write said so");
+                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                    let intermediate = outcome
+                        .records
+                        .first()
+                        .and_then(Record::index_groups)
+                        .expect("valid index groups readback")
+                        .clone();
+                    let as_target = target
+                        .write_index_groups_bytes(&intermediate)
+                        .expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::index_groups)
+                        .expect("valid index groups readback");
+                    assert_eq!(back, &groups, "{} -> {}", source.name(), target.name());
+                }
                 (source_kind, target_kind) => unreachable!(
                     "fidelity_pairs() only yields same-kind or CUBE-exception pairs, got {source_kind:?} -> {target_kind:?}"
                 ),
@@ -4244,8 +4386,8 @@ mod tests {
                                 .is_some_and(|back| held_from_volume(&back).contains(*flag))
                         })
                 }),
-                Kind::Mesh | Kind::Table => {
-                    unreachable!("SUPPLIED has no Mesh/Table entries (#339)")
+                Kind::Mesh | Kind::Table | Kind::IndexGroups => {
+                    unreachable!("SUPPLIED has no Mesh/Table/IndexGroups entries (#339)")
                 }
             };
             assert!(
@@ -4636,6 +4778,12 @@ mod tests {
                         "{format:?} declares no columns, so its mask is missing"
                     );
                 }
+                Kind::IndexGroups => {
+                    assert!(
+                        format.carries().contains(Carries::GROUPS),
+                        "{format:?} declares no groups, so its mask is missing"
+                    );
+                }
             }
         }
     }
@@ -4669,6 +4817,7 @@ mod tests {
                 writer_volume: None,
                 writer_mesh: None,
                 writer_table: None,
+                writer_index_groups: None,
             }
         }
 
@@ -4680,6 +4829,7 @@ mod tests {
         assert!(!requires_topology(&bare(Kind::Volume)));
         assert!(!requires_topology(&bare(Kind::Mesh)));
         assert!(!requires_topology(&bare(Kind::Table)));
+        assert!(!requires_topology(&bare(Kind::IndexGroups)));
         // A molecule/frames descriptor with nothing declared: still flagged
         // -- the relaxation did not turn the check off for the kinds that
         // need it.
@@ -4718,6 +4868,7 @@ mod tests {
                 writer_volume: None,
                 writer_mesh: None,
                 writer_table: None,
+                writer_index_groups: None,
             }
         }
 
@@ -4727,6 +4878,7 @@ mod tests {
                 Kind::Volume => d.carries.contains(Carries::SAMPLES),
                 Kind::Mesh => d.carries.contains(Carries::VERTICES),
                 Kind::Table => d.carries.contains(Carries::COLUMNS),
+                Kind::IndexGroups => d.carries.contains(Carries::GROUPS),
             }
         }
 
@@ -4734,17 +4886,20 @@ mod tests {
         assert!(passes(&bare(Kind::Volume, Carries::SAMPLES)));
         assert!(passes(&bare(Kind::Mesh, Carries::VERTICES)));
         assert!(passes(&bare(Kind::Table, Carries::COLUMNS)));
+        assert!(passes(&bare(Kind::IndexGroups, Carries::GROUPS)));
 
         // ... an empty mask does not -- the loophole the issue opens with.
         assert!(!passes(&bare(Kind::Volume, Carries::empty())));
         assert!(!passes(&bare(Kind::Mesh, Carries::empty())));
         assert!(!passes(&bare(Kind::Table, Carries::empty())));
+        assert!(!passes(&bare(Kind::IndexGroups, Carries::empty())));
 
         // ... and declaring a different kind's defining flag does not
         // satisfy this one -- the flags are not interchangeable.
         assert!(!passes(&bare(Kind::Volume, Carries::VERTICES)));
         assert!(!passes(&bare(Kind::Mesh, Carries::COLUMNS)));
         assert!(!passes(&bare(Kind::Table, Carries::SAMPLES)));
+        assert!(!passes(&bare(Kind::IndexGroups, Carries::COLUMNS)));
     }
 
     #[test]
@@ -4980,7 +5135,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 29);
+        assert_eq!(all().count(), 30);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

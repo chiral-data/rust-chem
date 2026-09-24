@@ -4,6 +4,7 @@ pub mod cell;
 pub mod force_field;
 pub mod geometry;
 pub mod graph;
+pub mod index_groups;
 pub mod layout;
 pub mod mesh;
 pub mod molecule;
@@ -27,6 +28,7 @@ pub mod prelude {
     pub use crate::core::force_field::{ForceFieldAtom, ForceFieldTopology};
     pub use crate::core::geometry::{BoundingBox, Point2, Point3};
     pub use crate::core::graph::{MoleculeGraph, Neighbor};
+    pub use crate::core::index_groups::{IndexGroup, IndexGroups};
     pub use crate::core::layout::{ensure_coords, layout};
     pub use crate::core::mesh::{Color32, Mesh, MeshError};
     pub use crate::core::molecule::{Molecule, MoleculeError};

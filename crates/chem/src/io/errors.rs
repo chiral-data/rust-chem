@@ -690,3 +690,21 @@ pub enum CsvError {
     #[error(transparent)]
     Table(#[from] crate::core::table::TableError),
 }
+
+/// GROMACS index file errors (#394). Every one rejects the whole file: a
+/// half-read index selects the wrong atoms without saying so.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum NdxError {
+    #[error("line {line}: atom index before any [ group ] header")]
+    IndexBeforeHeader { line: usize },
+
+    #[error("line {line}: {token:?} is not a 1-based atom index")]
+    InvalidIndex { line: usize, token: String },
+
+    #[error("line {line}: malformed group header {text:?}")]
+    InvalidHeader { line: usize, text: String },
+
+    #[error("no [ group ] headers in NDX")]
+    NoGroups,
+}

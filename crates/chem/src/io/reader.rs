@@ -20,6 +20,7 @@
 //! So [`ReadOutcome`] carries the skipped records alongside the good ones and
 //! lets each front end decide what to do with them.
 
+use crate::core::index_groups::IndexGroups;
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::table::Table;
@@ -72,6 +73,8 @@ pub enum Payload {
     /// A column store (#314). No registered format produces this yet — it
     /// lands with #337 (CSV).
     Table(Table),
+    /// Named groups of atom indices (#394) -- a GROMACS index file.
+    IndexGroups(IndexGroups),
 }
 
 /// One record read from a file.
@@ -97,6 +100,7 @@ impl Record {
             Payload::Volume(_) => None,
             Payload::Mesh(_) => None,
             Payload::Table(_) => None,
+            Payload::IndexGroups(_) => None,
         }
     }
 
@@ -108,6 +112,7 @@ impl Record {
             Payload::Volume(_) => None,
             Payload::Mesh(_) => None,
             Payload::Table(_) => None,
+            Payload::IndexGroups(_) => None,
         }
     }
 
@@ -119,6 +124,7 @@ impl Record {
             Payload::Volume(v) => Some(v),
             Payload::Mesh(_) => None,
             Payload::Table(_) => None,
+            Payload::IndexGroups(_) => None,
         }
     }
 
@@ -130,6 +136,7 @@ impl Record {
             Payload::Volume(_) => None,
             Payload::Mesh(m) => Some(m),
             Payload::Table(_) => None,
+            Payload::IndexGroups(_) => None,
         }
     }
 
@@ -141,6 +148,20 @@ impl Record {
             Payload::Volume(_) => None,
             Payload::Mesh(_) => None,
             Payload::Table(t) => Some(t),
+            Payload::IndexGroups(_) => None,
+        }
+    }
+
+    /// The index groups this record holds, or `None` if its payload is not
+    /// them.
+    pub fn index_groups(&self) -> Option<&IndexGroups> {
+        match &self.payload {
+            Payload::Molecule(_) => None,
+            Payload::Frames(_) => None,
+            Payload::Volume(_) => None,
+            Payload::Mesh(_) => None,
+            Payload::Table(_) => None,
+            Payload::IndexGroups(g) => Some(g),
         }
     }
 }

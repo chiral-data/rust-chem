@@ -20,6 +20,7 @@ pub mod mmcif;
 pub mod mol2;
 pub mod msgpack;
 pub mod nctraj;
+pub mod ndx;
 pub mod netcdf3;
 pub mod obj;
 pub mod open;
