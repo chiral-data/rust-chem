@@ -162,8 +162,11 @@ struct Parsed {
 fn parse(bytes: &[u8]) -> Result<Parsed, EdrError> {
     let mut r = XdrReader::new(bytes);
     let magic = r.read_i32()?;
+    // Version 1 has no magic: its first word is the term count. Any other
+    // file starting with a positive integer looks the same (XTC's 1995), so
+    // the refusal names both readings rather than claiming an old EDR.
     if magic > 0 {
-        return Err(EdrError::UnsupportedVersion(1));
+        return Err(EdrError::VersionOneOrNotEdr(magic));
     }
     if magic != NAMES_MAGIC {
         return Err(EdrError::NotEdr(magic));
@@ -574,11 +577,15 @@ mod tests {
             Err(EdrError::UnsupportedVersion(4))
         ));
 
-        // Version 1 has no names magic: its first word is the term count.
+        // Version 1 has no names magic: its first word is the term count,
+        // which an XTC's own magic (1995) is indistinguishable from.
         assert!(matches!(
             parse_edr(&2i32.to_be_bytes()),
-            Err(EdrError::UnsupportedVersion(1))
+            Err(EdrError::VersionOneOrNotEdr(2))
         ));
+        let xtc = parse_edr(&1995i32.to_be_bytes()).unwrap_err().to_string();
+        assert!(xtc.contains("not a GROMACS energy file"), "{xtc}");
+        assert!(xtc.contains("version 1"), "{xtc}");
         assert!(matches!(
             parse_edr(&(-1i32).to_be_bytes()),
             Err(EdrError::NotEdr(-1))

@@ -761,6 +761,12 @@ pub enum EdrError {
     #[error("EDR version {0} is not supported; only version 5 (GROMACS 4.6 and later) is read")]
     UnsupportedVersion(i32),
 
+    #[error(
+        "first word {0}: either an EDR version 1 file (not supported; only version 5 is read) \
+         or not a GROMACS energy file"
+    )]
+    VersionOneOrNotEdr(i32),
+
     #[error("frame {frame}: energy frame magic {found} is not -7777777")]
     BadFrameMagic { frame: usize, found: i32 },
 
