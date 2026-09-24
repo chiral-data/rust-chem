@@ -37,7 +37,7 @@
 //! skipped without decoding it, matching [`FrameSource`]'s own documented
 //! contract and the same approach MDAnalysis's `XDR.py` uses.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 
 use crate::core::atom::{Atom, Element};
 use crate::core::cell::UnitCell;
@@ -271,7 +271,7 @@ fn scan_offsets(bytes: &[u8]) -> Result<(Vec<u64>, usize), TrrError> {
 
 /// Random access to a TRR file's frames, indexed once on construction.
 pub(crate) struct TrrFrameSource {
-    cursor: io::Cursor<Vec<u8>>,
+    bytes: Vec<u8>,
     offsets: Vec<u64>,
     natoms: usize,
 }
@@ -280,10 +280,21 @@ impl TrrFrameSource {
     fn open(bytes: Vec<u8>) -> Result<Self, TrrError> {
         let (offsets, natoms) = scan_offsets(&bytes)?;
         Ok(Self {
-            cursor: io::Cursor::new(bytes),
+            bytes,
             offsets,
             natoms,
         })
+    }
+
+    /// Frame `index`'s own bytes, borrowed in place: a fetch touches only its
+    /// frame, never the rest of the file (#385).
+    fn frame_bytes(&self, index: usize) -> &[u8] {
+        let start = self.offsets[index] as usize;
+        let end = self
+            .offsets
+            .get(index + 1)
+            .map_or(self.bytes.len(), |&next| next as usize);
+        &self.bytes[start..end]
     }
 }
 
@@ -297,10 +308,7 @@ impl FrameSource for TrrFrameSource {
     }
 
     fn frame(&mut self, index: usize) -> io::Result<Frame> {
-        self.cursor.seek(SeekFrom::Start(self.offsets[index]))?;
-        let mut buf = Vec::new();
-        self.cursor.read_to_end(&mut buf)?;
-        parse_frame(&buf).map_err(io::Error::other)
+        parse_frame(self.frame_bytes(index)).map_err(io::Error::other)
     }
 }
 
@@ -674,6 +682,41 @@ mod tests {
         assert!((last.positions[0].x - 2.0).abs() < 1e-3);
         let first = back.frame(0).unwrap();
         assert!((first.positions[0].x - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_a_frame_fetch_touches_only_its_own_bytes() {
+        // #385: `frame` used to copy from the frame's offset to EOF, so a
+        // sequential walk touched ~n^2/2 frames' worth of bytes. Velocities on
+        // alternate frames make the frames differ in size.
+        let frames: Vec<Frame> = (0..4)
+            .map(|f| Frame {
+                positions: vec![Point3::new(f as f64, 0.0, 0.0); 3],
+                velocities: (f % 2 == 1).then(|| vec![Point3::new(0.1, 0.0, 0.0); 3]),
+                forces: None,
+                time: Some(f as f64),
+                step: Some(f as u64),
+                cell: None,
+            })
+            .collect();
+        let mut trajectory = trajectory_from(frames);
+        let bytes = write_trr_bytes(&mut trajectory, &WriteOptions::default());
+        let source = TrrFrameSource::open(bytes.clone()).expect("valid TRR");
+
+        let slices: Vec<&[u8]> = (0..source.frame_count())
+            .map(|i| source.frame_bytes(i))
+            .collect();
+        assert_eq!(slices.iter().map(|s| s.len()).sum::<usize>(), bytes.len());
+        assert_ne!(
+            slices[0].len(),
+            slices[1].len(),
+            "fixture frames differ in size"
+        );
+        for (i, slice) in slices.iter().enumerate() {
+            let start = source.offsets[i] as usize;
+            assert_eq!(*slice, &bytes[start..start + slice.len()], "frame {i}");
+            parse_frame(slice).expect("each frame parses from exactly its own bytes");
+        }
     }
 
     #[test]
