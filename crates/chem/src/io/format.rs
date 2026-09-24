@@ -1708,6 +1708,30 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_table: None,
         writer_index_groups: Some(crate::io::ndx::write_ndx_bytes),
     },
+    FormatDescriptor {
+        name: "GROMACS run parameters",
+        codes: &["mdp"],
+        extensions: &["mdp"],
+        category: Category::MolecularDynamicsAndDocking,
+        // A `key`/`value`/`comment` table, not a new kind (#395): the file
+        // describes a computation and carries no chemistry at all.
+        carries: Carries::COLUMNS,
+        reader: Some(crate::io::mdp::read_mdp_with_options),
+        writer: None,
+        supplier: Some(mdp_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Table,
+        // Text, no magic bytes -- resolved by extension only.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: Some(crate::io::mdp::write_mdp_table_bytes),
+        writer_index_groups: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1806,6 +1830,10 @@ fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dy
 
 fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::csv::CsvSupplier::new(reader, options))
+}
+
+fn mdp_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::mdp::MdpSupplier::new(reader, options))
 }
 
 fn ndx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2279,6 +2307,10 @@ impl Format {
     /// which [`Table`]'s equal-length columns cannot hold without losing the
     /// grouping.
     pub const NDX: Format = Format(29);
+    /// GROMACS run parameters (#395), see [`crate::io::mdp`]. Declared
+    /// [`Kind::Table`]: a `key`/`value`/`comment` table whose values are kept
+    /// as written, never type-inferred.
+    pub const MDP: Format = Format(30);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -3958,13 +3990,15 @@ mod tests {
                     assert!(!back.faces().is_empty(), "{}", format.name());
                 }
                 Kind::Table => {
-                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
+                    let table =
+                        Table::from_csv("key,value,comment\ndt,0.002,ps\n").expect("valid table");
                     let bytes = format.write_table_bytes(&table).expect("can_write said so");
                     let outcome = format.read_bytes(&bytes).expect("can_read said so");
                     let Some(back) = outcome.records.first().and_then(Record::table) else {
                         panic!("{format:?} wrote nothing readable");
                     };
                     assert!(back.num_columns() > 0, "{}", format.name());
+                    assert_eq!(back.num_rows(), 1, "{}", format.name());
                 }
                 Kind::IndexGroups => {
                     let groups = IndexGroups::new(vec![IndexGroup {
@@ -4035,11 +4069,11 @@ mod tests {
         // that predicts XTC losing TRR's velocities.
         let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
         // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
-        // 1x1 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
+        // 2x2 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
         // Molecules cross-kind pairs `cross_kind_pairs()` derives from
         // `kinds_compatible` -- a count this crate re-derives and pins, not
         // one asserted from memory (#339).
-        assert_eq!(pairs.len(), 353);
+        assert_eq!(pairs.len(), 356);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             match (source.kind(), target.kind()) {
@@ -4188,7 +4222,8 @@ mod tests {
                     );
                 }
                 (Kind::Table, Kind::Table) => {
-                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
+                    let table =
+                        Table::from_csv("key,value,comment\ndt,0.002,ps\n").expect("valid table");
                     let as_source = source.write_table_bytes(&table).expect("can_write said so");
                     let outcome = source.read_bytes(&as_source).expect("can_read said so");
                     let intermediate = outcome
@@ -4206,8 +4241,16 @@ mod tests {
                         .first()
                         .and_then(Record::table)
                         .expect("valid table readback");
-                    assert!(
-                        back.num_columns() > 0,
+                    // The row itself, not just a header: CSV infers `0.002` as
+                    // a float and MDP keeps it as text, so compare as text.
+                    let cell = |name: &str| {
+                        back.column(name)
+                            .and_then(|c| c.values[0].as_ref())
+                            .map(crate::io::csv::value_to_string)
+                    };
+                    assert_eq!(
+                        (cell("key"), cell("value")),
+                        (Some("dt".to_string()), Some("0.002".to_string())),
                         "{} -> {}",
                         source.name(),
                         target.name()
@@ -5135,7 +5178,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 30);
+        assert_eq!(all().count(), 31);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

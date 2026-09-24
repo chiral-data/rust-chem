@@ -789,8 +789,25 @@ fn run(cli: &Cli) -> Result<i32> {
                         anyhow::anyhow!("{} cannot be written, only read", format.name())
                     })?;
                     write_all_bytes(&bytes, output.as_deref())?;
-                    // The one registered Table format has no optional
-                    // Carries flag beyond COLUMNS to lose (#338).
+                    // No Table format has an optional Carries flag beyond
+                    // COLUMNS to lose (#338), but MDP writes only the
+                    // columns it names, so the rest are disclosed (#395).
+                    if format == Format::MDP {
+                        let dropped = chem::io::mdp::dropped_columns(&table);
+                        if !dropped.is_empty() {
+                            eprintln!(
+                                "{} discards column(s) {} (it writes only key, value, comment)",
+                                format.label(),
+                                dropped.join(", ")
+                            );
+                        }
+                        if table.num_rows() > 0 && table.column("key").is_none() {
+                            eprintln!(
+                                "{} has no key column, so no parameters were written",
+                                format.label()
+                            );
+                        }
+                    }
                     eprintln!("converted 1, skipped 0");
                     Ok(exit::OK)
                 }
