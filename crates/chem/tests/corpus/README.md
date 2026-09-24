@@ -55,6 +55,7 @@ molecule against several and pass for the wrong reason.
 | `lammps/ambiguous_style.data` | A 6-column `Atoms` section with no style comment -- ambiguous between `charge` and `molecular`/`bond`/`angle` -- proving `AmbiguousAtomStyle` fires by default and `LammpsReadOptions::atom_style` is the escape hatch |
 | `lammps/coarse_grained.data` | A `Masses` entry stating `1.0`, a reduced-unit bead mass matching no real element -- proving this reads as `Element::UNKNOWN`, not a failure or a guess |
 | `lammps/triclinic.data` | A genuinely non-orthogonal box (`xy xz yz` all nonzero) -- pins the closed-form box-to-`UnitCell` conversion's shape, which a sign or swapped cosine would still "succeed" while getting wrong |
+| `edr/em-first-3-frames.edr` | Real GROMACS 2022 output: the names block and first three frames of an energy minimisation, cut at a frame boundary so it is still a whole file (#399). Its expected values are what `gmx energy` prints for the same bytes |
 | `dcd/big_endian_with_cell.dcd` | Big-endian and a unit cell at once (#341), the byte-swap path and the cell heuristic exercised together. Generated -- see "Fixtures we generate" below |
 | `ccp4/permuted_axes.ccp4` | A permuted `MAPC`/`MAPR`/`MAPS` order with a non-cubic cell (#341) -- proves the axis relabelling is honoured independently of file storage order. Generated |
 | `ply/binary_big_endian.ply` | The one PLY encoding this crate never writes (#341); `ascii`/`binary_little_endian` need no fixture at all, since round-tripping through this crate's own writer already covers them. Generated |

@@ -11,6 +11,7 @@ pub mod cxsmiles;
 pub mod dcd;
 pub mod dsn6;
 pub mod dx;
+pub mod edr;
 pub mod errors;
 pub mod format;
 pub mod gro;
