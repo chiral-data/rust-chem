@@ -708,3 +708,15 @@ pub enum NdxError {
     #[error("no [ group ] headers in NDX")]
     NoGroups,
 }
+
+/// GROMACS run-parameter file errors (#395). Each rejects the whole file,
+/// the same stance [`NdxError`] takes.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum MdpError {
+    #[error("line {line}: no '=' in {text:?}")]
+    MissingEquals { line: usize, text: String },
+
+    #[error("line {line}: parameter with no name")]
+    EmptyKey { line: usize },
+}

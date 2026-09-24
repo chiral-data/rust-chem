@@ -1591,6 +1591,60 @@ fn test_convert_refuses_ndx_to_a_molecule_format_and_a_zero_index() {
 }
 
 #[test]
+fn test_convert_mdp_round_trips_through_csv() {
+    let mdp = "; run\nref-t = 300 300 ; K\ndefine =\n";
+    let to_csv = run(
+        &["convert", "--literal", mdp, "--from", "mdp", "--to", "csv"],
+        None,
+    );
+    assert_eq!(to_csv.code, 0, "{:?}", to_csv.stderr);
+    assert!(
+        to_csv.stdout.starts_with("key,value,comment\n"),
+        "{:?}",
+        to_csv.stdout
+    );
+
+    let back = run(
+        &[
+            "convert",
+            "--literal",
+            &to_csv.stdout,
+            "--from",
+            "csv",
+            "--to",
+            "mdp",
+        ],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+    assert_eq!(back.stdout, mdp);
+    assert!(!back.stderr.contains("discards"), "{:?}", back.stderr);
+}
+
+#[test]
+fn test_convert_csv_to_mdp_names_the_columns_it_drops() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "key,value,units\ndt,0.002,ps\n",
+            "--from",
+            "csv",
+            "--to",
+            "mdp",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "dt = 0.002\n");
+    assert!(
+        r.stderr.contains("discards column(s) units"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
 fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
     let path = fixture(
         "trajectory.xyz",
@@ -2588,15 +2642,17 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "ply",
         "csv",
         "ndx",
+        "mdp",
     ] {
         assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
     }
 
     // CSV (`Kind::Table`) is unrelated to every other kind: its only real
-    // cell is its own diagonal, `Carries::COLUMNS`'s legend letter `Y`. A
-    // genuinely unrelated cross-kind pair -- CSV x TRR among them -- must
-    // never render, so the whole row's non-blank content is exactly that
-    // one letter, not a computed (and meaningless) fidelity answer.
+    // cells are the Table block, CSV and MDP (#395), each
+    // `Carries::COLUMNS`'s legend letter `Y`. A genuinely unrelated
+    // cross-kind pair -- CSV x TRR among them -- must never render, so the
+    // whole row's non-blank content is exactly those two letters, not a
+    // computed (and meaningless) fidelity answer.
     let csv_line = r
         .stdout
         .lines()
@@ -2608,8 +2664,8 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         .filter(|c| !c.is_whitespace())
         .collect();
     assert_eq!(
-        cells, "Y",
-        "csv row should render only its own diagonal cell: {csv_line}"
+        cells, "YY",
+        "csv row should render only the Table block: {csv_line}"
     );
 
     // NDX (`Kind::IndexGroups`, #394) is the same shape: one diagonal cell.
