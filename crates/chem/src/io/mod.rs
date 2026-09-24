@@ -40,4 +40,5 @@ pub mod top;
 pub mod trr;
 pub mod xdr;
 pub mod xtc;
+pub mod xvg;
 pub mod xyz;

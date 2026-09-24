@@ -720,3 +720,32 @@ pub enum MdpError {
     #[error("line {line}: parameter with no name")]
     EmptyKey { line: usize },
 }
+
+/// Grace/XVG errors (#398). Each rejects the whole file, the same stance
+/// [`NdxError`] and [`MdpError`] take.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum XvgError {
+    #[error("line {line}: {token:?} is not a number")]
+    InvalidNumber { line: usize, token: String },
+
+    #[error("line {line}: {got} columns, but the first data row has {expected}")]
+    RaggedRow {
+        line: usize,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("line {line}: a second data set after '&' -- several sets are not one table")]
+    SecondDataSet { line: usize },
+
+    #[error("unsupported @TYPE {0:?}")]
+    UnsupportedType(String),
+
+    #[error("@TYPE {kind} has {expected} columns, but the data has {got}")]
+    TypeWidthMismatch {
+        kind: String,
+        expected: usize,
+        got: usize,
+    },
+}

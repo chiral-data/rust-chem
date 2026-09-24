@@ -789,9 +789,21 @@ fn run(cli: &Cli) -> Result<i32> {
                         anyhow::anyhow!("{} cannot be written, only read", format.name())
                     })?;
                     write_all_bytes(&bytes, output.as_deref())?;
-                    // No Table format has an optional Carries flag beyond
-                    // COLUMNS to lose (#338), but MDP writes only the
-                    // columns it names, so the rest are disclosed (#395).
+                    // TABLE_METADATA (#398) is the one optional flag, and it
+                    // goes through the same report as every other kind's.
+                    // MDP and XVG also write only some columns, so the rest
+                    // are named (#395, #398).
+                    write::report_kind_drop(format, format::held_from_table(&table));
+                    if format == Format::XVG {
+                        let dropped = chem::io::xvg::dropped_columns(&table);
+                        if !dropped.is_empty() {
+                            eprintln!(
+                                "{} discards column(s) {} (it writes only numeric columns)",
+                                format.label(),
+                                dropped.join(", ")
+                            );
+                        }
+                    }
                     if format == Format::MDP {
                         let dropped = chem::io::mdp::dropped_columns(&table);
                         if !dropped.is_empty() {
@@ -1214,7 +1226,8 @@ fn print_format_listing(query: &str) -> Result<()> {
 /// (a moment; `T` was already topology), `L` a volume's sample values
 /// (levels), `E` mesh vertices (`V` was already velocities), `K` mesh faces,
 /// `Y` table columns (`C` was already formal charge). `J` is an index file's
-/// groups (#394); `G` was already stereo_group.
+/// groups (#394); `G` was already stereo_group. `H` is a table's header
+/// metadata (#398).
 const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::TOPOLOGY, 'T', "topology"),
     (Carries::BONDS, 'B', "bonds"),
@@ -1240,6 +1253,7 @@ const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::FACES, 'K', "faces"),
     (Carries::COLUMNS, 'Y', "columns"),
     (Carries::GROUPS, 'J', "groups"),
+    (Carries::TABLE_METADATA, 'H', "table_metadata"),
 ];
 
 /// `chem convert -L matrix` (#257) — what survives every registered conversion.

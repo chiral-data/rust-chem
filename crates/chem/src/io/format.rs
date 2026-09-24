@@ -147,6 +147,11 @@ impl Carries {
     /// every index format holds (#394). The first bit past `u32`, which is
     /// why the mask widened to `u64`.
     pub const GROUPS: Carries = Carries(1 << 32);
+    /// A table's whole-table metadata, from
+    /// [`crate::core::table::Table::metadata`] -- an XVG's title and axis
+    /// labels, which is where its units live (#398). Optional, unlike
+    /// [`Carries::COLUMNS`]: CSV and MDP have nowhere to put it.
+    pub const TABLE_METADATA: Carries = Carries(1 << 33);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -187,6 +192,7 @@ impl Carries {
         (Carries::FACES, "faces"),
         (Carries::COLUMNS, "columns"),
         (Carries::GROUPS, "groups"),
+        (Carries::TABLE_METADATA, "table_metadata"),
     ];
 
     pub const fn empty() -> Carries {
@@ -1732,6 +1738,30 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_table: Some(crate::io::mdp::write_mdp_table_bytes),
         writer_index_groups: None,
     },
+    FormatDescriptor {
+        name: "Grace data sets",
+        codes: &["xvg"],
+        extensions: &["xvg"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Numeric columns plus the title and axis labels, which carry the
+        // units (#398).
+        carries: Carries::COLUMNS.or(Carries::TABLE_METADATA),
+        reader: Some(crate::io::xvg::read_xvg_with_options),
+        writer: None,
+        supplier: Some(xvg_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Table,
+        // Text, no magic bytes -- resolved by extension only.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: Some(crate::io::xvg::write_xvg_table_bytes),
+        writer_index_groups: None,
+    },
 ];
 
 fn smiles_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -1834,6 +1864,10 @@ fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supp
 
 fn mdp_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::mdp::MdpSupplier::new(reader, options))
+}
+
+fn xvg_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::xvg::XvgSupplier::new(reader, options))
 }
 
 fn ndx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2311,6 +2345,11 @@ impl Format {
     /// [`Kind::Table`]: a `key`/`value`/`comment` table whose values are kept
     /// as written, never type-inferred.
     pub const MDP: Format = Format(30);
+    /// Grace data sets (#398), see [`crate::io::xvg`] -- what `gmx energy`
+    /// writes. Declared [`Kind::Table`], the first with
+    /// [`Carries::TABLE_METADATA`]: its title and axis labels, where the
+    /// units live.
+    pub const XVG: Format = Format(31);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -2980,6 +3019,21 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
     // missing bond flag when the real cause was an unstated hydrogen count
     // reaching `kekulize` (#281). Readers now reconcile all three channels at
     // the boundary, so neither format loses what both masks claim.
+    // MDP's columns are text and XVG holds only numbers (#398), so neither
+    // writes anything of the other's: `chem convert` names the discarded
+    // columns rather than the matrix claiming they survive.
+    (
+        Format::MDP,
+        Format::XVG,
+        Carries::COLUMNS,
+        "MDP's columns are text; XVG writes only numeric columns",
+    ),
+    (
+        Format::XVG,
+        Format::MDP,
+        Carries::COLUMNS,
+        "XVG has no key column, so MDP writes no parameters",
+    ),
 ];
 
 /// Conversions that lose *atoms*, each naming the issue that owns it.
@@ -3257,6 +3311,16 @@ pub fn held_from_volume(grid: &VolumeGrid) -> Carries {
         carries = carries.or(Carries::TOPOLOGY).or(Carries::COORDS_3D);
     }
     carries
+}
+
+/// What a table actually holds (#398): `COLUMNS` unconditionally, plus
+/// `TABLE_METADATA` only if this table states any.
+pub fn held_from_table(table: &Table) -> Carries {
+    if table.metadata().is_empty() {
+        Carries::COLUMNS
+    } else {
+        Carries::COLUMNS.or(Carries::TABLE_METADATA)
+    }
 }
 
 /// Every ordered `(source, target)` pair sharing a `Kind` (#339) -- every
@@ -3781,6 +3845,49 @@ mod tests {
     /// sized to [`held_from_volume`]'s own flag list. [`VolumeGrid`] is
     /// `Clone`, so this returns the grids directly rather than needing a
     /// rebuild-per-use helper.
+    /// One table per `Kind::Table` flag, shaped so `format` can hold it:
+    /// MDP holds only its `key`/`value`/`comment` text, XVG only numbers,
+    /// and CSV either (#398).
+    fn one_per_attribute_table(format: Format) -> Vec<(Carries, Table)> {
+        let base = if format == Format::MDP {
+            Table::from_csv("key,value,comment\ndt,0.002,ps\n")
+        } else {
+            Table::from_csv("x,Potential\n0,1.5\n")
+        }
+        .expect("valid table");
+        let with_metadata = base
+            .clone()
+            .with_metadata(vec![("title".to_string(), "probe".to_string())]);
+        vec![
+            (Carries::COLUMNS, base),
+            (Carries::TABLE_METADATA, with_metadata),
+        ]
+    }
+
+    /// What of `fixture` reached `back`: `COLUMNS` only if every cell arrived
+    /// under its own column name -- compared as text, since CSV infers `0.002`
+    /// as a float where MDP keeps it as written -- and `TABLE_METADATA` if
+    /// any metadata did.
+    fn table_held(fixture: &Table, back: &Table) -> Carries {
+        let text = |t: &Table, name: &str, row: usize| {
+            t.column(name)
+                .and_then(|c| c.values.get(row).cloned().flatten())
+                .map(|v| crate::io::csv::value_to_string(&v))
+        };
+        let cells = back.num_rows() == fixture.num_rows()
+            && fixture.columns().iter().all(|c| {
+                (0..fixture.num_rows()).all(|r| text(back, &c.name, r) == text(fixture, &c.name, r))
+            });
+        let mut held = Carries::empty();
+        if cells {
+            held = held.or(Carries::COLUMNS);
+        }
+        if !back.metadata().is_empty() {
+            held = held.or(Carries::TABLE_METADATA);
+        }
+        held
+    }
+
     fn one_per_attribute_volume() -> Vec<(Carries, VolumeGrid)> {
         use crate::core::atom::{Atom, Element};
         use crate::core::cell::UnitCell;
@@ -3990,15 +4097,22 @@ mod tests {
                     assert!(!back.faces().is_empty(), "{}", format.name());
                 }
                 Kind::Table => {
-                    let table =
-                        Table::from_csv("key,value,comment\ndt,0.002,ps\n").expect("valid table");
-                    let bytes = format.write_table_bytes(&table).expect("can_write said so");
-                    let outcome = format.read_bytes(&bytes).expect("can_read said so");
-                    let Some(back) = outcome.records.first().and_then(Record::table) else {
-                        panic!("{format:?} wrote nothing readable");
-                    };
-                    assert!(back.num_columns() > 0, "{}", format.name());
-                    assert_eq!(back.num_rows(), 1, "{}", format.name());
+                    for (flag, table) in one_per_attribute_table(format) {
+                        let bytes = format.write_table_bytes(&table).expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(back) = outcome.records.first().and_then(Record::table) else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived = table_held(&table, back).contains(flag);
+                        let claimed = format.carries().contains(flag);
+
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
                 }
                 Kind::IndexGroups => {
                     let groups = IndexGroups::new(vec![IndexGroup {
@@ -4069,11 +4183,11 @@ mod tests {
         // that predicts XTC losing TRR's velocities.
         let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
         // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
-        // 2x2 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
+        // 3x3 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
         // Molecules cross-kind pairs `cross_kind_pairs()` derives from
         // `kinds_compatible` -- a count this crate re-derives and pins, not
         // one asserted from memory (#339).
-        assert_eq!(pairs.len(), 356);
+        assert_eq!(pairs.len(), 361);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             match (source.kind(), target.kind()) {
@@ -4222,39 +4336,43 @@ mod tests {
                     );
                 }
                 (Kind::Table, Kind::Table) => {
-                    let table =
-                        Table::from_csv("key,value,comment\ndt,0.002,ps\n").expect("valid table");
-                    let as_source = source.write_table_bytes(&table).expect("can_write said so");
-                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
-                    let intermediate = outcome
-                        .records
-                        .first()
-                        .and_then(Record::table)
-                        .expect("valid table readback")
-                        .clone();
-                    let as_target = target
-                        .write_table_bytes(&intermediate)
-                        .expect("can_write said so");
-                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
-                    let back = outcome
-                        .records
-                        .first()
-                        .and_then(Record::table)
-                        .expect("valid table readback");
-                    // The row itself, not just a header: CSV infers `0.002` as
-                    // a float and MDP keeps it as text, so compare as text.
-                    let cell = |name: &str| {
-                        back.column(name)
-                            .and_then(|c| c.values[0].as_ref())
-                            .map(crate::io::csv::value_to_string)
+                    // CSV holds anything, so its fixture is whatever the
+                    // other side can hold; MDP's and XVG's are their own.
+                    let shaped_by = if source == Format::CSV {
+                        target
+                    } else {
+                        source
                     };
-                    assert_eq!(
-                        (cell("key"), cell("value")),
-                        (Some("dt".to_string()), Some("0.002".to_string())),
-                        "{} -> {}",
-                        source.name(),
-                        target.name()
-                    );
+                    for (flag, table) in one_per_attribute_table(shaped_by) {
+                        let as_source =
+                            source.write_table_bytes(&table).expect("can_write said so");
+                        let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                        let intermediate = outcome
+                            .records
+                            .first()
+                            .and_then(Record::table)
+                            .expect("valid table readback")
+                            .clone();
+                        let as_target = target
+                            .write_table_bytes(&intermediate)
+                            .expect("can_write said so");
+                        let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                        let back = outcome
+                            .records
+                            .first()
+                            .and_then(Record::table)
+                            .expect("valid table readback");
+
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = table_held(&table, back).contains(flag);
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+                    }
                 }
                 (Kind::Volume, Kind::Molecules) => {
                     // CUBE's own dual nature (#338/#339) -- the only
@@ -5178,7 +5296,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 31);
+        assert_eq!(all().count(), 32);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }
