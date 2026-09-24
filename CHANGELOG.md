@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.1] - 2026-09-24
+
+### Features
+
+- **`Element` knows its radii and colour, so a 3D consumer no longer has to bring its own 118-entry table.** `vdw_radius()` and `covalent_radius()` return Ångströms as `Option<f64>` — Bondi 1964 with Mantina et al. 2009's main-group values, and Cordero et al. 2008 — generated from the pinned OpenBabel by `tools/oracle/generate_element_tables.py` rather than typed in; `None` wherever the source has no value, never its placeholder. `cpk_color()` is Jmol's CPK palette as plain `[u8; 3]`, so `core` gains no dependency (#388)
+
+### Bug Fixes
+
+- **A GRO file with a single zinc or magnesium ion failed to parse at all, and sodium and chloride ions silently read as nitrogen and carbon.** The atom name's first letter is still the rule, so a protein `CA` stays carbon; a monatomic ion whose residue repeats its name (`ZN ZN`, `NA NA`) now reads its two-letter element, and an atom that resolves to nothing is `Element::UNKNOWN` rather than an error that lost the whole frame. An ion under a differently named residue (`ION NA`) still reads by its first letter (#386)
+- **GRO dropped every atom name, so a round trip rewrote `OW`/`HW1`/`HW2` as `O`/`H`/`H`.** The name is now kept as `AtomSite::name` and written back, whenever it fits the column and reads back as its own element (#387)
+- **Walking an XTC or TRR trajectory was quadratic in file size: every frame fetch copied the rest of the file.** Each frame now parses in place from its own bytes. Converting an 8,000-frame, 93 MB TRR went from 164 s to 1.9 s (#385)
+
 ## [0.9.0] - 2026-09-22
 
 **The registry outgrew molecules.** v0.8.0 shipped eleven formats, and every one of them was a
