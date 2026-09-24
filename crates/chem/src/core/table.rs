@@ -85,9 +85,17 @@ pub enum TableError {
 /// This type only holds the rows. Whether a given CSV reads as a set of
 /// molecules or as a table, and registering [`crate::io::format::Kind::Table`]
 /// against a real format, is #337's job.
+///
+/// # Metadata
+///
+/// Ordered key/value pairs describing the table as a whole rather than any
+/// one column -- an XVG's title and axis labels (#398), which is where its
+/// units live. Empty for every table built by [`Self::new`] or
+/// [`Self::from_csv`]; CSV has nowhere to put it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
     columns: Vec<Column>,
+    metadata: Vec<(String, String)>,
 }
 
 impl Table {
@@ -105,7 +113,10 @@ impl Table {
                 });
             }
         }
-        Ok(Self { columns })
+        Ok(Self {
+            columns,
+            metadata: Vec::new(),
+        })
     }
 
     /// Parses `text` as CSV: the first row is column names, every row after
@@ -134,6 +145,7 @@ impl Table {
         let Some((header, data_rows)) = rows.split_first() else {
             return Ok(Self {
                 columns: Vec::new(),
+                metadata: Vec::new(),
             });
         };
 
@@ -173,6 +185,24 @@ impl Table {
 
     pub fn num_columns(&self) -> usize {
         self.columns.len()
+    }
+
+    /// This table with `metadata` in place of whatever it had, in order.
+    pub fn with_metadata(mut self, metadata: Vec<(String, String)>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+
+    /// The first value stored under `key`, if any.
+    pub fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -410,5 +440,19 @@ mod tests {
             Err(TableError::UnterminatedQuotedField { .. }) => {}
             other => panic!("expected UnterminatedQuotedField, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_metadata_defaults_to_empty_and_keeps_order() {
+        let table = Table::from_csv("a\n1\n").unwrap();
+        assert!(table.metadata().is_empty());
+
+        let table = table.with_metadata(vec![
+            ("title".to_string(), "Energies".to_string()),
+            ("xaxis_label".to_string(), "Time (ps)".to_string()),
+        ]);
+        assert_eq!(table.metadata()[0].0, "title");
+        assert_eq!(table.metadata_value("xaxis_label"), Some("Time (ps)"));
+        assert_eq!(table.metadata_value("yaxis_label"), None);
     }
 }

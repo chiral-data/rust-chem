@@ -1644,6 +1644,73 @@ fn test_convert_csv_to_mdp_names_the_columns_it_drops() {
     );
 }
 
+const GYRATE_XVG: &str = "@    title \"Radius of gyration\"\n@    xaxis  label \"Time (ps)\"\n@TYPE xy\n@ s0 legend \"Rg\"\n0 4.30449\n10 4.30394\n";
+
+#[test]
+fn test_convert_xvg_to_xvg_keeps_metadata_and_legends() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            GYRATE_XVG,
+            "--from",
+            "xvg",
+            "--to",
+            "xvg",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, GYRATE_XVG);
+    assert!(!r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_xvg_to_csv_reports_the_lost_metadata() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            GYRATE_XVG,
+            "--from",
+            "xvg",
+            "--to",
+            "csv",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "x,Rg\n0,4.30449\n10,4.30394\n");
+    assert!(
+        r.stderr.contains("cannot carry: table_metadata"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_csv_to_xvg_names_the_non_numeric_columns_it_drops() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "t,phase,E\n0,solid,1.5\n",
+            "--from",
+            "csv",
+            "--to",
+            "xvg",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "@ s0 legend \"E\"\n0 1.5\n");
+    assert!(
+        r.stderr.contains("discards column(s) phase"),
+        "{:?}",
+        r.stderr
+    );
+}
+
 #[test]
 fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
     let path = fixture(
@@ -2643,15 +2710,16 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "csv",
         "ndx",
         "mdp",
+        "xvg",
     ] {
         assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
     }
 
     // CSV (`Kind::Table`) is unrelated to every other kind: its only real
-    // cells are the Table block, CSV and MDP (#395), each
+    // cells are the Table block -- CSV, MDP (#395) and XVG (#398) -- each
     // `Carries::COLUMNS`'s legend letter `Y`. A genuinely unrelated
     // cross-kind pair -- CSV x TRR among them -- must never render, so the
-    // whole row's non-blank content is exactly those two letters, not a
+    // whole row's non-blank content is exactly those three letters, not a
     // computed (and meaningless) fidelity answer.
     let csv_line = r
         .stdout
@@ -2664,7 +2732,7 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         .filter(|c| !c.is_whitespace())
         .collect();
     assert_eq!(
-        cells, "YY",
+        cells, "YYY",
         "csv row should render only the Table block: {csv_line}"
     );
 
@@ -2694,6 +2762,7 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "faces",
         "columns",
         "groups",
+        "table_metadata",
     ] {
         assert!(
             r.stdout.contains(name),
