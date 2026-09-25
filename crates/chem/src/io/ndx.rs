@@ -84,7 +84,7 @@ pub fn parse_ndx(text: &str) -> Result<IndexGroups, NdxError> {
     Ok(IndexGroups::new(groups))
 }
 
-/// Serialises `groups` as an index file, 1-based, [`INDICES_PER_LINE`] to a
+/// Serialises `groups` as an index file, 1-based, `INDICES_PER_LINE` to a
 /// line.
 pub fn write_ndx(groups: &IndexGroups) -> String {
     let mut out = String::new();

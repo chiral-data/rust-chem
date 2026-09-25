@@ -283,7 +283,7 @@ fn read_frame(
 ///
 /// # Errors
 /// Any [`EdrError`]. A truncated final frame is not an error; use
-/// [`read_edr_bytes`] to see it reported.
+/// `read_edr_bytes` to see it reported.
 pub fn parse_edr(bytes: &[u8]) -> Result<Table, EdrError> {
     parse(bytes).map(|p| p.table)
 }
