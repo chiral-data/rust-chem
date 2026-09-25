@@ -1530,6 +1530,259 @@ fn test_convert_csv_to_csv_round_trips_a_table_for_the_first_time() {
 }
 
 #[test]
+fn test_convert_ndx_to_ndx_keeps_one_based_indices_and_duplicate_groups() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "[ X ]\n1 2 3\n[ X ]\n",
+            "--from",
+            "ndx",
+            "--to",
+            "ndx",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "[ X ]\n   1    2    3\n[ X ]\n");
+    assert!(
+        r.stderr.contains("converted 1, skipped 0"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_refuses_ndx_to_a_molecule_format_and_a_zero_index() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "[ X ]\n1\n",
+            "--from",
+            "ndx",
+            "--to",
+            "sdf",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(
+        r.stderr.contains("there is no conversion between them"),
+        "{:?}",
+        r.stderr
+    );
+
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "[ X ]\n0\n",
+            "--from",
+            "ndx",
+            "--to",
+            "ndx",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(r.stdout.is_empty(), "{:?}", r.stdout);
+    assert!(r.stderr.contains("1-based atom index"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_mdp_round_trips_through_csv() {
+    let mdp = "; run\nref-t = 300 300 ; K\ndefine =\n";
+    let to_csv = run(
+        &["convert", "--literal", mdp, "--from", "mdp", "--to", "csv"],
+        None,
+    );
+    assert_eq!(to_csv.code, 0, "{:?}", to_csv.stderr);
+    assert!(
+        to_csv.stdout.starts_with("key,value,comment\n"),
+        "{:?}",
+        to_csv.stdout
+    );
+
+    let back = run(
+        &[
+            "convert",
+            "--literal",
+            &to_csv.stdout,
+            "--from",
+            "csv",
+            "--to",
+            "mdp",
+        ],
+        None,
+    );
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+    assert_eq!(back.stdout, mdp);
+    assert!(!back.stderr.contains("discards"), "{:?}", back.stderr);
+}
+
+#[test]
+fn test_convert_csv_to_mdp_names_the_columns_it_drops() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "key,value,units\ndt,0.002,ps\n",
+            "--from",
+            "csv",
+            "--to",
+            "mdp",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "dt = 0.002\n");
+    assert!(
+        r.stderr.contains("discards column(s) units"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+const GYRATE_XVG: &str = "@    title \"Radius of gyration\"\n@    xaxis  label \"Time (ps)\"\n@TYPE xy\n@ s0 legend \"Rg\"\n0 4.30449\n10 4.30394\n";
+
+#[test]
+fn test_convert_xvg_to_xvg_keeps_metadata_and_legends() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            GYRATE_XVG,
+            "--from",
+            "xvg",
+            "--to",
+            "xvg",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, GYRATE_XVG);
+    assert!(!r.stderr.contains("cannot carry"), "{:?}", r.stderr);
+}
+
+#[test]
+fn test_convert_xvg_to_csv_reports_the_lost_metadata() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            GYRATE_XVG,
+            "--from",
+            "xvg",
+            "--to",
+            "csv",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "x,Rg\n0,4.30449\n10,4.30394\n");
+    assert!(
+        r.stderr.contains("cannot carry: table_metadata"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_csv_to_xvg_names_the_non_numeric_columns_it_drops() {
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "t,phase,E\n0,solid,1.5\n",
+            "--from",
+            "csv",
+            "--to",
+            "xvg",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert_eq!(r.stdout, "@ s0 legend \"E\"\n0 1.5\n");
+    assert!(
+        r.stderr.contains("discards column(s) phase"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+const EM_EDR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/corpus/edr/em-first-3-frames.edr"
+);
+
+#[test]
+fn test_convert_edr_to_xvg_matches_gmx_energy_and_names_the_lost_units() {
+    let r = run(&["convert", EM_EDR, "--to", "xvg"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stdout.starts_with("@    xaxis  label \"Time (ps)\"\n"),
+        "{:?}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("@ s0 legend \"Bond\"\n"),
+        "{:?}",
+        r.stdout
+    );
+    // The Potential column, as `gmx energy` prints it for the same file.
+    let potential = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("legend \"Potential\""))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.trim_start_matches('s').parse::<usize>().ok())
+        .expect("a Potential legend");
+    let first_row: Vec<&str> = r
+        .stdout
+        .lines()
+        .find(|l| !l.starts_with('@'))
+        .unwrap()
+        .split(' ')
+        .collect();
+    assert_eq!(first_row[potential + 1], "-3412099.75");
+    assert!(
+        r.stderr.contains("also loses table_metadata"),
+        "{:?}",
+        r.stderr
+    );
+}
+
+#[test]
+fn test_convert_csv_to_edr_and_back_keeps_the_numbers() {
+    let out = std::env::temp_dir().join("chem-cli-test-roundtrip.edr");
+    let r = run(
+        &[
+            "convert",
+            "--literal",
+            "t,phase,Potential\n0,solid,-1.5\n2,liquid,-2.5\n",
+            "--from",
+            "csv",
+            "--to",
+            "edr",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(
+        r.stderr.contains("discards column(s) phase"),
+        "{:?}",
+        r.stderr
+    );
+
+    let back = run(&["convert", out.to_str().unwrap(), "--to", "csv"], None);
+    assert_eq!(back.code, 0, "{:?}", back.stderr);
+    assert_eq!(back.stdout, "x,Potential\n0,-1.5\n2,-2.5\n");
+}
+
+#[test]
 fn test_convert_reads_a_multi_frame_xyz_trajectory_as_multiple_records() {
     let path = fixture(
         "trajectory.xyz",
@@ -2526,15 +2779,20 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "obj",
         "ply",
         "csv",
+        "ndx",
+        "mdp",
+        "xvg",
+        "edr",
     ] {
         assert!(r.stdout.contains(code), "no {code} row: {}", r.stdout);
     }
 
     // CSV (`Kind::Table`) is unrelated to every other kind: its only real
-    // cell is its own diagonal, `Carries::COLUMNS`'s legend letter `Y`. A
-    // genuinely unrelated cross-kind pair -- CSV x TRR among them -- must
-    // never render, so the whole row's non-blank content is exactly that
-    // one letter, not a computed (and meaningless) fidelity answer.
+    // cells are the Table block -- CSV, MDP (#395), XVG (#398) and EDR
+    // (#399) -- each `Carries::COLUMNS`'s legend letter `Y`. A genuinely
+    // unrelated cross-kind pair -- CSV x TRR among them -- must never
+    // render, so the whole row's non-blank content is exactly those four
+    // letters, not a computed (and meaningless) fidelity answer.
     let csv_line = r
         .stdout
         .lines()
@@ -2546,8 +2804,24 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         .filter(|c| !c.is_whitespace())
         .collect();
     assert_eq!(
-        cells, "Y",
-        "csv row should render only its own diagonal cell: {csv_line}"
+        cells, "YYYY",
+        "csv row should render only the Table block: {csv_line}"
+    );
+
+    // NDX (`Kind::IndexGroups`, #394) is the same shape: one diagonal cell.
+    let ndx_line = r
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("ndx"))
+        .unwrap_or_else(|| panic!("no ndx row: {}", r.stdout));
+    let cells: String = ndx_line
+        .trim_start_matches("ndx")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        cells, "J",
+        "ndx row should render only its own diagonal cell: {ndx_line}"
     );
 
     // The legend names every new flag, not just the original eleven.
@@ -2559,6 +2833,8 @@ fn test_l_matrix_covers_the_new_kinds_without_rendering_unrelated_cross_kind_cel
         "vertices",
         "faces",
         "columns",
+        "groups",
+        "table_metadata",
     ] {
         assert!(
             r.stdout.contains(name),

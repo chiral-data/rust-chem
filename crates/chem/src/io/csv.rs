@@ -53,7 +53,7 @@ use crate::io::reader::{Payload, ReadOutcome, Record, Skipped};
 use crate::io::smiles::parse_smiles;
 use crate::io::smiles_writer::write_smiles_for_molecule;
 
-fn value_to_string(value: &Value) -> String {
+pub(crate) fn value_to_string(value: &Value) -> String {
     match value {
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),

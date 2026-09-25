@@ -7,6 +7,7 @@ use std::ops::{BitAnd, BitOr, Not};
 use crate::core::atom::Chirality;
 use crate::core::bond::{BondOrder, BondStereo};
 use crate::core::geometry::Point3;
+use crate::core::index_groups::IndexGroups;
 use crate::core::mesh::Mesh;
 use crate::core::molecule::Molecule;
 use crate::core::table::Table;
@@ -40,7 +41,7 @@ use crate::io::supplier::{Supplier, Writer};
 /// dependency, the lean build's tree is a pinned property, and the surface
 /// needed here is four operators and an iterator.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Carries(u32);
+pub struct Carries(u64);
 
 impl Carries {
     /// Atoms and their elements — the one thing every molecular format holds,
@@ -139,10 +140,18 @@ impl Carries {
     pub const DONORS: Carries = Carries(1 << 30);
     /// Hydrogen-bond acceptor pairs, from
     /// [`crate::core::force_field::ForceFieldTopology::acceptors`]. PSF is
-    /// the first format to state these (#321). The last bit this `u32` has
-    /// room for — a 33rd flag needs a wider representation, not this one's
-    /// problem.
+    /// the first format to state these (#321).
     pub const ACCEPTORS: Carries = Carries(1 << 31);
+    /// An index file's named atom groups, from
+    /// [`crate::core::index_groups::IndexGroups::groups`] — the one thing
+    /// every index format holds (#394). The first bit past `u32`, which is
+    /// why the mask widened to `u64`.
+    pub const GROUPS: Carries = Carries(1 << 32);
+    /// A table's whole-table metadata, from
+    /// [`crate::core::table::Table::metadata`] -- an XVG's title and axis
+    /// labels, which is where its units live (#398). Optional, unlike
+    /// [`Carries::COLUMNS`]: CSV and MDP have nowhere to put it.
+    pub const TABLE_METADATA: Carries = Carries(1 << 33);
 
     /// Every flag above, in the order the report prints them.
     const ALL: &'static [(Carries, &'static str)] = &[
@@ -182,6 +191,8 @@ impl Carries {
         (Carries::VERTICES, "vertices"),
         (Carries::FACES, "faces"),
         (Carries::COLUMNS, "columns"),
+        (Carries::GROUPS, "groups"),
+        (Carries::TABLE_METADATA, "table_metadata"),
     ];
 
     pub const fn empty() -> Carries {
@@ -493,6 +504,9 @@ pub enum Kind {
     /// #314). No format is registered as this yet; the first will be #337
     /// (CSV).
     Table,
+    /// Named groups of atom indices, no structure implied
+    /// ([`crate::core::index_groups::IndexGroups`], #394) -- NDX.
+    IndexGroups,
 }
 
 /// Parses a whole file into molecules.
@@ -536,6 +550,10 @@ pub(crate) type ByteWriteMeshFn = fn(&Mesh, &WriteOptions) -> Vec<u8>;
 /// documents, since a table is neither a `Molecule` list nor any of the
 /// other three payload shapes.
 pub(crate) type ByteWriteTableFn = fn(&Table, &WriteOptions) -> Vec<u8>;
+
+/// Serialises a whole [`IndexGroups`] into one file's worth of bytes (#394) —
+/// the same "new, parallel field" reasoning [`ByteWriteTableFn`] documents.
+pub(crate) type ByteWriteIndexGroupsFn = fn(&IndexGroups, &WriteOptions) -> Vec<u8>;
 
 /// A byte pattern identifying a format's content, independent of any
 /// filename: the exact bytes expected starting at `offset` (#317).
@@ -615,6 +633,9 @@ pub struct FormatDescriptor {
     /// both a `Table` (its declared kind) and, as a disclosed opt-in, a
     /// molecule list with a `smiles` column.
     pub(crate) writer_table: Option<ByteWriteTableFn>,
+    /// Set only for a format whose writer takes a whole [`IndexGroups`]
+    /// (#394) — `None` for every format but NDX.
+    pub(crate) writer_index_groups: Option<ByteWriteIndexGroupsFn>,
 }
 
 /// Every format compiled into this build.
@@ -655,6 +676,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "MDL MOL format",
@@ -706,6 +728,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CXSMILES",
@@ -747,6 +770,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "XYZ",
@@ -777,6 +801,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PDB",
@@ -810,6 +835,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "mmCIF",
@@ -840,6 +866,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "Mol2",
@@ -875,6 +902,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PDBQT",
@@ -906,6 +934,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "GRO",
@@ -933,6 +962,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CML",
@@ -965,6 +995,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "commonchem JSON",
@@ -1005,6 +1036,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "BinaryCIF",
@@ -1038,6 +1070,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CIF core",
@@ -1076,6 +1109,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PSF",
@@ -1115,6 +1149,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PRMTOP",
@@ -1163,6 +1198,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "TOP",
@@ -1203,6 +1239,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "LAMMPS Data",
@@ -1246,6 +1283,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "TRR",
@@ -1282,6 +1320,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "XTC",
@@ -1313,6 +1352,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "DCD",
@@ -1346,6 +1386,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "NCTRAJ",
@@ -1387,6 +1428,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "LAMMPS Trajectory",
@@ -1427,6 +1469,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CUBE",
@@ -1457,6 +1500,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::cube::write_cube_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CCP4/MRC",
@@ -1487,6 +1531,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::ccp4::write_ccp4_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "DX",
@@ -1518,6 +1563,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::dx::write_dx_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "DSN6",
@@ -1545,6 +1591,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: Some(crate::io::dsn6::write_dsn6_bytes),
         writer_mesh: None,
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "OBJ",
@@ -1574,6 +1621,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: Some(crate::io::obj::write_obj_bytes),
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "PLY",
@@ -1606,6 +1654,7 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_volume: None,
         writer_mesh: Some(crate::io::ply::write_ply_bytes),
         writer_table: None,
+        writer_index_groups: None,
     },
     FormatDescriptor {
         name: "CSV",
@@ -1639,6 +1688,106 @@ static FORMATS: &[FormatDescriptor] = &[
         writer_mesh: None,
         // The declared/primary write shape.
         writer_table: Some(crate::io::csv::write_csv_table_bytes),
+        writer_index_groups: None,
+    },
+    FormatDescriptor {
+        name: "GROMACS index",
+        codes: &["ndx"],
+        extensions: &["ndx"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Groups only: an index file names no structure, so it carries no
+        // atoms of its own to declare (#394).
+        carries: Carries::GROUPS,
+        reader: Some(crate::io::ndx::read_ndx_with_options),
+        writer: None,
+        supplier: Some(ndx_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::IndexGroups,
+        // Text, no magic bytes -- resolved by extension only.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: None,
+        writer_index_groups: Some(crate::io::ndx::write_ndx_bytes),
+    },
+    FormatDescriptor {
+        name: "GROMACS run parameters",
+        codes: &["mdp"],
+        extensions: &["mdp"],
+        category: Category::MolecularDynamicsAndDocking,
+        // A `key`/`value`/`comment` table, not a new kind (#395): the file
+        // describes a computation and carries no chemistry at all.
+        carries: Carries::COLUMNS,
+        reader: Some(crate::io::mdp::read_mdp_with_options),
+        writer: None,
+        supplier: Some(mdp_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Table,
+        // Text, no magic bytes -- resolved by extension only.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: Some(crate::io::mdp::write_mdp_table_bytes),
+        writer_index_groups: None,
+    },
+    FormatDescriptor {
+        name: "Grace data sets",
+        codes: &["xvg"],
+        extensions: &["xvg"],
+        category: Category::MolecularDynamicsAndDocking,
+        // Numeric columns plus the title and axis labels, which carry the
+        // units (#398).
+        carries: Carries::COLUMNS.or(Carries::TABLE_METADATA),
+        reader: Some(crate::io::xvg::read_xvg_with_options),
+        writer: None,
+        supplier: Some(xvg_supplier),
+        writer_stream: None,
+        encoding: Encoding::Text,
+        kind: Kind::Table,
+        // Text, no magic bytes -- resolved by extension only.
+        magic: &[],
+        reader_bytes: None,
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: Some(crate::io::xvg::write_xvg_table_bytes),
+        writer_index_groups: None,
+    },
+    FormatDescriptor {
+        name: "GROMACS energy",
+        codes: &["edr"],
+        extensions: &["edr"],
+        category: Category::MolecularDynamicsAndDocking,
+        // A time series of named terms, with each term's unit as metadata
+        // (#399) -- the same shape XVG reads as.
+        carries: Carries::COLUMNS.or(Carries::TABLE_METADATA),
+        reader: None,
+        writer: None,
+        supplier: Some(edr_supplier),
+        writer_stream: None,
+        encoding: Encoding::Binary,
+        kind: Kind::Table,
+        // The names block's own magic, -55555.
+        magic: &[Signature {
+            offset: 0,
+            bytes: &[0xFF, 0xFF, 0x26, 0xFD],
+        }],
+        reader_bytes: Some(crate::io::edr::read_edr_bytes),
+        writer_bytes: None,
+        writer_trajectory: None,
+        writer_volume: None,
+        writer_mesh: None,
+        writer_table: Some(crate::io::edr::write_edr_table_bytes),
+        writer_index_groups: None,
     },
 ];
 
@@ -1738,6 +1887,22 @@ fn lammpstrj_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dy
 
 fn csv_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
     Box::new(crate::io::csv::CsvSupplier::new(reader, options))
+}
+
+fn mdp_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::mdp::MdpSupplier::new(reader, options))
+}
+
+fn edr_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::edr::EdrSupplier::new(reader, options))
+}
+
+fn xvg_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::xvg::XvgSupplier::new(reader, options))
+}
+
+fn ndx_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
+    Box::new(crate::io::ndx::NdxSupplier::new(reader, options))
 }
 
 fn cube_supplier(reader: Box<dyn BufRead>, options: &ReadOptions) -> Box<dyn Supplier> {
@@ -2202,6 +2367,24 @@ impl Format {
     /// `writer` (an opt-in molecule-list shape) and `writer_table` (its
     /// declared/primary shape) on the same descriptor.
     pub const CSV: Format = Format(28);
+    /// GROMACS index groups (#394), see [`crate::io::ndx`]. Declared
+    /// [`Kind::IndexGroups`]: ragged named groups of 1-based atom indices,
+    /// which [`Table`]'s equal-length columns cannot hold without losing the
+    /// grouping.
+    pub const NDX: Format = Format(29);
+    /// GROMACS run parameters (#395), see [`crate::io::mdp`]. Declared
+    /// [`Kind::Table`]: a `key`/`value`/`comment` table whose values are kept
+    /// as written, never type-inferred.
+    pub const MDP: Format = Format(30);
+    /// Grace data sets (#398), see [`crate::io::xvg`] -- what `gmx energy`
+    /// writes. Declared [`Kind::Table`], the first with
+    /// [`Carries::TABLE_METADATA`]: its title and axis labels, where the
+    /// units live.
+    pub const XVG: Format = Format(31);
+    /// GROMACS energy files (#399), see [`crate::io::edr`]. Version 5 only,
+    /// read into the same `x`-plus-terms table XVG reads into, with each
+    /// term's unit in [`Carries::TABLE_METADATA`].
+    pub const EDR: Format = Format(32);
 
     pub fn descriptor(&self) -> &'static FormatDescriptor {
         &FORMATS[self.0 as usize]
@@ -2300,6 +2483,7 @@ impl Format {
             || d.writer_volume.is_some()
             || d.writer_mesh.is_some()
             || d.writer_table.is_some()
+            || d.writer_index_groups.is_some()
     }
 
     /// Parses a whole file into molecules, from raw bytes (#309) — the
@@ -2453,6 +2637,22 @@ impl Format {
     ) -> Option<Vec<u8>> {
         let writer_table = self.descriptor().writer_table?;
         Some(writer_table(table, options))
+    }
+
+    /// Serialises a whole [`IndexGroups`] into raw bytes (#394), or `None` if
+    /// this format has no index-group writer — every format other than NDX.
+    pub fn write_index_groups_bytes(&self, groups: &IndexGroups) -> Option<Vec<u8>> {
+        self.write_index_groups_bytes_with_options(groups, &WriteOptions::default())
+    }
+
+    /// [`Self::write_index_groups_bytes`], with explicit per-format options.
+    pub fn write_index_groups_bytes_with_options(
+        &self,
+        groups: &IndexGroups,
+        options: &WriteOptions,
+    ) -> Option<Vec<u8>> {
+        let writer_index_groups = self.descriptor().writer_index_groups?;
+        Some(writer_index_groups(groups, options))
     }
 
     /// Streams molecules from `reader` one at a time, rather than
@@ -2854,6 +3054,47 @@ static PAIR_LOSSES: &[(Format, Format, Carries, &str)] = &[
     // missing bond flag when the real cause was an unstated hydrogen count
     // reaching `kekulize` (#281). Readers now reconcile all three channels at
     // the boundary, so neither format loses what both masks claim.
+    // MDP's columns are text and XVG holds only numbers (#398), so neither
+    // writes anything of the other's: `chem convert` names the discarded
+    // columns rather than the matrix claiming they survive.
+    (
+        Format::MDP,
+        Format::XVG,
+        Carries::COLUMNS,
+        "MDP's columns are text; XVG writes only numeric columns",
+    ),
+    (
+        Format::XVG,
+        Format::MDP,
+        Carries::COLUMNS,
+        "XVG has no key column, so MDP writes no parameters",
+    ),
+    // EDR is numbers too (#399), and its metadata is units where XVG's is a
+    // title and axis labels: neither side has anywhere for the other's.
+    (
+        Format::MDP,
+        Format::EDR,
+        Carries::COLUMNS,
+        "MDP's columns are text; EDR writes only numeric columns",
+    ),
+    (
+        Format::EDR,
+        Format::MDP,
+        Carries::COLUMNS,
+        "EDR has no key column, so MDP writes no parameters",
+    ),
+    (
+        Format::EDR,
+        Format::XVG,
+        Carries::TABLE_METADATA,
+        "XVG keeps a title and axis labels, not EDR's per-term units",
+    ),
+    (
+        Format::XVG,
+        Format::EDR,
+        Carries::TABLE_METADATA,
+        "EDR keeps per-term units, not XVG's title or axis labels",
+    ),
 ];
 
 /// Conversions that lose *atoms*, each naming the issue that owns it.
@@ -3035,6 +3276,7 @@ fn kind_description(kind: Kind) -> &'static str {
         Kind::Volume => "a volumetric grid",
         Kind::Mesh => "a mesh",
         Kind::Table => "a table",
+        Kind::IndexGroups => "index groups",
     }
 }
 
@@ -3130,6 +3372,16 @@ pub fn held_from_volume(grid: &VolumeGrid) -> Carries {
         carries = carries.or(Carries::TOPOLOGY).or(Carries::COORDS_3D);
     }
     carries
+}
+
+/// What a table actually holds (#398): `COLUMNS` unconditionally, plus
+/// `TABLE_METADATA` only if this table states any.
+pub fn held_from_table(table: &Table) -> Carries {
+    if table.metadata().is_empty() {
+        Carries::COLUMNS
+    } else {
+        Carries::COLUMNS.or(Carries::TABLE_METADATA)
+    }
 }
 
 /// Every ordered `(source, target)` pair sharing a `Kind` (#339) -- every
@@ -3256,6 +3508,7 @@ impl fmt::Display for Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::index_groups::IndexGroup;
     use crate::io::reader::{Payload, Record};
 
     #[test]
@@ -3653,6 +3906,59 @@ mod tests {
     /// sized to [`held_from_volume`]'s own flag list. [`VolumeGrid`] is
     /// `Clone`, so this returns the grids directly rather than needing a
     /// rebuild-per-use helper.
+    /// One table per `Kind::Table` flag, shaped so `format` can hold it:
+    /// MDP holds only its `key`/`value`/`comment` text, XVG and EDR only
+    /// numbers, and CSV either (#398). The metadata is each format's own
+    /// kind: a title for XVG, a unit for EDR (#399).
+    fn one_per_attribute_table(format: Format) -> Vec<(Carries, Table)> {
+        let base = if format == Format::MDP {
+            Table::from_csv("key,value,comment\ndt,0.002,ps\n")
+        } else {
+            Table::from_csv("x,Potential\n0,1.5\n")
+        }
+        .expect("valid table");
+        let metadata = if format == Format::EDR {
+            ("unit:Potential".to_string(), "kJ/mol".to_string())
+        } else {
+            ("title".to_string(), "probe".to_string())
+        };
+        let with_metadata = base.clone().with_metadata(vec![metadata]);
+        vec![
+            (Carries::COLUMNS, base),
+            (Carries::TABLE_METADATA, with_metadata),
+        ]
+    }
+
+    /// What of `fixture` reached `back`: `COLUMNS` only if every cell arrived
+    /// under its own column name -- compared as text, since CSV infers `0.002`
+    /// as a float where MDP keeps it as written -- and `TABLE_METADATA` only
+    /// if every one of the fixture's own entries did. EDR adds metadata of
+    /// its own on every read, so "any metadata" would prove nothing.
+    fn table_held(fixture: &Table, back: &Table) -> Carries {
+        let text = |t: &Table, name: &str, row: usize| {
+            t.column(name)
+                .and_then(|c| c.values.get(row).cloned().flatten())
+                .map(|v| crate::io::csv::value_to_string(&v))
+        };
+        let cells = back.num_rows() == fixture.num_rows()
+            && fixture.columns().iter().all(|c| {
+                (0..fixture.num_rows()).all(|r| text(back, &c.name, r) == text(fixture, &c.name, r))
+            });
+        let mut held = Carries::empty();
+        if cells {
+            held = held.or(Carries::COLUMNS);
+        }
+        if !fixture.metadata().is_empty()
+            && fixture
+                .metadata()
+                .iter()
+                .all(|(k, v)| back.metadata_value(k) == Some(v.as_str()))
+        {
+            held = held.or(Carries::TABLE_METADATA);
+        }
+        held
+    }
+
     fn one_per_attribute_volume() -> Vec<(Carries, VolumeGrid)> {
         use crate::core::atom::{Atom, Element};
         use crate::core::cell::UnitCell;
@@ -3862,13 +4168,36 @@ mod tests {
                     assert!(!back.faces().is_empty(), "{}", format.name());
                 }
                 Kind::Table => {
-                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
-                    let bytes = format.write_table_bytes(&table).expect("can_write said so");
+                    for (flag, table) in one_per_attribute_table(format) {
+                        let bytes = format.write_table_bytes(&table).expect("can_write said so");
+                        let outcome = format.read_bytes(&bytes).expect("can_read said so");
+                        let Some(back) = outcome.records.first().and_then(Record::table) else {
+                            panic!("{format:?} wrote nothing readable for {flag:?}");
+                        };
+                        let survived = table_held(&table, back).contains(flag);
+                        let claimed = format.carries().contains(flag);
+
+                        assert_eq!(
+                            claimed,
+                            survived,
+                            "{} claims {flag:?}={claimed} but a round trip gives {survived}",
+                            format.name()
+                        );
+                    }
+                }
+                Kind::IndexGroups => {
+                    let groups = IndexGroups::new(vec![IndexGroup {
+                        name: "probe".to_string(),
+                        atoms: vec![0, 4],
+                    }]);
+                    let bytes = format
+                        .write_index_groups_bytes(&groups)
+                        .expect("can_write said so");
                     let outcome = format.read_bytes(&bytes).expect("can_read said so");
-                    let Some(back) = outcome.records.first().and_then(Record::table) else {
+                    let Some(back) = outcome.records.first().and_then(Record::index_groups) else {
                         panic!("{format:?} wrote nothing readable");
                     };
-                    assert!(back.num_columns() > 0, "{}", format.name());
+                    assert_eq!(back, &groups, "{}", format.name());
                 }
             }
         }
@@ -3925,11 +4254,11 @@ mod tests {
         // that predicts XTC losing TRR's velocities.
         let pairs: Vec<(Format, Format)> = fidelity_pairs().collect();
         // 17x17 (Molecules) + 5x5 (Frames) + 4x4 (Volume) + 2x2 (Mesh) +
-        // 1x1 (Table) same-kind, plus the 17 CUBE -> Molecules cross-kind
-        // pairs `cross_kind_pairs()` derives from `kinds_compatible` -- a
-        // count this crate re-derives and pins, not one asserted from
-        // memory (#339).
-        assert_eq!(pairs.len(), 352);
+        // 4x4 (Table) + 1x1 (IndexGroups) same-kind, plus the 17 CUBE ->
+        // Molecules cross-kind pairs `cross_kind_pairs()` derives from
+        // `kinds_compatible` -- a count this crate re-derives and pins, not
+        // one asserted from memory (#339).
+        assert_eq!(pairs.len(), 368);
         for (source, target) in pairs {
             let predicted_mask = fidelity(source, target);
             match (source.kind(), target.kind()) {
@@ -4078,30 +4407,43 @@ mod tests {
                     );
                 }
                 (Kind::Table, Kind::Table) => {
-                    let table = Table::from_csv("a,b\n1,2\n").expect("valid table");
-                    let as_source = source.write_table_bytes(&table).expect("can_write said so");
-                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
-                    let intermediate = outcome
-                        .records
-                        .first()
-                        .and_then(Record::table)
-                        .expect("valid table readback")
-                        .clone();
-                    let as_target = target
-                        .write_table_bytes(&intermediate)
-                        .expect("can_write said so");
-                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
-                    let back = outcome
-                        .records
-                        .first()
-                        .and_then(Record::table)
-                        .expect("valid table readback");
-                    assert!(
-                        back.num_columns() > 0,
-                        "{} -> {}",
-                        source.name(),
-                        target.name()
-                    );
+                    // CSV holds anything, so its fixture is whatever the
+                    // other side can hold; MDP's and XVG's are their own.
+                    let shaped_by = if source == Format::CSV {
+                        target
+                    } else {
+                        source
+                    };
+                    for (flag, table) in one_per_attribute_table(shaped_by) {
+                        let as_source =
+                            source.write_table_bytes(&table).expect("can_write said so");
+                        let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                        let intermediate = outcome
+                            .records
+                            .first()
+                            .and_then(Record::table)
+                            .expect("valid table readback")
+                            .clone();
+                        let as_target = target
+                            .write_table_bytes(&intermediate)
+                            .expect("can_write said so");
+                        let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                        let back = outcome
+                            .records
+                            .first()
+                            .and_then(Record::table)
+                            .expect("valid table readback");
+
+                        let predicted = predicted_mask.contains(flag);
+                        let survived = table_held(&table, back).contains(flag);
+                        assert_eq!(
+                            predicted,
+                            survived,
+                            "{} -> {}: the matrix says {flag:?}={predicted} but the conversion gives {survived}",
+                            source.name(),
+                            target.name()
+                        );
+                    }
                 }
                 (Kind::Volume, Kind::Molecules) => {
                     // CUBE's own dual nature (#338/#339) -- the only
@@ -4141,6 +4483,38 @@ mod tests {
                         source.name(),
                         target.name()
                     );
+                }
+                (Kind::IndexGroups, Kind::IndexGroups) => {
+                    let groups = IndexGroups::new(vec![
+                        IndexGroup {
+                            name: "a".to_string(),
+                            atoms: vec![2, 2, 0],
+                        },
+                        IndexGroup {
+                            name: "a".to_string(),
+                            atoms: vec![],
+                        },
+                    ]);
+                    let as_source = source
+                        .write_index_groups_bytes(&groups)
+                        .expect("can_write said so");
+                    let outcome = source.read_bytes(&as_source).expect("can_read said so");
+                    let intermediate = outcome
+                        .records
+                        .first()
+                        .and_then(Record::index_groups)
+                        .expect("valid index groups readback")
+                        .clone();
+                    let as_target = target
+                        .write_index_groups_bytes(&intermediate)
+                        .expect("can_write said so");
+                    let outcome = target.read_bytes(&as_target).expect("can_read said so");
+                    let back = outcome
+                        .records
+                        .first()
+                        .and_then(Record::index_groups)
+                        .expect("valid index groups readback");
+                    assert_eq!(back, &groups, "{} -> {}", source.name(), target.name());
                 }
                 (source_kind, target_kind) => unreachable!(
                     "fidelity_pairs() only yields same-kind or CUBE-exception pairs, got {source_kind:?} -> {target_kind:?}"
@@ -4244,8 +4618,8 @@ mod tests {
                                 .is_some_and(|back| held_from_volume(&back).contains(*flag))
                         })
                 }),
-                Kind::Mesh | Kind::Table => {
-                    unreachable!("SUPPLIED has no Mesh/Table entries (#339)")
+                Kind::Mesh | Kind::Table | Kind::IndexGroups => {
+                    unreachable!("SUPPLIED has no Mesh/Table/IndexGroups entries (#339)")
                 }
             };
             assert!(
@@ -4636,6 +5010,12 @@ mod tests {
                         "{format:?} declares no columns, so its mask is missing"
                     );
                 }
+                Kind::IndexGroups => {
+                    assert!(
+                        format.carries().contains(Carries::GROUPS),
+                        "{format:?} declares no groups, so its mask is missing"
+                    );
+                }
             }
         }
     }
@@ -4669,6 +5049,7 @@ mod tests {
                 writer_volume: None,
                 writer_mesh: None,
                 writer_table: None,
+                writer_index_groups: None,
             }
         }
 
@@ -4680,6 +5061,7 @@ mod tests {
         assert!(!requires_topology(&bare(Kind::Volume)));
         assert!(!requires_topology(&bare(Kind::Mesh)));
         assert!(!requires_topology(&bare(Kind::Table)));
+        assert!(!requires_topology(&bare(Kind::IndexGroups)));
         // A molecule/frames descriptor with nothing declared: still flagged
         // -- the relaxation did not turn the check off for the kinds that
         // need it.
@@ -4718,6 +5100,7 @@ mod tests {
                 writer_volume: None,
                 writer_mesh: None,
                 writer_table: None,
+                writer_index_groups: None,
             }
         }
 
@@ -4727,6 +5110,7 @@ mod tests {
                 Kind::Volume => d.carries.contains(Carries::SAMPLES),
                 Kind::Mesh => d.carries.contains(Carries::VERTICES),
                 Kind::Table => d.carries.contains(Carries::COLUMNS),
+                Kind::IndexGroups => d.carries.contains(Carries::GROUPS),
             }
         }
 
@@ -4734,17 +5118,20 @@ mod tests {
         assert!(passes(&bare(Kind::Volume, Carries::SAMPLES)));
         assert!(passes(&bare(Kind::Mesh, Carries::VERTICES)));
         assert!(passes(&bare(Kind::Table, Carries::COLUMNS)));
+        assert!(passes(&bare(Kind::IndexGroups, Carries::GROUPS)));
 
         // ... an empty mask does not -- the loophole the issue opens with.
         assert!(!passes(&bare(Kind::Volume, Carries::empty())));
         assert!(!passes(&bare(Kind::Mesh, Carries::empty())));
         assert!(!passes(&bare(Kind::Table, Carries::empty())));
+        assert!(!passes(&bare(Kind::IndexGroups, Carries::empty())));
 
         // ... and declaring a different kind's defining flag does not
         // satisfy this one -- the flags are not interchangeable.
         assert!(!passes(&bare(Kind::Volume, Carries::VERTICES)));
         assert!(!passes(&bare(Kind::Mesh, Carries::COLUMNS)));
         assert!(!passes(&bare(Kind::Table, Carries::SAMPLES)));
+        assert!(!passes(&bare(Kind::IndexGroups, Carries::COLUMNS)));
     }
 
     #[test]
@@ -4806,7 +5193,8 @@ mod tests {
         // fifth -- the first outside `Kind::Frames` -- and PLY (#336) the
         // sixth -- the first outside `Kind::Volume` too, and the first
         // `Kind::Mesh` format with a real fixed signature at all (OBJ has
-        // none). Every other format leaves `magic` empty. Pinned explicitly
+        // none) -- and EDR (#399) the seventh, the first `Kind::Table` one.
+        // Every other format leaves `magic` empty. Pinned explicitly
         // rather than trusted silently, the same discipline #316's
         // `pairs_within_kind` count assertion follows.
         for format in all() {
@@ -4816,6 +5204,7 @@ mod tests {
                 || format == Format::NCTRAJ
                 || format == Format::CCP4
                 || format == Format::PLY
+                || format == Format::EDR
             {
                 continue;
             }
@@ -4831,6 +5220,11 @@ mod tests {
         // GROMACS's own fixed magic numbers, big-endian, 2 apart.
         assert_eq!(sniff(b"\x00\x00\x07\xc9REST"), Some(Format::TRR));
         assert_eq!(sniff(b"\x00\x00\x07\xcbREST"), Some(Format::XTC));
+        // EDR's names block opens with -55555.
+        assert_eq!(
+            sniff(b"\xff\xff\x26\xfd\x00\x00\x00\x05"),
+            Some(Format::EDR)
+        );
         // DCD's "CORD" sits at byte 4, after the leading Fortran record
         // marker (whatever it is) -- not byte 0.
         assert_eq!(sniff(b"\x54\x00\x00\x00CORD"), Some(Format::DCD));
@@ -4980,7 +5374,7 @@ mod tests {
         // true while there happened to be exactly two: every format the
         // registry has grown since (#221's CXSMILES included) has to keep
         // satisfying this, not just the first two.
-        assert_eq!(all().count(), 29);
+        assert_eq!(all().count(), 33);
         for format in all() {
             assert!(format.can_read() && format.can_write(), "{format:?}");
         }

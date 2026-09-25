@@ -690,3 +690,104 @@ pub enum CsvError {
     #[error(transparent)]
     Table(#[from] crate::core::table::TableError),
 }
+
+/// GROMACS index file errors (#394). Every one rejects the whole file: a
+/// half-read index selects the wrong atoms without saying so.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum NdxError {
+    #[error("line {line}: atom index before any [ group ] header")]
+    IndexBeforeHeader { line: usize },
+
+    #[error("line {line}: {token:?} is not a 1-based atom index")]
+    InvalidIndex { line: usize, token: String },
+
+    #[error("line {line}: malformed group header {text:?}")]
+    InvalidHeader { line: usize, text: String },
+
+    #[error("no [ group ] headers in NDX")]
+    NoGroups,
+}
+
+/// GROMACS run-parameter file errors (#395). Each rejects the whole file,
+/// the same stance [`NdxError`] takes.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum MdpError {
+    #[error("line {line}: no '=' in {text:?}")]
+    MissingEquals { line: usize, text: String },
+
+    #[error("line {line}: parameter with no name")]
+    EmptyKey { line: usize },
+}
+
+/// Grace/XVG errors (#398). Each rejects the whole file, the same stance
+/// [`NdxError`] and [`MdpError`] take.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum XvgError {
+    #[error("line {line}: {token:?} is not a number")]
+    InvalidNumber { line: usize, token: String },
+
+    #[error("line {line}: {got} columns, but the first data row has {expected}")]
+    RaggedRow {
+        line: usize,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("line {line}: a second data set after '&' -- several sets are not one table")]
+    SecondDataSet { line: usize },
+
+    #[error("unsupported @TYPE {0:?}")]
+    UnsupportedType(String),
+
+    #[error("@TYPE {kind} has {expected} columns, but the data has {got}")]
+    TypeWidthMismatch {
+        kind: String,
+        expected: usize,
+        got: usize,
+    },
+}
+
+/// GROMACS energy file errors (#399). A layout this reader does not know is
+/// refused rather than guessed at: a wrong guess reads as plausible numbers.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum EdrError {
+    #[error("not a GROMACS energy file (first word {0})")]
+    NotEdr(i32),
+
+    #[error("EDR version {0} is not supported; only version 5 (GROMACS 4.6 and later) is read")]
+    UnsupportedVersion(i32),
+
+    #[error(
+        "first word {0}: either an EDR version 1 file (not supported; only version 5 is read) \
+         or not a GROMACS energy file"
+    )]
+    VersionOneOrNotEdr(i32),
+
+    #[error("frame {frame}: energy frame magic {found} is not -7777777")]
+    BadFrameMagic { frame: usize, found: i32 },
+
+    #[error("frame {frame}: {found} energy terms, but the file declares {expected}")]
+    TermCountMismatch {
+        frame: usize,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error(
+        "frame 0: energy size {e_size} fits neither single nor double precision for {nre} terms"
+    )]
+    UnknownPrecision { nre: usize, e_size: i32 },
+
+    #[error("frame {frame}: block data type {kind} is not read (only int, float, double, int64)")]
+    UnsupportedBlockType { frame: usize, kind: i32 },
+
+    #[error("frame {frame}: negative count in the frame header")]
+    NegativeCount { frame: usize },
+
+    #[error(transparent)]
+    Xdr(#[from] XdrError),
+}

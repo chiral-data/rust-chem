@@ -789,8 +789,69 @@ fn run(cli: &Cli) -> Result<i32> {
                         anyhow::anyhow!("{} cannot be written, only read", format.name())
                     })?;
                     write_all_bytes(&bytes, output.as_deref())?;
-                    // The one registered Table format has no optional
-                    // Carries flag beyond COLUMNS to lose (#338).
+                    // TABLE_METADATA (#398) is the one optional flag, and it
+                    // goes through the same report as every other kind's.
+                    // A pinned pair loss is named too: XVG and EDR both claim
+                    // metadata but not each other's (#399). MDP, XVG and EDR
+                    // also write only some columns, so the rest are named.
+                    write::report_kind_drop(format, format::held_from_table(&table));
+                    let lost = format::pair_loss(source_kind_format, format)
+                        & format::held_from_table(&table);
+                    if !lost.is_empty() {
+                        eprintln!(
+                            "{} also loses {}: {}",
+                            format.label(),
+                            lost.names().collect::<Vec<_>>().join(", "),
+                            format::pair_loss_reason(source_kind_format, format).unwrap_or("")
+                        );
+                    }
+                    if format == Format::XVG || format == Format::EDR {
+                        let dropped = chem::io::xvg::dropped_columns(&table);
+                        if !dropped.is_empty() {
+                            eprintln!(
+                                "{} discards column(s) {} (it writes only numeric columns)",
+                                format.label(),
+                                dropped.join(", ")
+                            );
+                        }
+                    }
+                    if format == Format::MDP {
+                        let dropped = chem::io::mdp::dropped_columns(&table);
+                        if !dropped.is_empty() {
+                            eprintln!(
+                                "{} discards column(s) {} (it writes only key, value, comment)",
+                                format.label(),
+                                dropped.join(", ")
+                            );
+                        }
+                        if table.num_rows() > 0 && table.column("key").is_none() {
+                            eprintln!(
+                                "{} has no key column, so no parameters were written",
+                                format.label()
+                            );
+                        }
+                    }
+                    eprintln!("converted 1, skipped 0");
+                    Ok(exit::OK)
+                }
+
+                (Kind::IndexGroups, Kind::IndexGroups) => {
+                    let Some(record) =
+                        read_one_record(source_kind_format, input.as_deref(), literal.as_deref())?
+                    else {
+                        return Ok(exit::NO_INPUT);
+                    };
+                    let Payload::IndexGroups(groups) = record.payload else {
+                        bail!(
+                            "internal error: {} did not produce index groups",
+                            source_kind_format.name()
+                        );
+                    };
+                    let bytes = format.write_index_groups_bytes(&groups).ok_or_else(|| {
+                        anyhow::anyhow!("{} cannot be written, only read", format.name())
+                    })?;
+                    write_all_bytes(&bytes, output.as_deref())?;
+                    // NDX has no optional Carries flag beyond GROUPS to lose.
                     eprintln!("converted 1, skipped 0");
                     Ok(exit::OK)
                 }
@@ -1175,7 +1236,9 @@ fn print_format_listing(query: &str) -> Result<()> {
 /// velocities, `N` forces (Newtons; `F` was already b_factor), `M` frame time
 /// (a moment; `T` was already topology), `L` a volume's sample values
 /// (levels), `E` mesh vertices (`V` was already velocities), `K` mesh faces,
-/// `Y` table columns (`C` was already formal charge).
+/// `Y` table columns (`C` was already formal charge). `J` is an index file's
+/// groups (#394); `G` was already stereo_group. `H` is a table's header
+/// metadata (#398).
 const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::TOPOLOGY, 'T', "topology"),
     (Carries::BONDS, 'B', "bonds"),
@@ -1200,6 +1263,8 @@ const MATRIX_LEGEND: &[(Carries, char, &str)] = &[
     (Carries::VERTICES, 'E', "vertices"),
     (Carries::FACES, 'K', "faces"),
     (Carries::COLUMNS, 'Y', "columns"),
+    (Carries::GROUPS, 'J', "groups"),
+    (Carries::TABLE_METADATA, 'H', "table_metadata"),
 ];
 
 /// `chem convert -L matrix` (#257) — what survives every registered conversion.

@@ -59,6 +59,16 @@ impl<'a> XdrReader<'a> {
         Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    /// GROMACS's `xdr_int64`: the high then the low 32 bits, which is an
+    /// 8-byte big-endian integer (#399).
+    pub(crate) fn read_i64(&mut self) -> Result<i64, XdrError> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
     /// RFC 1014's `xdr_opaque`: `len` raw bytes, zero-padded to a multiple
     /// of 4 — **no length of its own** on the wire. XTC's coordinate block
     /// calls exactly this (via `xdrfile_read_opaque`/`xdrfile_write_opaque`)
@@ -116,6 +126,15 @@ impl XdrWriter {
     }
 
     pub(crate) fn write_f32(&mut self, v: f32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    pub(crate) fn write_f64(&mut self, v: f64) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// See [`XdrReader::read_i64`].
+    pub(crate) fn write_i64(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
 

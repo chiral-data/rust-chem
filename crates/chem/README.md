@@ -1,6 +1,6 @@
 # chem
 
-Cheminformatics in Rust: molecules, SMILES and 29 other formats, Morgan
+Cheminformatics in Rust: molecules, SMILES and 32 other formats, Morgan
 fingerprints, Tanimoto similarity search, and 2D depiction — with optional GPU
 kernels and a command-line tool.
 
