@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.2] - 2026-09-25
+
+### Features
+
+- **GROMACS index files (`.ndx`) read and write** via a new `IndexGroups` core type — an ordered list of named atom-index groups, kept in file order with duplicates and empty groups preserved rather than normalised away. Indices convert from the file's 1-based convention to 0-based on read and back on write; nothing is validated against a structure, since an index file names none (#394)
+- **GROMACS run-parameter files (`.mdp`) read and write** as a `key`/`value`/`comment` table. Keys keep their file spelling; `mdp::parameter_name()` gives the identity `grompp` uses (lowercase, `-` treated as `_`), so `ref-t`, `ref_t` and `Ref-T` compare equal without rewriting the file. Values are kept verbatim and never type-inferred, so lists (`ref_t = 300 300`) and compiler flags (`define = -DPOSRES`) round-trip as text (#395)
+- **Grace time-series files (`.xvg`), as `gmx energy` and friends write them, read and write** as a table. `Table` gains ordered key/value metadata (`metadata()`, `metadata_value()`, `with_metadata()`) to hold XVG's title, axis labels and type — a shape EDR (#399) reuses — behind a new `Carries::TABLE_METADATA` flag. Legends become column names, and Grace escape codes are kept as written (#398)
+- **GROMACS binary energy files (`.edr`), version 5, read and write** as a table shaped like XVG's — time plus one column per energy term, with units and version in metadata. Versions 1–4 are refused by name rather than guessed at; a truncated final frame keeps every complete frame, the same as `gmx energy` (#399)
+
 ## [0.9.1] - 2026-09-24
 
 ### Features
