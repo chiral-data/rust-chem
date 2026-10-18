@@ -13,6 +13,9 @@
 //! [`MultiFrameMode::Molecules`](crate::io::options::MultiFrameMode::Molecules)
 //! later models get templates but no links.
 //!
+//! [`PdbReadOptions::perceive_bonds`] runs last, after `CONECT` and the
+//! templates: it bonds by distance only the pairs still unbonded (see below).
+//!
 //! Hydrogen counts follow from that. PDB names no count of its own, so an
 //! atom arrives with none, and
 //! [`Molecule::calculate_implicit_hydrogens`] cannot be used to fill it in:
@@ -24,6 +27,10 @@
 //! Before it, a fully-`CONECT`ed benzene wrote back as
 //! `[C]1[C][C][C][C][C]1` — six carbons stated to have no hydrogens, which is
 //! not the molecule the file described.
+//!
+//! With [`PdbReadOptions::perceive_bonds`] set, atom pairs `CONECT` left
+//! unbonded are bonded by distance ([`crate::core::perceive::perceive_bonds`])
+//! before that fill, so the perceived bonds count toward it too.
 //!
 //! `CRYST1`'s orientation convention already matches this crate's fixed
 //! [`crate::core::cell::UnitCell`] (its own doc comment: "the near-universal
@@ -55,6 +62,7 @@ use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
+use crate::core::perceive::perceive_bonds;
 use crate::core::residue::{Chain, Residue};
 use crate::core::residue_templates::{add_residue_template_bonds, bond_conformer_pairs};
 use crate::core::site::AtomSite;
@@ -431,6 +439,10 @@ pub fn parse_pdb_with_options(text: &str, options: &PdbReadOptions) -> Result<Mo
 
     if mol.num_atoms() == 0 {
         return Err(PdbError::NoAtoms);
+    }
+
+    if options.perceive_bonds {
+        perceive_bonds(&mut mol);
     }
 
     // Only where CONECT said what an atom is bonded to. The unguarded form
@@ -1081,5 +1093,30 @@ END
         assert_eq!(mol.num_bonds(), 0);
         let with_default = parse_pdb_with_options(&text, &PdbReadOptions::default()).unwrap();
         assert_eq!(write_pdb(&mol), write_pdb(&with_default));
+    }
+
+    #[test]
+    fn test_perception_keeps_a_conect_bond_once_and_fills_hydrogens_from_both() {
+        // O-H1 is stated; O-H2 is only perceived. A stated 2.9 Å O...O contact
+        // is far past any covalent cutoff and must survive as stated.
+        let text = "\
+HETATM    1  O   HOH A   1       0.000   0.000   0.000  1.00  0.00           O
+HETATM    2  H1  HOH A   1       0.759   0.000   0.504  1.00  0.00           H
+HETATM    3  H2  HOH A   1       0.759   0.000  -0.504  1.00  0.00           H
+HETATM    4  O   HOH A   2       2.900   0.000   0.000  1.00  0.00           O
+CONECT    1    2    4
+END
+";
+        let options = PdbReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let mol = parse_pdb_with_options(text, &options).unwrap();
+        let mut pairs: Vec<_> = mol.bonds().iter().map(|b| b.atoms()).collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(0, 1), (0, 2), (0, 3)]);
+        assert_eq!(mol.atom(0).hydrogens(), Some(0));
+
+        assert_eq!(parse_pdb(text).unwrap().num_bonds(), 2, "off by default");
     }
 }

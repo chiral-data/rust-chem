@@ -404,6 +404,12 @@ impl FrameSource for MoleculeFrames {
     }
 }
 
+/// Under [`MultiFrameMode::Frames`] only the first parsed frame becomes the
+/// topology, so later frames skip bond perception.
+fn perceive_frame(mode: MultiFrameMode, perceive: bool, parsed_so_far: usize) -> bool {
+    perceive && (mode == MultiFrameMode::Molecules || parsed_so_far == 0)
+}
+
 /// Builds a [`Trajectory`] from a file's already-independently-parsed
 /// frames (#330): the first molecule, stripped of its own coordinates and
 /// cell, becomes the shared topology (whatever it actually parsed — atoms,
@@ -554,7 +560,15 @@ pub fn read_xyz_with_options(content: &str, options: &ReadOptions) -> ReadOutcom
 
         let frame = all_lines[i..i + frame_len].join("\n");
         position += 1;
-        match crate::io::xyz::parse_xyz(&frame) {
+        let xyz = crate::io::options::XyzReadOptions {
+            perceive_bonds: perceive_frame(
+                options.xyz.multi_frame,
+                options.xyz.perceive_bonds,
+                molecules.len(),
+            ),
+            ..options.xyz
+        };
+        match crate::io::xyz::parse_xyz_with_options(&frame, &xyz) {
             Ok(molecule) => molecules.push((position, molecule)),
             Err(e) => skipped.push(Skipped {
                 position,
@@ -615,7 +629,15 @@ fn push_pdb_record(
     options: &ReadOptions,
 ) {
     let record = lines.join("\n");
-    match crate::io::pdb::parse_pdb_with_options(&record, &options.pdb) {
+    let pdb = crate::io::options::PdbReadOptions {
+        perceive_bonds: perceive_frame(
+            options.pdb.multi_frame,
+            options.pdb.perceive_bonds,
+            molecules.len(),
+        ),
+        ..options.pdb
+    };
+    match crate::io::pdb::parse_pdb_with_options(&record, &pdb) {
         Ok(molecule) => molecules.push((position, molecule)),
         Err(e) => skipped.push(Skipped {
             position,
@@ -1171,7 +1193,15 @@ pub fn read_gro_with_options(content: &str, options: &ReadOptions) -> ReadOutcom
 
         let frame = all_lines[i..i + frame_len].join("\n");
         position += 1;
-        match crate::io::gro::parse_gro(&frame) {
+        let gro = crate::io::options::GroReadOptions {
+            perceive_bonds: perceive_frame(
+                options.gro.multi_frame,
+                options.gro.perceive_bonds,
+                molecules.len(),
+            ),
+            ..options.gro
+        };
+        match crate::io::gro::parse_gro_with_options(&frame, &gro) {
             Ok(molecule) => molecules.push((position, molecule)),
             Err(e) => skipped.push(Skipped {
                 position,
@@ -1713,6 +1743,7 @@ H 2.0 0.0 0.0
         let options = ReadOptions {
             xyz: crate::io::options::XyzReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };
@@ -1742,11 +1773,54 @@ H 2.0 0.0 0.0
         let options = ReadOptions {
             xyz: crate::io::options::XyzReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };
         let outcome = read_xyz_with_options("", &options);
         assert!(outcome.records.is_empty());
         assert_eq!(outcome.skipped.len(), 1);
+    }
+
+    const TWO_WATER_FRAMES: &str = "3\nw\nO 0.0 0.0 0.0\nH 0.757 0.586 0.0\nH -0.757 0.586 0.0\n\
+        3\nw\nO 0.0 0.0 0.1\nH 0.757 0.586 0.1\nH -0.757 0.586 0.1\n";
+
+    #[test]
+    fn test_xyz_perception_applies_to_every_molecule_record() {
+        let options = ReadOptions {
+            xyz: crate::io::options::XyzReadOptions {
+                perceive_bonds: true,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        };
+        let outcome = read_xyz_with_options(TWO_WATER_FRAMES, &options);
+        assert_eq!(outcome.records.len(), 2);
+        for record in &outcome.records {
+            assert_eq!(record.molecule().unwrap().num_bonds(), 2);
+        }
+    }
+
+    #[test]
+    fn test_xyz_frames_mode_perceives_the_shared_topology() {
+        let options = ReadOptions {
+            xyz: crate::io::options::XyzReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                perceive_bonds: true,
+            },
+            ..ReadOptions::default()
+        };
+        let outcome = read_xyz_with_options(TWO_WATER_FRAMES, &options);
+        let trajectory = outcome.records[0].trajectory().unwrap();
+        assert_eq!(trajectory.topology().num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_only_the_first_frame_is_perceived_under_frames_mode() {
+        use MultiFrameMode::{Frames, Molecules};
+        assert!(perceive_frame(Frames, true, 0));
+        assert!(!perceive_frame(Frames, true, 1));
+        assert!(perceive_frame(Molecules, true, 5));
+        assert!(!perceive_frame(Molecules, false, 0));
     }
 }

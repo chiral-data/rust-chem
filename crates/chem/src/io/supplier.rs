@@ -843,7 +843,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
 pub struct XyzSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> XyzSupplier<R> {
@@ -851,7 +851,7 @@ impl<R: BufRead> XyzSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -914,7 +914,7 @@ impl<R: BufRead> Iterator for XyzSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::xyz::parse_xyz(&frame)
+            crate::io::xyz::parse_xyz_with_options(&frame, &self.options.xyz)
                 .map(|molecule| {
                     let name = molecule
                         .name()
@@ -1403,7 +1403,7 @@ impl<W: Write> Writer for PdbqtWriter<W> {
 pub struct GroSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> GroSupplier<R> {
@@ -1411,7 +1411,7 @@ impl<R: BufRead> GroSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -1490,7 +1490,7 @@ impl<R: BufRead> Iterator for GroSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::gro::parse_gro(&frame)
+            crate::io::gro::parse_gro_with_options(&frame, &self.options.gro)
                 .map(|molecule| {
                     let name = molecule
                         .name()
@@ -2025,5 +2025,17 @@ mod tests {
 
         let back = crate::io::reader::read(&out, crate::io::format::Format::PDBQT);
         assert_eq!(back.records.len(), 3, "{out}");
+    }
+
+    #[test]
+    fn test_xyz_supplier_perceives_bonds_when_asked() {
+        let text = "3\nw\nO 0.0 0.0 0.0\nH 0.757 0.586 0.0\nH -0.757 0.586 0.0\n";
+        let mut options = options();
+        options.xyz.perceive_bonds = true;
+        let record = XyzSupplier::new(Cursor::new(text), &options)
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.molecule().unwrap().num_bonds(), 2);
     }
 }

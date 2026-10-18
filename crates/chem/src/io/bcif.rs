@@ -1184,4 +1184,18 @@ mod tests {
         assert!(mol.graph().has_edge(2, 4));
         assert_eq!(mol.num_bonds(), 2);
     }
+
+    #[test]
+    fn test_perception_reaches_binarycif_through_the_shared_builder() {
+        let bytes = encode_bcif(&[("x".to_string(), ethanol_like())]);
+        let off = decode_bcif(&bytes, &MmcifReadOptions::default()).unwrap();
+        assert_eq!(off[0].1.num_bonds(), 0);
+        let options = MmcifReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let on = decode_bcif(&bytes, &options).unwrap();
+        assert_eq!(on[0].1.num_bonds(), 2);
+        assert_eq!(on[0].1.atom(0).hydrogens(), Some(3));
+    }
 }

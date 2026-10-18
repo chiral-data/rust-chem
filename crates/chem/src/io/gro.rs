@@ -58,16 +58,23 @@
 //! [`crate::io::supplier::GroSupplier`]), the same division every prior
 //! format has; this module parses and writes exactly one already-isolated
 //! frame.
+//!
+//! **No bonds**: those live in the topology (`.top`), not here, unless
+//! [`GroReadOptions::perceive_bonds`] is set, which bonds atoms by distance
+//! ([`crate::core::perceive::perceive_bonds`]). Distances ignore the periodic
+//! box, so a molecule split across it stays split.
 
 use crate::core::atom::{Atom, Element};
 use crate::core::cell::UnitCell;
 use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
+use crate::core::perceive::perceive_bonds;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
 use crate::core::units::NM_TO_ANGSTROM;
 use crate::io::errors::GroError;
+use crate::io::options::GroReadOptions;
 
 fn element_from_symbol(sym: &str) -> Option<Element> {
     let sym = sym.trim();
@@ -190,6 +197,16 @@ fn cell_from_box_vectors(v1: Point3, v2: Point3, v3: Point3) -> UnitCell {
         angle_degrees(v1, v3),
         angle_degrees(v1, v2),
     )
+}
+
+/// [`parse_gro`] with GRO's own read options.
+pub fn parse_gro_with_options(text: &str, options: &GroReadOptions) -> Result<Molecule, GroError> {
+    let mut mol = parse_gro(text)?;
+    if options.perceive_bonds {
+        perceive_bonds(&mut mol);
+        mol.calculate_implicit_hydrogens_where_bonded();
+    }
+    Ok(mol)
 }
 
 /// Parses one GRO frame (a title line, a count line, that many atom
@@ -665,5 +682,17 @@ zeroed
         // are not, so it is a measurement and must survive untouched.
         let mol = parse_gro(WATER_GRO).expect("valid GRO");
         assert!(mol.has_coords3());
+    }
+
+    #[test]
+    fn test_perception_bonds_a_water_when_asked() {
+        assert_eq!(parse_gro(WATER_GRO).unwrap().num_bonds(), 0);
+        let options = GroReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let mol = parse_gro_with_options(WATER_GRO, &options).unwrap();
+        assert_eq!(mol.num_bonds(), 2);
+        assert_eq!(mol.atom(0).hydrogens(), Some(0));
     }
 }

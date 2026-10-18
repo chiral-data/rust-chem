@@ -27,6 +27,10 @@
 //! names but the residue lacks are skipped. BinaryCIF reads the same way.
 //! Neither writer emits `_chem_comp_bond`, so bonds don't survive a write.
 //!
+//! [`MmcifReadOptions::perceive_bonds`](crate::io::options::MmcifReadOptions::perceive_bonds)
+//! runs last: it bonds by distance ([`crate::core::perceive::perceive_bonds`])
+//! only the pairs no step above bonded.
+//!
 //! **Grammar subset**: bare (whitespace-delimited) tokens, single- and
 //! double-quoted tokens. Multi-line semicolon (`;...;`) text fields are
 //! **not** parsed — real files never need one inside `_atom_site`/`_cell`/
@@ -579,5 +583,59 @@ covale2 covale A 1 SG A 3 A 3 ND2 A 60 1_555 2_555
         let mol = parse_mmcif(LINKED_MMCIF).expect("reads");
         assert_eq!(mol.num_bonds(), 0);
         assert!(mol.atoms().iter().all(|a| a.hydrogens().is_none()));
+    }
+
+    #[test]
+    fn test_perception_after_templates_refills_the_hydrogens_it_changes() {
+        // A ligand carbon 1.53 Å past an alanine's CB, with no stated link:
+        // templates bond the alanine, perception adds CB-C1, and the one
+        // hydrogen fill must see both, leaving CB a CH2 rather than a CH3.
+        let text = "\
+data_tethered
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N N ALA A 1 9 A 5.606 4.546 11.941
+ATOM 2 C CA ALA A 1 9 A 5.598 5.767 11.082
+ATOM 3 C C ALA A 1 9 A 6.441 5.527 9.850
+ATOM 4 O O ALA A 1 9 A 6.052 5.933 8.744
+ATOM 5 C CB ALA A 1 9 A 6.022 6.977 11.891
+HETATM 6 C C1 LIG B . 101 A 6.450 8.198 12.707
+";
+        let read = |perceive_bonds| {
+            let options = MmcifReadOptions {
+                residue_templates: true,
+                perceive_bonds,
+                ..Default::default()
+            };
+            parse_mmcif_with_options(text, &options).unwrap()
+        };
+        let (templates, both) = (read(false), read(true));
+        assert_eq!(templates.atom(4).hydrogens(), Some(3));
+        assert!(both.graph().has_edge(4, 5));
+        assert_eq!(both.atom(4).hydrogens(), Some(2));
+        assert_eq!(both.atom(5).hydrogens(), Some(3));
+    }
+
+    #[test]
+    fn test_perception_bonds_a_water_when_asked() {
+        assert_eq!(parse_mmcif(WATER_MMCIF).unwrap().num_bonds(), 0);
+        let options = MmcifReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let mol = parse_mmcif_with_options(WATER_MMCIF, &options).unwrap();
+        assert_eq!(mol.num_bonds(), 2);
+        assert_eq!(mol.atom(0).hydrogens(), Some(0));
     }
 }
