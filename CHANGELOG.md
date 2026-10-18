@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.3] - 2026-10-18
+
+### Features
+
+- **A protein from PDB or mmCIF can arrive bonded, from standard-residue templates.** `residue_templates` on `PdbReadOptions` and `MmcifReadOptions` bonds the 20 amino acids (plus HID/HIE/HIP, MSE and terminal OXT) and the RNA/DNA nucleotides by atom name, with Kekulé orders, from a built-in table in `core::residue_templates`. Consecutive residues get their peptide or phosphodiester bond only within 2.0 Å, so a chain break stays a break, and atoms in different alternate locations are never bonded. Disulfides and covalent links come from what the file states: `SSBOND`/`LINK` for PDB, `_struct_conn` for mmCIF and BinaryCIF. Metal coordination, hydrogen bonds and links to a symmetry mate are left out (#403)
+- **A ligand in a `.cif` gets the bonds the file already gives it.** `chem_comp_bonds` on `MmcifReadOptions` bonds every residue whose name has `_chem_comp_bond` rows, by atom name within that residue, with the stated orders. Atoms the table names but the file leaves out are skipped. BinaryCIF reads the same way (#406)
+- **Bond perception from covalent radii, for files that state no connectivity.** `core::perceive::perceive_bonds` adds a single bond between atoms closer than r₁ + r₂ + 0.4 Å (Cordero radii), on a spatial grid so 100k atoms take milliseconds. It never bonds H–H, atoms without a radius, or different alternate locations of one site, and gives each hydrogen at most one bond. `perceive_bonds` on the XYZ, PDB, GRO and mmCIF read options runs it after every stated source, so a stated bond and its order are never overwritten (#405)
+- **An mmCIF or BinaryCIF NMR ensemble reads as frames, like the same ensemble in PDB.** `multi_frame` on `MmcifReadOptions` returns a block with several `pdbx_PDB_model_num` values as one `Payload::Frames` record: the first model is the topology, with one frame per model. A later model must match the first atom for atom, or it is reported in `skipped` with the reason. In the default mode, the models that aren't read are now reported in `skipped` instead of vanishing (#404)
+
+All four bond options are off by default, so existing reads are unchanged. When several are on, they apply in a fixed order: the file's own `CONECT`, then templates and links, then `_chem_comp_bond`, then perception. Each adds only pairs not yet bonded, and hydrogen counts are filled once, after the last.
+
+### Bug Fixes
+
+- **A multi-model PDB no longer reports the text after its last `ENDMDL` as a structure.** A wwPDB ensemble's closing `MASTER`/`END` lines were read as one more record and reported as `No atoms in PDB`. PDBQT had the same problem with a trailing `END` (#411)
+- **`CONECT` records after the last `ENDMDL` now reach every model.** wwPDB writes one `CONECT` block for all models after the final `ENDMDL`. It was read as a structure of its own and failed with `CONECT references unknown atom serial`, so no model got those bonds. The reader now applies them to each model, failing only a model that lacks a named atom. The streaming `PdbSupplier` drops the block without applying it, because applying it would mean buffering every model (#412)
+- **Building a molecule was quadratic in its atom count: `Molecule::add_atom` rebuilt the whole bond graph on every call.** It now grows the graph by one node (`MoleculeGraph::add_node`). Reading a 107,811-atom `.gro` went from 29.3 s to 0.03 s, with byte-identical output (#413)
+
 ## [0.9.2] - 2026-09-25
 
 ### Features
