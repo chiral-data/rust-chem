@@ -127,6 +127,127 @@ pub(crate) fn group_into_chains_and_residues(keys: &[ResidueKey]) -> (Vec<Chain>
     (chains, residues)
 }
 
+/// One later model of an NMR ensemble (#404): its `pdbx_PDB_model_num`, and
+/// its positions in the first model's atom order, or why it was rejected.
+pub(crate) struct LaterModel {
+    pub(crate) number: String,
+    pub(crate) positions: Result<Vec<Point3>, String>,
+}
+
+/// A block's first model as a [`Molecule`], plus every later model.
+pub(crate) struct CifModels {
+    pub(crate) molecule: Molecule,
+    pub(crate) later: Vec<LaterModel>,
+}
+
+/// [`build_molecule`] over the first `pdbx_PDB_model_num` only, with every
+/// later model checked against it (#404). Topology and bonds come from the
+/// first model alone, so a later model contributes nothing but positions.
+pub(crate) fn build_models(
+    singles: &HashMap<String, String>,
+    atom_site: Option<(&[String], &[Vec<String>])>,
+    loops: &CifLoops,
+    options: &MmcifReadOptions,
+) -> Result<CifModels, MmcifError> {
+    let Some((tags, rows)) = atom_site else {
+        let molecule = build_molecule(singles, None, loops, options)?;
+        return Ok(CifModels {
+            molecule,
+            later: Vec::new(),
+        });
+    };
+
+    let groups = group_rows_by_model(tags, rows);
+    if groups.len() <= 1 {
+        let molecule = build_molecule(singles, Some((tags, rows)), loops, options)?;
+        return Ok(CifModels {
+            molecule,
+            later: Vec::new(),
+        });
+    }
+
+    let first: Vec<Vec<String>> = groups[0].1.iter().map(|&i| rows[i].clone()).collect();
+    let molecule = build_molecule(singles, Some((tags, &first)), loops, options)?;
+    let later = groups[1..]
+        .iter()
+        .map(|(number, indices)| {
+            let model: Vec<&Vec<String>> = indices.iter().map(|&i| &rows[i]).collect();
+            LaterModel {
+                number: number.clone(),
+                positions: later_model_positions(tags, &first, &model, &groups[0].0),
+            }
+        })
+        .collect();
+    Ok(CifModels { molecule, later })
+}
+
+/// Row indices per model number, models in order of first appearance; one
+/// group when the column is absent.
+fn group_rows_by_model(tags: &[String], rows: &[Vec<String>]) -> Vec<(String, Vec<usize>)> {
+    let Some(col) = find_tag(tags, "_atom_site.pdbx_PDB_model_num") else {
+        return vec![(String::new(), (0..rows.len()).collect())];
+    };
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let number = row.get(col).map(String::as_str).unwrap_or("");
+        match groups.iter_mut().find(|(n, _)| n == number) {
+            Some((_, indices)) => indices.push(i),
+            None => groups.push((number.to_string(), vec![i])),
+        }
+    }
+    groups
+}
+
+/// A later model's positions, provided every atom matches the first model's
+/// on element, atom name, residue name, chain, sequence number and alt_loc.
+/// Stricter than PDB's count-only check because mmCIF rows state identity.
+fn later_model_positions(
+    tags: &[String],
+    first: &[Vec<String>],
+    model: &[&Vec<String>],
+    first_number: &str,
+) -> Result<Vec<Point3>, String> {
+    if model.len() != first.len() {
+        return Err(format!(
+            "{} atoms where model {first_number} has {}",
+            model.len(),
+            first.len()
+        ));
+    }
+
+    let tag = |suffix: &str| find_tag(tags, &format!("_atom_site.{suffix}"));
+    let identity_cols = [
+        tag("type_symbol"),
+        tag("label_atom_id"),
+        tag("auth_comp_id").or(tag("label_comp_id")),
+        tag("auth_asym_id").or(tag("label_asym_id")),
+        tag("auth_seq_id").or(tag("label_seq_id")),
+        tag("label_alt_id"),
+    ];
+    let identity =
+        |row: &[String]| identity_cols.map(|idx| cif_value(row, idx).unwrap_or("").to_string());
+    let xyz = [tag("Cartn_x"), tag("Cartn_y"), tag("Cartn_z")];
+
+    let mut positions = Vec::with_capacity(model.len());
+    for (i, (expected, row)) in first.iter().zip(model).enumerate() {
+        let (want, got) = (identity(expected), identity(row));
+        if want != got {
+            return Err(format!(
+                "atom {} is {} where model {first_number} has {}",
+                i + 1,
+                got.join(" ").trim(),
+                want.join(" ").trim()
+            ));
+        }
+        let [x, y, z] = xyz.map(|idx| idx.and_then(|c| row.get(c)?.parse::<f64>().ok()));
+        let (Some(x), Some(y), Some(z)) = (x, y, z) else {
+            return Err(format!("atom {} has no readable coordinates", i + 1));
+        };
+        positions.push(Point3::new(x, y, z));
+    }
+    Ok(positions)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_atom_site_loop(
     tags: &[String],
@@ -161,19 +282,8 @@ fn read_atom_site_loop(
     })?;
     let occupancy = tag("occupancy");
     let b_iso = tag("B_iso_or_equiv");
-    let model_num = tag("pdbx_PDB_model_num");
-
-    // A varying pdbx_PDB_model_num is mmCIF's NMR-ensemble convention --
-    // only the first model's rows are read, see `mmcif`'s module doc.
-    let first_model = model_num.and_then(|idx| rows.first().and_then(|r| r.get(idx).cloned()));
 
     for row in rows {
-        if let (Some(idx), Some(first)) = (model_num, &first_model)
-            && row.get(idx).is_some_and(|m| m != first)
-        {
-            continue;
-        }
-
         let is_hetero = group_pdb
             .and_then(|idx| row.get(idx))
             .is_some_and(|g| g.eq_ignore_ascii_case("HETATM"));
@@ -530,6 +640,7 @@ mod tests {
 
     const ON: MmcifReadOptions = MmcifReadOptions {
         chem_comp_bonds: true,
+        multi_frame: crate::io::options::MultiFrameMode::Molecules,
     };
 
     /// An mmCIF block with the given `_chem_comp_bond` rows and

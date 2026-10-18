@@ -1,0 +1,46 @@
+data_nmr_ensemble
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.auth_comp_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.pdbx_PDB_model_num
+ATOM 1 N N . GLY A 1 A GLY . -1.195 0.346 -0.120 1.00 0.00 1
+ATOM 2 C CA . GLY A 1 A GLY . 0.000 1.180 0.000 1.00 0.00 1
+ATOM 3 C C . GLY A 1 A GLY . 1.250 0.320 0.010 1.00 0.00 1
+ATOM 4 O O . GLY A 1 A GLY . 1.230 -0.910 0.050 1.00 0.00 1
+ATOM 5 N N . ALA A 2 A ALA . 2.410 0.970 -0.030 1.00 0.00 1
+ATOM 6 C CA . ALA A 2 A ALA . 3.700 0.300 -0.020 1.00 0.00 1
+ATOM 7 C C . ALA A 2 A ALA . 4.850 1.300 0.100 1.00 0.00 1
+ATOM 8 O O . ALA A 2 A ALA . 4.660 2.510 0.180 1.00 0.00 1
+ATOM 9 C CB . ALA A 2 A ALA . 3.850 -0.560 -1.270 1.00 0.00 1
+ATOM 10 N N . GLY A 1 A GLY . -1.085 0.276 -0.070 1.00 0.00 2
+ATOM 11 C CA . GLY A 1 A GLY . 0.120 1.100 0.050 1.00 0.00 2
+ATOM 12 C C . GLY A 1 A GLY . 1.380 0.230 0.060 1.00 0.00 2
+ATOM 13 O O . GLY A 1 A GLY . 1.340 -0.980 0.100 1.00 0.00 2
+ATOM 14 N N . ALA A 2 A ALA . 2.530 0.890 0.020 1.00 0.00 2
+ATOM 15 C CA . ALA A 2 A ALA . 3.830 0.210 0.030 1.00 0.00 2
+ATOM 16 C C . ALA A 2 A ALA . 4.960 1.230 0.150 1.00 0.00 2
+ATOM 17 O O . ALA A 2 A ALA . 4.780 2.430 0.230 1.00 0.00 2
+ATOM 18 C CB . ALA A 2 A ALA . 3.980 -0.650 -1.220 1.00 0.00 2
+ATOM 19 N N . GLY A 1 A GLY . -1.365 0.476 -0.190 1.00 0.00 3
+ATOM 20 C CA . GLY A 1 A GLY . -0.150 1.290 -0.070 1.00 0.00 3
+ATOM 21 C C . GLY A 1 A GLY . 1.120 0.410 -0.060 1.00 0.00 3
+ATOM 22 O O . GLY A 1 A GLY . 1.060 -0.780 -0.020 1.00 0.00 3
+ATOM 23 N N . ALA A 2 A ALA . 2.260 1.080 -0.100 1.00 0.00 3
+ATOM 24 C CA . ALA A 2 A ALA . 3.570 0.390 -0.090 1.00 0.00 3
+ATOM 25 C C . ALA A 2 A ALA . 4.680 1.430 0.030 1.00 0.00 3
+ATOM 26 O O . ALA A 2 A ALA . 4.510 2.620 0.110 1.00 0.00 3
+ATOM 27 C CB . ALA A 2 A ALA . 3.720 -0.470 -1.340 1.00 0.00 3

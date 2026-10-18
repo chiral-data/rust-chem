@@ -46,11 +46,11 @@ use std::collections::HashMap;
 use std::io::BufRead;
 
 use crate::core::molecule::Molecule;
-use crate::io::cif_model::{self, AtomSiteRows, CifLoops, RowPrecision};
+use crate::io::cif_model::{self, AtomSiteRows, CifLoops, CifModels, RowPrecision};
 use crate::io::errors::{BcifError, ReadError};
 use crate::io::msgpack::{self, Value};
 use crate::io::options::{MmcifReadOptions, ReadOptions, WriteOptions};
-use crate::io::reader::{Payload, ReadOutcome, Record, Skipped};
+use crate::io::reader::{Payload, ReadOutcome, Record, Skipped, push_cif_models};
 
 /// One decoded column, at whatever stage the encoding chain has reached.
 ///
@@ -360,11 +360,22 @@ fn decode_column(col: &Value) -> Result<Vec<Option<String>>, BcifError> {
 }
 
 /// Decodes a whole BinaryCIF document into one `(name, Molecule)` per data
-/// block.
+/// block, each block's first model only.
 pub(crate) fn decode_bcif(
     bytes: &[u8],
     options: &MmcifReadOptions,
 ) -> Result<Vec<(String, Molecule)>, BcifError> {
+    Ok(decode_bcif_models(bytes, options)?
+        .into_iter()
+        .map(|(name, models)| (name, models.molecule))
+        .collect())
+}
+
+/// [`decode_bcif`] keeping every block's later models (#404).
+fn decode_bcif_models(
+    bytes: &[u8],
+    options: &MmcifReadOptions,
+) -> Result<Vec<(String, CifModels)>, BcifError> {
     let top = msgpack::decode(bytes)?;
     let blocks = top
         .map_get("dataBlocks")
@@ -438,7 +449,7 @@ pub(crate) fn decode_bcif(
             }
         }
 
-        let molecule = cif_model::build_molecule(
+        let models = cif_model::build_models(
             &singles,
             atom_site
                 .as_ref()
@@ -451,7 +462,7 @@ pub(crate) fn decode_bcif(
         } else {
             header
         };
-        out.push((name, molecule));
+        out.push((name, models));
     }
     Ok(out)
 }
@@ -723,14 +734,10 @@ pub(crate) fn encode_bcif(records: &[(String, Molecule)]) -> Vec<u8> {
 /// [`crate::io::format::ByteReadFn`] for BinaryCIF.
 pub(crate) fn read_bcif_with_options(bytes: &[u8], options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
-    match decode_bcif(bytes, &options.mmcif) {
-        Ok(records) => {
-            for (name, molecule) in records {
-                out.records.push(Record {
-                    payload: Payload::Molecule(molecule),
-                    name,
-                    smiles: None,
-                });
+    match decode_bcif_models(bytes, &options.mmcif) {
+        Ok(blocks) => {
+            for (i, (name, models)) in blocks.into_iter().enumerate() {
+                push_cif_models(&mut out, options.mmcif.multi_frame, i + 1, name, models);
             }
         }
         Err(e) => out.skipped.push(Skipped {
@@ -1029,6 +1036,7 @@ mod tests {
         let cif = include_str!("../../tests/corpus/mmcif/dipeptide-with-ligand.cif");
         let options = MmcifReadOptions {
             chem_comp_bonds: true,
+            ..Default::default()
         };
         let from_text = crate::io::mmcif::parse_mmcif_with_options(cif, &options).unwrap();
 
@@ -1081,5 +1089,45 @@ mod tests {
             bonds(&from_text),
             vec![((6, 7), crate::core::bond::BondOrder::Double)]
         );
+    }
+
+    #[test]
+    fn test_an_nmr_ensemble_reads_the_same_as_its_mmcif_twin() {
+        // Written by `generate_nmr_ensemble.py`, not this crate's encoder.
+        let bytes = include_bytes!("../../tests/corpus/bcif/nmr-ensemble.bcif");
+        let cif = include_str!("../../tests/corpus/mmcif/nmr-ensemble.cif");
+
+        let default = read_bcif_with_options(bytes, &ReadOptions::default());
+        assert_eq!(default.records.len(), 1);
+        assert_eq!(default.records[0].name, "nmr_ensemble");
+        let errors: Vec<&str> = default.skipped.iter().map(|s| s.error.as_str()).collect();
+        assert_eq!(
+            errors,
+            crate::io::reader::read_mmcif(cif)
+                .skipped
+                .iter()
+                .map(|s| s.error.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let mut options = ReadOptions::default();
+        options.mmcif.multi_frame = crate::io::options::MultiFrameMode::Frames;
+        let trajectory = |outcome: ReadOutcome| match outcome.records.into_iter().next() {
+            Some(Record {
+                payload: Payload::Frames(t),
+                ..
+            }) => t,
+            _ => panic!("expected one Payload::Frames record"),
+        };
+        let mut from_bcif = trajectory(read_bcif_with_options(bytes, &options));
+        let mut from_cif = trajectory(crate::io::reader::read_mmcif_with_options(cif, &options));
+        assert_eq!(from_bcif.frame_count(), 3);
+        assert_eq!(from_bcif.frame_count(), from_cif.frame_count());
+        for i in 0..3 {
+            assert_eq!(
+                from_bcif.frame(i).unwrap().positions,
+                from_cif.frame(i).unwrap().positions
+            );
+        }
     }
 }
