@@ -1021,4 +1021,65 @@ mod tests {
         assert_eq!(water[0].1.num_atoms(), 3);
         assert!(water[0].1.cell().is_none());
     }
+
+    #[test]
+    fn test_chem_comp_bonds_read_the_same_as_from_mmcif() {
+        // The committed twin lacks the loop (the writer never emits it), so
+        // it is appended here as a string-encoded category.
+        let cif = include_str!("../../tests/corpus/mmcif/dipeptide-with-ligand.cif");
+        let options = MmcifReadOptions {
+            chem_comp_bonds: true,
+        };
+        let from_text = crate::io::mmcif::parse_mmcif_with_options(cif, &options).unwrap();
+
+        let rows: Vec<Vec<String>> = cif
+            .lines()
+            .filter(|l| l.starts_with("LIG C1"))
+            .map(|l| l.split_whitespace().map(str::to_string).collect())
+            .collect();
+        let columns = ["comp_id", "atom_id_1", "atom_id_2", "value_order"]
+            .iter()
+            .enumerate()
+            .map(|(ci, col)| {
+                let values: Vec<String> = rows.iter().map(|r| r[ci].clone()).collect();
+                encode_column(col, &values, ColumnEncoding::Str)
+            })
+            .collect();
+        let chem_comp_bond = Value::map(vec![
+            ("name", Value::str("_chem_comp_bond")),
+            ("rowCount", Value::Int(rows.len() as i64)),
+            ("columns", Value::Array(columns)),
+        ]);
+
+        let top = msgpack::decode(include_bytes!(
+            "../../tests/corpus/bcif/dipeptide-with-ligand.bcif"
+        ))
+        .unwrap();
+        let block = &top.map_get("dataBlocks").unwrap().as_array().unwrap()[0];
+        let mut categories = block
+            .map_get("categories")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .to_vec();
+        categories.insert(0, chem_comp_bond);
+        let doc = Value::map(vec![(
+            "dataBlocks",
+            Value::Array(vec![Value::map(vec![
+                ("header", Value::str("dipeptide")),
+                ("categories", Value::Array(categories)),
+            ])]),
+        )]);
+        let from_binary = decode_bcif(&msgpack::encode(&doc), &options).unwrap();
+        let from_binary = &from_binary[0].1;
+
+        let bonds = |mol: &Molecule| -> Vec<_> {
+            mol.bonds().iter().map(|b| (b.atoms(), b.order())).collect()
+        };
+        assert_eq!(bonds(&from_text), bonds(from_binary));
+        assert_eq!(
+            bonds(&from_text),
+            vec![((6, 7), crate::core::bond::BondOrder::Double)]
+        );
+    }
 }
