@@ -3,8 +3,8 @@
 //!
 //! Both formats describe the same thing: a `singles` map of one-off
 //! `_category.item value` pairs (`_cell.length_a`, `_symmetry.space_group_
-//! name_H-M`, ...) and, for the one loop this crate reads, an `_atom_site`
-//! table as parallel `tags`/`rows`. mmCIF text tokenizes lines into that
+//! name_H-M`, ...), an `_atom_site` table as parallel `tags`/`rows`, and
+//! every other loop in the block, by category, in the same shape. mmCIF text tokenizes lines into that
 //! shape; BinaryCIF decodes MessagePack categories/columns into the same
 //! shape (see `bcif::decode_bcif`). Everything below this line — turning
 //! that shape into a [`Molecule`] and back — used to live inside
@@ -15,18 +15,32 @@
 use std::collections::HashMap;
 
 use crate::core::atom::{Atom, Element};
+use crate::core::bond::{Bond, BondOrder};
 use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
+use crate::core::perceive::perceive_bonds;
 use crate::core::residue::{Chain, Residue};
+use crate::core::residue_templates::{add_residue_template_bonds, bond_conformer_pairs};
 use crate::core::site::AtomSite;
 use crate::io::errors::MmcifError;
+use crate::io::options::MmcifReadOptions;
 
 /// An `_atom_site` table: one CIF tag per column, one row per atom -- the
 /// shape both mmCIF text and BinaryCIF decode into before
 /// [`build_molecule`] ever runs.
 pub(crate) type AtomSiteRows = (Vec<String>, Vec<Vec<String>>);
+
+/// Every other loop in the block (`_struct_conn`, `_chem_comp_bond`, ...),
+/// keyed by its lower-cased category name, in the same tags/rows shape.
+pub(crate) type CifLoops = HashMap<String, AtomSiteRows>;
+
+/// The category a CIF tag belongs to, lower-cased: `_struct_conn.id` →
+/// `_struct_conn`.
+pub(crate) fn category_of(tag: &str) -> String {
+    tag.split('.').next().unwrap_or(tag).to_ascii_lowercase()
+}
 
 /// `.` and `?` both mean "not provided" for an optional CIF value.
 pub(crate) fn cif_value(row: &[String], idx: Option<usize>) -> Option<&str> {
@@ -115,6 +129,127 @@ pub(crate) fn group_into_chains_and_residues(keys: &[ResidueKey]) -> (Vec<Chain>
     (chains, residues)
 }
 
+/// One later model of an NMR ensemble (#404): its `pdbx_PDB_model_num`, and
+/// its positions in the first model's atom order, or why it was rejected.
+pub(crate) struct LaterModel {
+    pub(crate) number: String,
+    pub(crate) positions: Result<Vec<Point3>, String>,
+}
+
+/// A block's first model as a [`Molecule`], plus every later model.
+pub(crate) struct CifModels {
+    pub(crate) molecule: Molecule,
+    pub(crate) later: Vec<LaterModel>,
+}
+
+/// [`build_molecule`] over the first `pdbx_PDB_model_num` only, with every
+/// later model checked against it (#404). Topology and bonds come from the
+/// first model alone, so a later model contributes nothing but positions.
+pub(crate) fn build_models(
+    singles: &HashMap<String, String>,
+    atom_site: Option<(&[String], &[Vec<String>])>,
+    loops: &CifLoops,
+    options: &MmcifReadOptions,
+) -> Result<CifModels, MmcifError> {
+    let Some((tags, rows)) = atom_site else {
+        let molecule = build_molecule(singles, None, loops, options)?;
+        return Ok(CifModels {
+            molecule,
+            later: Vec::new(),
+        });
+    };
+
+    let groups = group_rows_by_model(tags, rows);
+    if groups.len() <= 1 {
+        let molecule = build_molecule(singles, Some((tags, rows)), loops, options)?;
+        return Ok(CifModels {
+            molecule,
+            later: Vec::new(),
+        });
+    }
+
+    let first: Vec<Vec<String>> = groups[0].1.iter().map(|&i| rows[i].clone()).collect();
+    let molecule = build_molecule(singles, Some((tags, &first)), loops, options)?;
+    let later = groups[1..]
+        .iter()
+        .map(|(number, indices)| {
+            let model: Vec<&Vec<String>> = indices.iter().map(|&i| &rows[i]).collect();
+            LaterModel {
+                number: number.clone(),
+                positions: later_model_positions(tags, &first, &model, &groups[0].0),
+            }
+        })
+        .collect();
+    Ok(CifModels { molecule, later })
+}
+
+/// Row indices per model number, models in order of first appearance; one
+/// group when the column is absent.
+fn group_rows_by_model(tags: &[String], rows: &[Vec<String>]) -> Vec<(String, Vec<usize>)> {
+    let Some(col) = find_tag(tags, "_atom_site.pdbx_PDB_model_num") else {
+        return vec![(String::new(), (0..rows.len()).collect())];
+    };
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let number = row.get(col).map(String::as_str).unwrap_or("");
+        match groups.iter_mut().find(|(n, _)| n == number) {
+            Some((_, indices)) => indices.push(i),
+            None => groups.push((number.to_string(), vec![i])),
+        }
+    }
+    groups
+}
+
+/// A later model's positions, provided every atom matches the first model's
+/// on element, atom name, residue name, chain, sequence number and alt_loc.
+/// Stricter than PDB's count-only check because mmCIF rows state identity.
+fn later_model_positions(
+    tags: &[String],
+    first: &[Vec<String>],
+    model: &[&Vec<String>],
+    first_number: &str,
+) -> Result<Vec<Point3>, String> {
+    if model.len() != first.len() {
+        return Err(format!(
+            "{} atoms where model {first_number} has {}",
+            model.len(),
+            first.len()
+        ));
+    }
+
+    let tag = |suffix: &str| find_tag(tags, &format!("_atom_site.{suffix}"));
+    let identity_cols = [
+        tag("type_symbol"),
+        tag("label_atom_id"),
+        tag("auth_comp_id").or(tag("label_comp_id")),
+        tag("auth_asym_id").or(tag("label_asym_id")),
+        tag("auth_seq_id").or(tag("label_seq_id")),
+        tag("label_alt_id"),
+    ];
+    let identity =
+        |row: &[String]| identity_cols.map(|idx| cif_value(row, idx).unwrap_or("").to_string());
+    let xyz = [tag("Cartn_x"), tag("Cartn_y"), tag("Cartn_z")];
+
+    let mut positions = Vec::with_capacity(model.len());
+    for (i, (expected, row)) in first.iter().zip(model).enumerate() {
+        let (want, got) = (identity(expected), identity(row));
+        if want != got {
+            return Err(format!(
+                "atom {} is {} where model {first_number} has {}",
+                i + 1,
+                got.join(" ").trim(),
+                want.join(" ").trim()
+            ));
+        }
+        let [x, y, z] = xyz.map(|idx| idx.and_then(|c| row.get(c)?.parse::<f64>().ok()));
+        let (Some(x), Some(y), Some(z)) = (x, y, z) else {
+            return Err(format!("atom {} has no readable coordinates", i + 1));
+        };
+        positions.push(Point3::new(x, y, z));
+    }
+    Ok(positions)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_atom_site_loop(
     tags: &[String],
@@ -123,6 +258,7 @@ fn read_atom_site_loop(
     sites: &mut Vec<AtomSite>,
     coords: &mut Vec<Point3>,
     keys: &mut Vec<ResidueKey>,
+    labels: &mut Vec<AtomLabel>,
 ) -> Result<(), MmcifError> {
     let tag = |suffix: &str| find_tag(tags, &format!("_atom_site.{suffix}"));
 
@@ -134,6 +270,7 @@ fn read_atom_site_loop(
     let label_alt_id = tag("label_alt_id");
     let label_comp_id = tag("label_comp_id");
     let label_asym_id = tag("label_asym_id");
+    let label_seq_id = tag("label_seq_id");
     let auth_seq_id = tag("auth_seq_id").or(tag("label_seq_id"));
     let auth_asym_id = tag("auth_asym_id").or(label_asym_id);
     let auth_comp_id = tag("auth_comp_id").or(label_comp_id);
@@ -149,19 +286,8 @@ fn read_atom_site_loop(
     })?;
     let occupancy = tag("occupancy");
     let b_iso = tag("B_iso_or_equiv");
-    let model_num = tag("pdbx_PDB_model_num");
-
-    // A varying pdbx_PDB_model_num is mmCIF's NMR-ensemble convention --
-    // only the first model's rows are read, see `mmcif`'s module doc.
-    let first_model = model_num.and_then(|idx| rows.first().and_then(|r| r.get(idx).cloned()));
 
     for row in rows {
-        if let (Some(idx), Some(first)) = (model_num, &first_model)
-            && row.get(idx).is_some_and(|m| m != first)
-        {
-            continue;
-        }
-
         let is_hetero = group_pdb
             .and_then(|idx| row.get(idx))
             .is_some_and(|g| g.eq_ignore_ascii_case("HETATM"));
@@ -206,9 +332,202 @@ fn read_atom_site_loop(
             insertion_code: cif_value(row, ins_code).and_then(|s| s.chars().next()),
             is_hetero,
         });
+        labels.push(AtomLabel {
+            asym_id: cif_value(row, label_asym_id).map(str::to_string),
+            seq_id: cif_value(row, label_seq_id).map(str::to_string),
+        });
     }
 
     Ok(())
+}
+
+/// A `_chem_comp_bond.value_order`. The aromatic flag is ignored: the PDB
+/// flags Kekulé orders too, and keeping them avoids half-aromatic rings.
+fn chem_comp_bond_order(value: Option<&str>) -> BondOrder {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("doub") => BondOrder::Double,
+        Some("trip") => BondOrder::Triple,
+        Some("quad") => BondOrder::Quadruple,
+        Some("arom") => BondOrder::Aromatic,
+        _ => BondOrder::Single,
+    }
+}
+
+/// Bonds every residue instance whose name has `_chem_comp_bond` rows,
+/// matched by atom name within that instance only (#406). A name the
+/// instance lacks is skipped; an already-bonded pair keeps its order.
+fn apply_chem_comp_bonds(
+    mol: &mut Molecule,
+    (tags, rows): &AtomSiteRows,
+) -> Result<(), MmcifError> {
+    let tag = |suffix: &str| find_tag(tags, &format!("_chem_comp_bond.{suffix}"));
+    let (comp_id, atom_1, atom_2) = (tag("comp_id"), tag("atom_id_1"), tag("atom_id_2"));
+    let value_order = tag("value_order");
+
+    let mut by_comp: HashMap<&str, Vec<(&str, &str, BondOrder)>> = HashMap::new();
+    for row in rows {
+        if let (Some(comp), Some(a), Some(b)) = (
+            cif_value(row, comp_id),
+            cif_value(row, atom_1),
+            cif_value(row, atom_2),
+        ) {
+            let order = chem_comp_bond_order(cif_value(row, value_order));
+            by_comp.entry(comp).or_default().push((a, b, order));
+        }
+    }
+
+    let mut pairs = Vec::new();
+    for residue in mol.residues() {
+        let Some(entries) = by_comp.get(residue.name.as_str()) else {
+            continue;
+        };
+        // A name maps to several atoms when it has alternate locations.
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for i in residue.atoms.clone() {
+            if let Some(name) = mol.site(i).and_then(|s| s.name.as_deref()) {
+                by_name.entry(name).or_default().push(i);
+            }
+        }
+        for &(a, b, order) in entries {
+            let (Some(xs), Some(ys)) = (by_name.get(a), by_name.get(b)) else {
+                continue;
+            };
+            for &x in xs {
+                for &y in ys {
+                    if x != y && alt_locs_compatible(mol, x, y) {
+                        pairs.push((x, y, order));
+                    }
+                }
+            }
+        }
+    }
+
+    for (x, y, order) in pairs {
+        if !mol.graph().has_edge(x, y) {
+            mol.add_bond(Bond::new(x, y, order))
+                .map_err(|e| MmcifError::ParseError(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Two atoms can bond unless they sit in different alternate locations.
+fn alt_locs_compatible(mol: &Molecule, x: usize, y: usize) -> bool {
+    let alt = |i| mol.site(i).and_then(|s| s.alt_loc);
+    match (alt(x), alt(y)) {
+        (Some(p), Some(q)) => p == q,
+        _ => true,
+    }
+}
+
+/// An atom's `label_asym_id`/`label_seq_id`, kept only to resolve
+/// `_struct_conn` partners; the topology holds the `auth_*` numbering.
+struct AtomLabel {
+    asym_id: Option<String>,
+    seq_id: Option<String>,
+}
+
+/// Bonds the covalent rows of `_struct_conn` (`disulf`, `covale*`); hydrogen
+/// bonds and metal coordination are not covalent and are left out.
+fn bond_struct_conn(
+    mol: &mut Molecule,
+    singles: &HashMap<String, String>,
+    loops: &CifLoops,
+    labels: &[AtomLabel],
+) {
+    // A single row is written as plain `_struct_conn.item value` pairs, not a loop.
+    let (single_tags, single_values): (Vec<String>, Vec<String>) = singles
+        .iter()
+        .filter(|(tag, _)| category_of(tag) == "_struct_conn")
+        .map(|(tag, value)| (tag.clone(), value.clone()))
+        .unzip();
+    let one_row: AtomSiteRows = (single_tags, vec![single_values]);
+    let (tags, rows) = loops.get("_struct_conn").unwrap_or(&one_row);
+    let tag = |suffix: &str| find_tag(tags, &format!("_struct_conn.{suffix}"));
+    let conn_type = tag("conn_type_id");
+    let value_order = tag("pdbx_value_order");
+
+    for row in rows {
+        let covalent = cif_value(row, conn_type).is_some_and(|t| {
+            let t = t.to_ascii_lowercase();
+            t == "disulf" || t.starts_with("covale")
+        });
+        if !covalent {
+            continue;
+        }
+        let symmetry = |n: u8| cif_value(row, tag(&format!("ptnr{n}_symmetry")));
+        if let (Some(a), Some(b)) = (symmetry(1), symmetry(2))
+            && a != b
+        {
+            continue;
+        }
+        let order = match cif_value(row, value_order).map(str::to_ascii_lowercase) {
+            Some(o) if o == "doub" => BondOrder::Double,
+            Some(o) if o == "trip" => BondOrder::Triple,
+            _ => BondOrder::Single,
+        };
+        let left = resolve_partner(mol, labels, row, &tag, 1);
+        let right = resolve_partner(mol, labels, row, &tag, 2);
+        bond_conformer_pairs(mol, &left, &right, order);
+    }
+}
+
+/// The atoms one `_struct_conn` partner names: by `label_*` IDs, falling
+/// back to `auth_*` when those are absent or match nothing. Empty when the
+/// partner cannot be resolved, which skips the row.
+fn resolve_partner(
+    mol: &Molecule,
+    labels: &[AtomLabel],
+    row: &[String],
+    tag: &dyn Fn(&str) -> Option<usize>,
+    n: u8,
+) -> Vec<usize> {
+    let value = |name: String| cif_value(row, tag(&name));
+    let Some(atom) =
+        value(format!("ptnr{n}_label_atom_id")).or_else(|| value(format!("ptnr{n}_auth_atom_id")))
+    else {
+        return Vec::new();
+    };
+    let alt_loc = value(format!("pdbx_ptnr{n}_label_alt_id")).and_then(|s| s.chars().next());
+    let sites = mol.sites().unwrap_or(&[]);
+    let named = |i: &usize| {
+        let site = &sites[*i];
+        site.name.as_deref() == Some(atom)
+            && (alt_loc.is_none() || site.alt_loc.is_none() || site.alt_loc == alt_loc)
+    };
+
+    if let (Some(asym), Some(seq)) = (
+        value(format!("ptnr{n}_label_asym_id")),
+        value(format!("ptnr{n}_label_seq_id")),
+    ) {
+        let found: Vec<usize> = (0..labels.len())
+            .filter(|&i| {
+                labels[i].asym_id.as_deref() == Some(asym)
+                    && labels[i].seq_id.as_deref() == Some(seq)
+            })
+            .filter(named)
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+
+    let (Some(asym), Some(seq)) = (
+        value(format!("ptnr{n}_auth_asym_id")),
+        value(format!("ptnr{n}_auth_seq_id")).and_then(|s| s.parse::<i32>().ok()),
+    ) else {
+        return Vec::new();
+    };
+    let insertion_code = value(format!("pdbx_ptnr{n}_PDB_ins_code")).and_then(|s| s.chars().next());
+    let chains = mol.chains();
+    mol.residues()
+        .iter()
+        .filter(|r| {
+            r.sequence == seq && r.insertion_code == insertion_code && chains[r.chain_ix].id == asym
+        })
+        .flat_map(|r| r.atoms.clone())
+        .filter(named)
+        .collect()
 }
 
 /// Builds a [`Molecule`] from a CIF-shaped `singles` map and an optional
@@ -221,14 +540,25 @@ fn read_atom_site_loop(
 pub(crate) fn build_molecule(
     singles: &HashMap<String, String>,
     atom_site: Option<(&[String], &[Vec<String>])>,
+    loops: &CifLoops,
+    options: &MmcifReadOptions,
 ) -> Result<Molecule, MmcifError> {
     let mut mol = Molecule::new();
     let mut sites = Vec::new();
     let mut coords = Vec::new();
     let mut keys = Vec::new();
+    let mut labels = Vec::new();
 
     if let Some((tags, rows)) = atom_site {
-        read_atom_site_loop(tags, rows, &mut mol, &mut sites, &mut coords, &mut keys)?;
+        read_atom_site_loop(
+            tags,
+            rows,
+            &mut mol,
+            &mut sites,
+            &mut coords,
+            &mut keys,
+            &mut labels,
+        )?;
     }
 
     // Zeros in these columns are what a format with no room to say "unknown"
@@ -244,6 +574,25 @@ pub(crate) fn build_molecule(
     let (chains, residues) = group_into_chains_and_residues(&keys);
     mol.set_topology(chains, residues)
         .map_err(|e| MmcifError::ParseError(e.to_string()))?;
+
+    // The bond pipeline: each step only adds pairs not yet bonded, so the
+    // order is the precedence -- templates, then `_chem_comp_bond`, then
+    // perception for whatever no stated source bonded.
+    if options.residue_templates {
+        add_residue_template_bonds(&mut mol);
+        bond_struct_conn(&mut mol, singles, loops, &labels);
+    }
+    if options.chem_comp_bonds
+        && let Some(table) = loops.get("_chem_comp_bond")
+    {
+        apply_chem_comp_bonds(&mut mol, table)?;
+    }
+    if options.perceive_bonds {
+        perceive_bonds(&mut mol);
+    }
+    // A no-op on a bondless read, so the default output is unchanged; a
+    // bondless atom keeps `None`, since its connectivity was never stated.
+    mol.calculate_implicit_hydrogens_where_bonded();
 
     if let (Some(a), Some(b), Some(c), Some(alpha), Some(beta), Some(gamma)) = (
         singles.get("_cell.length_a").and_then(|s| s.parse().ok()),
@@ -419,4 +768,157 @@ pub(crate) fn build_rows(
     }
 
     (singles, (tags, rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::mmcif::parse_mmcif_with_options;
+
+    const ON: MmcifReadOptions = MmcifReadOptions {
+        residue_templates: false,
+        chem_comp_bonds: true,
+        multi_frame: crate::io::options::MultiFrameMode::Molecules,
+        perceive_bonds: false,
+    };
+
+    /// An mmCIF block with the given `_chem_comp_bond` rows and
+    /// `(name, alt_id, comp, seq)` atoms, all in chain A.
+    fn block(bond_rows: &[&str], atoms: &[(&str, &str, &str, i32)]) -> String {
+        let mut text = String::from("data_test\n");
+        if !bond_rows.is_empty() {
+            text.push_str(
+                "loop_\n_chem_comp_bond.comp_id\n_chem_comp_bond.atom_id_1\n\
+                 _chem_comp_bond.atom_id_2\n_chem_comp_bond.value_order\n",
+            );
+            for row in bond_rows {
+                text.push_str(row);
+                text.push('\n');
+            }
+        }
+        text.push_str(
+            "loop_\n_atom_site.group_PDB\n_atom_site.type_symbol\n_atom_site.label_atom_id\n\
+             _atom_site.label_alt_id\n_atom_site.auth_comp_id\n_atom_site.auth_seq_id\n\
+             _atom_site.auth_asym_id\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n",
+        );
+        for (i, (name, alt, comp, seq)) in atoms.iter().enumerate() {
+            let element = &name[..1];
+            text.push_str(&format!(
+                "HETATM {element} {name} {alt} {comp} {seq} A {i}.0 1.0 1.0\n"
+            ));
+        }
+        text
+    }
+
+    fn bonds(mol: &Molecule) -> Vec<(usize, usize, BondOrder)> {
+        let mut out: Vec<_> = mol
+            .bonds()
+            .iter()
+            .map(|b| {
+                let (x, y) = b.atoms();
+                (x.min(y), x.max(y), b.order())
+            })
+            .collect();
+        out.sort_by_key(|&(x, y, _)| (x, y));
+        out
+    }
+
+    #[test]
+    fn test_a_doub_row_gives_a_double_bond() {
+        let text = block(
+            &["LIG C1 O1 doub"],
+            &[("C1", ".", "LIG", 1), ("O1", ".", "LIG", 1)],
+        );
+        let mol = parse_mmcif_with_options(&text, &ON).unwrap();
+        assert_eq!(bonds(&mol), vec![(0, 1, BondOrder::Double)]);
+        assert_eq!(mol.atom(0).hydrogens(), Some(2));
+    }
+
+    #[test]
+    fn test_the_option_off_reads_no_bonds() {
+        let text = block(
+            &["LIG C1 O1 doub"],
+            &[("C1", ".", "LIG", 1), ("O1", ".", "LIG", 1)],
+        );
+        let mol = parse_mmcif_with_options(&text, &MmcifReadOptions::default()).unwrap();
+        assert_eq!(mol.num_bonds(), 0);
+        assert_eq!(mol.atom(0).hydrogens(), None);
+    }
+
+    #[test]
+    fn test_a_row_naming_a_missing_hydrogen_is_skipped() {
+        let text = block(
+            &["LIG C1 O1 sing", "LIG O1 HO1 sing"],
+            &[("C1", ".", "LIG", 1), ("O1", ".", "LIG", 1)],
+        );
+        let mol = parse_mmcif_with_options(&text, &ON).unwrap();
+        assert_eq!(bonds(&mol), vec![(0, 1, BondOrder::Single)]);
+    }
+
+    #[test]
+    fn test_a_comp_with_no_rows_gets_no_bonds() {
+        let text = block(
+            &["LIG C1 O1 sing"],
+            &[("C1", ".", "ETH", 1), ("O1", ".", "ETH", 1)],
+        );
+        let mol = parse_mmcif_with_options(&text, &ON).unwrap();
+        assert_eq!(mol.num_bonds(), 0);
+    }
+
+    #[test]
+    fn test_two_instances_are_bonded_separately() {
+        let text = block(
+            &["LIG C1 O1 sing"],
+            &[
+                ("C1", ".", "LIG", 1),
+                ("O1", ".", "LIG", 1),
+                ("C1", ".", "LIG", 2),
+                ("O1", ".", "LIG", 2),
+            ],
+        );
+        let mol = parse_mmcif_with_options(&text, &ON).unwrap();
+        assert_eq!(
+            bonds(&mol),
+            vec![(0, 1, BondOrder::Single), (2, 3, BondOrder::Single)]
+        );
+    }
+
+    #[test]
+    fn test_alternate_locations_bond_only_within_their_own_location() {
+        let text = block(
+            &["LIG C1 O1 sing"],
+            &[
+                ("C1", ".", "LIG", 1),
+                ("O1", "A", "LIG", 1),
+                ("O1", "B", "LIG", 1),
+                ("C1", "A", "LIG", 2),
+                ("O1", "B", "LIG", 2),
+            ],
+        );
+        let mol = parse_mmcif_with_options(&text, &ON).unwrap();
+        assert_eq!(
+            bonds(&mol),
+            vec![(0, 1, BondOrder::Single), (0, 2, BondOrder::Single)]
+        );
+    }
+
+    #[test]
+    fn test_value_orders_map_case_insensitively_and_unknown_is_single() {
+        assert_eq!(chem_comp_bond_order(Some("DOUB")), BondOrder::Double);
+        assert_eq!(chem_comp_bond_order(Some("trip")), BondOrder::Triple);
+        assert_eq!(chem_comp_bond_order(Some("quad")), BondOrder::Quadruple);
+        assert_eq!(chem_comp_bond_order(Some("arom")), BondOrder::Aromatic);
+        assert_eq!(chem_comp_bond_order(Some("delo")), BondOrder::Single);
+        assert_eq!(chem_comp_bond_order(None), BondOrder::Single);
+    }
+
+    #[test]
+    fn test_a_repeated_pair_keeps_the_first_order() {
+        let text = block(
+            &["LIG C1 O1 doub", "LIG O1 C1 sing"],
+            &[("C1", ".", "LIG", 1), ("O1", ".", "LIG", 1)],
+        );
+        let mol = parse_mmcif_with_options(&text, &ON).unwrap();
+        assert_eq!(bonds(&mol), vec![(0, 1, BondOrder::Double)]);
+    }
 }

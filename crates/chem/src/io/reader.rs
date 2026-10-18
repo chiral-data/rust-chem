@@ -26,6 +26,7 @@ use crate::core::molecule::Molecule;
 use crate::core::table::Table;
 use crate::core::trajectory::{Frame, FrameSource, Trajectory};
 use crate::core::volume::VolumeGrid;
+use crate::io::cif_model::CifModels;
 use crate::io::options::{MultiFrameMode, ReadOptions};
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
@@ -403,6 +404,12 @@ impl FrameSource for MoleculeFrames {
     }
 }
 
+/// Under [`MultiFrameMode::Frames`] only the first parsed frame becomes the
+/// topology, so later frames skip bond perception.
+fn perceive_frame(mode: MultiFrameMode, perceive: bool, parsed_so_far: usize) -> bool {
+    perceive && (mode == MultiFrameMode::Molecules || parsed_so_far == 0)
+}
+
 /// Builds a [`Trajectory`] from a file's already-independently-parsed
 /// frames (#330): the first molecule, stripped of its own coordinates and
 /// cell, becomes the shared topology (whatever it actually parsed — atoms,
@@ -553,7 +560,15 @@ pub fn read_xyz_with_options(content: &str, options: &ReadOptions) -> ReadOutcom
 
         let frame = all_lines[i..i + frame_len].join("\n");
         position += 1;
-        match crate::io::xyz::parse_xyz(&frame) {
+        let xyz = crate::io::options::XyzReadOptions {
+            perceive_bonds: perceive_frame(
+                options.xyz.multi_frame,
+                options.xyz.perceive_bonds,
+                molecules.len(),
+            ),
+            ..options.xyz
+        };
+        match crate::io::xyz::parse_xyz_with_options(&frame, &xyz) {
             Ok(molecule) => molecules.push((position, molecule)),
             Err(e) => skipped.push(Skipped {
                 position,
@@ -581,29 +596,55 @@ pub fn read_pdb(content: &str) -> ReadOutcome {
 /// model's own topology — including its `CONECT` bonds — shared by every
 /// frame; a later model's `CONECT` is never consulted) when
 /// [`MultiFrameMode::Frames`] is requested (#330).
+///
+/// Text after the last `ENDMDL` with no `ATOM`/`HETATM` is the file's tail,
+/// not a model (#411). Its `CONECT` records apply to every model, matched by
+/// serial within that model, since serials restart in each `MODEL` (#412).
 pub fn read_pdb_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut molecules: Vec<(usize, Molecule)> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    let (models, tail) = split_models(content);
+    let tail_conect: Vec<&str> = tail
+        .into_iter()
+        .filter(|line| line.starts_with("CONECT"))
+        .collect();
+
+    for (index, mut lines) in models.into_iter().enumerate() {
+        lines.extend(&tail_conect);
+        push_pdb_record(&mut molecules, &mut skipped, &lines, index + 1, options);
+    }
+
+    assemble_multi_frame_outcome(options.pdb.multi_frame, molecules, skipped)
+}
+
+/// Whether a PDB/PDBQT line is an `ATOM` or `HETATM` record.
+pub(crate) fn is_atom_line(line: &str) -> bool {
+    matches!(line.get(0..6).map(str::trim), Some("ATOM" | "HETATM"))
+}
+
+/// Splits PDB/PDBQT text into `ENDMDL`-terminated models plus the file's
+/// tail. The remainder after the last `ENDMDL` is a tail only when it has no
+/// atoms; otherwise it is one more model, which a file without `ENDMDL`
+/// always is.
+fn split_models(content: &str) -> (Vec<Vec<&str>>, Vec<&str>) {
+    let mut models: Vec<Vec<&str>> = Vec::new();
     let mut lines: Vec<&str> = Vec::new();
-    let mut position = 0;
 
     for line in content.lines() {
         lines.push(line);
         if line.trim() == "ENDMDL" {
-            position += 1;
-            push_pdb_record(&mut molecules, &mut skipped, &lines, position);
-            lines.clear();
+            models.push(std::mem::take(&mut lines));
         }
     }
 
-    // A trailing structure with no `ENDMDL` -- which a single-model file
-    // always is.
-    if lines.iter().any(|line| !line.trim().is_empty()) {
-        position += 1;
-        push_pdb_record(&mut molecules, &mut skipped, &lines, position);
+    if !lines.iter().any(|line| !line.trim().is_empty()) {
+        return (models, Vec::new());
     }
-
-    assemble_multi_frame_outcome(options.pdb.multi_frame, molecules, skipped)
+    if !models.is_empty() && !lines.iter().any(|line| is_atom_line(line)) {
+        return (models, lines);
+    }
+    models.push(lines);
+    (models, Vec::new())
 }
 
 fn push_pdb_record(
@@ -611,9 +652,18 @@ fn push_pdb_record(
     skipped: &mut Vec<Skipped>,
     lines: &[&str],
     position: usize,
+    options: &ReadOptions,
 ) {
     let record = lines.join("\n");
-    match crate::io::pdb::parse_pdb(&record) {
+    let pdb = crate::io::options::PdbReadOptions {
+        perceive_bonds: perceive_frame(
+            options.pdb.multi_frame,
+            options.pdb.perceive_bonds,
+            molecules.len(),
+        ),
+        ..options.pdb
+    };
+    match crate::io::pdb::parse_pdb_with_options(&record, &pdb) {
         Ok(molecule) => molecules.push((position, molecule)),
         Err(e) => skipped.push(Skipped {
             position,
@@ -631,9 +681,9 @@ pub fn read_mmcif(content: &str) -> ReadOutcome {
 /// One molecule per `data_` block (#224). A block boundary is a line
 /// starting with `data_`; a file with only one is one implicit record,
 /// today's common case for a single deposited structure. Within a block, a
-/// varying `pdbx_PDB_model_num` is [`crate::io::mmcif::parse_mmcif`]'s own
-/// job (its own doc explains why), not this splitter's.
-pub fn read_mmcif_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+/// varying `pdbx_PDB_model_num` is an NMR ensemble, read per
+/// [`MultiFrameMode`] from `options.mmcif.multi_frame` (#404).
+pub fn read_mmcif_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let mut lines: Vec<&str> = Vec::new();
     let mut position = 0;
@@ -642,37 +692,104 @@ pub fn read_mmcif_with_options(content: &str, _options: &ReadOptions) -> ReadOut
         let starts_new_block = line.trim_start().to_ascii_lowercase().starts_with("data_");
         if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
             position += 1;
-            push_mmcif_record(&mut out, &lines, position);
+            push_mmcif_record(&mut out, &lines, position, options);
             lines.clear();
         }
         lines.push(line);
     }
     if lines.iter().any(|line| !line.trim().is_empty()) {
         position += 1;
-        push_mmcif_record(&mut out, &lines, position);
+        push_mmcif_record(&mut out, &lines, position, options);
     }
 
     out
 }
 
-fn push_mmcif_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+fn push_mmcif_record(
+    out: &mut ReadOutcome,
+    lines: &[&str],
+    position: usize,
+    options: &ReadOptions,
+) {
     let record = lines.join("\n");
-    match crate::io::mmcif::parse_mmcif(&record) {
-        Ok(molecule) => {
-            let name = molecule
+    match crate::io::mmcif::parse_mmcif_models(&record, &options.mmcif) {
+        Ok(models) => {
+            let name = models
+                .molecule
                 .name()
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
-            out.records.push(Record {
-                payload: Payload::Molecule(molecule),
-                name,
-                smiles: None,
-            });
+            push_cif_models(out, options.mmcif.multi_frame, position, name, models);
         }
         Err(e) => out.skipped.push(Skipped {
             position,
             input: String::new(),
             error: e.to_string(),
+        }),
+    }
+}
+
+/// One mmCIF or BinaryCIF block as records (#404). A single-model block is
+/// one `Molecule` record in either mode. An ensemble is one `Frames` record
+/// under [`MultiFrameMode::Frames`], built by the same
+/// `molecules_to_trajectory` PDB uses; otherwise its first model. A later
+/// model that is not a frame is reported in `skipped`.
+pub(crate) fn push_cif_models(
+    out: &mut ReadOutcome,
+    mode: MultiFrameMode,
+    position: usize,
+    name: String,
+    models: CifModels,
+) {
+    let CifModels { molecule, later } = models;
+    let skip = |out: &mut ReadOutcome, number: &str, reason: String| {
+        out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: format!("model {number} not read: {reason}"),
+        })
+    };
+
+    if later.is_empty() || mode == MultiFrameMode::Molecules {
+        for model in later {
+            let reason = model.positions.err().unwrap_or_else(|| {
+                "ensemble models are read only under MultiFrameMode::Frames".to_string()
+            });
+            skip(out, &model.number, reason);
+        }
+        out.records.push(Record {
+            payload: Payload::Molecule(molecule),
+            name,
+            smiles: None,
+        });
+        return;
+    }
+
+    let mut frames = vec![molecule.clone()];
+    for model in later {
+        let positions = match model.positions {
+            Ok(positions) => positions,
+            Err(reason) => {
+                skip(out, &model.number, reason);
+                continue;
+            }
+        };
+        let mut frame = molecule.clone();
+        match frame.set_coords3(positions) {
+            Ok(()) => frames.push(frame),
+            Err(e) => skip(out, &model.number, e.to_string()),
+        }
+    }
+    match molecules_to_trajectory(frames) {
+        Ok(trajectory) => out.records.push(Record {
+            payload: Payload::Frames(trajectory),
+            name,
+            smiles: None,
+        }),
+        Err(error) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error,
         }),
     }
 }
@@ -1001,24 +1118,14 @@ pub fn read_pdbqt(content: &str) -> ReadOutcome {
 /// `MODEL`/`ENDMDL`-wrapped multi-pose file (AutoDock Vina's real docked-
 /// results output shape) (#226) -- mirrors [`read_pdb_with_options`]
 /// exactly, since PDBQT borrows this framing directly from PDB, including
-/// the same [`MultiFrameMode::Frames`] option (#330).
+/// the same [`MultiFrameMode::Frames`] option (#330) and the same atom-less
+/// tail rule (#411).
 pub fn read_pdbqt_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut molecules: Vec<(usize, Molecule)> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
-    let mut lines: Vec<&str> = Vec::new();
-    let mut position = 0;
-
-    for line in content.lines() {
-        lines.push(line);
-        if line.trim() == "ENDMDL" {
-            position += 1;
-            push_pdbqt_record(&mut molecules, &mut skipped, &lines, position);
-            lines.clear();
-        }
-    }
-    if lines.iter().any(|line| !line.trim().is_empty()) {
-        position += 1;
-        push_pdbqt_record(&mut molecules, &mut skipped, &lines, position);
+    let (models, _tail) = split_models(content);
+    for (index, lines) in models.iter().enumerate() {
+        push_pdbqt_record(&mut molecules, &mut skipped, lines, index + 1);
     }
 
     assemble_multi_frame_outcome(options.pdbqt.multi_frame, molecules, skipped)
@@ -1102,7 +1209,15 @@ pub fn read_gro_with_options(content: &str, options: &ReadOptions) -> ReadOutcom
 
         let frame = all_lines[i..i + frame_len].join("\n");
         position += 1;
-        match crate::io::gro::parse_gro(&frame) {
+        let gro = crate::io::options::GroReadOptions {
+            perceive_bonds: perceive_frame(
+                options.gro.multi_frame,
+                options.gro.perceive_bonds,
+                molecules.len(),
+            ),
+            ..options.gro
+        };
+        match crate::io::gro::parse_gro_with_options(&frame, &gro) {
             Ok(molecule) => molecules.push((position, molecule)),
             Err(e) => skipped.push(Skipped {
                 position,
@@ -1449,6 +1564,7 @@ $$$$
         let options = ReadOptions {
             pdb: crate::io::options::PdbReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };
@@ -1484,6 +1600,145 @@ $$$$
         );
     }
 
+    const NMR_ENSEMBLE_CIF: &str = include_str!("../../tests/corpus/mmcif/nmr-ensemble.cif");
+
+    /// `nmr-ensemble.cif` as PDB `MODEL` records, same atoms and positions.
+    const NMR_ENSEMBLE_PDB: &str = "\
+MODEL        1
+ATOM      1  N   GLY A   1      -1.195   0.346  -0.120  1.00  0.00           N
+ATOM      2  CA  GLY A   1       0.000   1.180   0.000  1.00  0.00           C
+ATOM      3  C   GLY A   1       1.250   0.320   0.010  1.00  0.00           C
+ATOM      4  O   GLY A   1       1.230  -0.910   0.050  1.00  0.00           O
+ATOM      5  N   ALA A   2       2.410   0.970  -0.030  1.00  0.00           N
+ATOM      6  CA  ALA A   2       3.700   0.300  -0.020  1.00  0.00           C
+ATOM      7  C   ALA A   2       4.850   1.300   0.100  1.00  0.00           C
+ATOM      8  O   ALA A   2       4.660   2.510   0.180  1.00  0.00           O
+ATOM      9  CB  ALA A   2       3.850  -0.560  -1.270  1.00  0.00           C
+ENDMDL
+MODEL        2
+ATOM      1  N   GLY A   1      -1.085   0.276  -0.070  1.00  0.00           N
+ATOM      2  CA  GLY A   1       0.120   1.100   0.050  1.00  0.00           C
+ATOM      3  C   GLY A   1       1.380   0.230   0.060  1.00  0.00           C
+ATOM      4  O   GLY A   1       1.340  -0.980   0.100  1.00  0.00           O
+ATOM      5  N   ALA A   2       2.530   0.890   0.020  1.00  0.00           N
+ATOM      6  CA  ALA A   2       3.830   0.210   0.030  1.00  0.00           C
+ATOM      7  C   ALA A   2       4.960   1.230   0.150  1.00  0.00           C
+ATOM      8  O   ALA A   2       4.780   2.430   0.230  1.00  0.00           O
+ATOM      9  CB  ALA A   2       3.980  -0.650  -1.220  1.00  0.00           C
+ENDMDL
+MODEL        3
+ATOM      1  N   GLY A   1      -1.365   0.476  -0.190  1.00  0.00           N
+ATOM      2  CA  GLY A   1      -0.150   1.290  -0.070  1.00  0.00           C
+ATOM      3  C   GLY A   1       1.120   0.410  -0.060  1.00  0.00           C
+ATOM      4  O   GLY A   1       1.060  -0.780  -0.020  1.00  0.00           O
+ATOM      5  N   ALA A   2       2.260   1.080  -0.100  1.00  0.00           N
+ATOM      6  CA  ALA A   2       3.570   0.390  -0.090  1.00  0.00           C
+ATOM      7  C   ALA A   2       4.680   1.430   0.030  1.00  0.00           C
+ATOM      8  O   ALA A   2       4.510   2.620   0.110  1.00  0.00           O
+ATOM      9  CB  ALA A   2       3.720  -0.470  -1.340  1.00  0.00           C
+ENDMDL
+END
+";
+
+    fn cif_frames_options() -> ReadOptions {
+        ReadOptions {
+            mmcif: crate::io::options::MmcifReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        }
+    }
+
+    fn only_trajectory(outcome: ReadOutcome) -> Trajectory {
+        assert_eq!(outcome.records.len(), 1);
+        match outcome.records.into_iter().next().unwrap().payload {
+            Payload::Frames(t) => t,
+            other => panic!("expected Payload::Frames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mmcif_default_mode_reports_every_later_model_as_skipped() {
+        let out = read_mmcif(NMR_ENSEMBLE_CIF);
+        assert_eq!(out.records.len(), 1);
+        let Payload::Molecule(mol) = &out.records[0].payload else {
+            panic!("expected Payload::Molecule");
+        };
+        assert_eq!(mol.num_atoms(), 9);
+        let errors: Vec<&str> = out.skipped.iter().map(|s| s.error.as_str()).collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].starts_with("model 2 not read"), "{errors:?}");
+        assert!(errors[1].starts_with("model 3 not read"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_mmcif_frames_mode_matches_the_same_ensemble_read_as_pdb() {
+        let outcome = read_mmcif_with_options(NMR_ENSEMBLE_CIF, &cif_frames_options());
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let mut cif = only_trajectory(outcome);
+        assert_eq!(cif.topology().num_atoms(), 9);
+        assert_eq!(cif.topology().residues().len(), 2);
+        assert!(!cif.topology().has_coords3(), "positions live in frames");
+
+        let pdb_options = ReadOptions {
+            pdb: crate::io::options::PdbReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        };
+        let mut pdb = only_trajectory(read_pdb_with_options(NMR_ENSEMBLE_PDB, &pdb_options));
+
+        assert_eq!(cif.frame_count(), 3);
+        assert_eq!(pdb.frame_count(), cif.frame_count());
+        for i in 0..cif.frame_count() {
+            let (c, p) = (cif.frame(i).unwrap(), pdb.frame(i).unwrap());
+            assert_eq!(c.step, p.step);
+            for (a, b) in c.positions.iter().zip(&p.positions) {
+                assert!(a.distance(*b) < 1e-9, "frame {i}: {a:?} vs {b:?}");
+            }
+        }
+        assert_ne!(
+            cif.frame(0).unwrap().positions,
+            cif.frame(1).unwrap().positions
+        );
+    }
+
+    #[test]
+    fn test_mmcif_frames_mode_skips_a_model_missing_an_atom() {
+        // Model 2 loses its last atom (CB); models 1 and 3 still animate.
+        let text: String = NMR_ENSEMBLE_CIF
+            .lines()
+            .filter(|l| !l.starts_with("ATOM 18 "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let outcome = read_mmcif_with_options(&text, &cif_frames_options());
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert_eq!(
+            outcome.skipped[0].error,
+            "model 2 not read: 8 atoms where model 1 has 9"
+        );
+        assert_eq!(only_trajectory(outcome).frame_count(), 2);
+    }
+
+    #[test]
+    fn test_mmcif_frames_mode_leaves_a_single_model_block_a_molecule() {
+        let options = cif_frames_options();
+        let text = format!(
+            "{0}{0}",
+            "data_a\nloop_\n_atom_site.type_symbol\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\nC 1.0 0.0 0.0\n"
+        );
+        let out = read_mmcif_with_options(&text, &options);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
+        assert!(
+            out.records
+                .iter()
+                .all(|r| matches!(r.payload, Payload::Molecule(_)))
+        );
+    }
+
     #[test]
     fn test_xyz_frames_mode_a_later_frames_different_atom_count_is_caught_lazily() {
         // Construction only checks frame 0 against the shared topology --
@@ -1504,6 +1759,7 @@ H 2.0 0.0 0.0
         let options = ReadOptions {
             xyz: crate::io::options::XyzReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };
@@ -1533,11 +1789,171 @@ H 2.0 0.0 0.0
         let options = ReadOptions {
             xyz: crate::io::options::XyzReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };
         let outcome = read_xyz_with_options("", &options);
         assert!(outcome.records.is_empty());
         assert_eq!(outcome.skipped.len(), 1);
+    }
+
+    const TWO_WATER_FRAMES: &str = "3\nw\nO 0.0 0.0 0.0\nH 0.757 0.586 0.0\nH -0.757 0.586 0.0\n\
+        3\nw\nO 0.0 0.0 0.1\nH 0.757 0.586 0.1\nH -0.757 0.586 0.1\n";
+
+    #[test]
+    fn test_xyz_perception_applies_to_every_molecule_record() {
+        let options = ReadOptions {
+            xyz: crate::io::options::XyzReadOptions {
+                perceive_bonds: true,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        };
+        let outcome = read_xyz_with_options(TWO_WATER_FRAMES, &options);
+        assert_eq!(outcome.records.len(), 2);
+        for record in &outcome.records {
+            assert_eq!(record.molecule().unwrap().num_bonds(), 2);
+        }
+    }
+
+    #[test]
+    fn test_xyz_frames_mode_perceives_the_shared_topology() {
+        let options = ReadOptions {
+            xyz: crate::io::options::XyzReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                perceive_bonds: true,
+            },
+            ..ReadOptions::default()
+        };
+        let outcome = read_xyz_with_options(TWO_WATER_FRAMES, &options);
+        let trajectory = outcome.records[0].trajectory().unwrap();
+        assert_eq!(trajectory.topology().num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_only_the_first_frame_is_perceived_under_frames_mode() {
+        use MultiFrameMode::{Frames, Molecules};
+        assert!(perceive_frame(Frames, true, 0));
+        assert!(!perceive_frame(Frames, true, 1));
+        assert!(perceive_frame(Molecules, true, 5));
+        assert!(!perceive_frame(Molecules, false, 0));
+    }
+
+    /// Two models of a three-atom ligand, then a wwPDB-style tail.
+    fn ensemble_with_tail(tail: &str) -> String {
+        let model = |n: usize| {
+            format!(
+                "MODEL     {n:>4}
+HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C
+HETATM    2  O1  LIG A   1       1.400   0.000   0.000  1.00  0.00           O
+HETATM    3  C2  LIG A   1       2.000   1.200   0.000  1.00  0.00           C
+ENDMDL
+"
+            )
+        };
+        format!("{}{}{tail}", model(1), model(2))
+    }
+
+    const CONECT_TAIL: &str = "\
+CONECT    1    2
+CONECT    2    1    3
+CONECT    3    2
+MASTER        0    0    0    0    0    0    0    0    6    0    3    0
+END
+";
+
+    fn pdb_frames_options() -> ReadOptions {
+        ReadOptions {
+            pdb: crate::io::options::PdbReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_pdb_master_end_tail_is_not_a_record() {
+        let text = ensemble_with_tail(
+            "MASTER        0    0    0    0    0    0    0    0    6    0    0    0\nEND\n",
+        );
+        let out = read_pdb(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
+
+        let out = read_pdb_with_options(&text, &pdb_frames_options());
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records[0].trajectory().unwrap().frame_count(), 2);
+    }
+
+    #[test]
+    fn test_pdb_tail_conect_bonds_every_model() {
+        let text = ensemble_with_tail(CONECT_TAIL);
+        let out = read_pdb(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
+        for record in &out.records {
+            assert_eq!(record.molecule().unwrap().num_bonds(), 2);
+        }
+
+        let out = read_pdb_with_options(&text, &pdb_frames_options());
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        let trajectory = out.records[0].trajectory().unwrap();
+        assert_eq!(trajectory.frame_count(), 2);
+        assert_eq!(trajectory.topology().num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_pdb_tail_conect_naming_a_missing_serial_fails_that_model_only() {
+        let text = ensemble_with_tail(CONECT_TAIL).replacen(
+            "HETATM    3  C2  LIG A   1       2.000   1.200   0.000  1.00  0.00           C\nENDMDL\nCONECT",
+            "ENDMDL\nCONECT",
+            1,
+        );
+        let out = read_pdb(&text);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].molecule().unwrap().num_bonds(), 2);
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 2);
+        assert!(
+            out.skipped[0].error.contains("serial 3"),
+            "{}",
+            out.skipped[0].error
+        );
+    }
+
+    #[test]
+    fn test_pdb_remainder_with_atoms_after_the_last_endmdl_is_still_a_model() {
+        let text = ensemble_with_tail(
+            "HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n",
+        );
+        let out = read_pdb(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 3);
+    }
+
+    #[test]
+    fn test_pdb_without_endmdl_is_one_record_even_with_no_atoms() {
+        let out = read_pdb("HEADER    NOTHING\nEND\n");
+        assert!(out.records.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_pdbqt_end_tail_after_the_last_endmdl_is_not_a_record() {
+        let pose = "MODEL        1
+ROOT
+ATOM      1  C   UNL     1       0.000   0.000   0.000  1.00  0.00    +0.000 C
+ATOM      2  O   UNL     1       1.400   0.000   0.000  1.00  0.00    +0.000 OA
+ENDROOT
+TORSDOF 0
+ENDMDL
+";
+        let text = format!("{pose}{pose}REMARK done\nEND\n");
+        let out = read_pdbqt(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
     }
 }

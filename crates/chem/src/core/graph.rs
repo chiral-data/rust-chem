@@ -38,6 +38,13 @@ impl MoleculeGraph {
         self.edge_map.len() / 2
     }
 
+    /// Appends an isolated node and returns its index.
+    pub fn add_node(&mut self) -> usize {
+        self.adjacency.push(Vec::new());
+        self.num_atoms += 1;
+        self.num_atoms - 1
+    }
+
     pub fn add_edge(&mut self, atom1: usize, atom2: usize, bond_idx: usize) {
         assert!(atom1 < self.num_atoms, "Atom1 index out of bounds");
         assert!(atom2 < self.num_atoms, "Atom2 index out of bounds");
@@ -166,6 +173,19 @@ mod tests {
         let graph = MoleculeGraph::new(5);
         assert_eq!(graph.num_atoms(), 5);
         assert_eq!(graph.num_bonds(), 0);
+    }
+
+    #[test]
+    fn test_add_node_appends_an_isolated_node() {
+        let mut graph = MoleculeGraph::new(2);
+        graph.add_edge(0, 1, 0);
+        assert_eq!(graph.add_node(), 2);
+        assert_eq!(graph.num_atoms(), 3);
+        assert_eq!(graph.degree(2), 0);
+        assert_eq!(graph.neighbors(0), &[Neighbor::new(1, 0)]);
+        graph.add_edge(2, 0, 1);
+        assert_eq!(graph.get_bond(0, 2), Some(1));
+        assert_eq!(graph.connected_components().len(), 1);
     }
 
     #[test]

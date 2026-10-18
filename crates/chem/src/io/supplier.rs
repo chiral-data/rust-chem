@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 use crate::core::molecule::Molecule;
 use crate::io::errors::ReadError;
 use crate::io::options::{ReadOptions, WriteOptions};
-use crate::io::reader::{Payload, Record};
+use crate::io::reader::{Payload, Record, is_atom_line};
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
@@ -257,10 +257,15 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
 /// holding several back to back (#223), the same role SDF's `$$$$` plays;
 /// mirrors [`crate::io::reader::read_pdb_with_options`]'s splitting
 /// exactly, one line read at a time instead of over a pre-loaded string.
+///
+/// An atom-less tail after the last `ENDMDL` is dropped, but its `CONECT`
+/// records are not applied: that would mean buffering every model until the
+/// tail arrives. [`crate::io::reader::read_pdb_with_options`] applies them.
 pub struct PdbSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
-    _options: ReadOptions,
+    seen_endmdl: bool,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> PdbSupplier<R> {
@@ -268,7 +273,8 @@ impl<R: BufRead> PdbSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: options.clone(),
+            seen_endmdl: false,
+            options: options.clone(),
         }
     }
 }
@@ -285,7 +291,7 @@ pub struct MmcifSupplier<R> {
     /// A `data_` line already read from the stream but not yet claimed by
     /// the record currently being built -- it belongs to the next one.
     pending: Option<String>,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> MmcifSupplier<R> {
@@ -294,7 +300,7 @@ impl<R: BufRead> MmcifSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -341,7 +347,7 @@ impl<R: BufRead> Iterator for MmcifSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::mmcif::parse_mmcif(&buffer)
+            crate::io::mmcif::parse_mmcif_with_options(&buffer, &self.options.mmcif)
                 .map(|molecule| {
                     let name = molecule
                         .name()
@@ -791,8 +797,11 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
                     if !got_any_line || buffer.trim().is_empty() {
                         return None;
                     }
-                    // A trailing structure with no `ENDMDL` -- which a
-                    // single-model file always is.
+                    // After an `ENDMDL`, an atom-less remainder is the tail
+                    // (#411); otherwise it is one more structure.
+                    if self.seen_endmdl && !buffer.lines().any(is_atom_line) {
+                        return None;
+                    }
                     break;
                 }
                 Some(Ok(line)) => line,
@@ -809,6 +818,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
             buffer.push_str(&raw);
             buffer.push('\n');
             if is_terminator {
+                self.seen_endmdl = true;
                 break;
             }
         }
@@ -816,7 +826,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::pdb::parse_pdb(&buffer)
+            crate::io::pdb::parse_pdb_with_options(&buffer, &self.options.pdb)
                 .map(|molecule| {
                     let name = molecule
                         .name()
@@ -843,7 +853,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
 pub struct XyzSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> XyzSupplier<R> {
@@ -851,7 +861,7 @@ impl<R: BufRead> XyzSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -914,7 +924,7 @@ impl<R: BufRead> Iterator for XyzSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::xyz::parse_xyz(&frame)
+            crate::io::xyz::parse_xyz_with_options(&frame, &self.options.xyz)
                 .map(|molecule| {
                     let name = molecule
                         .name()
@@ -1264,6 +1274,7 @@ impl<W: Write> Writer for Mol2Writer<W> {
 pub struct PdbqtSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
+    seen_endmdl: bool,
     _options: ReadOptions,
 }
 
@@ -1272,6 +1283,7 @@ impl<R: BufRead> PdbqtSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
+            seen_endmdl: false,
             _options: options.clone(),
         }
     }
@@ -1290,6 +1302,9 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
                     if !got_any_line || buffer.trim().is_empty() {
                         return None;
                     }
+                    if self.seen_endmdl && !buffer.lines().any(is_atom_line) {
+                        return None;
+                    }
                     break;
                 }
                 Some(Ok(line)) => line,
@@ -1306,6 +1321,7 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
             buffer.push_str(&raw);
             buffer.push('\n');
             if is_terminator {
+                self.seen_endmdl = true;
                 break;
             }
         }
@@ -1403,7 +1419,7 @@ impl<W: Write> Writer for PdbqtWriter<W> {
 pub struct GroSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> GroSupplier<R> {
@@ -1411,7 +1427,7 @@ impl<R: BufRead> GroSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -1490,7 +1506,7 @@ impl<R: BufRead> Iterator for GroSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::gro::parse_gro(&frame)
+            crate::io::gro::parse_gro_with_options(&frame, &self.options.gro)
                 .map(|molecule| {
                     let name = molecule
                         .name()
@@ -2025,5 +2041,50 @@ mod tests {
 
         let back = crate::io::reader::read(&out, crate::io::format::Format::PDBQT);
         assert_eq!(back.records.len(), 3, "{out}");
+    }
+
+    #[test]
+    fn test_xyz_supplier_perceives_bonds_when_asked() {
+        let text = "3\nw\nO 0.0 0.0 0.0\nH 0.757 0.586 0.0\nH -0.757 0.586 0.0\n";
+        let mut options = options();
+        options.xyz.perceive_bonds = true;
+        let record = XyzSupplier::new(Cursor::new(text), &options)
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.molecule().unwrap().num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_pdb_supplier_drops_an_atomless_tail_without_its_conect() {
+        let model = "MODEL        1
+HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C
+HETATM    2  O1  LIG A   1       1.400   0.000   0.000  1.00  0.00           O
+ENDMDL
+";
+        let text = format!("{model}{model}CONECT    1    2\nCONECT    2    1\nEND\n");
+        let records: Vec<_> = PdbSupplier::new(Cursor::new(text.as_bytes()), &options())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record.molecule().unwrap().num_bonds(), 0);
+        }
+    }
+
+    #[test]
+    fn test_pdbqt_supplier_drops_an_atomless_tail() {
+        let pose = "MODEL        1
+ROOT
+ATOM      1  C   UNL     1       0.000   0.000   0.000  1.00  0.00    +0.000 C
+ENDROOT
+TORSDOF 0
+ENDMDL
+";
+        let text = format!("{pose}{pose}END\n");
+        let records: Vec<_> = PdbqtSupplier::new(Cursor::new(text.as_bytes()), &options())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
     }
 }

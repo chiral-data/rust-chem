@@ -24,6 +24,7 @@ pub struct ReadOptions {
     pub pdbqt: PdbqtReadOptions,
     pub gro: GroReadOptions,
     pub csv: CsvReadOptions,
+    pub mmcif: MmcifReadOptions,
 }
 
 /// Whether a format that was already multi-frame (XYZ, PDB, PDBQT, GRO --
@@ -31,6 +32,10 @@ pub struct ReadOptions {
 /// records (the default, and every existing caller's current behavior) or as
 /// one [`crate::io::reader::Payload::Frames`] [`crate::core::trajectory::Trajectory`]
 /// sharing a single topology.
+///
+/// mmCIF and BinaryCIF (#404) apply it per block, to the models of an NMR
+/// ensemble: under `Molecules` a block is its first model, with each later
+/// model reported in [`crate::io::reader::ReadOutcome::skipped`].
 ///
 /// `Molecules` is the honest default: `Kind::Molecules` describes what these
 /// formats return unless told otherwise, not a lie a read can silently
@@ -49,11 +54,21 @@ pub enum MultiFrameMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct XyzReadOptions {
     pub multi_frame: MultiFrameMode,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]). Off by default.
+    pub perceive_bonds: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PdbReadOptions {
     pub multi_frame: MultiFrameMode,
+    /// Bond standard residues from [`crate::core::residue_templates`] and
+    /// apply `SSBOND`/`LINK`, on top of `CONECT` (#403). Off by default, so
+    /// a caller gets only the bonds the file states.
+    pub residue_templates: bool,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]). Off by default.
+    pub perceive_bonds: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,6 +79,28 @@ pub struct PdbqtReadOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroReadOptions {
     pub multi_frame: MultiFrameMode,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]). Off by default.
+    pub perceive_bonds: bool,
+}
+
+/// mmCIF's and BinaryCIF's read options, one struct for both since both
+/// build through [`crate::io::cif_model`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MmcifReadOptions {
+    /// Bond standard residues from [`crate::core::residue_templates`] and
+    /// apply `_struct_conn`'s covalent links (#403). Off by default: with it
+    /// off, mmCIF reads no bonds at all.
+    pub residue_templates: bool,
+    /// Bond each residue by the file's own `_chem_comp_bond` table, matched
+    /// on atom name (#406). Off by default, so a read stays bondless.
+    pub chem_comp_bonds: bool,
+    /// Read an NMR ensemble's later models as frames (#404).
+    pub multi_frame: MultiFrameMode,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]), after every stated bond.
+    /// Off by default.
+    pub perceive_bonds: bool,
 }
 
 /// CSV's own read options (#337): whether row 0 is a header, and which

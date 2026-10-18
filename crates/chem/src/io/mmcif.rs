@@ -11,11 +11,25 @@
 //! BinaryCIF (#319) — this module is the text-specific tokenizer/formatter
 //! around it.
 //!
-//! **No bonds at all** — stricter than PDB's `CONECT`-only cut. mmCIF's
-//! rough analogue, `_struct_conn`, is a separate loop keyed by
-//! `label_asym_id`/`label_seq_id`/`label_atom_id` triples rather than a
-//! simple serial number, and rarer in ordinary deposited structures than
-//! `CONECT`. Deferred entirely, stated here rather than silently dropped.
+//! **No bonds by default.** With
+//! [`MmcifReadOptions::residue_templates`](crate::io::options::MmcifReadOptions::residue_templates)
+//! on (#403), standard residues are bonded from
+//! [`crate::core::residue_templates`], then the covalent rows of
+//! `_struct_conn` (`disulf`, `covale*`), each partner matched by its
+//! `label_*` IDs or, failing that, its `auth_*` IDs. Hydrogen bonds, metal
+//! coordination, links to a symmetry mate and unresolvable partners are
+//! skipped. BinaryCIF shares all of this through [`crate::io::cif_model`].
+//!
+//! With
+//! [`MmcifReadOptions::chem_comp_bonds`](crate::io::options::MmcifReadOptions::chem_comp_bonds)
+//! on, each residue is bonded by the block's own `_chem_comp_bond` table,
+//! matched on atom name, with the stated orders (#406); atoms the table
+//! names but the residue lacks are skipped. BinaryCIF reads the same way.
+//! Neither writer emits `_chem_comp_bond`, so bonds don't survive a write.
+//!
+//! [`MmcifReadOptions::perceive_bonds`](crate::io::options::MmcifReadOptions::perceive_bonds)
+//! runs last: it bonds by distance ([`crate::core::perceive::perceive_bonds`])
+//! only the pairs no step above bonded.
 //!
 //! **Grammar subset**: bare (whitespace-delimited) tokens, single- and
 //! double-quoted tokens. Multi-line semicolon (`;...;`) text fields are
@@ -28,17 +42,20 @@
 //! ([`crate::io::reader::read_mmcif_with_options`],
 //! [`crate::io::supplier::MmcifSupplier`]), the same division every prior
 //! format has. **A varying `pdbx_PDB_model_num` within one block's
-//! `_atom_site` loop** (mmCIF's actual NMR-ensemble convention — unlike
-//! PDB, models share one loop rather than living in separate blocks) is
-//! *not* split into multiple records: only the first model's atoms are
-//! read, later ones skipped rather than merged in. Stated plainly rather
-//! than silently combining distinct models into one incoherent structure;
-//! most deposited structures are single-model, and NMR ensembles
-//! specifically are the case this doesn't handle.
+//! `_atom_site` loop** is mmCIF's NMR-ensemble convention: models share one
+//! loop rather than living in separate blocks. [`parse_mmcif`] returns the
+//! first model. The reader returns the whole ensemble as one
+//! [`crate::io::reader::Payload::Frames`] record under
+//! [`crate::io::options::MultiFrameMode::Frames`], and otherwise reports
+//! each later model as skipped (#404). A later model whose atoms differ
+//! from the first model's is always skipped, never merged.
 
 use crate::core::molecule::Molecule;
-use crate::io::cif_model::{AtomSiteRows, RowPrecision, build_molecule, build_rows};
+use crate::io::cif_model::{
+    AtomSiteRows, CifLoops, CifModels, RowPrecision, build_models, build_rows, category_of,
+};
 use crate::io::errors::MmcifError;
+use crate::io::options::MmcifReadOptions;
 
 /// Splits one line into its whitespace-delimited or quoted tokens. A quote
 /// is a delimiter only where it starts a token (preceded by whitespace or
@@ -84,8 +101,26 @@ pub(crate) fn tokenize_line(line: &str) -> Vec<String> {
 
 /// Parses one mmCIF `data_` block (or a whole file with only one).
 pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
+    parse_mmcif_with_options(text, &MmcifReadOptions::default())
+}
+
+/// [`parse_mmcif`] with mmCIF's own read options. Returns the first model
+/// of an NMR ensemble.
+pub fn parse_mmcif_with_options(
+    text: &str,
+    options: &MmcifReadOptions,
+) -> Result<Molecule, MmcifError> {
+    parse_mmcif_models(text, options).map(|models| models.molecule)
+}
+
+/// One block's first model plus its later models (#404).
+pub(crate) fn parse_mmcif_models(
+    text: &str,
+    options: &MmcifReadOptions,
+) -> Result<CifModels, MmcifError> {
     let mut singles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut atom_site: Option<AtomSiteRows> = None;
+    let mut loops = CifLoops::new();
 
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -122,9 +157,9 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
 
             if tags.first().is_some_and(|t| t.starts_with("_atom_site.")) {
                 atom_site = Some((tags, rows));
+            } else if let Some(first) = tags.first() {
+                loops.insert(category_of(first), (tags, rows));
             }
-            // Every other loop (e.g. `_struct_conn`) is out of scope --
-            // see the module doc.
             continue;
         }
 
@@ -137,11 +172,13 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
         i += 1;
     }
 
-    build_molecule(
+    build_models(
         &singles,
         atom_site
             .as_ref()
             .map(|(t, r)| (t.as_slice(), r.as_slice())),
+        &loops,
+        options,
     )
 }
 
@@ -183,7 +220,7 @@ pub fn write_mmcif(mol: &Molecule) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::geometry::Point3;
 
@@ -279,13 +316,84 @@ HETATM 3 H H2 . HOH A 1 A HOH . 0.759 0.000 -0.504 1.00 20.00 1
     }
 
     #[test]
-    fn test_only_the_first_model_is_read_when_the_model_number_varies() {
+    fn test_parse_mmcif_returns_the_first_model_of_an_ensemble() {
+        // The later model reaches only the reader (#404); `parse_mmcif`'s
+        // signature has room for one molecule.
         let text = "data_x\nloop_\n_atom_site.type_symbol\n_atom_site.Cartn_x\n\
                     _atom_site.Cartn_y\n_atom_site.Cartn_z\n_atom_site.pdbx_PDB_model_num\n\
                     C 0.0 0.0 0.0 1\nC 1.0 1.0 1.0 2\n";
         let mol = parse_mmcif(text).expect("valid mmCIF");
         assert_eq!(mol.num_atoms(), 1);
         assert_eq!(mol.coord3(0), Some(Point3::new(0.0, 0.0, 0.0)));
+
+        let models = parse_mmcif_models(text, &MmcifReadOptions::default()).unwrap();
+        assert_eq!(models.later.len(), 1);
+        assert_eq!(
+            models.later[0].positions,
+            Ok(vec![Point3::new(1.0, 1.0, 1.0)])
+        );
+    }
+
+    const ENSEMBLE_HEADER: &str = "data_x\nloop_\n_atom_site.type_symbol\n\
+        _atom_site.label_atom_id\n_atom_site.label_comp_id\n_atom_site.auth_asym_id\n\
+        _atom_site.auth_seq_id\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n\
+        _atom_site.pdbx_PDB_model_num\n";
+
+    fn ensemble(rows: &[&str]) -> CifModels {
+        let text = format!("{ENSEMBLE_HEADER}{}\n", rows.join("\n"));
+        parse_mmcif_models(&text, &MmcifReadOptions::default()).expect("valid mmCIF")
+    }
+
+    #[test]
+    fn test_a_three_model_block_gives_one_molecule_and_two_later_models() {
+        let models = ensemble(&[
+            "N N GLY A 1 0.0 0.0 0.0 1",
+            "C CA GLY A 1 1.5 0.0 0.0 1",
+            "N N GLY A 1 0.1 0.0 0.0 2",
+            "C CA GLY A 1 1.6 0.0 0.0 2",
+            "N N GLY A 1 0.2 0.0 0.0 3",
+            "C CA GLY A 1 1.7 0.0 0.0 3",
+        ]);
+        assert_eq!(models.molecule.num_atoms(), 2);
+        assert_eq!(models.molecule.residues().len(), 1);
+        let numbers: Vec<&str> = models.later.iter().map(|m| m.number.as_str()).collect();
+        assert_eq!(numbers, ["2", "3"]);
+        assert_eq!(
+            models.later[1].positions,
+            Ok(vec![Point3::new(0.2, 0.0, 0.0), Point3::new(1.7, 0.0, 0.0)])
+        );
+    }
+
+    #[test]
+    fn test_a_later_model_with_one_atom_fewer_is_rejected_with_a_reason() {
+        let models = ensemble(&[
+            "N N GLY A 1 0.0 0.0 0.0 1",
+            "C CA GLY A 1 1.5 0.0 0.0 1",
+            "N N GLY A 1 0.1 0.0 0.0 2",
+        ]);
+        assert_eq!(models.molecule.num_atoms(), 2);
+        let reason = models.later[0].positions.as_ref().unwrap_err();
+        assert_eq!(reason, "1 atoms where model 1 has 2");
+    }
+
+    #[test]
+    fn test_a_later_model_naming_a_different_atom_is_rejected() {
+        // Same count, different atom: what a count-only check would merge.
+        let models = ensemble(&[
+            "N N GLY A 1 0.0 0.0 0.0 1",
+            "C CA GLY A 1 1.5 0.0 0.0 1",
+            "N N GLY A 1 0.1 0.0 0.0 2",
+            "C CB GLY A 1 1.6 0.0 0.0 2",
+        ]);
+        let reason = models.later[0].positions.as_ref().unwrap_err();
+        assert!(reason.starts_with("atom 2 is C CB GLY A 1"), "{reason}");
+    }
+
+    #[test]
+    fn test_a_single_model_block_has_no_later_models() {
+        let models = ensemble(&["N N GLY A 1 0.0 0.0 0.0 1", "C CA GLY A 1 1.5 0.0 0.0 1"]);
+        assert_eq!(models.molecule.num_atoms(), 2);
+        assert!(models.later.is_empty());
     }
 
     #[test]
@@ -384,5 +492,150 @@ ATOM 2 O O UNK A 1 A 0.000 0.000 0.000\n";
                     _atom_site.Cartn_y\n_atom_site.Cartn_z\n";
         let mol = parse_mmcif(text).expect("a present-but-empty atom_site loop is legal mmCIF");
         assert_eq!(mol.num_atoms(), 0);
+    }
+
+    /// Partners named by `label_*` IDs, one ligand only by `auth_*` (its
+    /// `label_seq_id` is `.`), and three rows that must not bond: metal
+    /// coordination, a hydrogen bond, and a link to a symmetry mate.
+    pub(crate) const LINKED_MMCIF: &str = "\
+data_links
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 S SG . CYS A 1 3 A 0.0 0.0 0.0
+ATOM 2 S SG . CYS A 2 40 A 2.0 0.0 0.0
+ATOM 3 N ND2 . ASN A 3 60 A 9.0 0.0 0.0
+ATOM 4 N NE2 . HIS A 4 50 A 5.0 0.0 0.0
+HETATM 5 C C1 . NAG B . 102 A 10.4 0.0 0.0
+HETATM 6 Zn ZN . ZN C . 101 A 7.0 0.0 0.0
+loop_
+_struct_conn.id
+_struct_conn.conn_type_id
+_struct_conn.ptnr1_label_asym_id
+_struct_conn.ptnr1_label_seq_id
+_struct_conn.ptnr1_label_atom_id
+_struct_conn.ptnr1_auth_asym_id
+_struct_conn.ptnr1_auth_seq_id
+_struct_conn.ptnr2_label_asym_id
+_struct_conn.ptnr2_label_seq_id
+_struct_conn.ptnr2_label_atom_id
+_struct_conn.ptnr2_auth_asym_id
+_struct_conn.ptnr2_auth_seq_id
+_struct_conn.ptnr1_symmetry
+_struct_conn.ptnr2_symmetry
+disulf1 disulf A 1 SG A 3 A 2 SG A 40 1_555 1_555
+covale1 covale A 3 ND2 A 60 B . C1 A 102 1_555 1_555
+metalc1 metalc A 4 NE2 A 50 C . ZN A 101 1_555 1_555
+hydrog1 hydrog A 1 SG A 3 A 4 NE2 A 50 1_555 1_555
+covale2 covale A 1 SG A 3 A 3 ND2 A 60 1_555 2_555
+";
+
+    #[test]
+    fn test_struct_conn_bonds_only_covalent_rows_inside_the_model() {
+        let options = MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let mol = parse_mmcif_with_options(LINKED_MMCIF, &options).expect("reads");
+        let bonded = |a: usize, b: usize| mol.graph().has_edge(a, b);
+        assert!(bonded(0, 1), "disulf, by label IDs");
+        assert!(bonded(2, 4), "covale, falling back to auth IDs");
+        assert_eq!(
+            mol.num_bonds(),
+            2,
+            "metalc, hydrog and a symmetry mate stay out"
+        );
+        assert_eq!(mol.atom(0).hydrogens(), Some(1));
+        assert_eq!(mol.atom(3).hydrogens(), None, "bondless stays unknown");
+    }
+
+    #[test]
+    fn test_a_single_struct_conn_row_written_without_a_loop_still_bonds() {
+        let (atoms, _) = LINKED_MMCIF.split_once("loop_\n_struct_conn").unwrap();
+        let text = format!(
+            "{atoms}_struct_conn.id disulf1\n_struct_conn.conn_type_id disulf\n\
+             _struct_conn.ptnr1_label_asym_id A\n_struct_conn.ptnr1_label_seq_id 1\n\
+             _struct_conn.ptnr1_label_atom_id SG\n_struct_conn.ptnr2_label_asym_id A\n\
+             _struct_conn.ptnr2_label_seq_id 2\n_struct_conn.ptnr2_label_atom_id SG\n"
+        );
+        let options = MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let mol = parse_mmcif_with_options(&text, &options).expect("reads");
+        assert!(mol.graph().has_edge(0, 1));
+        assert_eq!(mol.num_bonds(), 1);
+    }
+
+    #[test]
+    fn test_struct_conn_is_ignored_by_default() {
+        let mol = parse_mmcif(LINKED_MMCIF).expect("reads");
+        assert_eq!(mol.num_bonds(), 0);
+        assert!(mol.atoms().iter().all(|a| a.hydrogens().is_none()));
+    }
+
+    #[test]
+    fn test_perception_after_templates_refills_the_hydrogens_it_changes() {
+        // A ligand carbon 1.53 Å past an alanine's CB, with no stated link:
+        // templates bond the alanine, perception adds CB-C1, and the one
+        // hydrogen fill must see both, leaving CB a CH2 rather than a CH3.
+        let text = "\
+data_tethered
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N N ALA A 1 9 A 5.606 4.546 11.941
+ATOM 2 C CA ALA A 1 9 A 5.598 5.767 11.082
+ATOM 3 C C ALA A 1 9 A 6.441 5.527 9.850
+ATOM 4 O O ALA A 1 9 A 6.052 5.933 8.744
+ATOM 5 C CB ALA A 1 9 A 6.022 6.977 11.891
+HETATM 6 C C1 LIG B . 101 A 6.450 8.198 12.707
+";
+        let read = |perceive_bonds| {
+            let options = MmcifReadOptions {
+                residue_templates: true,
+                perceive_bonds,
+                ..Default::default()
+            };
+            parse_mmcif_with_options(text, &options).unwrap()
+        };
+        let (templates, both) = (read(false), read(true));
+        assert_eq!(templates.atom(4).hydrogens(), Some(3));
+        assert!(both.graph().has_edge(4, 5));
+        assert_eq!(both.atom(4).hydrogens(), Some(2));
+        assert_eq!(both.atom(5).hydrogens(), Some(3));
+    }
+
+    #[test]
+    fn test_perception_bonds_a_water_when_asked() {
+        assert_eq!(parse_mmcif(WATER_MMCIF).unwrap().num_bonds(), 0);
+        let options = MmcifReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let mol = parse_mmcif_with_options(WATER_MMCIF, &options).unwrap();
+        assert_eq!(mol.num_bonds(), 2);
+        assert_eq!(mol.atom(0).hydrogens(), Some(0));
     }
 }

@@ -21,10 +21,16 @@
 //! is the reader's/supplier's job ([`crate::io::reader::read_xyz_with_options`],
 //! [`crate::io::supplier::XyzSupplier`]), not this module's — this file
 //! parses and writes exactly one frame, mirroring [`crate::io::sdf::parse_sdf`].
+//!
+//! XYZ states no bonds, so a molecule arrives with none unless
+//! [`XyzReadOptions::perceive_bonds`] is set, which bonds atoms by distance
+//! ([`crate::core::perceive::perceive_bonds`]), all as single bonds.
 
 use crate::core::geometry::is_placeholder_3d;
 use crate::core::molecule::Molecule;
+use crate::core::perceive::perceive_bonds;
 use crate::io::errors::XyzError;
+use crate::io::options::XyzReadOptions;
 
 /// Parses one XYZ frame: the count line, the comment line, then that many
 /// atom lines.
@@ -78,6 +84,16 @@ pub fn parse_xyz(text: &str) -> Result<Molecule, XyzError> {
     if !is_placeholder_3d(&coords) {
         mol.set_coords3(coords)
             .map_err(|e| XyzError::ParseError(e.to_string()))?;
+    }
+    Ok(mol)
+}
+
+/// [`parse_xyz`] with XYZ's own read options.
+pub fn parse_xyz_with_options(text: &str, options: &XyzReadOptions) -> Result<Molecule, XyzError> {
+    let mut mol = parse_xyz(text)?;
+    if options.perceive_bonds {
+        perceive_bonds(&mut mol);
+        mol.calculate_implicit_hydrogens_where_bonded();
     }
     Ok(mol)
 }
@@ -247,5 +263,63 @@ mod tests {
         let text = "2\nreal\nC 0.0 0.0 0.0\nO 1.4 0.0 0.0\n";
         let mol = parse_xyz(text).expect("valid XYZ");
         assert!(mol.has_coords3());
+    }
+
+    /// PubChem CID 2519's 3D conformer.
+    const CAFFEINE: &str = "24\ncaffeine\nO 0.4700 2.5688 0.0006\nO -3.1271 -0.4436 -0.0003\nN -0.9686 -1.3125 0.0000\nN 2.2182 0.1412 -0.0003\nN -1.3477 1.0797 -0.0001\nN 1.4119 -1.9372 0.0002\nC 0.8579 0.2592 -0.0008\nC 0.3897 -1.0264 -0.0004\nC 0.0307 1.4220 -0.0006\nC -1.9061 -0.2495 -0.0004\nC 2.5032 -1.1998 0.0003\nC -1.4276 -2.6960 0.0008\nC 3.1926 1.2061 0.0003\nC -2.2969 2.1881 0.0007\nH 3.5163 -1.5787 0.0008\nH -1.0451 -3.1973 -0.8937\nH -2.5186 -2.7596 0.0011\nH -1.0447 -3.1963 0.8957\nH 4.1992 0.7801 0.0002\nH 3.0468 1.8092 -0.8992\nH 3.0466 1.8083 0.9004\nH -1.8087 3.1651 -0.0003\nH -2.9322 2.1027 0.8881\nH -2.9346 2.1021 -0.8849\n";
+
+    #[test]
+    fn test_bonds_are_not_perceived_by_default() {
+        let mol = parse_xyz_with_options(CAFFEINE, &XyzReadOptions::default()).unwrap();
+        assert_eq!(mol.num_bonds(), 0);
+    }
+
+    #[test]
+    fn test_perceived_caffeine_matches_its_stated_connectivity() {
+        let options = XyzReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let mol = parse_xyz_with_options(CAFFEINE, &options).unwrap();
+        let mut pairs: Vec<(usize, usize)> = mol
+            .bonds()
+            .iter()
+            .map(|b| {
+                let (a, c) = b.atoms();
+                (a.min(c), a.max(c))
+            })
+            .collect();
+        pairs.sort_unstable();
+        // PubChem's own bond block for the same record, orders dropped.
+        let expected = vec![
+            (0, 8),
+            (1, 9),
+            (2, 7),
+            (2, 9),
+            (2, 11),
+            (3, 6),
+            (3, 10),
+            (3, 12),
+            (4, 8),
+            (4, 9),
+            (4, 13),
+            (5, 7),
+            (5, 10),
+            (6, 7),
+            (6, 8),
+            (10, 14),
+            (11, 15),
+            (11, 16),
+            (11, 17),
+            (12, 18),
+            (12, 19),
+            (12, 20),
+            (13, 21),
+            (13, 22),
+            (13, 23),
+        ];
+        assert_eq!(pairs, expected);
+        // Bonded atoms get a hydrogen count, so the write isn't all brackets.
+        assert!(mol.atoms().iter().all(|a| a.hydrogens().is_some()));
     }
 }

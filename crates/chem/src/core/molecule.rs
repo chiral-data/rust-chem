@@ -242,11 +242,9 @@ impl Molecule {
         // an existing group's meaning is untouched by a new atom that was
         // never a member of it.
 
-        let mut new_graph = MoleculeGraph::new(self.atoms.len());
-        for (bond_idx, bond) in self.bonds.iter().enumerate() {
-            new_graph.add_edge(bond.atom1(), bond.atom2(), bond_idx);
-        }
-        self.graph = new_graph;
+        // A new atom has no bonds, so growing the graph equals a rebuild from
+        // `bonds`; rebuilding here made building a molecule O(n²).
+        self.graph.add_node();
 
         idx
     }
@@ -1328,6 +1326,111 @@ mod tests {
         mol.add_bond(Bond::new(a1, a3, BondOrder::Single)).unwrap();
         assert_eq!(mol.degree(a1), 2);
         assert_eq!(mol.degree(a2), 1);
+    }
+
+    // ---- the graph mirrors `bonds` -------------------------------------
+
+    /// Asserts `mol.graph` equals a graph rebuilt from `mol.bonds`.
+    fn assert_graph_matches_a_rebuild(mol: &Molecule) {
+        let mut rebuilt = MoleculeGraph::new(mol.num_atoms());
+        for (bond_idx, bond) in mol.bonds().iter().enumerate() {
+            rebuilt.add_edge(bond.atom1(), bond.atom2(), bond_idx);
+        }
+        let graph = mol.graph();
+        assert_eq!(graph.num_atoms(), rebuilt.num_atoms());
+        assert_eq!(graph.num_bonds(), rebuilt.num_bonds());
+        for a in 0..mol.num_atoms() {
+            assert_eq!(graph.neighbors(a), rebuilt.neighbors(a), "atom {a}");
+            assert_eq!(graph.degree(a), rebuilt.degree(a), "atom {a}");
+            for b in 0..mol.num_atoms() {
+                assert_eq!(graph.has_edge(a, b), rebuilt.has_edge(a, b));
+                assert_eq!(graph.get_bond(a, b), rebuilt.get_bond(a, b));
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_atom_after_bonds_keeps_every_neighbour_list() {
+        let mut mol = Molecule::new();
+        for _ in 0..4 {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        mol.add_bond(Bond::new(1, 2, BondOrder::Double)).unwrap();
+        mol.add_bond(Bond::new(2, 3, BondOrder::Single)).unwrap();
+        let before: Vec<Vec<_>> = (0..4).map(|a| mol.neighbors(a).to_vec()).collect();
+
+        let new = mol.add_atom(Atom::new(Element::oxygen()));
+
+        assert_eq!(new, 4);
+        assert_eq!(mol.degree(new), 0);
+        for (a, neighbours) in before.iter().enumerate() {
+            assert_eq!(mol.neighbors(a), neighbours.as_slice());
+        }
+        assert_graph_matches_a_rebuild(&mol);
+    }
+
+    #[test]
+    fn test_the_graph_matches_a_rebuild_after_mixed_edits() {
+        let mut mol = crate::io::smiles::parse_smiles("c1ccccc1C(=O)O").expect("valid SMILES");
+        assert_graph_matches_a_rebuild(&mol);
+
+        let n = mol.add_atom(Atom::new(Element::nitrogen()));
+        mol.add_bond(Bond::new(0, n, BondOrder::Single)).unwrap();
+        assert_graph_matches_a_rebuild(&mol);
+
+        // A refused bond leaves both sides untouched.
+        assert!(
+            mol.add_bond(Bond::new(n, n + 7, BondOrder::Single))
+                .is_err()
+        );
+        // In-place edits to bonds and atoms cannot move an endpoint.
+        mol.bond_mut(0).set_order(BondOrder::Double);
+        mol.atom_mut(n).set_hydrogens(2);
+        mol.calculate_implicit_hydrogens();
+        mol.set_coords3(vec![Point3::new(0.0, 0.0, 0.0); mol.num_atoms()])
+            .unwrap();
+        assert_graph_matches_a_rebuild(&mol);
+
+        // Interleave atoms with bonds to them, then repeat a bond.
+        for _ in 0..3 {
+            let a = mol.add_atom(Atom::new(Element::carbon()));
+            let b = mol.add_atom(Atom::new(Element::hydrogen()));
+            mol.add_bond(Bond::new(a, a - 1, BondOrder::Single))
+                .unwrap();
+            mol.add_bond(Bond::new(b, a, BondOrder::Single)).unwrap();
+            assert_graph_matches_a_rebuild(&mol);
+        }
+        mol.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        assert_graph_matches_a_rebuild(&mol);
+
+        let mut copy = mol.clone();
+        copy.add_atom(Atom::new(Element::carbon()));
+        assert_graph_matches_a_rebuild(&copy);
+        assert_graph_matches_a_rebuild(&mol);
+
+        let mut sized = Molecule::with_capacity(4, 2);
+        sized.add_atom(Atom::new(Element::carbon()));
+        sized.add_atom(Atom::new(Element::carbon()));
+        sized.add_bond(Bond::new(0, 1, BondOrder::Single)).unwrap();
+        sized.add_atom(Atom::new(Element::carbon()));
+        assert_graph_matches_a_rebuild(&sized);
+    }
+
+    #[test]
+    #[ignore = "timing; run with --release --ignored"]
+    fn test_building_100k_atoms_is_fast() {
+        // Pins add_atom at O(1): it rebuilt the graph per call before #413.
+        let n = 103_823;
+        let start = std::time::Instant::now();
+        let mut mol = Molecule::new();
+        for _ in 0..n {
+            mol.add_atom(Atom::new(Element::carbon()));
+        }
+        let elapsed = start.elapsed();
+        eprintln!("{n} atoms, {elapsed:?}");
+        assert_eq!(mol.graph().num_atoms(), n);
+        assert!(elapsed.as_secs_f64() < 0.5, "{elapsed:?}");
     }
 
     fn two_atom_molecule() -> Molecule {

@@ -46,11 +46,11 @@ use std::collections::HashMap;
 use std::io::BufRead;
 
 use crate::core::molecule::Molecule;
-use crate::io::cif_model::{self, AtomSiteRows, RowPrecision};
+use crate::io::cif_model::{self, AtomSiteRows, CifLoops, CifModels, RowPrecision};
 use crate::io::errors::{BcifError, ReadError};
 use crate::io::msgpack::{self, Value};
-use crate::io::options::{ReadOptions, WriteOptions};
-use crate::io::reader::{Payload, ReadOutcome, Record, Skipped};
+use crate::io::options::{MmcifReadOptions, ReadOptions, WriteOptions};
+use crate::io::reader::{Payload, ReadOutcome, Record, Skipped, push_cif_models};
 
 /// One decoded column, at whatever stage the encoding chain has reached.
 ///
@@ -360,8 +360,22 @@ fn decode_column(col: &Value) -> Result<Vec<Option<String>>, BcifError> {
 }
 
 /// Decodes a whole BinaryCIF document into one `(name, Molecule)` per data
-/// block.
-pub(crate) fn decode_bcif(bytes: &[u8]) -> Result<Vec<(String, Molecule)>, BcifError> {
+/// block, each block's first model only.
+pub(crate) fn decode_bcif(
+    bytes: &[u8],
+    options: &MmcifReadOptions,
+) -> Result<Vec<(String, Molecule)>, BcifError> {
+    Ok(decode_bcif_models(bytes, options)?
+        .into_iter()
+        .map(|(name, models)| (name, models.molecule))
+        .collect())
+}
+
+/// [`decode_bcif`] keeping every block's later models (#404).
+fn decode_bcif_models(
+    bytes: &[u8],
+    options: &MmcifReadOptions,
+) -> Result<Vec<(String, CifModels)>, BcifError> {
     let top = msgpack::decode(bytes)?;
     let blocks = top
         .map_get("dataBlocks")
@@ -382,6 +396,7 @@ pub(crate) fn decode_bcif(bytes: &[u8]) -> Result<Vec<(String, Molecule)>, BcifE
 
         let mut singles: HashMap<String, String> = HashMap::new();
         let mut atom_site: Option<AtomSiteRows> = None;
+        let mut loops = CifLoops::new();
 
         for category in categories {
             let name = category
@@ -397,58 +412,57 @@ pub(crate) fn decode_bcif(bytes: &[u8]) -> Result<Vec<(String, Molecule)>, BcifE
                 .and_then(Value::as_array)
                 .unwrap_or(&[]);
 
+            let mut tags = Vec::with_capacity(columns.len());
+            let mut per_column: Vec<Vec<Option<String>>> = Vec::with_capacity(columns.len());
+            for col in columns {
+                let col_name = col
+                    .map_get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| BcifError::ParseError("column has no name".to_string()))?;
+                tags.push(format!("{name}.{col_name}"));
+                per_column.push(decode_column(col)?);
+            }
+            let mut rows = Vec::with_capacity(row_count);
+            for r in 0..row_count {
+                let row: Vec<String> = per_column
+                    .iter()
+                    .map(|values| {
+                        values
+                            .get(r)
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| "?".to_string())
+                    })
+                    .collect();
+                rows.push(row);
+            }
+
             if name == "_atom_site" {
-                let mut tags = Vec::with_capacity(columns.len());
-                let mut per_column: Vec<Vec<Option<String>>> = Vec::with_capacity(columns.len());
-                for col in columns {
-                    let col_name = col
-                        .map_get("name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| BcifError::ParseError("column has no name".to_string()))?;
-                    tags.push(format!("_atom_site.{col_name}"));
-                    per_column.push(decode_column(col)?);
-                }
-                let mut rows = Vec::with_capacity(row_count);
-                for r in 0..row_count {
-                    let row: Vec<String> = per_column
-                        .iter()
-                        .map(|values| {
-                            values
-                                .get(r)
-                                .cloned()
-                                .flatten()
-                                .unwrap_or_else(|| "?".to_string())
-                        })
-                        .collect();
-                    rows.push(row);
-                }
                 atom_site = Some((tags, rows));
             } else {
-                for col in columns {
-                    let col_name = col
-                        .map_get("name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| BcifError::ParseError("column has no name".to_string()))?;
-                    let values = decode_column(col)?;
+                for (tag, values) in tags.iter().zip(&per_column) {
                     if let Some(Some(first)) = values.first() {
-                        singles.insert(format!("{name}.{col_name}"), first.clone());
+                        singles.insert(tag.clone(), first.clone());
                     }
                 }
+                loops.insert(cif_model::category_of(name), (tags, rows));
             }
         }
 
-        let molecule = cif_model::build_molecule(
+        let models = cif_model::build_models(
             &singles,
             atom_site
                 .as_ref()
                 .map(|(t, r)| (t.as_slice(), r.as_slice())),
+            &loops,
+            options,
         )?;
         let name = if header.is_empty() {
             format!("Molecule_{}", i + 1)
         } else {
             header
         };
-        out.push((name, molecule));
+        out.push((name, models));
     }
     Ok(out)
 }
@@ -718,16 +732,12 @@ pub(crate) fn encode_bcif(records: &[(String, Molecule)]) -> Vec<u8> {
 // --- registry entry points --------------------------------------------------
 
 /// [`crate::io::format::ByteReadFn`] for BinaryCIF.
-pub(crate) fn read_bcif_with_options(bytes: &[u8], _options: &ReadOptions) -> ReadOutcome {
+pub(crate) fn read_bcif_with_options(bytes: &[u8], options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
-    match decode_bcif(bytes) {
-        Ok(records) => {
-            for (name, molecule) in records {
-                out.records.push(Record {
-                    payload: Payload::Molecule(molecule),
-                    name,
-                    smiles: None,
-                });
+    match decode_bcif_models(bytes, &options.mmcif) {
+        Ok(blocks) => {
+            for (i, (name, models)) in blocks.into_iter().enumerate() {
+                push_cif_models(&mut out, options.mmcif.multi_frame, i + 1, name, models);
             }
         }
         Err(e) => out.skipped.push(Skipped {
@@ -755,14 +765,14 @@ pub struct BcifSupplier {
 }
 
 impl BcifSupplier {
-    pub fn new<R: BufRead>(mut reader: R, _options: &ReadOptions) -> Self {
+    pub fn new<R: BufRead>(mut reader: R, options: &ReadOptions) -> Self {
         let mut bytes = Vec::new();
         let records = match reader.read_to_end(&mut bytes) {
             Err(source) => vec![Err(ReadError::Io {
                 position: 1,
                 source,
             })],
-            Ok(_) => match decode_bcif(&bytes) {
+            Ok(_) => match decode_bcif(&bytes, &options.mmcif) {
                 Ok(molecules) => molecules
                     .into_iter()
                     .map(|(name, molecule)| {
@@ -848,7 +858,7 @@ mod tests {
     fn test_a_molecule_round_trips_through_encode_and_decode() {
         let mol = ethanol_like();
         let bytes = encode_bcif(&[("ethanol".to_string(), mol.clone())]);
-        let back = decode_bcif(&bytes).expect("valid BinaryCIF");
+        let back = decode_bcif(&bytes, &MmcifReadOptions::default()).expect("valid BinaryCIF");
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, "ethanol");
         assert_eq!(back[0].1.num_atoms(), 3);
@@ -865,7 +875,7 @@ mod tests {
             .unwrap();
 
         let bytes = encode_bcif(&[("x".to_string(), mol)]);
-        let back = decode_bcif(&bytes).unwrap();
+        let back = decode_bcif(&bytes, &MmcifReadOptions::default()).unwrap();
         assert_eq!(back[0].1.coord3(0).unwrap().x, 1.234_567_89);
     }
 
@@ -877,7 +887,7 @@ mod tests {
         mol.set_space_group(crate::core::cell::SpaceGroup::from_symbol("P 21 21 21"));
 
         let bytes = encode_bcif(&[("x".to_string(), mol.clone())]);
-        let back = decode_bcif(&bytes).unwrap();
+        let back = decode_bcif(&bytes, &MmcifReadOptions::default()).unwrap();
         assert_eq!(back[0].1.cell(), mol.cell());
         assert_eq!(
             back[0].1.space_group().and_then(|g| g.symbol.as_deref()),
@@ -933,7 +943,7 @@ mod tests {
         .unwrap();
 
         let bytes = encode_bcif(&[("x".to_string(), mol.clone())]);
-        let back = decode_bcif(&bytes).unwrap();
+        let back = decode_bcif(&bytes, &MmcifReadOptions::default()).unwrap();
         assert_eq!(back[0].1.residues()[0].sequence, 300);
     }
 
@@ -989,7 +999,7 @@ mod tests {
     #[test]
     fn test_a_document_with_no_data_blocks_key_is_a_clear_error() {
         let bytes = msgpack::encode(&Value::map(vec![("version", Value::str("0.3.0"))]));
-        let err = decode_bcif(&bytes).unwrap_err();
+        let err = decode_bcif(&bytes, &MmcifReadOptions::default()).unwrap_err();
         assert!(matches!(err, BcifError::ParseError(_)), "{err}");
     }
 
@@ -1000,18 +1010,192 @@ mod tests {
         // and not hand-crafted bytes, so this proves the encoder and decoder
         // agree with each other on real structure-sized input, not just the
         // small hand-built molecules the other tests in this module use.
-        let dipeptide = decode_bcif(include_bytes!(
-            "../../tests/corpus/bcif/dipeptide-with-ligand.bcif"
-        ))
+        let dipeptide = decode_bcif(
+            include_bytes!("../../tests/corpus/bcif/dipeptide-with-ligand.bcif"),
+            &MmcifReadOptions::default(),
+        )
         .expect("valid BinaryCIF");
         assert_eq!(dipeptide.len(), 1);
         assert_eq!(dipeptide[0].1.num_atoms(), 8);
         assert!(dipeptide[0].1.has_coords3());
 
-        let water = decode_bcif(include_bytes!("../../tests/corpus/bcif/water-no-cell.bcif"))
-            .expect("valid BinaryCIF");
+        let water = decode_bcif(
+            include_bytes!("../../tests/corpus/bcif/water-no-cell.bcif"),
+            &MmcifReadOptions::default(),
+        )
+        .expect("valid BinaryCIF");
         assert_eq!(water.len(), 1);
         assert_eq!(water[0].1.num_atoms(), 3);
         assert!(water[0].1.cell().is_none());
+    }
+
+    #[test]
+    fn test_chem_comp_bonds_read_the_same_as_from_mmcif() {
+        // The committed twin lacks the loop (the writer never emits it), so
+        // it is appended here as a string-encoded category.
+        let cif = include_str!("../../tests/corpus/mmcif/dipeptide-with-ligand.cif");
+        let options = MmcifReadOptions {
+            chem_comp_bonds: true,
+            ..Default::default()
+        };
+        let from_text = crate::io::mmcif::parse_mmcif_with_options(cif, &options).unwrap();
+
+        let rows: Vec<Vec<String>> = cif
+            .lines()
+            .filter(|l| l.starts_with("LIG C1"))
+            .map(|l| l.split_whitespace().map(str::to_string).collect())
+            .collect();
+        let columns = ["comp_id", "atom_id_1", "atom_id_2", "value_order"]
+            .iter()
+            .enumerate()
+            .map(|(ci, col)| {
+                let values: Vec<String> = rows.iter().map(|r| r[ci].clone()).collect();
+                encode_column(col, &values, ColumnEncoding::Str)
+            })
+            .collect();
+        let chem_comp_bond = Value::map(vec![
+            ("name", Value::str("_chem_comp_bond")),
+            ("rowCount", Value::Int(rows.len() as i64)),
+            ("columns", Value::Array(columns)),
+        ]);
+
+        let top = msgpack::decode(include_bytes!(
+            "../../tests/corpus/bcif/dipeptide-with-ligand.bcif"
+        ))
+        .unwrap();
+        let block = &top.map_get("dataBlocks").unwrap().as_array().unwrap()[0];
+        let mut categories = block
+            .map_get("categories")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .to_vec();
+        categories.insert(0, chem_comp_bond);
+        let doc = Value::map(vec![(
+            "dataBlocks",
+            Value::Array(vec![Value::map(vec![
+                ("header", Value::str("dipeptide")),
+                ("categories", Value::Array(categories)),
+            ])]),
+        )]);
+        let from_binary = decode_bcif(&msgpack::encode(&doc), &options).unwrap();
+        let from_binary = &from_binary[0].1;
+
+        let bonds = |mol: &Molecule| -> Vec<_> {
+            mol.bonds().iter().map(|b| (b.atoms(), b.order())).collect()
+        };
+        assert_eq!(bonds(&from_text), bonds(from_binary));
+        assert_eq!(
+            bonds(&from_text),
+            vec![((6, 7), crate::core::bond::BondOrder::Double)]
+        );
+    }
+
+    #[test]
+    fn test_an_nmr_ensemble_reads_the_same_as_its_mmcif_twin() {
+        // Written by `generate_nmr_ensemble.py`, not this crate's encoder.
+        let bytes = include_bytes!("../../tests/corpus/bcif/nmr-ensemble.bcif");
+        let cif = include_str!("../../tests/corpus/mmcif/nmr-ensemble.cif");
+
+        let default = read_bcif_with_options(bytes, &ReadOptions::default());
+        assert_eq!(default.records.len(), 1);
+        assert_eq!(default.records[0].name, "nmr_ensemble");
+        let errors: Vec<&str> = default.skipped.iter().map(|s| s.error.as_str()).collect();
+        assert_eq!(
+            errors,
+            crate::io::reader::read_mmcif(cif)
+                .skipped
+                .iter()
+                .map(|s| s.error.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let mut options = ReadOptions::default();
+        options.mmcif.multi_frame = crate::io::options::MultiFrameMode::Frames;
+        let trajectory = |outcome: ReadOutcome| match outcome.records.into_iter().next() {
+            Some(Record {
+                payload: Payload::Frames(t),
+                ..
+            }) => t,
+            _ => panic!("expected one Payload::Frames record"),
+        };
+        let mut from_bcif = trajectory(read_bcif_with_options(bytes, &options));
+        let mut from_cif = trajectory(crate::io::reader::read_mmcif_with_options(cif, &options));
+        assert_eq!(from_bcif.frame_count(), 3);
+        assert_eq!(from_bcif.frame_count(), from_cif.frame_count());
+        for i in 0..3 {
+            assert_eq!(
+                from_bcif.frame(i).unwrap().positions,
+                from_cif.frame(i).unwrap().positions
+            );
+        }
+    }
+
+    /// The loops of a small mmCIF text, as BinaryCIF categories of string
+    /// columns: enough to put a `_struct_conn` beside an `_atom_site`.
+    fn categories_from_mmcif(text: &str) -> Vec<Value> {
+        let mut categories = Vec::new();
+        for block in text.split("loop_\n").skip(1) {
+            let (tags, rows): (Vec<&str>, Vec<&str>) =
+                block.lines().partition(|line| line.starts_with('_'));
+            let rows: Vec<Vec<&str>> = rows
+                .iter()
+                .map(|r| r.split_whitespace().collect())
+                .collect();
+            let (category, _) = tags[0].split_once('.').unwrap();
+            let columns = tags
+                .iter()
+                .enumerate()
+                .map(|(ci, tag)| {
+                    let values: Vec<String> = rows.iter().map(|r| r[ci].to_string()).collect();
+                    encode_column(tag.split_once('.').unwrap().1, &values, ColumnEncoding::Str)
+                })
+                .collect();
+            categories.push(Value::map(vec![
+                ("name", Value::str(category)),
+                ("rowCount", Value::Int(rows.len() as i64)),
+                ("columns", Value::Array(columns)),
+            ]));
+        }
+        categories
+    }
+
+    #[test]
+    fn test_residue_templates_and_struct_conn_apply_to_binarycif_too() {
+        let block = Value::map(vec![
+            ("header", Value::str("links")),
+            (
+                "categories",
+                Value::Array(categories_from_mmcif(crate::io::mmcif::tests::LINKED_MMCIF)),
+            ),
+        ]);
+        let bytes = msgpack::encode(&Value::map(vec![("dataBlocks", Value::Array(vec![block]))]));
+
+        let off = decode_bcif(&bytes, &MmcifReadOptions::default()).expect("valid BinaryCIF");
+        assert_eq!(off[0].1.num_bonds(), 0);
+
+        let options = MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let on = decode_bcif(&bytes, &options).expect("valid BinaryCIF");
+        let mol = &on[0].1;
+        assert!(mol.graph().has_edge(0, 1));
+        assert!(mol.graph().has_edge(2, 4));
+        assert_eq!(mol.num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_perception_reaches_binarycif_through_the_shared_builder() {
+        let bytes = encode_bcif(&[("x".to_string(), ethanol_like())]);
+        let off = decode_bcif(&bytes, &MmcifReadOptions::default()).unwrap();
+        assert_eq!(off[0].1.num_bonds(), 0);
+        let options = MmcifReadOptions {
+            perceive_bonds: true,
+            ..Default::default()
+        };
+        let on = decode_bcif(&bytes, &options).unwrap();
+        assert_eq!(on[0].1.num_bonds(), 2);
+        assert_eq!(on[0].1.atom(0).hydrogens(), Some(3));
     }
 }
