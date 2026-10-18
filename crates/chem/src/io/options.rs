@@ -59,6 +59,10 @@ pub struct XyzReadOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PdbReadOptions {
     pub multi_frame: MultiFrameMode,
+    /// Bond standard residues from [`crate::core::residue_templates`] and
+    /// apply `SSBOND`/`LINK`, on top of `CONECT` (#403). Off by default, so
+    /// a caller gets only the bonds the file states.
+    pub residue_templates: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -75,6 +79,10 @@ pub struct GroReadOptions {
 /// build through [`crate::io::cif_model`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MmcifReadOptions {
+    /// Bond standard residues from [`crate::core::residue_templates`] and
+    /// apply `_struct_conn`'s covalent links (#403). Off by default: with it
+    /// off, mmCIF reads no bonds at all.
+    pub residue_templates: bool,
     /// Bond each residue by the file's own `_chem_comp_bond` table, matched
     /// on atom name (#406). Off by default, so a read stays bondless.
     pub chem_comp_bonds: bool,

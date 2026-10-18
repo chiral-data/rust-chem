@@ -12,6 +12,15 @@
 //! around it.
 //!
 //! **No bonds by default.** With
+//! [`MmcifReadOptions::residue_templates`](crate::io::options::MmcifReadOptions::residue_templates)
+//! on (#403), standard residues are bonded from
+//! [`crate::core::residue_templates`], then the covalent rows of
+//! `_struct_conn` (`disulf`, `covale*`), each partner matched by its
+//! `label_*` IDs or, failing that, its `auth_*` IDs. Hydrogen bonds, metal
+//! coordination, links to a symmetry mate and unresolvable partners are
+//! skipped. BinaryCIF shares all of this through [`crate::io::cif_model`].
+//!
+//! With
 //! [`MmcifReadOptions::chem_comp_bonds`](crate::io::options::MmcifReadOptions::chem_comp_bonds)
 //! on, each residue is bonded by the block's own `_chem_comp_bond` table,
 //! matched on atom name, with the stated orders (#406); atoms the table
@@ -207,7 +216,7 @@ pub fn write_mmcif(mol: &Molecule) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::geometry::Point3;
 
@@ -479,5 +488,96 @@ ATOM 2 O O UNK A 1 A 0.000 0.000 0.000\n";
                     _atom_site.Cartn_y\n_atom_site.Cartn_z\n";
         let mol = parse_mmcif(text).expect("a present-but-empty atom_site loop is legal mmCIF");
         assert_eq!(mol.num_atoms(), 0);
+    }
+
+    /// Partners named by `label_*` IDs, one ligand only by `auth_*` (its
+    /// `label_seq_id` is `.`), and three rows that must not bond: metal
+    /// coordination, a hydrogen bond, and a link to a symmetry mate.
+    pub(crate) const LINKED_MMCIF: &str = "\
+data_links
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 S SG . CYS A 1 3 A 0.0 0.0 0.0
+ATOM 2 S SG . CYS A 2 40 A 2.0 0.0 0.0
+ATOM 3 N ND2 . ASN A 3 60 A 9.0 0.0 0.0
+ATOM 4 N NE2 . HIS A 4 50 A 5.0 0.0 0.0
+HETATM 5 C C1 . NAG B . 102 A 10.4 0.0 0.0
+HETATM 6 Zn ZN . ZN C . 101 A 7.0 0.0 0.0
+loop_
+_struct_conn.id
+_struct_conn.conn_type_id
+_struct_conn.ptnr1_label_asym_id
+_struct_conn.ptnr1_label_seq_id
+_struct_conn.ptnr1_label_atom_id
+_struct_conn.ptnr1_auth_asym_id
+_struct_conn.ptnr1_auth_seq_id
+_struct_conn.ptnr2_label_asym_id
+_struct_conn.ptnr2_label_seq_id
+_struct_conn.ptnr2_label_atom_id
+_struct_conn.ptnr2_auth_asym_id
+_struct_conn.ptnr2_auth_seq_id
+_struct_conn.ptnr1_symmetry
+_struct_conn.ptnr2_symmetry
+disulf1 disulf A 1 SG A 3 A 2 SG A 40 1_555 1_555
+covale1 covale A 3 ND2 A 60 B . C1 A 102 1_555 1_555
+metalc1 metalc A 4 NE2 A 50 C . ZN A 101 1_555 1_555
+hydrog1 hydrog A 1 SG A 3 A 4 NE2 A 50 1_555 1_555
+covale2 covale A 1 SG A 3 A 3 ND2 A 60 1_555 2_555
+";
+
+    #[test]
+    fn test_struct_conn_bonds_only_covalent_rows_inside_the_model() {
+        let options = MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let mol = parse_mmcif_with_options(LINKED_MMCIF, &options).expect("reads");
+        let bonded = |a: usize, b: usize| mol.graph().has_edge(a, b);
+        assert!(bonded(0, 1), "disulf, by label IDs");
+        assert!(bonded(2, 4), "covale, falling back to auth IDs");
+        assert_eq!(
+            mol.num_bonds(),
+            2,
+            "metalc, hydrog and a symmetry mate stay out"
+        );
+        assert_eq!(mol.atom(0).hydrogens(), Some(1));
+        assert_eq!(mol.atom(3).hydrogens(), None, "bondless stays unknown");
+    }
+
+    #[test]
+    fn test_a_single_struct_conn_row_written_without_a_loop_still_bonds() {
+        let (atoms, _) = LINKED_MMCIF.split_once("loop_\n_struct_conn").unwrap();
+        let text = format!(
+            "{atoms}_struct_conn.id disulf1\n_struct_conn.conn_type_id disulf\n\
+             _struct_conn.ptnr1_label_asym_id A\n_struct_conn.ptnr1_label_seq_id 1\n\
+             _struct_conn.ptnr1_label_atom_id SG\n_struct_conn.ptnr2_label_asym_id A\n\
+             _struct_conn.ptnr2_label_seq_id 2\n_struct_conn.ptnr2_label_atom_id SG\n"
+        );
+        let options = MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let mol = parse_mmcif_with_options(&text, &options).expect("reads");
+        assert!(mol.graph().has_edge(0, 1));
+        assert_eq!(mol.num_bonds(), 1);
+    }
+
+    #[test]
+    fn test_struct_conn_is_ignored_by_default() {
+        let mol = parse_mmcif(LINKED_MMCIF).expect("reads");
+        assert_eq!(mol.num_bonds(), 0);
+        assert!(mol.atoms().iter().all(|a| a.hydrogens().is_none()));
     }
 }

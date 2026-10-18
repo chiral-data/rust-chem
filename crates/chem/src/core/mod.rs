@@ -9,6 +9,7 @@ pub mod layout;
 pub mod mesh;
 pub mod molecule;
 pub mod residue;
+pub mod residue_templates;
 pub mod rings;
 pub mod site;
 pub mod stereo;

@@ -592,7 +592,7 @@ pub fn read_pdb_with_options(content: &str, options: &ReadOptions) -> ReadOutcom
         lines.push(line);
         if line.trim() == "ENDMDL" {
             position += 1;
-            push_pdb_record(&mut molecules, &mut skipped, &lines, position);
+            push_pdb_record(&mut molecules, &mut skipped, &lines, position, options);
             lines.clear();
         }
     }
@@ -601,7 +601,7 @@ pub fn read_pdb_with_options(content: &str, options: &ReadOptions) -> ReadOutcom
     // always is.
     if lines.iter().any(|line| !line.trim().is_empty()) {
         position += 1;
-        push_pdb_record(&mut molecules, &mut skipped, &lines, position);
+        push_pdb_record(&mut molecules, &mut skipped, &lines, position, options);
     }
 
     assemble_multi_frame_outcome(options.pdb.multi_frame, molecules, skipped)
@@ -612,9 +612,10 @@ fn push_pdb_record(
     skipped: &mut Vec<Skipped>,
     lines: &[&str],
     position: usize,
+    options: &ReadOptions,
 ) {
     let record = lines.join("\n");
-    match crate::io::pdb::parse_pdb(&record) {
+    match crate::io::pdb::parse_pdb_with_options(&record, &options.pdb) {
         Ok(molecule) => molecules.push((position, molecule)),
         Err(e) => skipped.push(Skipped {
             position,
@@ -1517,6 +1518,7 @@ $$$$
         let options = ReadOptions {
             pdb: crate::io::options::PdbReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };
@@ -1636,6 +1638,7 @@ END
         let pdb_options = ReadOptions {
             pdb: crate::io::options::PdbReadOptions {
                 multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
             },
             ..ReadOptions::default()
         };

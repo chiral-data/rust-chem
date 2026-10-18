@@ -1130,4 +1130,58 @@ mod tests {
             );
         }
     }
+
+    /// The loops of a small mmCIF text, as BinaryCIF categories of string
+    /// columns: enough to put a `_struct_conn` beside an `_atom_site`.
+    fn categories_from_mmcif(text: &str) -> Vec<Value> {
+        let mut categories = Vec::new();
+        for block in text.split("loop_\n").skip(1) {
+            let (tags, rows): (Vec<&str>, Vec<&str>) =
+                block.lines().partition(|line| line.starts_with('_'));
+            let rows: Vec<Vec<&str>> = rows
+                .iter()
+                .map(|r| r.split_whitespace().collect())
+                .collect();
+            let (category, _) = tags[0].split_once('.').unwrap();
+            let columns = tags
+                .iter()
+                .enumerate()
+                .map(|(ci, tag)| {
+                    let values: Vec<String> = rows.iter().map(|r| r[ci].to_string()).collect();
+                    encode_column(tag.split_once('.').unwrap().1, &values, ColumnEncoding::Str)
+                })
+                .collect();
+            categories.push(Value::map(vec![
+                ("name", Value::str(category)),
+                ("rowCount", Value::Int(rows.len() as i64)),
+                ("columns", Value::Array(columns)),
+            ]));
+        }
+        categories
+    }
+
+    #[test]
+    fn test_residue_templates_and_struct_conn_apply_to_binarycif_too() {
+        let block = Value::map(vec![
+            ("header", Value::str("links")),
+            (
+                "categories",
+                Value::Array(categories_from_mmcif(crate::io::mmcif::tests::LINKED_MMCIF)),
+            ),
+        ]);
+        let bytes = msgpack::encode(&Value::map(vec![("dataBlocks", Value::Array(vec![block]))]));
+
+        let off = decode_bcif(&bytes, &MmcifReadOptions::default()).expect("valid BinaryCIF");
+        assert_eq!(off[0].1.num_bonds(), 0);
+
+        let options = MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let on = decode_bcif(&bytes, &options).expect("valid BinaryCIF");
+        let mol = &on[0].1;
+        assert!(mol.graph().has_edge(0, 1));
+        assert!(mol.graph().has_edge(2, 4));
+        assert_eq!(mol.num_bonds(), 2);
+    }
 }

@@ -1,23 +1,26 @@
 //! PDB — fixed-column text, `ATOM`/`HETATM` per atom, `CRYST1` for the unit
 //! cell, `CONECT` for explicit bonds (#223).
 //!
-//! **No bonds are synthesised beyond what `CONECT` states explicitly.** Real
-//! PDB files conventionally leave standard protein/nucleic-acid backbone
-//! bonding to be inferred from residue templates (a fixed table of atom
-//! names/bonds per each of the 20 standard amino acids plus nucleotides)
-//! rather than stating it — this crate has no such table, and building one
-//! is a materially larger, separable undertaking than this story. `CONECT`
-//! itself stays in scope: it is reading data the file states, not guessing
-//! at it.
+//! **By default no bonds are synthesised beyond what `CONECT` states.** Real
+//! PDB files leave standard protein/nucleic-acid bonding to residue
+//! templates rather than stating it. With
+//! [`PdbReadOptions::residue_templates`] on (#403), standard residues are
+//! bonded from [`crate::core::residue_templates`] after `CONECT`, then the
+//! `SSBOND` and `LINK` records are bonded too. A `LINK` to a metal, or across
+//! a symmetry operator, is skipped: it is coordination or a contact with a
+//! crystal mate, not a bond inside this model. Under `MODEL` splitting these
+//! header records reach the first model only, so in
+//! [`MultiFrameMode::Molecules`](crate::io::options::MultiFrameMode::Molecules)
+//! later models get templates but no links.
 //!
 //! Hydrogen counts follow from that. PDB names no count of its own, so an
 //! atom arrives with none, and
 //! [`Molecule::calculate_implicit_hydrogens`] cannot be used to fill it in:
-//! it sums the bond orders around an atom, and with most atoms bondless by
-//! construction it would hand each one its *free-atom* count — a backbone
+//! it sums the bond orders around an atom, and with atoms left bondless it
+//! would hand each one its *free-atom* count — a backbone
 //! carbon reading as methane. What is called instead is
 //! [`Molecule::calculate_implicit_hydrogens_where_bonded`], which fills only
-//! the atoms `CONECT` did describe and leaves the rest honestly blank (#285).
+//! the atoms some bond describes and leaves the rest honestly blank (#285).
 //! Before it, a fully-`CONECT`ed benzene wrote back as
 //! `[C]1[C][C][C][C][C]1` — six carbons stated to have no hydrogens, which is
 //! not the molecule the file described.
@@ -53,8 +56,10 @@ use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
+use crate::core::residue_templates::{add_residue_template_bonds, bond_conformer_pairs};
 use crate::core::site::AtomSite;
 use crate::io::errors::PdbError;
+use crate::io::options::PdbReadOptions;
 
 /// 1-based, inclusive column range, matching the spec's own numbering.
 /// `None` for a line too short to have this field, or a wholly blank one —
@@ -191,9 +196,87 @@ fn group_into_chains_and_residues(keys: &[ResidueKey]) -> (Vec<Chain>, Vec<Resid
     (chains, residues)
 }
 
+/// One end of an `SSBOND` or `LINK` record.
+struct LinkEnd {
+    atom: String,
+    alt_loc: Option<char>,
+    residue: String,
+    chain_id: String,
+    sequence: i32,
+    insertion_code: Option<char>,
+}
+
+/// A `SSBOND`/`LINK` pair, or `None` for one across a symmetry operator,
+/// whose partner is a crystal mate rather than an atom in this file.
+fn parse_link(line: &str, is_ssbond: bool) -> Option<(LinkEnd, LinkEnd)> {
+    let field = |a, b| column(line, a, b).map(str::trim);
+    let (sym1, sym2) = (field(60, 65), field(67, 72));
+    if sym1.is_some() && sym2.is_some() && sym1 != sym2 {
+        return None;
+    }
+    let end = |name: Option<&str>, alt: usize, res: usize, chain: usize, seq: usize| {
+        Some(LinkEnd {
+            atom: name?.to_string(),
+            alt_loc: column(line, alt, alt).and_then(|s| s.chars().next()),
+            residue: field(res, res + 2)?.to_string(),
+            chain_id: field(chain, chain).unwrap_or("").to_string(),
+            sequence: field(seq, seq + 3)?.parse().ok()?,
+            insertion_code: column(line, seq + 4, seq + 4).and_then(|s| s.chars().next()),
+        })
+    };
+    if is_ssbond {
+        // SSBOND has no atom or alt-loc columns: the partners are always SG.
+        Some((
+            end(Some("SG"), 0, 12, 16, 18)?,
+            end(Some("SG"), 0, 26, 30, 32)?,
+        ))
+    } else {
+        Some((
+            end(field(13, 16), 17, 18, 22, 23)?,
+            end(field(43, 46), 47, 48, 52, 53)?,
+        ))
+    }
+}
+
+/// The atoms one link end names, every alternate location of it.
+fn resolve_link_end(mol: &Molecule, end: &LinkEnd) -> Vec<usize> {
+    let chains = mol.chains();
+    let sites = mol.sites().unwrap_or(&[]);
+    mol.residues()
+        .iter()
+        .filter(|r| {
+            r.name == end.residue
+                && r.sequence == end.sequence
+                && r.insertion_code == end.insertion_code
+                && chains[r.chain_ix].id == end.chain_id
+        })
+        .flat_map(|r| r.atoms.clone())
+        .filter(|&i| {
+            let site = &sites[i];
+            site.name.as_deref() == Some(end.atom.as_str())
+                && (end.alt_loc.is_none() || site.alt_loc.is_none() || site.alt_loc == end.alt_loc)
+        })
+        .collect()
+}
+
+/// Metals coordinate rather than bond covalently; PDB's `LINK` does not say
+/// which it is, so the element decides.
+fn is_metal(atomic_number: u8) -> bool {
+    !matches!(
+        atomic_number,
+        1 | 2 | 5..=10 | 14..=18 | 32..=36 | 51..=54 | 85 | 86
+    )
+}
+
 /// Parses one PDB structure (a single `MODEL`, or a whole file with none).
 pub fn parse_pdb(text: &str) -> Result<Molecule, PdbError> {
+    parse_pdb_with_options(text, &PdbReadOptions::default())
+}
+
+/// [`parse_pdb`] with PDB's own read options.
+pub fn parse_pdb_with_options(text: &str, options: &PdbReadOptions) -> Result<Molecule, PdbError> {
     let mut mol = Molecule::new();
+    let mut links: Vec<(LinkEnd, LinkEnd)> = Vec::new();
     let mut sites = Vec::new();
     let mut coords = Vec::new();
     let mut keys = Vec::new();
@@ -264,6 +347,9 @@ pub fn parse_pdb(text: &str) -> Result<Molecule, PdbError> {
                     space_group = Some(SpaceGroup::from_symbol(sym.trim()));
                 }
             }
+            "SSBOND" | "LINK" => {
+                links.extend(parse_link(line, line.starts_with("SSBOND")));
+            }
             "CONECT" => {
                 let src_serial: i64 = column(line, 7, 11)
                     .map(str::trim)
@@ -326,6 +412,21 @@ pub fn parse_pdb(text: &str) -> Result<Molecule, PdbError> {
     for (a, b) in conect_pairs {
         mol.add_bond(Bond::new(a, b, BondOrder::Single))
             .map_err(|e| PdbError::ParseError(e.to_string()))?;
+    }
+
+    if options.residue_templates {
+        add_residue_template_bonds(&mut mol);
+        for (first, second) in &links {
+            let left = resolve_link_end(&mol, first);
+            let right = resolve_link_end(&mol, second);
+            let metal = left
+                .iter()
+                .chain(&right)
+                .any(|&i| is_metal(mol.atom(i).atomic_number()));
+            if !metal {
+                bond_conformer_pairs(&mut mol, &left, &right, BondOrder::Single);
+            }
+        }
     }
 
     if mol.num_atoms() == 0 {
@@ -869,5 +970,116 @@ END
         let molecule = parse_pdb(text).expect("reads");
         assert_eq!(molecule.atom(0).hydrogens(), Some(0));
         assert_eq!(molecule.num_atoms(), 5);
+    }
+
+    /// An 80-column record with each `(column, text)` placed at its 1-based
+    /// column, so a test states the spec's positions rather than counting
+    /// blanks.
+    fn record(fields: &[(usize, &str)]) -> String {
+        let mut line = vec![b' '; 80];
+        for &(col, text) in fields {
+            line[col - 1..col - 1 + text.len()].copy_from_slice(text.as_bytes());
+        }
+        String::from_utf8(line).unwrap().trim_end().to_string()
+    }
+
+    fn atom(
+        serial: usize,
+        het: bool,
+        name: &str,
+        res: &str,
+        seq: &str,
+        x: f64,
+        el: &str,
+    ) -> String {
+        let coords = format!("{x:>8.3}{:>8.3}{:>8.3}", 0.0, 0.0);
+        record(&[
+            (1, if het { "HETATM" } else { "ATOM" }),
+            (7, &format!("{serial:>5}")),
+            (14, name),
+            (18, res),
+            (22, "A"),
+            (23, &format!("{seq:>4}")),
+            (31, &coords),
+            (77, &format!("{el:>2}")),
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn link(
+        name1: &str,
+        res1: &str,
+        seq1: &str,
+        name2: &str,
+        res2: &str,
+        seq2: &str,
+        sym2: &str,
+    ) -> String {
+        record(&[
+            (1, "LINK"),
+            (14, name1),
+            (18, res1),
+            (22, "A"),
+            (23, &format!("{seq1:>4}")),
+            (44, name2),
+            (48, res2),
+            (52, "A"),
+            (53, &format!("{seq2:>4}")),
+            (60, "  1555"),
+            (67, sym2),
+        ])
+    }
+
+    fn linked_structure() -> String {
+        [
+            record(&[
+                (1, "SSBOND"),
+                (12, "CYS"),
+                (16, "A"),
+                (18, "   3"),
+                (26, "CYS"),
+                (30, "A"),
+                (32, "  40"),
+                (60, "  1555"),
+                (67, "  1555"),
+            ]),
+            link("NE2", "HIS", "50", "ZN", "ZN", "101", "  1555"),
+            link("ND2", "ASN", "60", "C1", "NAG", "102", "  1555"),
+            link("O4", "NAG", "102", "C1", "NAG", "103", "  2555"),
+            atom(1, false, "SG", "CYS", "3", 0.0, "S"),
+            atom(2, false, "SG", "CYS", "40", 2.0, "S"),
+            atom(3, false, "NE2", "HIS", "50", 5.0, "N"),
+            atom(4, false, "ND2", "ASN", "60", 9.0, "N"),
+            atom(5, true, "ZN", "ZN", "101", 7.0, "ZN"),
+            atom(6, true, "C1", "NAG", "102", 10.4, "C"),
+            atom(7, true, "O4", "NAG", "102", 12.0, "O"),
+            atom(8, true, "C1", "NAG", "103", 13.0, "C"),
+            "END".to_string(),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn test_links_bond_only_covalent_partners_inside_the_model() {
+        let options = PdbReadOptions {
+            residue_templates: true,
+            ..PdbReadOptions::default()
+        };
+        let mol = parse_pdb_with_options(&linked_structure(), &options).expect("reads");
+        let bonded = |a: usize, b: usize| mol.graph().has_edge(a, b);
+        assert!(bonded(0, 1), "SSBOND");
+        assert!(bonded(3, 5), "LINK between non-metals");
+        assert!(!bonded(2, 4), "a LINK to a metal is coordination");
+        assert!(!bonded(6, 7), "a LINK across a symmetry operator");
+        assert_eq!(mol.num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_links_and_templates_are_off_by_default() {
+        let text = linked_structure();
+        let mol = parse_pdb(&text).expect("reads");
+        assert_eq!(mol.num_bonds(), 0);
+        let with_default = parse_pdb_with_options(&text, &PdbReadOptions::default()).unwrap();
+        assert_eq!(write_pdb(&mol), write_pdb(&with_default));
     }
 }
