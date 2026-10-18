@@ -160,3 +160,110 @@ fn test_promoted_regressions_still_parse() {
         }
     }
 }
+
+/// One bond end: chain, residue number, atom name.
+type NamedAtom = (String, i32, String);
+
+/// Each bond as its two (chain, residue number, atom name) ends, sorted, so
+/// two formats' reads compare by name rather than by atom index.
+fn named_bonds(mol: &chem::core::molecule::Molecule) -> Vec<(NamedAtom, NamedAtom)> {
+    let end = |i: usize| {
+        let residue = mol.residue_of(i).expect("every atom has a residue");
+        let chain = mol.chain_of(i).expect("every atom has a chain");
+        let name = mol.site(i).and_then(|s| s.name.clone()).unwrap_or_default();
+        (chain.id.clone(), residue.sequence, name)
+    };
+    let mut bonds: Vec<_> = mol
+        .bonds()
+        .iter()
+        .map(|b| {
+            let (a, c) = (end(b.atom1()), end(b.atom2()));
+            if a <= c { (a, c) } else { (c, a) }
+        })
+        .collect();
+    bonds.sort();
+    bonds
+}
+
+#[test]
+fn test_crambin_gets_the_same_template_bonds_from_pdb_and_mmcif() {
+    let pdb_text = fs::read_to_string(corpus_dir().join("pdb/crambin-1crn.pdb")).unwrap();
+    let cif_text = fs::read_to_string(corpus_dir().join("mmcif/crambin-1crn.cif")).unwrap();
+    let pdb = chem::io::pdb::parse_pdb_with_options(
+        &pdb_text,
+        &chem::io::options::PdbReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cif = chem::io::mmcif::parse_mmcif_with_options(
+        &cif_text,
+        &chem::io::options::MmcifReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // 327 heavy atoms in one chain, plus one ring closure each for 5 PRO,
+    // 1 PHE, 2 TYR and 3 disulfides: fully connected, no break.
+    assert_eq!(pdb.num_atoms(), 327);
+    assert_eq!(pdb.num_bonds(), 326 + 11);
+    assert_eq!(named_bonds(&pdb), named_bonds(&cif));
+
+    let disulfides = named_bonds(&cif)
+        .into_iter()
+        .filter(|(a, b)| a.2 == "SG" && b.2 == "SG")
+        .count();
+    assert_eq!(disulfides, 3);
+
+    // Hydrogens fill from the template bonds: crambin's own formula.
+    assert_eq!(pdb.formula(), "C202H315N55O64S6");
+    assert_eq!(cif.formula(), pdb.formula());
+
+    // The default stays the file's own statement: CONECT for PDB, nothing for mmCIF.
+    assert_eq!(chem::io::pdb::parse_pdb(&pdb_text).unwrap().num_bonds(), 3);
+    assert_eq!(
+        chem::io::mmcif::parse_mmcif(&cif_text).unwrap().num_bonds(),
+        0
+    );
+}
+
+#[test]
+fn test_templates_and_chem_comp_bonds_together_read_like_templates_alone() {
+    // 1CRN's own `_chem_comp_bond` table repeats the templates' intra-residue
+    // bonds, so turning it on as well must change nothing -- in particular
+    // the hydrogen fill must run once, after every bond step.
+    let text = fs::read_to_string(corpus_dir().join("mmcif/crambin-1crn.cif")).unwrap();
+    let read = |chem_comp_bonds| {
+        chem::io::mmcif::parse_mmcif_with_options(
+            &text,
+            &chem::io::options::MmcifReadOptions {
+                residue_templates: true,
+                chem_comp_bonds,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let (alone, both) = (read(false), read(true));
+    assert_eq!(named_bonds(&both), named_bonds(&alone));
+    let orders = |m: &chem::prelude::Molecule| {
+        let mut v: Vec<_> = m
+            .bonds()
+            .iter()
+            .map(|b| {
+                (
+                    b.atom1().min(b.atom2()),
+                    b.atom1().max(b.atom2()),
+                    b.order(),
+                )
+            })
+            .collect();
+        v.sort_by_key(|&(a, b, _)| (a, b));
+        v
+    };
+    assert_eq!(orders(&both), orders(&alone));
+    assert_eq!(both.formula(), "C202H315N55O64S6");
+}

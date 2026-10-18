@@ -260,7 +260,7 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
 pub struct PdbSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> PdbSupplier<R> {
@@ -268,7 +268,7 @@ impl<R: BufRead> PdbSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -816,7 +816,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::pdb::parse_pdb(&buffer)
+            crate::io::pdb::parse_pdb_with_options(&buffer, &self.options.pdb)
                 .map(|molecule| {
                     let name = molecule
                         .name()

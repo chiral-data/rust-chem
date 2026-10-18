@@ -77,7 +77,7 @@ impl Carries {
     pub const STEREO_GROUP: Carries = Carries(1 << 15);
     /// The bonds between atoms, separate from [`Carries::TOPOLOGY`] because
     /// four registered formats carry atoms and no bonds at all — XYZ and GRO
-    /// have no bond block, mmCIF's `_struct_conn` is unread (#224), and PDBQT
+    /// have no bond block, mmCIF reads none by default (#224, #403), and PDBQT
     /// gives only `BRANCH` pivots (#226).
     ///
     /// Split out in #257. Before it, a conversion into any of the four turned
@@ -810,11 +810,9 @@ static FORMATS: &[FormatDescriptor] = &[
         category: Category::BiologicalData,
         // No FORMAL_CHARGE/ISOTOPE/STEREO_ATOM/STEREO_BOND/AROMATICITY/
         // PARTIAL_CHARGE/PROPERTIES: none of those have a real, reliably
-        // populated column in this format as this crate reads it. No
-        // synthesised bonds beyond explicit CONECT records either — real
-        // files leave standard polymer backbone bonding to residue-template
-        // inference this crate does not implement (#223), see
-        // `io/pdb.rs`'s module doc for why.
+        // populated column in this format as this crate reads it. Bonds are
+        // CONECT's by default; residue templates are opt-in (#403), see
+        // `io/pdb.rs`'s module doc.
         carries: Carries::TOPOLOGY
             .or(Carries::BONDS)
             .or(Carries::COORDS_3D)
@@ -843,10 +841,9 @@ static FORMATS: &[FormatDescriptor] = &[
         extensions: &["cif", "mmcif"],
         category: Category::BiologicalData,
         // Same mask as PDB, and for the same reasons -- see `io/pdb.rs`'s
-        // module doc. Stricter on bonds: not even CONECT's rough
-        // equivalent (`_struct_conn`) is read here (#224), so no bonds are
-        // claimed or produced at all -- which is what the absent BONDS says
-        // now that #257 has split it out of TOPOLOGY.
+        // module doc. Stricter on bonds: none are read by default, and the
+        // writer emits none, so BONDS stays absent; residue templates and
+        // `_struct_conn` are an opt-in read (#403).
         carries: Carries::TOPOLOGY
             .or(Carries::COORDS_3D)
             .or(Carries::RESIDUES)
@@ -2200,10 +2197,11 @@ impl Format {
     pub const CXSMILES: Format = Format(2);
     /// XYZ (#222) — coordinates only, no unit cell, see [`crate::io::xyz`].
     pub const XYZ: Format = Format(3);
-    /// PDB (#223) — no synthesised bonds beyond `CONECT`, see
+    /// PDB (#223) — `CONECT` bonds, plus opt-in residue templates (#403), see
     /// [`crate::io::pdb`].
     pub const PDB: Format = Format(4);
-    /// mmCIF (#224) — no bonds at all, see [`crate::io::mmcif`].
+    /// mmCIF (#224) — no bonds unless residue templates are on (#403), see
+    /// [`crate::io::mmcif`].
     pub const MMCIF: Format = Format(5);
     /// Mol2 (#225) — a curated SYBYL type subset, see [`crate::io::mol2`].
     pub const MOL2: Format = Format(6);

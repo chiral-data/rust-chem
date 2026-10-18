@@ -21,6 +21,7 @@ use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
+use crate::core::residue_templates::{add_residue_template_bonds, bond_conformer_pairs};
 use crate::core::site::AtomSite;
 use crate::io::errors::MmcifError;
 use crate::io::options::MmcifReadOptions;
@@ -256,6 +257,7 @@ fn read_atom_site_loop(
     sites: &mut Vec<AtomSite>,
     coords: &mut Vec<Point3>,
     keys: &mut Vec<ResidueKey>,
+    labels: &mut Vec<AtomLabel>,
 ) -> Result<(), MmcifError> {
     let tag = |suffix: &str| find_tag(tags, &format!("_atom_site.{suffix}"));
 
@@ -267,6 +269,7 @@ fn read_atom_site_loop(
     let label_alt_id = tag("label_alt_id");
     let label_comp_id = tag("label_comp_id");
     let label_asym_id = tag("label_asym_id");
+    let label_seq_id = tag("label_seq_id");
     let auth_seq_id = tag("auth_seq_id").or(tag("label_seq_id"));
     let auth_asym_id = tag("auth_asym_id").or(label_asym_id);
     let auth_comp_id = tag("auth_comp_id").or(label_comp_id);
@@ -327,6 +330,10 @@ fn read_atom_site_loop(
                 .unwrap_or(1),
             insertion_code: cif_value(row, ins_code).and_then(|s| s.chars().next()),
             is_hetero,
+        });
+        labels.push(AtomLabel {
+            asym_id: cif_value(row, label_asym_id).map(str::to_string),
+            seq_id: cif_value(row, label_seq_id).map(str::to_string),
         });
     }
 
@@ -412,6 +419,116 @@ fn alt_locs_compatible(mol: &Molecule, x: usize, y: usize) -> bool {
     }
 }
 
+/// An atom's `label_asym_id`/`label_seq_id`, kept only to resolve
+/// `_struct_conn` partners; the topology holds the `auth_*` numbering.
+struct AtomLabel {
+    asym_id: Option<String>,
+    seq_id: Option<String>,
+}
+
+/// Bonds the covalent rows of `_struct_conn` (`disulf`, `covale*`); hydrogen
+/// bonds and metal coordination are not covalent and are left out.
+fn bond_struct_conn(
+    mol: &mut Molecule,
+    singles: &HashMap<String, String>,
+    loops: &CifLoops,
+    labels: &[AtomLabel],
+) {
+    // A single row is written as plain `_struct_conn.item value` pairs, not a loop.
+    let (single_tags, single_values): (Vec<String>, Vec<String>) = singles
+        .iter()
+        .filter(|(tag, _)| category_of(tag) == "_struct_conn")
+        .map(|(tag, value)| (tag.clone(), value.clone()))
+        .unzip();
+    let one_row: AtomSiteRows = (single_tags, vec![single_values]);
+    let (tags, rows) = loops.get("_struct_conn").unwrap_or(&one_row);
+    let tag = |suffix: &str| find_tag(tags, &format!("_struct_conn.{suffix}"));
+    let conn_type = tag("conn_type_id");
+    let value_order = tag("pdbx_value_order");
+
+    for row in rows {
+        let covalent = cif_value(row, conn_type).is_some_and(|t| {
+            let t = t.to_ascii_lowercase();
+            t == "disulf" || t.starts_with("covale")
+        });
+        if !covalent {
+            continue;
+        }
+        let symmetry = |n: u8| cif_value(row, tag(&format!("ptnr{n}_symmetry")));
+        if let (Some(a), Some(b)) = (symmetry(1), symmetry(2))
+            && a != b
+        {
+            continue;
+        }
+        let order = match cif_value(row, value_order).map(str::to_ascii_lowercase) {
+            Some(o) if o == "doub" => BondOrder::Double,
+            Some(o) if o == "trip" => BondOrder::Triple,
+            _ => BondOrder::Single,
+        };
+        let left = resolve_partner(mol, labels, row, &tag, 1);
+        let right = resolve_partner(mol, labels, row, &tag, 2);
+        bond_conformer_pairs(mol, &left, &right, order);
+    }
+}
+
+/// The atoms one `_struct_conn` partner names: by `label_*` IDs, falling
+/// back to `auth_*` when those are absent or match nothing. Empty when the
+/// partner cannot be resolved, which skips the row.
+fn resolve_partner(
+    mol: &Molecule,
+    labels: &[AtomLabel],
+    row: &[String],
+    tag: &dyn Fn(&str) -> Option<usize>,
+    n: u8,
+) -> Vec<usize> {
+    let value = |name: String| cif_value(row, tag(&name));
+    let Some(atom) =
+        value(format!("ptnr{n}_label_atom_id")).or_else(|| value(format!("ptnr{n}_auth_atom_id")))
+    else {
+        return Vec::new();
+    };
+    let alt_loc = value(format!("pdbx_ptnr{n}_label_alt_id")).and_then(|s| s.chars().next());
+    let sites = mol.sites().unwrap_or(&[]);
+    let named = |i: &usize| {
+        let site = &sites[*i];
+        site.name.as_deref() == Some(atom)
+            && (alt_loc.is_none() || site.alt_loc.is_none() || site.alt_loc == alt_loc)
+    };
+
+    if let (Some(asym), Some(seq)) = (
+        value(format!("ptnr{n}_label_asym_id")),
+        value(format!("ptnr{n}_label_seq_id")),
+    ) {
+        let found: Vec<usize> = (0..labels.len())
+            .filter(|&i| {
+                labels[i].asym_id.as_deref() == Some(asym)
+                    && labels[i].seq_id.as_deref() == Some(seq)
+            })
+            .filter(named)
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+
+    let (Some(asym), Some(seq)) = (
+        value(format!("ptnr{n}_auth_asym_id")),
+        value(format!("ptnr{n}_auth_seq_id")).and_then(|s| s.parse::<i32>().ok()),
+    ) else {
+        return Vec::new();
+    };
+    let insertion_code = value(format!("pdbx_ptnr{n}_PDB_ins_code")).and_then(|s| s.chars().next());
+    let chains = mol.chains();
+    mol.residues()
+        .iter()
+        .filter(|r| {
+            r.sequence == seq && r.insertion_code == insertion_code && chains[r.chain_ix].id == asym
+        })
+        .flat_map(|r| r.atoms.clone())
+        .filter(named)
+        .collect()
+}
+
 /// Builds a [`Molecule`] from a CIF-shaped `singles` map and an optional
 /// `_atom_site` table, independent of which format the shape came from.
 ///
@@ -429,9 +546,18 @@ pub(crate) fn build_molecule(
     let mut sites = Vec::new();
     let mut coords = Vec::new();
     let mut keys = Vec::new();
+    let mut labels = Vec::new();
 
     if let Some((tags, rows)) = atom_site {
-        read_atom_site_loop(tags, rows, &mut mol, &mut sites, &mut coords, &mut keys)?;
+        read_atom_site_loop(
+            tags,
+            rows,
+            &mut mol,
+            &mut sites,
+            &mut coords,
+            &mut keys,
+            &mut labels,
+        )?;
     }
 
     // Zeros in these columns are what a format with no room to say "unknown"
@@ -448,7 +574,12 @@ pub(crate) fn build_molecule(
     mol.set_topology(chains, residues)
         .map_err(|e| MmcifError::ParseError(e.to_string()))?;
 
-    // The bond pipeline: each step only adds pairs not yet bonded.
+    // The bond pipeline: each step only adds pairs not yet bonded, so the
+    // order is the precedence -- templates, then `_chem_comp_bond`.
+    if options.residue_templates {
+        add_residue_template_bonds(&mut mol);
+        bond_struct_conn(&mut mol, singles, loops, &labels);
+    }
     if options.chem_comp_bonds
         && let Some(table) = loops.get("_chem_comp_bond")
     {
@@ -639,6 +770,7 @@ mod tests {
     use crate::io::mmcif::parse_mmcif_with_options;
 
     const ON: MmcifReadOptions = MmcifReadOptions {
+        residue_templates: false,
         chem_comp_bonds: true,
         multi_frame: crate::io::options::MultiFrameMode::Molecules,
     };
