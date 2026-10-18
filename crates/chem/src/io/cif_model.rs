@@ -3,8 +3,8 @@
 //!
 //! Both formats describe the same thing: a `singles` map of one-off
 //! `_category.item value` pairs (`_cell.length_a`, `_symmetry.space_group_
-//! name_H-M`, ...) and, for the one loop this crate reads, an `_atom_site`
-//! table as parallel `tags`/`rows`. mmCIF text tokenizes lines into that
+//! name_H-M`, ...), an `_atom_site` table as parallel `tags`/`rows`, and
+//! every other loop in the block, by category, in the same shape. mmCIF text tokenizes lines into that
 //! shape; BinaryCIF decodes MessagePack categories/columns into the same
 //! shape (see `bcif::decode_bcif`). Everything below this line — turning
 //! that shape into a [`Molecule`] and back — used to live inside
@@ -22,11 +22,22 @@ use crate::core::molecule::Molecule;
 use crate::core::residue::{Chain, Residue};
 use crate::core::site::AtomSite;
 use crate::io::errors::MmcifError;
+use crate::io::options::MmcifReadOptions;
 
 /// An `_atom_site` table: one CIF tag per column, one row per atom -- the
 /// shape both mmCIF text and BinaryCIF decode into before
 /// [`build_molecule`] ever runs.
 pub(crate) type AtomSiteRows = (Vec<String>, Vec<Vec<String>>);
+
+/// Every other loop in the block (`_struct_conn`, `_chem_comp_bond`, ...),
+/// keyed by its lower-cased category name, in the same tags/rows shape.
+pub(crate) type CifLoops = HashMap<String, AtomSiteRows>;
+
+/// The category a CIF tag belongs to, lower-cased: `_struct_conn.id` →
+/// `_struct_conn`.
+pub(crate) fn category_of(tag: &str) -> String {
+    tag.split('.').next().unwrap_or(tag).to_ascii_lowercase()
+}
 
 /// `.` and `?` both mean "not provided" for an optional CIF value.
 pub(crate) fn cif_value(row: &[String], idx: Option<usize>) -> Option<&str> {
@@ -221,6 +232,8 @@ fn read_atom_site_loop(
 pub(crate) fn build_molecule(
     singles: &HashMap<String, String>,
     atom_site: Option<(&[String], &[Vec<String>])>,
+    _loops: &CifLoops,
+    _options: &MmcifReadOptions,
 ) -> Result<Molecule, MmcifError> {
     let mut mol = Molecule::new();
     let mut sites = Vec::new();

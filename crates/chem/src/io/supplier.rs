@@ -285,7 +285,7 @@ pub struct MmcifSupplier<R> {
     /// A `data_` line already read from the stream but not yet claimed by
     /// the record currently being built -- it belongs to the next one.
     pending: Option<String>,
-    _options: ReadOptions,
+    options: ReadOptions,
 }
 
 impl<R: BufRead> MmcifSupplier<R> {
@@ -294,7 +294,7 @@ impl<R: BufRead> MmcifSupplier<R> {
             lines: reader.lines(),
             position: 0,
             pending: None,
-            _options: options.clone(),
+            options: options.clone(),
         }
     }
 }
@@ -341,7 +341,7 @@ impl<R: BufRead> Iterator for MmcifSupplier<R> {
         self.position += 1;
         let position = self.position;
         Some(
-            crate::io::mmcif::parse_mmcif(&buffer)
+            crate::io::mmcif::parse_mmcif_with_options(&buffer, &self.options.mmcif)
                 .map(|molecule| {
                     let name = molecule
                         .name()

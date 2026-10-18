@@ -633,7 +633,7 @@ pub fn read_mmcif(content: &str) -> ReadOutcome {
 /// today's common case for a single deposited structure. Within a block, a
 /// varying `pdbx_PDB_model_num` is [`crate::io::mmcif::parse_mmcif`]'s own
 /// job (its own doc explains why), not this splitter's.
-pub fn read_mmcif_with_options(content: &str, _options: &ReadOptions) -> ReadOutcome {
+pub fn read_mmcif_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let mut lines: Vec<&str> = Vec::new();
     let mut position = 0;
@@ -642,22 +642,27 @@ pub fn read_mmcif_with_options(content: &str, _options: &ReadOptions) -> ReadOut
         let starts_new_block = line.trim_start().to_ascii_lowercase().starts_with("data_");
         if starts_new_block && lines.iter().any(|l: &&str| !l.trim().is_empty()) {
             position += 1;
-            push_mmcif_record(&mut out, &lines, position);
+            push_mmcif_record(&mut out, &lines, position, options);
             lines.clear();
         }
         lines.push(line);
     }
     if lines.iter().any(|line| !line.trim().is_empty()) {
         position += 1;
-        push_mmcif_record(&mut out, &lines, position);
+        push_mmcif_record(&mut out, &lines, position, options);
     }
 
     out
 }
 
-fn push_mmcif_record(out: &mut ReadOutcome, lines: &[&str], position: usize) {
+fn push_mmcif_record(
+    out: &mut ReadOutcome,
+    lines: &[&str],
+    position: usize,
+    options: &ReadOptions,
+) {
     let record = lines.join("\n");
-    match crate::io::mmcif::parse_mmcif(&record) {
+    match crate::io::mmcif::parse_mmcif_with_options(&record, &options.mmcif) {
         Ok(molecule) => {
             let name = molecule
                 .name()

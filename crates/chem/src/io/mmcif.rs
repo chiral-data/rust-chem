@@ -37,8 +37,11 @@
 //! specifically are the case this doesn't handle.
 
 use crate::core::molecule::Molecule;
-use crate::io::cif_model::{AtomSiteRows, RowPrecision, build_molecule, build_rows};
+use crate::io::cif_model::{
+    AtomSiteRows, CifLoops, RowPrecision, build_molecule, build_rows, category_of,
+};
 use crate::io::errors::MmcifError;
+use crate::io::options::MmcifReadOptions;
 
 /// Splits one line into its whitespace-delimited or quoted tokens. A quote
 /// is a delimiter only where it starts a token (preceded by whitespace or
@@ -84,8 +87,17 @@ pub(crate) fn tokenize_line(line: &str) -> Vec<String> {
 
 /// Parses one mmCIF `data_` block (or a whole file with only one).
 pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
+    parse_mmcif_with_options(text, &MmcifReadOptions::default())
+}
+
+/// [`parse_mmcif`] with mmCIF's own read options.
+pub fn parse_mmcif_with_options(
+    text: &str,
+    options: &MmcifReadOptions,
+) -> Result<Molecule, MmcifError> {
     let mut singles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut atom_site: Option<AtomSiteRows> = None;
+    let mut loops = CifLoops::new();
 
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -122,9 +134,9 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
 
             if tags.first().is_some_and(|t| t.starts_with("_atom_site.")) {
                 atom_site = Some((tags, rows));
+            } else if let Some(first) = tags.first() {
+                loops.insert(category_of(first), (tags, rows));
             }
-            // Every other loop (e.g. `_struct_conn`) is out of scope --
-            // see the module doc.
             continue;
         }
 
@@ -142,6 +154,8 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
         atom_site
             .as_ref()
             .map(|(t, r)| (t.as_slice(), r.as_slice())),
+        &loops,
+        options,
     )
 }
 

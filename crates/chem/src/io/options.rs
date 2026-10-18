@@ -24,6 +24,7 @@ pub struct ReadOptions {
     pub pdbqt: PdbqtReadOptions,
     pub gro: GroReadOptions,
     pub csv: CsvReadOptions,
+    pub mmcif: MmcifReadOptions,
 }
 
 /// Whether a format that was already multi-frame (XYZ, PDB, PDBQT, GRO --
@@ -65,6 +66,11 @@ pub struct PdbqtReadOptions {
 pub struct GroReadOptions {
     pub multi_frame: MultiFrameMode,
 }
+
+/// mmCIF's and BinaryCIF's read options, one struct for both since both
+/// build through [`crate::io::cif_model`]. Empty until a reader needs one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MmcifReadOptions {}
 
 /// CSV's own read options (#337): whether row 0 is a header, and which
 /// column (if any) states a structure. `structure_column` is the whole
