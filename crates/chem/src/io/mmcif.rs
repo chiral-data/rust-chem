@@ -11,11 +11,12 @@
 //! BinaryCIF (#319) — this module is the text-specific tokenizer/formatter
 //! around it.
 //!
-//! **No bonds at all** — stricter than PDB's `CONECT`-only cut. mmCIF's
-//! rough analogue, `_struct_conn`, is a separate loop keyed by
-//! `label_asym_id`/`label_seq_id`/`label_atom_id` triples rather than a
-//! simple serial number, and rarer in ordinary deposited structures than
-//! `CONECT`. Deferred entirely, stated here rather than silently dropped.
+//! **No bonds by default.** With
+//! [`MmcifReadOptions::chem_comp_bonds`](crate::io::options::MmcifReadOptions::chem_comp_bonds)
+//! on, each residue is bonded by the block's own `_chem_comp_bond` table,
+//! matched on atom name, with the stated orders (#406); atoms the table
+//! names but the residue lacks are skipped. BinaryCIF reads the same way.
+//! Neither writer emits `_chem_comp_bond`, so bonds don't survive a write.
 //!
 //! **Grammar subset**: bare (whitespace-delimited) tokens, single- and
 //! double-quoted tokens. Multi-line semicolon (`;...;`) text fields are

@@ -68,9 +68,13 @@ pub struct GroReadOptions {
 }
 
 /// mmCIF's and BinaryCIF's read options, one struct for both since both
-/// build through [`crate::io::cif_model`]. Empty until a reader needs one.
+/// build through [`crate::io::cif_model`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MmcifReadOptions {}
+pub struct MmcifReadOptions {
+    /// Bond each residue by the file's own `_chem_comp_bond` table, matched
+    /// on atom name (#406). Off by default, so a read stays bondless.
+    pub chem_comp_bonds: bool,
+}
 
 /// CSV's own read options (#337): whether row 0 is a header, and which
 /// column (if any) states a structure. `structure_column` is the whole
