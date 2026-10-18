@@ -20,6 +20,7 @@ use crate::core::cell::{SpaceGroup, UnitCell};
 use crate::core::elements::ELEMENT_SYMBOLS;
 use crate::core::geometry::{Point3, is_placeholder_3d};
 use crate::core::molecule::Molecule;
+use crate::core::perceive::perceive_bonds;
 use crate::core::residue::{Chain, Residue};
 use crate::core::residue_templates::{add_residue_template_bonds, bond_conformer_pairs};
 use crate::core::site::AtomSite;
@@ -575,7 +576,8 @@ pub(crate) fn build_molecule(
         .map_err(|e| MmcifError::ParseError(e.to_string()))?;
 
     // The bond pipeline: each step only adds pairs not yet bonded, so the
-    // order is the precedence -- templates, then `_chem_comp_bond`.
+    // order is the precedence -- templates, then `_chem_comp_bond`, then
+    // perception for whatever no stated source bonded.
     if options.residue_templates {
         add_residue_template_bonds(&mut mol);
         bond_struct_conn(&mut mol, singles, loops, &labels);
@@ -585,7 +587,11 @@ pub(crate) fn build_molecule(
     {
         apply_chem_comp_bonds(&mut mol, table)?;
     }
-    // A no-op on a bondless read, so the default output is unchanged.
+    if options.perceive_bonds {
+        perceive_bonds(&mut mol);
+    }
+    // A no-op on a bondless read, so the default output is unchanged; a
+    // bondless atom keeps `None`, since its connectivity was never stated.
     mol.calculate_implicit_hydrogens_where_bonded();
 
     if let (Some(a), Some(b), Some(c), Some(alpha), Some(beta), Some(gamma)) = (
@@ -773,6 +779,7 @@ mod tests {
         residue_templates: false,
         chem_comp_bonds: true,
         multi_frame: crate::io::options::MultiFrameMode::Molecules,
+        perceive_bonds: false,
     };
 
     /// An mmCIF block with the given `_chem_comp_bond` rows and

@@ -8,6 +8,7 @@ pub mod index_groups;
 pub mod layout;
 pub mod mesh;
 pub mod molecule;
+pub mod perceive;
 pub mod residue;
 pub mod residue_templates;
 pub mod rings;
@@ -33,6 +34,7 @@ pub mod prelude {
     pub use crate::core::layout::{ensure_coords, layout};
     pub use crate::core::mesh::{Color32, Mesh, MeshError};
     pub use crate::core::molecule::{Molecule, MoleculeError};
+    pub use crate::core::perceive::perceive_bonds;
     pub use crate::core::residue::{Chain, Residue};
     pub use crate::core::rings::{Ring, find_sssr, perceive_rings, ring_count};
     pub use crate::core::site::AtomSite;

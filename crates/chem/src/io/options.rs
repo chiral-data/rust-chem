@@ -54,6 +54,9 @@ pub enum MultiFrameMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct XyzReadOptions {
     pub multi_frame: MultiFrameMode,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]). Off by default.
+    pub perceive_bonds: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +66,9 @@ pub struct PdbReadOptions {
     /// apply `SSBOND`/`LINK`, on top of `CONECT` (#403). Off by default, so
     /// a caller gets only the bonds the file states.
     pub residue_templates: bool,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]). Off by default.
+    pub perceive_bonds: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +79,9 @@ pub struct PdbqtReadOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroReadOptions {
     pub multi_frame: MultiFrameMode,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]). Off by default.
+    pub perceive_bonds: bool,
 }
 
 /// mmCIF's and BinaryCIF's read options, one struct for both since both
@@ -88,6 +97,10 @@ pub struct MmcifReadOptions {
     pub chem_comp_bonds: bool,
     /// Read an NMR ensemble's later models as frames (#404).
     pub multi_frame: MultiFrameMode,
+    /// Bond atom pairs the file left unbonded by distance
+    /// ([`crate::core::perceive::perceive_bonds`]), after every stated bond.
+    /// Off by default.
+    pub perceive_bonds: bool,
 }
 
 /// CSV's own read options (#337): whether row 0 is a header, and which
