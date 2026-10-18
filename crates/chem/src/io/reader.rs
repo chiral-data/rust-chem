@@ -596,29 +596,55 @@ pub fn read_pdb(content: &str) -> ReadOutcome {
 /// model's own topology — including its `CONECT` bonds — shared by every
 /// frame; a later model's `CONECT` is never consulted) when
 /// [`MultiFrameMode::Frames`] is requested (#330).
+///
+/// Text after the last `ENDMDL` with no `ATOM`/`HETATM` is the file's tail,
+/// not a model (#411). Its `CONECT` records apply to every model, matched by
+/// serial within that model, since serials restart in each `MODEL` (#412).
 pub fn read_pdb_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut molecules: Vec<(usize, Molecule)> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    let (models, tail) = split_models(content);
+    let tail_conect: Vec<&str> = tail
+        .into_iter()
+        .filter(|line| line.starts_with("CONECT"))
+        .collect();
+
+    for (index, mut lines) in models.into_iter().enumerate() {
+        lines.extend(&tail_conect);
+        push_pdb_record(&mut molecules, &mut skipped, &lines, index + 1, options);
+    }
+
+    assemble_multi_frame_outcome(options.pdb.multi_frame, molecules, skipped)
+}
+
+/// Whether a PDB/PDBQT line is an `ATOM` or `HETATM` record.
+pub(crate) fn is_atom_line(line: &str) -> bool {
+    matches!(line.get(0..6).map(str::trim), Some("ATOM" | "HETATM"))
+}
+
+/// Splits PDB/PDBQT text into `ENDMDL`-terminated models plus the file's
+/// tail. The remainder after the last `ENDMDL` is a tail only when it has no
+/// atoms; otherwise it is one more model, which a file without `ENDMDL`
+/// always is.
+fn split_models(content: &str) -> (Vec<Vec<&str>>, Vec<&str>) {
+    let mut models: Vec<Vec<&str>> = Vec::new();
     let mut lines: Vec<&str> = Vec::new();
-    let mut position = 0;
 
     for line in content.lines() {
         lines.push(line);
         if line.trim() == "ENDMDL" {
-            position += 1;
-            push_pdb_record(&mut molecules, &mut skipped, &lines, position, options);
-            lines.clear();
+            models.push(std::mem::take(&mut lines));
         }
     }
 
-    // A trailing structure with no `ENDMDL` -- which a single-model file
-    // always is.
-    if lines.iter().any(|line| !line.trim().is_empty()) {
-        position += 1;
-        push_pdb_record(&mut molecules, &mut skipped, &lines, position, options);
+    if !lines.iter().any(|line| !line.trim().is_empty()) {
+        return (models, Vec::new());
     }
-
-    assemble_multi_frame_outcome(options.pdb.multi_frame, molecules, skipped)
+    if !models.is_empty() && !lines.iter().any(|line| is_atom_line(line)) {
+        return (models, lines);
+    }
+    models.push(lines);
+    (models, Vec::new())
 }
 
 fn push_pdb_record(
@@ -1092,24 +1118,14 @@ pub fn read_pdbqt(content: &str) -> ReadOutcome {
 /// `MODEL`/`ENDMDL`-wrapped multi-pose file (AutoDock Vina's real docked-
 /// results output shape) (#226) -- mirrors [`read_pdb_with_options`]
 /// exactly, since PDBQT borrows this framing directly from PDB, including
-/// the same [`MultiFrameMode::Frames`] option (#330).
+/// the same [`MultiFrameMode::Frames`] option (#330) and the same atom-less
+/// tail rule (#411).
 pub fn read_pdbqt_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut molecules: Vec<(usize, Molecule)> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
-    let mut lines: Vec<&str> = Vec::new();
-    let mut position = 0;
-
-    for line in content.lines() {
-        lines.push(line);
-        if line.trim() == "ENDMDL" {
-            position += 1;
-            push_pdbqt_record(&mut molecules, &mut skipped, &lines, position);
-            lines.clear();
-        }
-    }
-    if lines.iter().any(|line| !line.trim().is_empty()) {
-        position += 1;
-        push_pdbqt_record(&mut molecules, &mut skipped, &lines, position);
+    let (models, _tail) = split_models(content);
+    for (index, lines) in models.iter().enumerate() {
+        push_pdbqt_record(&mut molecules, &mut skipped, lines, index + 1);
     }
 
     assemble_multi_frame_outcome(options.pdbqt.multi_frame, molecules, skipped)
@@ -1822,5 +1838,122 @@ H 2.0 0.0 0.0
         assert!(!perceive_frame(Frames, true, 1));
         assert!(perceive_frame(Molecules, true, 5));
         assert!(!perceive_frame(Molecules, false, 0));
+    }
+
+    /// Two models of a three-atom ligand, then a wwPDB-style tail.
+    fn ensemble_with_tail(tail: &str) -> String {
+        let model = |n: usize| {
+            format!(
+                "MODEL     {n:>4}
+HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C
+HETATM    2  O1  LIG A   1       1.400   0.000   0.000  1.00  0.00           O
+HETATM    3  C2  LIG A   1       2.000   1.200   0.000  1.00  0.00           C
+ENDMDL
+"
+            )
+        };
+        format!("{}{}{tail}", model(1), model(2))
+    }
+
+    const CONECT_TAIL: &str = "\
+CONECT    1    2
+CONECT    2    1    3
+CONECT    3    2
+MASTER        0    0    0    0    0    0    0    0    6    0    3    0
+END
+";
+
+    fn pdb_frames_options() -> ReadOptions {
+        ReadOptions {
+            pdb: crate::io::options::PdbReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_pdb_master_end_tail_is_not_a_record() {
+        let text = ensemble_with_tail(
+            "MASTER        0    0    0    0    0    0    0    0    6    0    0    0\nEND\n",
+        );
+        let out = read_pdb(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
+
+        let out = read_pdb_with_options(&text, &pdb_frames_options());
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records[0].trajectory().unwrap().frame_count(), 2);
+    }
+
+    #[test]
+    fn test_pdb_tail_conect_bonds_every_model() {
+        let text = ensemble_with_tail(CONECT_TAIL);
+        let out = read_pdb(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
+        for record in &out.records {
+            assert_eq!(record.molecule().unwrap().num_bonds(), 2);
+        }
+
+        let out = read_pdb_with_options(&text, &pdb_frames_options());
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        let trajectory = out.records[0].trajectory().unwrap();
+        assert_eq!(trajectory.frame_count(), 2);
+        assert_eq!(trajectory.topology().num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_pdb_tail_conect_naming_a_missing_serial_fails_that_model_only() {
+        let text = ensemble_with_tail(CONECT_TAIL).replacen(
+            "HETATM    3  C2  LIG A   1       2.000   1.200   0.000  1.00  0.00           C\nENDMDL\nCONECT",
+            "ENDMDL\nCONECT",
+            1,
+        );
+        let out = read_pdb(&text);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].molecule().unwrap().num_bonds(), 2);
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 2);
+        assert!(
+            out.skipped[0].error.contains("serial 3"),
+            "{}",
+            out.skipped[0].error
+        );
+    }
+
+    #[test]
+    fn test_pdb_remainder_with_atoms_after_the_last_endmdl_is_still_a_model() {
+        let text = ensemble_with_tail(
+            "HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n",
+        );
+        let out = read_pdb(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 3);
+    }
+
+    #[test]
+    fn test_pdb_without_endmdl_is_one_record_even_with_no_atoms() {
+        let out = read_pdb("HEADER    NOTHING\nEND\n");
+        assert!(out.records.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].position, 1);
+    }
+
+    #[test]
+    fn test_pdbqt_end_tail_after_the_last_endmdl_is_not_a_record() {
+        let pose = "MODEL        1
+ROOT
+ATOM      1  C   UNL     1       0.000   0.000   0.000  1.00  0.00    +0.000 C
+ATOM      2  O   UNL     1       1.400   0.000   0.000  1.00  0.00    +0.000 OA
+ENDROOT
+TORSDOF 0
+ENDMDL
+";
+        let text = format!("{pose}{pose}REMARK done\nEND\n");
+        let out = read_pdbqt(&text);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
     }
 }

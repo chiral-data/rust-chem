@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 use crate::core::molecule::Molecule;
 use crate::io::errors::ReadError;
 use crate::io::options::{ReadOptions, WriteOptions};
-use crate::io::reader::{Payload, Record};
+use crate::io::reader::{Payload, Record, is_atom_line};
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
 
@@ -257,9 +257,14 @@ impl<R: BufRead> Iterator for SdfSupplier<R> {
 /// holding several back to back (#223), the same role SDF's `$$$$` plays;
 /// mirrors [`crate::io::reader::read_pdb_with_options`]'s splitting
 /// exactly, one line read at a time instead of over a pre-loaded string.
+///
+/// An atom-less tail after the last `ENDMDL` is dropped, but its `CONECT`
+/// records are not applied: that would mean buffering every model until the
+/// tail arrives. [`crate::io::reader::read_pdb_with_options`] applies them.
 pub struct PdbSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
+    seen_endmdl: bool,
     options: ReadOptions,
 }
 
@@ -268,6 +273,7 @@ impl<R: BufRead> PdbSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
+            seen_endmdl: false,
             options: options.clone(),
         }
     }
@@ -791,8 +797,11 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
                     if !got_any_line || buffer.trim().is_empty() {
                         return None;
                     }
-                    // A trailing structure with no `ENDMDL` -- which a
-                    // single-model file always is.
+                    // After an `ENDMDL`, an atom-less remainder is the tail
+                    // (#411); otherwise it is one more structure.
+                    if self.seen_endmdl && !buffer.lines().any(is_atom_line) {
+                        return None;
+                    }
                     break;
                 }
                 Some(Ok(line)) => line,
@@ -809,6 +818,7 @@ impl<R: BufRead> Iterator for PdbSupplier<R> {
             buffer.push_str(&raw);
             buffer.push('\n');
             if is_terminator {
+                self.seen_endmdl = true;
                 break;
             }
         }
@@ -1264,6 +1274,7 @@ impl<W: Write> Writer for Mol2Writer<W> {
 pub struct PdbqtSupplier<R> {
     lines: std::io::Lines<R>,
     position: usize,
+    seen_endmdl: bool,
     _options: ReadOptions,
 }
 
@@ -1272,6 +1283,7 @@ impl<R: BufRead> PdbqtSupplier<R> {
         Self {
             lines: reader.lines(),
             position: 0,
+            seen_endmdl: false,
             _options: options.clone(),
         }
     }
@@ -1290,6 +1302,9 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
                     if !got_any_line || buffer.trim().is_empty() {
                         return None;
                     }
+                    if self.seen_endmdl && !buffer.lines().any(is_atom_line) {
+                        return None;
+                    }
                     break;
                 }
                 Some(Ok(line)) => line,
@@ -1306,6 +1321,7 @@ impl<R: BufRead> Iterator for PdbqtSupplier<R> {
             buffer.push_str(&raw);
             buffer.push('\n');
             if is_terminator {
+                self.seen_endmdl = true;
                 break;
             }
         }
@@ -2037,5 +2053,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.molecule().unwrap().num_bonds(), 2);
+    }
+
+    #[test]
+    fn test_pdb_supplier_drops_an_atomless_tail_without_its_conect() {
+        let model = "MODEL        1
+HETATM    1  C1  LIG A   1       0.000   0.000   0.000  1.00  0.00           C
+HETATM    2  O1  LIG A   1       1.400   0.000   0.000  1.00  0.00           O
+ENDMDL
+";
+        let text = format!("{model}{model}CONECT    1    2\nCONECT    2    1\nEND\n");
+        let records: Vec<_> = PdbSupplier::new(Cursor::new(text.as_bytes()), &options())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record.molecule().unwrap().num_bonds(), 0);
+        }
+    }
+
+    #[test]
+    fn test_pdbqt_supplier_drops_an_atomless_tail() {
+        let pose = "MODEL        1
+ROOT
+ATOM      1  C   UNL     1       0.000   0.000   0.000  1.00  0.00    +0.000 C
+ENDROOT
+TORSDOF 0
+ENDMDL
+";
+        let text = format!("{pose}{pose}END\n");
+        let records: Vec<_> = PdbqtSupplier::new(Cursor::new(text.as_bytes()), &options())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
     }
 }

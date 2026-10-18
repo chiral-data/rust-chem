@@ -506,9 +506,9 @@ pub fn frame_model(serial: usize, body: &str) -> String {
 /// does not apply here -- sibling `<molecule>` elements with no root are not
 /// valid XML, whereas an unframed PDB structure is perfectly valid.
 ///
-/// **No trailing `END` after the last `ENDMDL`.** Measured: a bare `END` there
-/// reads back as an extra, empty record, the artefact visible in OpenBabel's
-/// own multi-model output.
+/// **No trailing `END` after the last `ENDMDL`.** A reader that splits on
+/// `ENDMDL` alone, as ours did before #411, reads it back as an extra, empty
+/// record, the artefact visible in OpenBabel's own multi-model output.
 pub fn frame_models(structures: &[String]) -> String {
     if structures.len() < 2 {
         return structures.first().cloned().unwrap_or_default();
