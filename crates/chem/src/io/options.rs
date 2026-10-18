@@ -33,6 +33,10 @@ pub struct ReadOptions {
 /// one [`crate::io::reader::Payload::Frames`] [`crate::core::trajectory::Trajectory`]
 /// sharing a single topology.
 ///
+/// mmCIF and BinaryCIF (#404) apply it per block, to the models of an NMR
+/// ensemble: under `Molecules` a block is its first model, with each later
+/// model reported in [`crate::io::reader::ReadOutcome::skipped`].
+///
 /// `Molecules` is the honest default: `Kind::Molecules` describes what these
 /// formats return unless told otherwise, not a lie a read can silently
 /// contradict. `Frames` is the disclosed exception a caller opts into --
@@ -74,6 +78,8 @@ pub struct MmcifReadOptions {
     /// Bond each residue by the file's own `_chem_comp_bond` table, matched
     /// on atom name (#406). Off by default, so a read stays bondless.
     pub chem_comp_bonds: bool,
+    /// Read an NMR ensemble's later models as frames (#404).
+    pub multi_frame: MultiFrameMode,
 }
 
 /// CSV's own read options (#337): whether row 0 is a header, and which

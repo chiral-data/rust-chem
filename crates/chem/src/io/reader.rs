@@ -26,6 +26,7 @@ use crate::core::molecule::Molecule;
 use crate::core::table::Table;
 use crate::core::trajectory::{Frame, FrameSource, Trajectory};
 use crate::core::volume::VolumeGrid;
+use crate::io::cif_model::CifModels;
 use crate::io::options::{MultiFrameMode, ReadOptions};
 use crate::io::sdf::parse_sdf;
 use crate::io::smiles::parse_smiles;
@@ -631,8 +632,8 @@ pub fn read_mmcif(content: &str) -> ReadOutcome {
 /// One molecule per `data_` block (#224). A block boundary is a line
 /// starting with `data_`; a file with only one is one implicit record,
 /// today's common case for a single deposited structure. Within a block, a
-/// varying `pdbx_PDB_model_num` is [`crate::io::mmcif::parse_mmcif`]'s own
-/// job (its own doc explains why), not this splitter's.
+/// varying `pdbx_PDB_model_num` is an NMR ensemble, read per
+/// [`MultiFrameMode`] from `options.mmcif.multi_frame` (#404).
 pub fn read_mmcif_with_options(content: &str, options: &ReadOptions) -> ReadOutcome {
     let mut out = ReadOutcome::default();
     let mut lines: Vec<&str> = Vec::new();
@@ -662,22 +663,84 @@ fn push_mmcif_record(
     options: &ReadOptions,
 ) {
     let record = lines.join("\n");
-    match crate::io::mmcif::parse_mmcif_with_options(&record, &options.mmcif) {
-        Ok(molecule) => {
-            let name = molecule
+    match crate::io::mmcif::parse_mmcif_models(&record, &options.mmcif) {
+        Ok(models) => {
+            let name = models
+                .molecule
                 .name()
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Molecule_{position}"));
-            out.records.push(Record {
-                payload: Payload::Molecule(molecule),
-                name,
-                smiles: None,
-            });
+            push_cif_models(out, options.mmcif.multi_frame, position, name, models);
         }
         Err(e) => out.skipped.push(Skipped {
             position,
             input: String::new(),
             error: e.to_string(),
+        }),
+    }
+}
+
+/// One mmCIF or BinaryCIF block as records (#404). A single-model block is
+/// one `Molecule` record in either mode. An ensemble is one `Frames` record
+/// under [`MultiFrameMode::Frames`], built by the same
+/// `molecules_to_trajectory` PDB uses; otherwise its first model. A later
+/// model that is not a frame is reported in `skipped`.
+pub(crate) fn push_cif_models(
+    out: &mut ReadOutcome,
+    mode: MultiFrameMode,
+    position: usize,
+    name: String,
+    models: CifModels,
+) {
+    let CifModels { molecule, later } = models;
+    let skip = |out: &mut ReadOutcome, number: &str, reason: String| {
+        out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error: format!("model {number} not read: {reason}"),
+        })
+    };
+
+    if later.is_empty() || mode == MultiFrameMode::Molecules {
+        for model in later {
+            let reason = model.positions.err().unwrap_or_else(|| {
+                "ensemble models are read only under MultiFrameMode::Frames".to_string()
+            });
+            skip(out, &model.number, reason);
+        }
+        out.records.push(Record {
+            payload: Payload::Molecule(molecule),
+            name,
+            smiles: None,
+        });
+        return;
+    }
+
+    let mut frames = vec![molecule.clone()];
+    for model in later {
+        let positions = match model.positions {
+            Ok(positions) => positions,
+            Err(reason) => {
+                skip(out, &model.number, reason);
+                continue;
+            }
+        };
+        let mut frame = molecule.clone();
+        match frame.set_coords3(positions) {
+            Ok(()) => frames.push(frame),
+            Err(e) => skip(out, &model.number, e.to_string()),
+        }
+    }
+    match molecules_to_trajectory(frames) {
+        Ok(trajectory) => out.records.push(Record {
+            payload: Payload::Frames(trajectory),
+            name,
+            smiles: None,
+        }),
+        Err(error) => out.skipped.push(Skipped {
+            position,
+            input: String::new(),
+            error,
         }),
     }
 }
@@ -1486,6 +1549,144 @@ $$$$
             (f1.positions[1].x - 2.0).abs() < 1e-6,
             "{}",
             f1.positions[1].x
+        );
+    }
+
+    const NMR_ENSEMBLE_CIF: &str = include_str!("../../tests/corpus/mmcif/nmr-ensemble.cif");
+
+    /// `nmr-ensemble.cif` as PDB `MODEL` records, same atoms and positions.
+    const NMR_ENSEMBLE_PDB: &str = "\
+MODEL        1
+ATOM      1  N   GLY A   1      -1.195   0.346  -0.120  1.00  0.00           N
+ATOM      2  CA  GLY A   1       0.000   1.180   0.000  1.00  0.00           C
+ATOM      3  C   GLY A   1       1.250   0.320   0.010  1.00  0.00           C
+ATOM      4  O   GLY A   1       1.230  -0.910   0.050  1.00  0.00           O
+ATOM      5  N   ALA A   2       2.410   0.970  -0.030  1.00  0.00           N
+ATOM      6  CA  ALA A   2       3.700   0.300  -0.020  1.00  0.00           C
+ATOM      7  C   ALA A   2       4.850   1.300   0.100  1.00  0.00           C
+ATOM      8  O   ALA A   2       4.660   2.510   0.180  1.00  0.00           O
+ATOM      9  CB  ALA A   2       3.850  -0.560  -1.270  1.00  0.00           C
+ENDMDL
+MODEL        2
+ATOM      1  N   GLY A   1      -1.085   0.276  -0.070  1.00  0.00           N
+ATOM      2  CA  GLY A   1       0.120   1.100   0.050  1.00  0.00           C
+ATOM      3  C   GLY A   1       1.380   0.230   0.060  1.00  0.00           C
+ATOM      4  O   GLY A   1       1.340  -0.980   0.100  1.00  0.00           O
+ATOM      5  N   ALA A   2       2.530   0.890   0.020  1.00  0.00           N
+ATOM      6  CA  ALA A   2       3.830   0.210   0.030  1.00  0.00           C
+ATOM      7  C   ALA A   2       4.960   1.230   0.150  1.00  0.00           C
+ATOM      8  O   ALA A   2       4.780   2.430   0.230  1.00  0.00           O
+ATOM      9  CB  ALA A   2       3.980  -0.650  -1.220  1.00  0.00           C
+ENDMDL
+MODEL        3
+ATOM      1  N   GLY A   1      -1.365   0.476  -0.190  1.00  0.00           N
+ATOM      2  CA  GLY A   1      -0.150   1.290  -0.070  1.00  0.00           C
+ATOM      3  C   GLY A   1       1.120   0.410  -0.060  1.00  0.00           C
+ATOM      4  O   GLY A   1       1.060  -0.780  -0.020  1.00  0.00           O
+ATOM      5  N   ALA A   2       2.260   1.080  -0.100  1.00  0.00           N
+ATOM      6  CA  ALA A   2       3.570   0.390  -0.090  1.00  0.00           C
+ATOM      7  C   ALA A   2       4.680   1.430   0.030  1.00  0.00           C
+ATOM      8  O   ALA A   2       4.510   2.620   0.110  1.00  0.00           O
+ATOM      9  CB  ALA A   2       3.720  -0.470  -1.340  1.00  0.00           C
+ENDMDL
+END
+";
+
+    fn cif_frames_options() -> ReadOptions {
+        ReadOptions {
+            mmcif: crate::io::options::MmcifReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+                ..Default::default()
+            },
+            ..ReadOptions::default()
+        }
+    }
+
+    fn only_trajectory(outcome: ReadOutcome) -> Trajectory {
+        assert_eq!(outcome.records.len(), 1);
+        match outcome.records.into_iter().next().unwrap().payload {
+            Payload::Frames(t) => t,
+            other => panic!("expected Payload::Frames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mmcif_default_mode_reports_every_later_model_as_skipped() {
+        let out = read_mmcif(NMR_ENSEMBLE_CIF);
+        assert_eq!(out.records.len(), 1);
+        let Payload::Molecule(mol) = &out.records[0].payload else {
+            panic!("expected Payload::Molecule");
+        };
+        assert_eq!(mol.num_atoms(), 9);
+        let errors: Vec<&str> = out.skipped.iter().map(|s| s.error.as_str()).collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].starts_with("model 2 not read"), "{errors:?}");
+        assert!(errors[1].starts_with("model 3 not read"), "{errors:?}");
+    }
+
+    #[test]
+    fn test_mmcif_frames_mode_matches_the_same_ensemble_read_as_pdb() {
+        let outcome = read_mmcif_with_options(NMR_ENSEMBLE_CIF, &cif_frames_options());
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let mut cif = only_trajectory(outcome);
+        assert_eq!(cif.topology().num_atoms(), 9);
+        assert_eq!(cif.topology().residues().len(), 2);
+        assert!(!cif.topology().has_coords3(), "positions live in frames");
+
+        let pdb_options = ReadOptions {
+            pdb: crate::io::options::PdbReadOptions {
+                multi_frame: MultiFrameMode::Frames,
+            },
+            ..ReadOptions::default()
+        };
+        let mut pdb = only_trajectory(read_pdb_with_options(NMR_ENSEMBLE_PDB, &pdb_options));
+
+        assert_eq!(cif.frame_count(), 3);
+        assert_eq!(pdb.frame_count(), cif.frame_count());
+        for i in 0..cif.frame_count() {
+            let (c, p) = (cif.frame(i).unwrap(), pdb.frame(i).unwrap());
+            assert_eq!(c.step, p.step);
+            for (a, b) in c.positions.iter().zip(&p.positions) {
+                assert!(a.distance(*b) < 1e-9, "frame {i}: {a:?} vs {b:?}");
+            }
+        }
+        assert_ne!(
+            cif.frame(0).unwrap().positions,
+            cif.frame(1).unwrap().positions
+        );
+    }
+
+    #[test]
+    fn test_mmcif_frames_mode_skips_a_model_missing_an_atom() {
+        // Model 2 loses its last atom (CB); models 1 and 3 still animate.
+        let text: String = NMR_ENSEMBLE_CIF
+            .lines()
+            .filter(|l| !l.starts_with("ATOM 18 "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let outcome = read_mmcif_with_options(&text, &cif_frames_options());
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert_eq!(
+            outcome.skipped[0].error,
+            "model 2 not read: 8 atoms where model 1 has 9"
+        );
+        assert_eq!(only_trajectory(outcome).frame_count(), 2);
+    }
+
+    #[test]
+    fn test_mmcif_frames_mode_leaves_a_single_model_block_a_molecule() {
+        let options = cif_frames_options();
+        let text = format!(
+            "{0}{0}",
+            "data_a\nloop_\n_atom_site.type_symbol\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\nC 1.0 0.0 0.0\n"
+        );
+        let out = read_mmcif_with_options(&text, &options);
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert_eq!(out.records.len(), 2);
+        assert!(
+            out.records
+                .iter()
+                .all(|r| matches!(r.payload, Payload::Molecule(_)))
         );
     }
 

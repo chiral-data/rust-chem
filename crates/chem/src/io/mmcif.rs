@@ -29,17 +29,17 @@
 //! ([`crate::io::reader::read_mmcif_with_options`],
 //! [`crate::io::supplier::MmcifSupplier`]), the same division every prior
 //! format has. **A varying `pdbx_PDB_model_num` within one block's
-//! `_atom_site` loop** (mmCIF's actual NMR-ensemble convention — unlike
-//! PDB, models share one loop rather than living in separate blocks) is
-//! *not* split into multiple records: only the first model's atoms are
-//! read, later ones skipped rather than merged in. Stated plainly rather
-//! than silently combining distinct models into one incoherent structure;
-//! most deposited structures are single-model, and NMR ensembles
-//! specifically are the case this doesn't handle.
+//! `_atom_site` loop** is mmCIF's NMR-ensemble convention: models share one
+//! loop rather than living in separate blocks. [`parse_mmcif`] returns the
+//! first model. The reader returns the whole ensemble as one
+//! [`crate::io::reader::Payload::Frames`] record under
+//! [`crate::io::options::MultiFrameMode::Frames`], and otherwise reports
+//! each later model as skipped (#404). A later model whose atoms differ
+//! from the first model's is always skipped, never merged.
 
 use crate::core::molecule::Molecule;
 use crate::io::cif_model::{
-    AtomSiteRows, CifLoops, RowPrecision, build_molecule, build_rows, category_of,
+    AtomSiteRows, CifLoops, CifModels, RowPrecision, build_models, build_rows, category_of,
 };
 use crate::io::errors::MmcifError;
 use crate::io::options::MmcifReadOptions;
@@ -91,11 +91,20 @@ pub fn parse_mmcif(text: &str) -> Result<Molecule, MmcifError> {
     parse_mmcif_with_options(text, &MmcifReadOptions::default())
 }
 
-/// [`parse_mmcif`] with mmCIF's own read options.
+/// [`parse_mmcif`] with mmCIF's own read options. Returns the first model
+/// of an NMR ensemble.
 pub fn parse_mmcif_with_options(
     text: &str,
     options: &MmcifReadOptions,
 ) -> Result<Molecule, MmcifError> {
+    parse_mmcif_models(text, options).map(|models| models.molecule)
+}
+
+/// One block's first model plus its later models (#404).
+pub(crate) fn parse_mmcif_models(
+    text: &str,
+    options: &MmcifReadOptions,
+) -> Result<CifModels, MmcifError> {
     let mut singles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut atom_site: Option<AtomSiteRows> = None;
     let mut loops = CifLoops::new();
@@ -150,7 +159,7 @@ pub fn parse_mmcif_with_options(
         i += 1;
     }
 
-    build_molecule(
+    build_models(
         &singles,
         atom_site
             .as_ref()
@@ -294,13 +303,84 @@ HETATM 3 H H2 . HOH A 1 A HOH . 0.759 0.000 -0.504 1.00 20.00 1
     }
 
     #[test]
-    fn test_only_the_first_model_is_read_when_the_model_number_varies() {
+    fn test_parse_mmcif_returns_the_first_model_of_an_ensemble() {
+        // The later model reaches only the reader (#404); `parse_mmcif`'s
+        // signature has room for one molecule.
         let text = "data_x\nloop_\n_atom_site.type_symbol\n_atom_site.Cartn_x\n\
                     _atom_site.Cartn_y\n_atom_site.Cartn_z\n_atom_site.pdbx_PDB_model_num\n\
                     C 0.0 0.0 0.0 1\nC 1.0 1.0 1.0 2\n";
         let mol = parse_mmcif(text).expect("valid mmCIF");
         assert_eq!(mol.num_atoms(), 1);
         assert_eq!(mol.coord3(0), Some(Point3::new(0.0, 0.0, 0.0)));
+
+        let models = parse_mmcif_models(text, &MmcifReadOptions::default()).unwrap();
+        assert_eq!(models.later.len(), 1);
+        assert_eq!(
+            models.later[0].positions,
+            Ok(vec![Point3::new(1.0, 1.0, 1.0)])
+        );
+    }
+
+    const ENSEMBLE_HEADER: &str = "data_x\nloop_\n_atom_site.type_symbol\n\
+        _atom_site.label_atom_id\n_atom_site.label_comp_id\n_atom_site.auth_asym_id\n\
+        _atom_site.auth_seq_id\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n\
+        _atom_site.pdbx_PDB_model_num\n";
+
+    fn ensemble(rows: &[&str]) -> CifModels {
+        let text = format!("{ENSEMBLE_HEADER}{}\n", rows.join("\n"));
+        parse_mmcif_models(&text, &MmcifReadOptions::default()).expect("valid mmCIF")
+    }
+
+    #[test]
+    fn test_a_three_model_block_gives_one_molecule_and_two_later_models() {
+        let models = ensemble(&[
+            "N N GLY A 1 0.0 0.0 0.0 1",
+            "C CA GLY A 1 1.5 0.0 0.0 1",
+            "N N GLY A 1 0.1 0.0 0.0 2",
+            "C CA GLY A 1 1.6 0.0 0.0 2",
+            "N N GLY A 1 0.2 0.0 0.0 3",
+            "C CA GLY A 1 1.7 0.0 0.0 3",
+        ]);
+        assert_eq!(models.molecule.num_atoms(), 2);
+        assert_eq!(models.molecule.residues().len(), 1);
+        let numbers: Vec<&str> = models.later.iter().map(|m| m.number.as_str()).collect();
+        assert_eq!(numbers, ["2", "3"]);
+        assert_eq!(
+            models.later[1].positions,
+            Ok(vec![Point3::new(0.2, 0.0, 0.0), Point3::new(1.7, 0.0, 0.0)])
+        );
+    }
+
+    #[test]
+    fn test_a_later_model_with_one_atom_fewer_is_rejected_with_a_reason() {
+        let models = ensemble(&[
+            "N N GLY A 1 0.0 0.0 0.0 1",
+            "C CA GLY A 1 1.5 0.0 0.0 1",
+            "N N GLY A 1 0.1 0.0 0.0 2",
+        ]);
+        assert_eq!(models.molecule.num_atoms(), 2);
+        let reason = models.later[0].positions.as_ref().unwrap_err();
+        assert_eq!(reason, "1 atoms where model 1 has 2");
+    }
+
+    #[test]
+    fn test_a_later_model_naming_a_different_atom_is_rejected() {
+        // Same count, different atom: what a count-only check would merge.
+        let models = ensemble(&[
+            "N N GLY A 1 0.0 0.0 0.0 1",
+            "C CA GLY A 1 1.5 0.0 0.0 1",
+            "N N GLY A 1 0.1 0.0 0.0 2",
+            "C CB GLY A 1 1.6 0.0 0.0 2",
+        ]);
+        let reason = models.later[0].positions.as_ref().unwrap_err();
+        assert!(reason.starts_with("atom 2 is C CB GLY A 1"), "{reason}");
+    }
+
+    #[test]
+    fn test_a_single_model_block_has_no_later_models() {
+        let models = ensemble(&["N N GLY A 1 0.0 0.0 0.0 1", "C CA GLY A 1 1.5 0.0 0.0 1"]);
+        assert_eq!(models.molecule.num_atoms(), 2);
+        assert!(models.later.is_empty());
     }
 
     #[test]
