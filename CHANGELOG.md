@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.4] - 2026-10-19
+
+### Bug Fixes
+
+- **A protein written as PDBQT is a rigid receptor, with its residues intact.** `write_pdbqt` always wrote a ligand torsion tree. On crambin, each disulfide's SG pair was a `ROOT` fragment written out whole, so a partner SG landed beside its cysteine and the file read back as 49 residues instead of 46. Fully bonded, the protein became a 73-torsion ligand, which AutoDock Vina refuses as a receptor. `PdbqtWriteOptions::role` on `WriteOptions` (`Auto`, `Ligand`, `Receptor`) now chooses. `Auto`, the default, writes a molecule of more than one residue as a receptor: its atoms in input order with no `ROOT`, `BRANCH` or `TORSDOF`. Anything else is written as a ligand, as before. A ligand's `ROOT` block now keeps input atom order, so separate components no longer interleave. `chem convert --pdbqt-role <auto|ligand|receptor>` exposes the choice, and `chem convert -H pdbqt` lists it. A peptide meant as a flexible ligand now needs `--pdbqt-role ligand` (#417)
+
 ## [0.9.3] - 2026-10-18
 
 ### Features
