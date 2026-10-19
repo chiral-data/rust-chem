@@ -1363,14 +1363,16 @@ pub struct PdbqtWriter<W> {
     /// framed retroactively once one does. One ligand of memory, not the file.
     held: Option<String>,
     written: usize,
+    options: crate::io::options::PdbqtWriteOptions,
 }
 
 impl<W: Write> PdbqtWriter<W> {
-    pub fn new(writer: W, _options: &WriteOptions) -> Self {
+    pub fn new(writer: W, options: &WriteOptions) -> Self {
         Self {
             writer,
             held: None,
             written: 0,
+            options: options.pdbqt,
         }
     }
 
@@ -1384,7 +1386,7 @@ impl<W: Write> PdbqtWriter<W> {
 
 impl<W: Write> Writer for PdbqtWriter<W> {
     fn write_molecule(&mut self, _name: &str, molecule: &Molecule) -> std::io::Result<()> {
-        let body = crate::io::pdbqt::write_pdbqt(molecule);
+        let body = crate::io::pdbqt::write_pdbqt_with_options(molecule, &self.options);
         match self.held.take() {
             // The second arrival is what makes this a multi-record file, so the
             // first goes out framed now rather than as it was held.
@@ -2041,6 +2043,24 @@ mod tests {
 
         let back = crate::io::reader::read(&out, crate::io::format::Format::PDBQT);
         assert_eq!(back.records.len(), 3, "{out}");
+    }
+
+    #[test]
+    fn test_the_pdbqt_writer_honours_the_receptor_role() {
+        let ethanol = crate::io::smiles::parse_smiles("CCO").expect("valid SMILES");
+        let options = WriteOptions {
+            pdbqt: crate::io::options::PdbqtWriteOptions {
+                role: crate::io::options::PdbqtRole::Receptor,
+            },
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        let mut writer: Box<dyn Writer> = Box::new(PdbqtWriter::new(&mut out, &options));
+        writer.write_molecule("a", &ethanol).expect("writes");
+        writer.finish().expect("finishes");
+        let out = String::from_utf8(out).expect("utf-8");
+
+        assert!(!out.contains("ROOT"), "{out}");
     }
 
     #[test]

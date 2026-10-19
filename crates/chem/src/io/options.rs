@@ -173,6 +173,7 @@ pub struct WriteOptions {
     pub sdf: SdfWriteOptions,
     pub xtc: XtcWriteOptions,
     pub ply: PlyWriteOptions,
+    pub pdbqt: PdbqtWriteOptions,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -221,6 +222,25 @@ pub enum PlyWriteEncoding {
     #[default]
     BinaryLittleEndian,
     Ascii,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PdbqtWriteOptions {
+    pub role: PdbqtRole,
+}
+
+/// Whether a PDBQT is written as a docking ligand or a rigid receptor (#417).
+///
+/// A ligand is a `ROOT`/`BRANCH` torsion tree; a receptor is its atoms in
+/// input order with no tree at all, which is what AutoDock Vina requires of a
+/// rigid receptor. `Auto` writes a molecule of more than one residue as a
+/// receptor and anything else as a ligand, so a peptide ligand needs `Ligand`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PdbqtRole {
+    #[default]
+    Auto,
+    Ligand,
+    Receptor,
 }
 
 #[cfg(test)]

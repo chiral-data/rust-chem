@@ -2129,15 +2129,15 @@ fn write_mol2_records(records: &[(String, Molecule)], _options: &WriteOptions) -
     out
 }
 
-fn write_pdbqt_records(records: &[(String, Molecule)], _options: &WriteOptions) -> String {
-    // PDBQT has no write options today, and no per-record name to thread
-    // through -- see `PdbqtWriter`'s own doc comment.
+fn write_pdbqt_records(records: &[(String, Molecule)], options: &WriteOptions) -> String {
+    // No per-record name to thread through -- see `PdbqtWriter`'s own doc
+    // comment.
     //
     // Framed like PDB's, which is where PDBQT takes this convention from --
     // and where AutoDock Vina's own multi-pose output takes it too (#267).
     let ligands: Vec<String> = records
         .iter()
-        .map(|(_, molecule)| crate::io::pdbqt::write_pdbqt(molecule))
+        .map(|(_, molecule)| crate::io::pdbqt::write_pdbqt_with_options(molecule, &options.pdbqt))
         .collect();
     crate::io::pdb::frame_models(&ligands)
 }

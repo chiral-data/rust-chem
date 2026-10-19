@@ -28,7 +28,7 @@ use chem::draw::structure::{StructureOptions, StructureTheme};
 use chem::draw::svg::structure_to_svg;
 use chem::io::format::{self, Carries, Kind};
 use chem::io::open::{open_supplier_as, open_writer_as};
-use chem::io::options::{ReadOptions, WriteOptions};
+use chem::io::options::{PdbqtRole, PdbqtWriteOptions, ReadOptions, WriteOptions};
 use chem::io::reader::{Format, Payload, Record};
 use chem::io::supplier::{Supplier, Writer};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -78,6 +78,27 @@ enum FpFormat {
     Chem,
     /// chemfp's FPS format (#243).
     Fps,
+}
+
+/// How `chem convert` writes a PDBQT (#417).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PdbqtRoleArg {
+    /// A receptor when the molecule has more than one residue, else a ligand.
+    Auto,
+    /// A `ROOT`/`BRANCH` torsion tree, even for a peptide.
+    Ligand,
+    /// A rigid receptor: atoms in input order, no torsion tree.
+    Receptor,
+}
+
+impl From<PdbqtRoleArg> for PdbqtRole {
+    fn from(role: PdbqtRoleArg) -> Self {
+        match role {
+            PdbqtRoleArg::Auto => PdbqtRole::Auto,
+            PdbqtRoleArg::Ligand => PdbqtRole::Ligand,
+            PdbqtRoleArg::Receptor => PdbqtRole::Receptor,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -233,6 +254,10 @@ enum Command {
         /// Allow writing over the input file.
         #[arg(long)]
         force: bool,
+
+        /// Write a PDBQT as a docking ligand or a rigid receptor.
+        #[arg(long, value_enum, default_value_t = PdbqtRoleArg::Auto)]
+        pdbqt_role: PdbqtRoleArg,
 
         /// List every registered format (`chem convert -L formats`), or
         /// detail one by code (`chem convert -L sdf`). A pure query — no
@@ -575,6 +600,7 @@ fn run(cli: &Cli) -> Result<i32> {
             literal,
             gen3d,
             force,
+            pdbqt_role,
             list,
             describe,
         } => {
@@ -598,6 +624,12 @@ fn run(cli: &Cli) -> Result<i32> {
             let from_format = resolve_format_code(from.as_deref())?;
             let to_format = resolve_format_code(to.as_deref())?;
             let format = resolve_convert_output_format(to_format, output.as_deref())?;
+            let write_options = WriteOptions {
+                pdbqt: PdbqtWriteOptions {
+                    role: (*pdbqt_role).into(),
+                },
+                ..WriteOptions::default()
+            };
 
             // The Kind gate (#338): both format identities resolved with no
             // file opened on either side yet, so a genuine mismatch is
@@ -610,7 +642,8 @@ fn run(cli: &Cli) -> Result<i32> {
                 (Kind::Molecules, Kind::Molecules) => {
                     let (mut supplier, label, source_format): (Box<dyn Supplier>, String, Format) =
                         resolve_convert_input(input.as_deref(), literal.as_deref(), from_format)?;
-                    let mut writer = resolve_convert_output(format, output.as_deref())?;
+                    let mut writer =
+                        resolve_convert_output(format, output.as_deref(), &write_options)?;
 
                     let mut tracker = write::DropTracker::for_conversion(source_format, format);
                     let mut written = 0usize;
@@ -682,7 +715,8 @@ fn run(cli: &Cli) -> Result<i32> {
                         );
                     };
 
-                    let mut writer = resolve_convert_output(format, output.as_deref())?;
+                    let mut writer =
+                        resolve_convert_output(format, output.as_deref(), &write_options)?;
                     let mut tracker =
                         write::DropTracker::for_conversion(source_kind_format, format);
                     tracker.record(&record.name, molecule);
@@ -1106,11 +1140,15 @@ fn resolve_convert_output_format(to: Option<Format>, output: Option<&Path>) -> R
 }
 
 /// Resolves `chem convert`'s output into a streaming [`Writer`].
-fn resolve_convert_output(format: Format, output: Option<&Path>) -> Result<Box<dyn Writer>> {
+fn resolve_convert_output(
+    format: Format,
+    output: Option<&Path>,
+    options: &WriteOptions,
+) -> Result<Box<dyn Writer>> {
     match output.filter(|p| p.as_os_str() != "-") {
-        Some(path) => Ok(open_writer_as(path, format, &WriteOptions::default())?),
+        Some(path) => Ok(open_writer_as(path, format, options)?),
         None => format
-            .writer_stream(std::io::stdout().lock(), &WriteOptions::default())
+            .writer_stream(std::io::stdout().lock(), options)
             .ok_or_else(|| anyhow::anyhow!("{} cannot be written, only read", format.name())),
     }
 }
@@ -1392,13 +1430,15 @@ fn print_format_options(code: &str) -> Result<()> {
     let format = Format::from_code(code)
         .ok_or_else(|| anyhow::anyhow!("unrecognized format code: {code:?}"))?;
     print_format_detail(format);
-    // #212 built the option-bag mechanism, but nothing has wired a
-    // per-format option to a CLI flag yet -- SDF's one option
-    // (MolfileVersion) isn't reachable from `chem convert` today, and
-    // SMILES has no options at all. A real "describe your options"
-    // mechanism earns its place once there's a second thing to describe;
-    // until then this says so honestly rather than inventing detail.
-    println!("no format-specific options are exposed on the command line yet");
+    // One flag so far (#417). A real "describe your options" mechanism earns
+    // its place once there's a second thing to describe.
+    if format == Format::PDBQT {
+        println!(
+            "--pdbqt-role <auto|ligand|receptor>  ligand torsion tree or rigid receptor (default auto: receptor above one residue)"
+        );
+    } else {
+        println!("no format-specific options are exposed on the command line for this format");
+    }
     Ok(())
 }
 
