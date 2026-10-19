@@ -27,8 +27,8 @@
 //! which for the usual connected ligand is the `fragments - 1` this said
 //! before #259, and in both cases is simply the number of rotatable bonds.
 //!
-//! Atoms are renumbered in traversal order (the ROOT fragment's atoms
-//! first, then each branch depth-first) — real ligand PDBQT files lay
+//! Atoms are renumbered in traversal order (the ROOT block's atoms first,
+//! in input order, then each branch depth-first) — real ligand PDBQT files lay
 //! fragments out contiguously this way, and `BRANCH i j`'s `i`/`j` refer
 //! to those written serials, not the input molecule's own atom indices.
 //!
@@ -53,6 +53,17 @@
 //! fragments as rigid, which is the honest consequence of being handed
 //! them — stripping solvent is an explicit operation, not a side effect of
 //! writing a file.
+//!
+//! # Ligand or receptor
+//!
+//! The torsion tree describes a *ligand*. A docking receptor is rigid, and
+//! AutoDock Vina rejects one carrying `ROOT`, `BRANCH` or `TORSDOF`; a
+//! protein written as a tree also scattered its residues across the branches,
+//! so it no longer read back as the same residues (#417). A receptor is
+//! therefore written as its atoms in input order and nothing else.
+//! [`PdbqtRole::Auto`] treats a molecule of more than one residue as a
+//! receptor, and [`PdbqtWriteOptions::role`] overrides it, as a peptide ligand
+//! needs.
 //!
 //! # AutoDock atom typing
 //!
@@ -112,6 +123,7 @@ use crate::core::residue::{Chain, Residue};
 use crate::core::rings::perceive_rings;
 use crate::core::site::AtomSite;
 use crate::io::errors::PdbqtError;
+use crate::io::options::{PdbqtRole, PdbqtWriteOptions};
 
 fn column(line: &str, start_1based: usize, end_1based: usize) -> Option<&str> {
     let bytes = line.as_bytes();
@@ -431,15 +443,34 @@ fn write_atom_line(out: &mut String, mol: &Molecule, atom_idx: usize, serial: us
     ));
 }
 
-/// Writes one PDBQT ligand (a `ROOT`/`BRANCH`.../`TORSDOF` block).
-///
-/// Panics never; a molecule with more than one connected component gets a
-/// `REMARK` line naming the loss and only its largest component is
-/// written -- see the module doc for why this isn't a `Result`.
+/// Writes one PDBQT with the default options: a molecule of more than one
+/// residue as a rigid receptor, anything else as a ligand.
 pub fn write_pdbqt(mol: &Molecule) -> String {
+    write_pdbqt_with_options(mol, &PdbqtWriteOptions::default())
+}
+
+/// Writes one PDBQT, as a ligand (a `ROOT`/`BRANCH`.../`TORSDOF` block) or a
+/// rigid receptor (its atoms in input order and nothing else).
+///
+/// Never panics, and every atom is written, whatever the number of connected
+/// components -- see the module doc.
+pub fn write_pdbqt_with_options(mol: &Molecule, options: &PdbqtWriteOptions) -> String {
     let mut working = mol.clone();
     perceive_rings(&mut working);
     let working = &working;
+
+    let receptor = match options.role {
+        PdbqtRole::Receptor => true,
+        PdbqtRole::Ligand => false,
+        PdbqtRole::Auto => working.residues().len() > 1,
+    };
+    if receptor {
+        let mut out = String::new();
+        for atom_idx in 0..working.num_atoms() {
+            write_atom_line(&mut out, working, atom_idx, atom_idx + 1);
+        }
+        return out;
+    }
 
     let candidate_bonds: Vec<usize> = working
         .bonds()
@@ -499,11 +530,17 @@ pub fn write_pdbqt(mol: &Molecule) -> String {
     let mut new_serial = HashMap::new();
 
     // Every root laid down first, because the ROOT block is a contiguous run
-    // from the head of `order`; only then can any branch be walked.
-    let mut root_atom_count = 0;
-    for &root in &roots {
-        place_fragment(&fragments, root, &mut order, &mut new_serial);
-        root_atom_count += fragments[root].len();
+    // from the head of `order`; only then can any branch be walked. Pooled in
+    // input order, so two components never interleave a residue (#417).
+    let mut root_atoms: Vec<usize> = roots
+        .iter()
+        .flat_map(|&root| fragments[root].iter().copied())
+        .collect();
+    root_atoms.sort_unstable();
+    let root_atom_count = root_atoms.len();
+    for atom in root_atoms {
+        new_serial.insert(atom, order.len() + 1);
+        order.push(atom);
     }
     let mut children = Vec::new();
     for &root in &roots {
@@ -890,6 +927,107 @@ mod tests {
                 assert!(serials.contains(&serial), "dangling {serial} in {line:?}");
             }
         }
+    }
+
+    const CRAMBIN: &str = include_str!("../../tests/corpus/pdb/crambin-1crn.pdb");
+
+    fn residue_runs(written: &str) -> usize {
+        parse_pdbqt(written).expect("reads back").residues().len()
+    }
+
+    fn atom_names(mol: &Molecule) -> Vec<String> {
+        (0..mol.num_atoms())
+            .map(|i| mol.site(i).and_then(|s| s.name.clone()).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn test_a_protein_is_written_as_a_rigid_receptor_in_input_order() {
+        // #417: the disulfide SG pairs were each a ROOT fragment, so a partner
+        // SG was written beside its cysteine and crambin read back as 49.
+        let protein = crate::io::pdb::parse_pdb(CRAMBIN).expect("crambin");
+        assert_eq!(protein.residues().len(), 46);
+        let written = write_pdbqt(&protein);
+
+        assert!(!written.contains("ROOT"), "{written}");
+        assert!(!written.contains("TORSDOF"), "{written}");
+        assert_eq!(residue_runs(&written), 46);
+        let back = parse_pdbqt(&written).expect("reads back");
+        assert_eq!(atom_names(&back), atom_names(&protein));
+    }
+
+    #[test]
+    fn test_a_fully_bonded_protein_is_still_a_receptor_not_73_torsions() {
+        let options = crate::io::options::PdbReadOptions {
+            residue_templates: true,
+            ..Default::default()
+        };
+        let protein = crate::io::pdb::parse_pdb_with_options(CRAMBIN, &options).expect("crambin");
+        let written = write_pdbqt(&protein);
+
+        assert!(!written.contains("BRANCH"), "{written}");
+        assert_eq!(residue_runs(&written), 46);
+    }
+
+    #[test]
+    fn test_the_ligand_role_writes_a_protein_as_a_tree() {
+        let protein = crate::io::pdb::parse_pdb(CRAMBIN).expect("crambin");
+        let ligand = PdbqtWriteOptions {
+            role: PdbqtRole::Ligand,
+        };
+        let written = write_pdbqt_with_options(&protein, &ligand);
+
+        assert!(written.starts_with("ROOT\n"), "{written}");
+        assert!(written.contains("TORSDOF 0"), "{written}");
+        // Rigid, so the ROOT block keeps input order and the residues whole.
+        assert_eq!(residue_runs(&written), 46);
+    }
+
+    #[test]
+    fn test_the_receptor_role_writes_a_small_molecule_with_no_tree() {
+        let mut mol = parse_smiles("CCO").expect("valid SMILES");
+        mol.set_coords3(vec![Point3::ORIGIN; mol.num_atoms()])
+            .expect("one per atom");
+        let receptor = PdbqtWriteOptions {
+            role: PdbqtRole::Receptor,
+        };
+        let written = write_pdbqt_with_options(&mol, &receptor);
+
+        assert!(!written.contains("ROOT"), "{written}");
+        assert_eq!(written.lines().count(), mol.num_atoms(), "{written}");
+    }
+
+    #[test]
+    fn test_root_serials_follow_input_order_across_components() {
+        // Two components whose atoms interleave in the input: each used to be
+        // laid down whole, so the second's atom jumped ahead of the first's.
+        let mut mol = Molecule::new();
+        for element in [
+            Element::carbon(),
+            Element::oxygen(),
+            Element::carbon(),
+            Element::oxygen(),
+        ] {
+            mol.add_atom(Atom::new(element));
+        }
+        mol.add_bond(Bond::new(0, 2, BondOrder::Single))
+            .expect("bond");
+        mol.add_bond(Bond::new(1, 3, BondOrder::Single))
+            .expect("bond");
+        mol.set_coords3(
+            (0..4)
+                .map(|i| Point3::new(f64::from(i), 0.0, 0.0))
+                .collect(),
+        )
+        .expect("one per atom");
+        let written = write_pdbqt(&mol);
+
+        let xs: Vec<&str> = written
+            .lines()
+            .filter(|l| l.starts_with("ATOM"))
+            .map(|l| l[30..38].trim())
+            .collect();
+        assert_eq!(xs, ["0.000", "1.000", "2.000", "3.000"], "{written}");
     }
 
     #[test]
