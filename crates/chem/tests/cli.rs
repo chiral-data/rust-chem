@@ -1176,7 +1176,7 @@ fn test_convert_list_unrecognized_code_is_an_error() {
 }
 
 #[test]
-fn test_convert_describe_reports_no_options_exposed_yet() {
+fn test_convert_describe_names_the_one_exposed_option() {
     let r = run(&["convert", "-H", "sdf"], None);
     assert_eq!(r.code, 0, "{:?}", r.stderr);
     assert!(
@@ -1192,6 +1192,10 @@ fn test_convert_describe_reports_no_options_exposed_yet() {
         "{:?}",
         r.stdout
     );
+
+    let r = run(&["convert", "-H", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("--pdbqt-role"), "{:?}", r.stdout);
 }
 
 #[test]
@@ -2199,6 +2203,54 @@ fn test_convert_writes_a_branched_ligand_as_pdbqt_with_torsion_tree() {
     assert!(r.stdout.contains("TORSDOF 2"), "{:?}", r.stdout);
     let branch_lines = r.stdout.lines().filter(|l| l.starts_with("BRANCH")).count();
     assert_eq!(branch_lines, 2, "{:?}", r.stdout);
+}
+
+const CRAMBIN_PDB: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/corpus/pdb/crambin-1crn.pdb"
+);
+
+#[test]
+fn test_convert_writes_a_protein_as_a_rigid_pdbqt_receptor() {
+    // #417: crambin came out as one ROOT with CYS 40's SG pulled up beside
+    // CYS 3's, so it read back as 49 residues.
+    let r = run(&["convert", CRAMBIN_PDB, "--to", "pdbqt"], None);
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(!r.stdout.contains("ROOT"), "{:?}", r.stdout);
+    assert!(!r.stdout.contains("TORSDOF"), "{:?}", r.stdout);
+    let atoms = r.stdout.lines().filter(|l| l.starts_with("ATOM")).count();
+    assert_eq!(atoms, 327);
+}
+
+#[test]
+fn test_convert_pdbqt_role_ligand_forces_the_torsion_tree() {
+    let r = run(
+        &[
+            "convert",
+            CRAMBIN_PDB,
+            "--to",
+            "pdbqt",
+            "--pdbqt-role",
+            "ligand",
+        ],
+        None,
+    );
+    assert_eq!(r.code, 0, "{:?}", r.stderr);
+    assert!(r.stdout.contains("ROOT"), "{:?}", r.stdout);
+
+    let r = run(
+        &[
+            "convert",
+            CRAMBIN_PDB,
+            "--to",
+            "pdbqt",
+            "--pdbqt-role",
+            "recepter",
+        ],
+        None,
+    );
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("receptor"), "{:?}", r.stderr);
 }
 
 #[test]
